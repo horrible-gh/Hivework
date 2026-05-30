@@ -13,6 +13,7 @@ Output: list of axis dicts [{axis_id, title, brief, depends_on}]
 
 import json
 import subprocess
+import shutil
 import logging
 import os
 from typing import Any
@@ -38,9 +39,9 @@ instruction in natural language. Your ONLY job is to CUT it into independent
 micro-tasks that free-tier workers ("drones") can each finish in a single
 session, each producing a ~1 page brief.
 
-You do NOT perform the research or work yourself.
-You do NOT use any tools, read any files, or run any commands.
-You ONLY output the decomposition.
+You do NOT perform the full investigation yourself — your deliverable is the
+PLAN, not the findings. You MAY take a quick look at the repo (a light ls/grep
+to orient the cut), but keep it minimal. Then output the decomposition JSON.
 
 ## Rules for a good cut
 
@@ -83,12 +84,22 @@ def build_decompose_prompt(seed_text: str, recipe_section1: str = "") -> str:
         Full prompt string for copilot.
     """
     recipe_part = recipe_section1 if recipe_section1 else RECIPE_FIXED_AXES
-    return f"""{DECOMPOSE_SYSTEM}
+    return f"""Your task RIGHT NOW: read the software investigation request below and break it into a parallel research plan, then reply with ONLY a JSON object. This is a real, concrete task — act on it immediately. Do not reply conversationally, do not say "I'm ready", do not ask what to do. The request is already here:
+
+═══════════════ INVESTIGATION REQUEST (decompose THIS) ═══════════════
+{seed_text}
+══════════════════════════════════════════════════════════════════════
+
+Now cut that request into independent micro-tasks (axes) for free-tier worker
+agents, following the rules and output schema below.
+
+{DECOMPOSE_SYSTEM}
 
 {recipe_part}
 
-## USER'S RAW INSTRUCTION:
-{seed_text}
+═══════════════════════════════════════════════════════════════════
+Respond NOW with ONLY the JSON object specified above — start with `{{`, end
+with `}}`. No prose, no markdown fences, no "I'm ready", nothing else.
 """
 
 
@@ -115,10 +126,41 @@ def run_decompose(
 
     prompt = build_decompose_prompt(seed_text, recipe_section1)
     logger.info("Running decompose worker...")
-    logger.debug("Prompt length: %d chars", len(prompt))
+    logger.info("Prompt length: %d chars (seed=%d, recipe§1=%d)",
+                len(prompt), len(seed_text), len(recipe_section1))
+
+    # Persist the exact prompt sent, so delivery problems are inspectable.
+    try:
+        with open(os.path.join(os.getcwd(), "decompose_prompt_last.txt"),
+                  "w", encoding="utf-8") as f:
+            f.write(prompt)
+    except OSError:
+        pass
 
     raw_output = _call_copilot(prompt, model=model, cwd=codebase_root)
-    result = extract_first_json(raw_output)
+
+    # Persist raw output so decompose failures are never blind (was: no dump).
+    dump_path = os.path.join(os.getcwd(), "decompose_raw_last.txt")
+    try:
+        with open(dump_path, "w", encoding="utf-8") as f:
+            f.write(raw_output or "")
+    except OSError:
+        dump_path = "(dump failed)"
+
+    if not raw_output or not raw_output.strip():
+        raise ValueError(
+            f"Decompose worker returned empty output (quota/timeout/rc!=0?). "
+            f"Raw saved to {dump_path}"
+        )
+
+    try:
+        result = extract_first_json(raw_output)
+    except ValueError as e:
+        snippet = raw_output.strip()[:800]
+        raise ValueError(
+            f"{e}\nWorker did not emit the required JSON object. "
+            f"Full raw saved to {dump_path}. First 800 chars of output:\n{snippet}"
+        ) from e
 
     # Validate structure
     if "tasks" not in result:
@@ -167,9 +209,11 @@ def _call_copilot(prompt: str, model: str = "gpt-5-mini",
     Returns:
         Raw stdout string.
     """
+    # Mirror ai_launcher run_worker.py: copilot reads the prompt from STDIN
+    # (no -p arg). Passing a long/non-ASCII prompt as a cmd.exe argv truncates
+    # it (cmd.exe ~8KB limit + cp932 codepage mangling of Korean). Stdin avoids both.
     cmd = [
-        "copilot",
-        "-p", prompt,
+        shutil.which("copilot.cmd") or shutil.which("copilot") or "copilot",
         "--allow-all",
         "--model", model,
     ]
@@ -177,8 +221,11 @@ def _call_copilot(prompt: str, model: str = "gpt-5-mini",
     logger.debug("Calling copilot: model=%s, cwd=%s", model, cwd)
     result = subprocess.run(
         cmd,
+        input=prompt,
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        errors="replace",
         cwd=cwd,
         timeout=300,  # 5 min timeout
     )

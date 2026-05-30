@@ -11,6 +11,7 @@ Uses subprocess + concurrent.futures for parallel execution.
 
 import os
 import subprocess
+import shutil
 import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any
@@ -140,9 +141,12 @@ def run_fanout(
 
         try:
             result = subprocess.run(
-                ["copilot", "-p", prompt, "--allow-all", "--model", model],
+                [shutil.which("copilot.cmd") or shutil.which("copilot") or "copilot", "--allow-all", "--model", model],
+                input=prompt,  # prompt via stdin (cmd.exe argv truncates long/Korean prompts)
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 cwd=codebase_root,
                 timeout=600,  # 10 min per axis
             )
