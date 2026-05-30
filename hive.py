@@ -25,6 +25,22 @@ from hive.reconcile import run_reconcile_loop
 from hive.assemble import run_assemble
 
 
+def _force_utf8_io() -> None:
+    """Make our own stdout/stderr UTF-8 so Korean logs don't crash on Windows.
+
+    On Windows the console defaults to cp932; logging Korean (seed paths,
+    conflict details, copilot output snippets) raises UnicodeEncodeError and
+    kills the first launch. Reconfiguring here is self-protecting regardless
+    of how hive.py is invoked (no reliance on the caller's environment).
+    PYTHONIOENCODING is also set as a cheap defence for any child Python.
+    """
+    os.environ.setdefault("PYTHONIOENCODING", "utf-8")
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is not None:
+            reconfigure(encoding="utf-8", errors="replace")
+
+
 def setup_logging(verbose: bool = False) -> None:
     """Configure logging for the orchestrator."""
     level = logging.DEBUG if verbose else logging.INFO
@@ -224,6 +240,8 @@ def run_pipeline(args: argparse.Namespace) -> None:
 
 def main() -> None:
     """CLI entry point."""
+    _force_utf8_io()
+
     parser = argparse.ArgumentParser(
         prog="hive",
         description="Hivework full-loop orchestrator — automated investigation pipeline",
