@@ -11,10 +11,11 @@ Uses subprocess + concurrent.futures for parallel execution.
 
 import os
 import subprocess
-import shutil
 import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any
+
+from hive.providers import call_worker
 
 logger = logging.getLogger("hive.fanout")
 
@@ -108,6 +109,9 @@ def run_fanout(
     contract_path: str | None = None,
     model: str = "gpt-5-mini",
     max_workers: int = 4,
+    provider: str = "copilot",
+    ledger=None,
+    provider_kwargs: dict | None = None,
 ) -> dict[str, str]:
     """Run fan-out: launch parallel copilot workers for each axis.
 
@@ -129,7 +133,7 @@ def run_fanout(
     contract = load_comb_contract(contract_path, codebase_root)
     comb_files: dict[str, str] = {}
 
-    def _run_one_axis(axis: dict[str, Any]) -> tuple[str, str]:
+    def _run_one_axis(axis: dict[str, Any]) -> tuple[str, str, str, str, float, bool, str]:
         axis_id = axis.get("id", axis.get("axis_id", "?"))
         prompt = build_comb_prompt(contract, axis, seed_text)
 
@@ -140,16 +144,9 @@ def run_fanout(
         err_path = os.path.join(combs_dir, f"err_{axis_id}.txt")
 
         try:
-            result = subprocess.run(
-                [shutil.which("copilot.cmd") or shutil.which("copilot") or "copilot", "--allow-all", "--model", model],
-                input=prompt,  # prompt via stdin (cmd.exe argv truncates long/Korean prompts)
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                cwd=codebase_root,
-                timeout=600,  # 10 min per axis
-            )
+            result = call_worker(provider, model, prompt, cwd=codebase_root, timeout=600,
+                                 **(provider_kwargs or {}))
+            err_msg = result.stderr[:200] if result.exit_code != 0 else ""
 
             with open(comb_path, 'w', encoding='utf-8') as f:
                 f.write(result.stdout)
@@ -157,26 +154,36 @@ def run_fanout(
                 f.write(result.stderr)
 
             logger.info("  [fan-out] Axis %s done (exit=%d, stdout=%d bytes)",
-                        axis_id, result.returncode, len(result.stdout))
+                        axis_id, result.exit_code, len(result.stdout))
+            return axis_id, comb_path, prompt, result.stdout, result.latency_s, result.exit_code == 0, err_msg
 
         except subprocess.TimeoutExpired:
             logger.error("  [fan-out] Axis %s TIMED OUT", axis_id)
+            timeout_msg = f"TIMEOUT: worker for axis {axis_id} exceeded 600s limit"
             with open(comb_path, 'w', encoding='utf-8') as f:
-                f.write(f"TIMEOUT: worker for axis {axis_id} exceeded 600s limit")
+                f.write(timeout_msg)
             with open(err_path, 'w', encoding='utf-8') as f:
                 f.write("TIMEOUT")
-
-        return axis_id, comb_path
+            return axis_id, comb_path, prompt, timeout_msg, 600.0, False, "TIMEOUT"
 
     # Launch in parallel
     logger.info("Fan-out: launching %d workers (max_parallel=%d)",
                 len(axes), max_workers)
 
+    results: list[tuple[str, str, str, str, float, bool, str]] = []
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
         futures = {pool.submit(_run_one_axis, axis): axis for axis in axes}
         for future in as_completed(futures):
-            axis_id, comb_path = future.result()
+            result = future.result()
+            results.append(result)
+            axis_id, comb_path, *_ = result
             comb_files[axis_id] = comb_path
+
+    if ledger is not None:
+        for axis_id, comb_path, prompt, output, latency_s, ok, err_msg in results:
+            ledger.record_call("swarm", axis_id, provider, model,
+                               prompt=prompt, output=output, latency_s=latency_s,
+                               comb_path=comb_path, ok=ok, err=err_msg)
 
     logger.info("Fan-out complete: %d combs saved", len(comb_files))
     return comb_files

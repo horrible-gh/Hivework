@@ -15,12 +15,10 @@ The output must match the honey_v2_N150.md skeleton:
 
 import json
 import os
-import subprocess
-import shutil
 import logging
 from typing import Any
 
-from hive.parse import extract_first_json
+from hive.providers import call_worker
 
 logger = logging.getLogger("hive.assemble")
 
@@ -125,6 +123,9 @@ def run_assemble(
     output_path: str,
     model: str = "gpt-5-mini",
     rounds_used: int = 0,
+    provider: str = "copilot",
+    ledger=None,
+    provider_kwargs: dict | None = None,
 ) -> str:
     """Run the assemble stage by calling a copilot worker.
 
@@ -149,7 +150,14 @@ def run_assemble(
     logger.info("Running assemble worker...")
     logger.debug("Prompt length: %d chars", len(prompt))
 
-    raw_output = _call_copilot(prompt, model=model, cwd=codebase_root)
+    wr = call_worker(provider, model, prompt, cwd=codebase_root, timeout=600,
+                     **(provider_kwargs or {}))
+    raw_output = wr.stdout
+    if ledger is not None:
+        ledger.record_call("assemble", "assemble", provider, model,
+                           prompt=prompt, output=wr.stdout, latency_s=wr.latency_s,
+                           ok=wr.exit_code == 0,
+                           err=wr.stderr[:200] if wr.exit_code != 0 else "")
 
     # The assemble worker outputs markdown directly (not JSON)
     # Strip any leading tool-trace lines (● lines)
@@ -192,39 +200,5 @@ def _strip_tool_traces(raw: str) -> str:
 
 def _call_copilot(prompt: str, model: str = "gpt-5-mini",
                   cwd: str | None = None) -> str:
-    """Call copilot CLI and return stdout.
-
-    Args:
-        prompt: Full prompt text.
-        model: Model name.
-        cwd: Working directory for subprocess.
-
-    Returns:
-        Raw stdout string.
-    """
-    # Mirror ai_launcher run_worker.py: copilot reads the prompt from STDIN
-    # (no -p arg). Passing a long/non-ASCII prompt as a cmd.exe argv truncates
-    # it (cmd.exe ~8KB limit + cp932 codepage mangling of Korean). Stdin avoids both.
-    cmd = [
-        shutil.which("copilot.cmd") or shutil.which("copilot") or "copilot",
-        "--allow-all",
-        "--model", model,
-    ]
-
-    logger.debug("Calling copilot: model=%s, cwd=%s", model, cwd)
-    result = subprocess.run(
-        cmd,
-        input=prompt,
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        cwd=cwd,
-        timeout=600,  # 10 min timeout for assemble
-    )
-
-    if result.returncode != 0:
-        logger.warning("Copilot returned code %d, stderr: %s",
-                       result.returncode, result.stderr[:500])
-
-    return result.stdout
+    """Legacy wrapper around the provider adapter."""
+    return call_worker("copilot", model, prompt, cwd=cwd, timeout=600).stdout

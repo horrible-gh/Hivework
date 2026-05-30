@@ -15,12 +15,12 @@ The reconcile brief MUST:
 
 import os
 import subprocess
-import shutil
 import logging
 from typing import Any
 
 from hive.parse import extract_first_json
 from hive.conflict_scan import scan_conflicts
+from hive.providers import call_worker
 
 logger = logging.getLogger("hive.reconcile")
 
@@ -91,6 +91,9 @@ def run_reconcile_loop(
     comb_contract: str,
     model: str = "gpt-5-mini",
     round_cap: int = 2,
+    provider: str = "copilot",
+    ledger=None,
+    provider_kwargs: dict | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], int]:
     """Run the reconcile loop until conflicts converge or round cap is reached.
 
@@ -143,16 +146,14 @@ def run_reconcile_loop(
         err_path = os.path.join(combs_dir, f"err_{reconcile_id}.txt")
 
         try:
-            result = subprocess.run(
-                [shutil.which("copilot.cmd") or shutil.which("copilot") or "copilot", "--allow-all", "--model", model],
-                input=prompt,  # prompt via stdin (cmd.exe argv truncates long/Korean prompts)
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                cwd=codebase_root,
-                timeout=600,
-            )
+            result = call_worker(provider, model, prompt, cwd=codebase_root, timeout=600,
+                                 **(provider_kwargs or {}))
+
+            if ledger is not None:
+                ledger.record_call("queen", reconcile_id, provider, model,
+                                   prompt=prompt, output=result.stdout, latency_s=result.latency_s,
+                                   comb_path=comb_path, ok=result.exit_code == 0,
+                                   err=result.stderr[:200] if result.exit_code != 0 else "")
 
             with open(comb_path, 'w', encoding='utf-8') as f:
                 f.write(result.stdout)

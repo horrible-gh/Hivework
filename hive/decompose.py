@@ -12,13 +12,12 @@ Output: list of axis dicts [{axis_id, title, brief, depends_on}]
 """
 
 import json
-import subprocess
-import shutil
 import logging
 import os
 from typing import Any
 
 from hive.parse import extract_first_json
+from hive.providers import call_worker
 
 logger = logging.getLogger("hive.decompose")
 
@@ -108,6 +107,9 @@ def run_decompose(
     recipe_path: str | None = None,
     codebase_root: str | None = None,
     model: str = "gpt-5-mini",
+    provider: str = "copilot",
+    ledger=None,
+    provider_kwargs: dict | None = None,
 ) -> dict[str, Any]:
     """Run the decompose stage by calling a copilot worker.
 
@@ -137,7 +139,14 @@ def run_decompose(
     except OSError:
         pass
 
-    raw_output = _call_copilot(prompt, model=model, cwd=codebase_root)
+    wr = call_worker(provider, model, prompt, cwd=codebase_root, timeout=300,
+                     **(provider_kwargs or {}))
+    raw_output = wr.stdout
+    if ledger is not None:
+        ledger.record_call("queen", "decompose", provider, model,
+                           prompt=prompt, output=wr.stdout, latency_s=wr.latency_s,
+                           ok=wr.exit_code == 0,
+                           err=wr.stderr[:200] if wr.exit_code != 0 else "")
 
     # Persist raw output so decompose failures are never blind (was: no dump).
     dump_path = os.path.join(os.getcwd(), "decompose_raw_last.txt")
@@ -199,39 +208,5 @@ def _extract_recipe_section1(recipe_path: str) -> str:
 
 def _call_copilot(prompt: str, model: str = "gpt-5-mini",
                   cwd: str | None = None) -> str:
-    """Call copilot CLI and return stdout.
-
-    Args:
-        prompt: Full prompt text.
-        model: Model name.
-        cwd: Working directory for subprocess.
-
-    Returns:
-        Raw stdout string.
-    """
-    # Mirror ai_launcher run_worker.py: copilot reads the prompt from STDIN
-    # (no -p arg). Passing a long/non-ASCII prompt as a cmd.exe argv truncates
-    # it (cmd.exe ~8KB limit + cp932 codepage mangling of Korean). Stdin avoids both.
-    cmd = [
-        shutil.which("copilot.cmd") or shutil.which("copilot") or "copilot",
-        "--allow-all",
-        "--model", model,
-    ]
-
-    logger.debug("Calling copilot: model=%s, cwd=%s", model, cwd)
-    result = subprocess.run(
-        cmd,
-        input=prompt,
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        cwd=cwd,
-        timeout=300,  # 5 min timeout
-    )
-
-    if result.returncode != 0:
-        logger.warning("Copilot returned code %d, stderr: %s",
-                       result.returncode, result.stderr[:500])
-
-    return result.stdout
+    """Legacy wrapper around the provider adapter."""
+    return call_worker("copilot", model, prompt, cwd=cwd, timeout=300).stdout

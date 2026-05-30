@@ -3,3 +3,4 @@
 /hive/__pycache__/
 /*.txt
 __pycache__
+hive_ledger.db
