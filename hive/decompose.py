@@ -24,12 +24,12 @@ logger = logging.getLogger("hive.decompose")
 
 # Fixed axes that recipe_code_bug.md §1 requires always present
 RECIPE_FIXED_AXES = """
-## 반드시 포함할 고정 축 (레시피 §1):
-- **설계 SSOT grep**: Documents/projects/<proj>/ 설계문서에서 "의도된 사양" grep. 코드 vs 설계 대조.
-- **head-resolver / SQL 게이트**: 분기·루프·early-return·SQL WHERE 조건이 실행 도달성을 가르는 지점 조사. 특히 server/sql/queries/*.json.
-- **리그레션 blame**: git log/git blame으로 증상 관련 라인의 최근 변경·도입 커밋 특정. "언제부터 깨졌나 / 이미 고쳐졌나".
+## Fixed axes that MUST be included (recipe §1):
+- **Design SSOT grep**: grep the design docs under Documents/projects/<proj>/ for the "intended spec." Contrast code vs design.
+- **head-resolver / SQL gate**: investigate where branches, loops, early-returns, and SQL WHERE conditions decide execution reachability. Especially server/sql/queries/*.json.
+- **Regression blame**: use git log / git blame to pin the recent change / introducing commit for the lines tied to the symptom. "Since when did it break / is it already fixed."
 
-이 세 축은 날것 A~G 외에 반드시 추가/보강하라.
+In addition to the raw axes A-G, you MUST add/reinforce these three axes.
 """
 
 DECOMPOSE_SYSTEM = """# ROLE: DECOMPOSER ("queen") — automated fan-out pipeline
@@ -174,16 +174,16 @@ def run_decompose(
 
 
 def _extract_recipe_section1(recipe_path: str) -> str:
-    """Extract §1 (입구 — 고정 절단축) section from recipe card."""
+    """Extract the §1 (Entrance — fixed cut axes) section from the recipe card."""
     with open(recipe_path, 'r', encoding='utf-8') as f:
         text = f.read()
 
-    # Extract from "## ① 입구" to "## ②" or end
+    # Extract from "## ① Entrance" to "## ②"/"## ③" or end
     lines = text.split('\n')
     in_section = False
     section_lines = []
     for line in lines:
-        if '① 입구' in line or '§1' in line:
+        if line.startswith('## ①') or '§1' in line:
             in_section = True
             section_lines.append(line)
             continue

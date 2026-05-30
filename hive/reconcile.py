@@ -10,7 +10,7 @@ When conflict-scan detects conflicts:
 The reconcile brief MUST:
   - Quote both conflicting conclusions with their file:line evidence
   - Ask a narrowed question focused on resolving the specific contradiction
-  - Always ask about execution reachability ("이 코드가 진짜 도나?")
+  - Always ask about execution reachability ("does that code actually run?")
 """
 
 import os
@@ -37,43 +37,45 @@ def build_reconcile_brief(conflicts: list[dict[str, Any]],
         Reconcile prompt brief text.
     """
     lines = [
-        "# RECONCILE 재조사 — 충돌 해소 조사",
+        "# RECONCILE re-investigation — conflict-resolution pass",
         "",
-        "아래 충돌이 발견됐다. 이 모순을 해소하는 데 필요한 것만 좁혀 조사하라.",
-        "반드시 **실행 도달성**(\"그 코드가 진짜 도나?\")을 따져라.",
+        "The conflicts below were detected. Investigate only what is needed to resolve the contradiction, narrowed.",
+        "You MUST judge **execution reachability** (\"does that code actually run?\").",
         "",
     ]
 
     for i, conflict in enumerate(conflicts, 1):
-        lines.append(f"## 충돌 {i}: {conflict['type']}")
-        lines.append(f"- 축 A: {conflict['axis_a']}")
+        lines.append(f"## Conflict {i}: {conflict['type']}")
+        lines.append(f"- Axis A: {conflict['axis_a']}")
         if conflict.get('axis_b'):
-            lines.append(f"- 축 B: {conflict['axis_b']}")
-        lines.append(f"- 상세: {conflict['detail']}")
-        lines.append(f"- 근거 A: {conflict.get('evidence_a', 'N/A')}")
+            lines.append(f"- Axis B: {conflict['axis_b']}")
+        lines.append(f"- Detail: {conflict['detail']}")
+        lines.append(f"- Evidence A: {conflict.get('evidence_a', 'N/A')}")
         if conflict.get('evidence_b'):
-            lines.append(f"- 근거 B: {conflict['evidence_b']}")
+            lines.append(f"- Evidence B: {conflict['evidence_b']}")
         lines.append("")
 
         # Add specific narrowed questions based on conflict type
         if conflict["type"] == "root_cause_mismatch":
             lines.append(
-                "**좁힌 질문:** 위 두 근본원인 중 어느 쪽이 대상 시나리오에서 "
-                "실제로 실행되는 경로인가? 두 file:line을 모두 열어 분기조건·"
-                "SQL WHERE·try/except를 따져 도달성을 판별하라."
+                "**Narrowed question:** Of the two root causes above, which one is the "
+                "path actually executed in the target scenario? Open both file:line "
+                "locations and judge reachability via branch conditions, SQL WHERE, "
+                "and try/except."
             )
         elif conflict["type"] == "termination_divergence":
             lines.append(
-                "**좁힌 질문:** 한쪽은 resolved, 다른 쪽은 미결로 남겼다. "
-                "미결 측이 지적한 코드 경로가 실제로 대상 시나리오에서 "
-                "실행 가능한가? file:line을 따라 분기조건을 정적으로 판별하라."
+                "**Narrowed question:** One side left it resolved, the other unresolved. "
+                "Is the code path flagged by the unresolved side actually reachable in "
+                "the target scenario? Follow the file:line and judge the branch "
+                "conditions statically."
             )
         elif conflict["type"] == "unresolved_conditional":
             lines.append(
-                "**좁힌 질문:** reachable=conditional로 남긴 경로에 "
-                "실제로 도달하는 시나리오가 존재하는가? "
-                "해당 조건을 만족시키는 구체적 데이터 상태(예: "
-                "특정 칼럼이 NULL인 행이 존재하는 경로)를 정적으로 특정하라."
+                "**Narrowed question:** For the path left as reachable=conditional, does a "
+                "scenario that actually reaches it exist? Pin down statically the concrete "
+                "data state that satisfies the condition (e.g. a path where a row with a "
+                "specific column being NULL exists)."
             )
         lines.append("")
 
@@ -124,14 +126,14 @@ def run_reconcile_loop(
         reconcile_id = f"RECONCILE{round_num}" if round_num > 1 else "RECONCILE_R1"
         prompt = f"""{comb_contract}
 
-[배정된 축]
+[Assigned axis]
 - axis_id: {reconcile_id}
-- title: Reconcile 재조사 (라운드 {round_num})
-- brief: 아래 충돌을 좁힌 정적 조사로 해소하라.
+- title: Reconcile re-investigation (round {round_num})
+- brief: Resolve the conflicts below via a narrowed static investigation.
 
 {brief}
 
-[원본 시드]
+[Original seed]
 {seed_text}
 """
 

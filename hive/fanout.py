@@ -19,35 +19,35 @@ from typing import Any
 logger = logging.getLogger("hive.fanout")
 
 # Default comb contract template — loaded from file if available
-DEFAULT_COMB_CONTRACT = """[역할] 너는 Hivework 무료워커(drone) 1명. 배정된 단일 조사축 하나만 판다. 코드 수정 금지 — investigation-only. 모든 주장은 실제 파일을 grep/read로 열어 확인한 file:line 근거 필수. 추측 금지.
+DEFAULT_COMB_CONTRACT = """[Role] You are one Hivework free worker (drone). You dig into the single investigation axis assigned to you, and only that one. No code edits — investigation-only. Every claim MUST cite file:line evidence verified by actually opening the file with grep/read. No guessing.
 
-[대상 코드베이스 루트] {codebase_root} (git repo)
+[Target codebase root] {codebase_root} (git repo)
 
-[깊이 규약 — 얕은 comb 금지] 다음을 반드시 한다:
-1. **실행 도달성**: 코드가 "있다"가 아니라 "실제로 실행되는가"를 따져라. 분기조건·early return·try/except 삼킴·**SQL WHERE 게이트**가 그 블록을 스킵시키는지 확인. "존재"와 "도달"을 구분해 적어라.
-2. **콜체인 트레이스**: 진입점→…→DB write까지 file:line을 `→`로 이어라.
-3. **설계 대조**(가능하면): 코드 동작 vs 설계문서가 의도한 사양을 대조. 어긋나면 그게 버그, 일치하면 의도.
-4. **blame**(축이 리그레션/이력이면): `git log`/`git blame`으로 관련 라인의 도입·수정 커밋(해시+제목)을 특정. "이미 고쳐졌나"도 확인.
+[Depth contract — no shallow combs] You MUST do the following:
+1. **Execution reachability**: judge not that the code "exists" but whether it "actually runs." Check whether branch conditions, early returns, swallowed try/except, or **SQL WHERE gates** skip the block. Write "exists" and "reached" as distinct facts.
+2. **Call-chain trace**: connect file:line with `→` from entry point → … → the DB write.
+3. **Design contrast** (when possible): contrast the code's behavior against the spec intended by the design docs. A mismatch is the bug; a match is intended behavior.
+4. **blame** (if the axis is about regression/history): use `git log` / `git blame` to pin the introducing/modifying commit (hash + title) for the relevant lines. Also check "is it already fixed."
 
-[출력 규약 — comb] 아래 JSON 한 덩어리만. 산문·JSON 외 텍스트 금지.
+[Output contract — comb] Output ONLY the single JSON object below. No prose, no text outside the JSON.
 {{
-  "axis_id": "<축 id>",
-  "axis_title": "<축 제목>",
-  "trace": "<진입점→…→DB/UI까지 콜체인 한 줄, file:line 포함. 해당없으면 null>",
+  "axis_id": "<axis id>",
+  "axis_title": "<axis title>",
+  "trace": "<one-line call chain from entry point → … → DB/UI, with file:line. null if not applicable>",
   "findings": [
     {{
-      "claim": "<확인한 사실>",
-      "evidence": [{{"file":"<상대경로>","lines":"<예 49-78>","what":"<그 라인이 보여주는 것>"}}],
-      "reachable": "yes|no|conditional — 이 코드가 대상 시나리오에서 실제 실행되는가 + 조건",
+      "claim": "<the fact you verified>",
+      "evidence": [{{"file":"<relative path>","lines":"<e.g. 49-78>","what":"<what those lines show>"}}],
+      "reachable": "yes|no|conditional — does this code actually run in the target scenario, plus the condition",
       "confidence": "high|med|low"
     }}
   ],
-  "design_ref": [{{"doc":"<설계ID 예 M026 §8-1>","intended":"<설계가 의도한 것>","matches_code":"yes|no"}}],
-  "regression": {{"commit":"<해시 제목 / null>","what_changed":"<무엇이 언제 바뀜 / null>"}},
-  "root_cause_signal": "<이 축이 증상의 근본원인을 직접 짚으면 file:line, 아니면 null>",
-  "cross_refs": ["<다른 축 id>"],
+  "design_ref": [{{"doc":"<design ID, e.g. M026 §8-1>","intended":"<what the design intended>","matches_code":"yes|no"}}],
+  "regression": {{"commit":"<hash title / null>","what_changed":"<what changed and when / null>"}},
+  "root_cause_signal": "<file:line if this axis directly pins the symptom's root cause, otherwise null>",
+  "cross_refs": ["<other axis id>"],
   "termination": "resolved | needs_runtime | needs_external | needs_pm",
-  "notes": "<한줄. 못 닫았으면 무엇을 더 봐야 하는지>"
+  "notes": "<one line. if unclosed, what else needs to be looked at>"
 }}
 """
 
@@ -90,12 +90,12 @@ def build_comb_prompt(contract: str, axis: dict[str, Any],
 
     return f"""{contract}
 
-[배정된 축]
+[Assigned axis]
 - axis_id: {axis_id}
 - title: {title}
 - brief: {brief}
 
-[원본 시드 (전체 맥락)]
+[Original seed (full context)]
 {seed_text}
 """
 

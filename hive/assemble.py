@@ -1,6 +1,6 @@
 """Assemble stage — delegates final honey synthesis to a drone worker.
 
-Takes all parsed combs + reconcile results + recipe §3 (출구) rules
+Takes all parsed combs + reconcile results + recipe §3 (Exit) rules
 and sends them to a copilot worker for final honey markdown assembly.
 
 The output must match the honey_v2_N150.md skeleton:
@@ -24,24 +24,24 @@ from hive.parse import extract_first_json
 
 logger = logging.getLogger("hive.assemble")
 
-ASSEMBLE_SYSTEM = """# ROLE: ASSEMBLER (honey 조립기) — automated pipeline final stage
+ASSEMBLE_SYSTEM = """# ROLE: ASSEMBLER (honey builder) — automated pipeline final stage
 
 You are the ASSEMBLER in an automated Hivework pipeline. You receive:
 1. All parsed comb results (drone investigation outputs) as JSON
 2. Reconcile round results (if any)
-3. The recipe §3 출구 rules defining the output format
+3. The recipe §3 exit rules defining the output format
 
 Your ONLY job is to synthesize all comb findings into a single honey markdown document.
 
-## Output format (STRICT — honey_v2 골격):
+## Output format (STRICT — honey_v2 skeleton):
 
-1. **헤더블록**: 조사 ID / 프로젝트 / 날짜 / 조사자(Hivework drone pool) / 상태(investigation-only) / 축 구성
-2. **핵심 결론 한 줄**: 가장 중요한 발견을 한 문장으로 요약 (> ⚠️ 블록)
-3. **번호 섹션** = 축 1:1: 각 축별로 §번호, 축 제목, 콜체인 코드블록 트레이스, 발견 요약
-4. **Gap 분석 표**: | Gap | file:line | issue | 상태 |
-5. **설계 SSOT 대조표**: | 설계ID §절 | 의도 | 코드 실제 | 일치 |
-6. **출처표 + 충돌수렴 결과**: | 결론행 | 축/drone | 근거 file:line | + 충돌수렴 서술
-7. **repro 가설 + Fix direction**: 최소 재현 시퀀스 + Fix option A/B/C + 추천
+1. **Header block**: investigation ID / project / date / investigator (Hivework drone pool) / status (investigation-only) / axis composition
+2. **One-line key conclusion**: summarize the single most important finding in one sentence (> ⚠️ block)
+3. **Numbered sections** = axes 1:1: for each axis, a §number, axis title, call-chain code-block trace, finding summary
+4. **Gap analysis table**: | Gap | file:line | issue | status |
+5. **Design SSOT comparison table**: | design ID §section | intent | actual code | match |
+6. **Source table + conflict-convergence results**: | conclusion row | axis/drone | evidence file:line | + conflict-convergence narrative
+7. **repro hypothesis + Fix direction**: minimal reproduction sequence + Fix option A/B/C + recommendation
 
 ## Rules:
 - Use ONLY information from the provided combs. Do NOT invent or assume.
@@ -75,23 +75,23 @@ def build_assemble_prompt(
 
     return f"""{ASSEMBLE_SYSTEM}
 
-## 레시피 §3 (출구 — 출력형태 규칙):
+## Recipe §3 (Exit — output-format rules):
 {recipe_section3}
 
-## 충돌 재조사 결과:
-- 라운드 사용: {rounds_used}
-- 잔여 충돌(경성경계): {conflicts_json}
+## Conflict re-investigation results:
+- Rounds used: {rounds_used}
+- Remaining conflicts (hard boundaries): {conflicts_json}
 
-## 원본 시드:
+## Original seed:
 {seed_text}
 
-## 전체 comb 결과 (JSON):
+## All comb results (JSON):
 {combs_json}
 """
 
 
 def _extract_recipe_section3(recipe_path: str) -> str:
-    """Extract §3 (출구 — honey 출력형태) section from recipe card."""
+    """Extract the §3 (Exit — honey output shape) section from the recipe card."""
     with open(recipe_path, 'r', encoding='utf-8') as f:
         text = f.read()
 
@@ -99,7 +99,7 @@ def _extract_recipe_section3(recipe_path: str) -> str:
     in_section = False
     section_lines = []
     for line in lines:
-        if '③ 출구' in line or '§3' in line:
+        if line.startswith('## ③') or '§3' in line:
             in_section = True
             section_lines.append(line)
             continue
