@@ -2,3 +2,4 @@
 /smoke/
 /hive/__pycache__/
 /*.txt
+__pycache__
