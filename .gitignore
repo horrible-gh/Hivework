@@ -1,2 +1,4 @@
 /.claude/
 /smoke/
+/hive/__pycache__/
+/*.txt
