@@ -1,6 +1,7 @@
 /.claude/
 /smoke/
 /hive/__pycache__/
+/test/__pycache__/
 /*.txt
 __pycache__
 hive_ledger.db
