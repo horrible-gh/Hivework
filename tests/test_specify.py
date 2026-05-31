@@ -7,6 +7,8 @@ The provider is mocked so these run without the copilot CLI. Coverage:
   ④ A stale/not_found edit downgrades ready_to_apply → needs_reinvestigation
   ⑤ run_specify raises ValueError when the author emits no JSON
   ⑥ config exposes a 'specify' role and --model override reaches it
+  ⑦ effectiveness gate: deterministic no-op + model review downgrade a ready spec
+    whose edits do not change the reported behavior; inconclusive review → needs_pm
 """
 
 import json
@@ -25,6 +27,16 @@ from hive.providers import WorkerResult
 
 def _wr(stdout: str) -> WorkerResult:
     return WorkerResult(stdout=stdout, stderr="", exit_code=0, latency_s=0.01)
+
+
+def _review(reviews: list) -> str:
+    """A well-formed effectiveness-review worker response."""
+    return json.dumps({"reviews": reviews})
+
+
+def _fresh_ready() -> dict:
+    """A fresh deep copy of the ready spec (tests mutate it)."""
+    return json.loads(json.dumps(_READY_SPEC))
 
 
 _READY_SPEC = {
@@ -116,12 +128,15 @@ class TestRunSpecify(unittest.TestCase):
         self.out = os.path.join(self.tmp, "spec.json")
 
     def _run(self, stdout: str):
+        # review=False: these tests cover authoring/normalize, not the gate, so a
+        # single mocked worker call is enough.
         with mock.patch.object(specify, "call_worker", return_value=_wr(stdout)):
             return specify.run_specify(
                 honey_path=self.honey,
                 codebase_root=self.tmp,
                 output_path=self.out,
                 contract_path=self.contract,
+                review=False,
             )
 
     def test_parses_writes_and_returns(self):
@@ -151,6 +166,109 @@ class TestRunSpecify(unittest.TestCase):
     def test_no_json_raises(self):
         with self.assertRaises(ValueError):
             self._run("● Read a.py\n  └ nothing parseable here\n")
+
+
+class TestDeterministicNoop(unittest.TestCase):
+    def test_whitespace_only_change_is_noop(self):
+        spec = {"edits": [
+            {"id": "E1", "anchor_old": "  return x", "replacement_new": "  return x  "},
+        ]}
+        self.assertEqual(specify._deterministic_noop_ids(spec), ["E1"])
+
+    def test_real_change_is_not_noop(self):
+        spec = {"edits": [
+            {"id": "E1", "anchor_old": "x = 1", "replacement_new": "x = 2"},
+        ]}
+        self.assertEqual(specify._deterministic_noop_ids(spec), [])
+
+    def test_indentation_change_is_not_noop(self):
+        # Indentation is significant (Python) — it must NOT be treated as a no-op.
+        spec = {"edits": [
+            {"id": "E1", "anchor_old": "if a:\n    b()", "replacement_new": "if a:\n  b()"},
+        ]}
+        self.assertEqual(specify._deterministic_noop_ids(spec), [])
+
+
+class TestEffectivenessGateUnit(unittest.TestCase):
+    def test_ineffective_review_downgrades(self):
+        out = specify._apply_effectiveness_gate(
+            _fresh_ready(), [],
+            {"E1": {"effective": False, "coherent": True, "reason": "never reached"}}, False)
+        self.assertEqual(out["termination"], "needs_reinvestigation")
+        self.assertIn("E1", out["effectiveness"]["ineffective_ids"])
+        self.assertFalse(out["edits"][0]["effectiveness"]["ok"])
+
+    def test_incoherent_review_downgrades(self):
+        out = specify._apply_effectiveness_gate(
+            _fresh_ready(), [],
+            {"E1": {"effective": True, "coherent": False, "reason": "contradicts honey"}}, False)
+        self.assertEqual(out["termination"], "needs_reinvestigation")
+
+    def test_deterministic_noop_downgrades_even_if_review_says_ok(self):
+        out = specify._apply_effectiveness_gate(
+            _fresh_ready(), ["E1"], {"E1": {"effective": True, "coherent": True}}, False)
+        self.assertEqual(out["termination"], "needs_reinvestigation")
+
+    def test_inconclusive_downgrades_to_needs_pm(self):
+        out = specify._apply_effectiveness_gate(_fresh_ready(), [], {}, True)
+        self.assertEqual(out["termination"], "needs_pm")
+
+    def test_all_good_keeps_ready(self):
+        out = specify._apply_effectiveness_gate(
+            _fresh_ready(), [], {"E1": {"effective": True, "coherent": True}}, False)
+        self.assertEqual(out["termination"], "ready_to_apply")
+
+    def test_never_upgrades_a_non_ready_spec(self):
+        spec = _fresh_ready()
+        spec["termination"] = "needs_pm"
+        out = specify._apply_effectiveness_gate(
+            spec, ["E1"], {"E1": {"effective": False}}, True)
+        self.assertEqual(out["termination"], "needs_pm")
+
+
+class TestRunSpecifyWithReview(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.honey = os.path.join(self.tmp, "honey.md")
+        with open(self.honey, "w", encoding="utf-8") as f:
+            f.write("# honey\nSymptom: X is wrong. Fix: change x.\n")
+        self.contract = os.path.join(self.tmp, "contract.md")
+        with open(self.contract, "w", encoding="utf-8") as f:
+            f.write("[Role] specify author contract")
+        self.out = os.path.join(self.tmp, "spec.json")
+
+    def _run(self, author_stdout: str, review_stdout: str):
+        # First worker call = author; second = effectiveness review.
+        with mock.patch.object(specify, "call_worker",
+                               side_effect=[_wr(author_stdout), _wr(review_stdout)]):
+            return specify.run_specify(
+                honey_path=self.honey,
+                codebase_root=self.tmp,
+                output_path=self.out,
+                contract_path=self.contract,
+            )
+
+    def test_review_keeps_ready_when_effective(self):
+        spec = self._run(
+            json.dumps(_READY_SPEC),
+            _review([{"id": "E1", "effective": True, "coherent": True, "reason": "ok"}]))
+        self.assertEqual(spec["termination"], "ready_to_apply")
+
+    def test_review_downgrades_when_ineffective(self):
+        spec = self._run(
+            json.dumps(_READY_SPEC),
+            _review([{"id": "E1", "effective": False, "coherent": True,
+                      "reason": "guard can never be true"}]))
+        self.assertEqual(spec["termination"], "needs_reinvestigation")
+        # The downgrade reason is persisted to the SSOT on disk.
+        with open(self.out, encoding="utf-8") as f:
+            on_disk = json.load(f)
+        self.assertEqual(on_disk["termination"], "needs_reinvestigation")
+        self.assertIn("E1", on_disk["effectiveness"]["ineffective_ids"])
+
+    def test_unparseable_review_downgrades_to_needs_pm(self):
+        spec = self._run(json.dumps(_READY_SPEC), "● no parseable json here\n")
+        self.assertEqual(spec["termination"], "needs_pm")
 
 
 class TestConfigSpecifyRole(unittest.TestCase):

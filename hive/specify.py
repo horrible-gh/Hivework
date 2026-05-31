@@ -18,6 +18,13 @@ Key invariants (mirrored from recipes/edit_spec_contract_v1.md):
     a later promotion) applies. specify never writes to the target codebase.
   - The JSON edit-spec is the SSOT; the human-facing unified diff is a DERIVED view
     rendered later by hive/apply.py — specify does not author the diff.
+  - Effectiveness gate: an edit whose anchor is valid but whose change does not
+    alter the behavior the honey identified — a no-op assignment, a guard whose
+    condition can never be true, a whitespace-only diff — must NOT be presented as
+    ready. After authoring, specify re-reads the edits (a deterministic no-op check
+    plus an independent model review) and downgrades a ready_to_apply spec that does
+    not actually change the reported behavior. A ready claim that cannot be verified
+    is deferred to a human (needs_pm) rather than trusted.
 
 The author's role prompt is the contract file itself, loaded at runtime so the
 contract stays the single source of authoring rules (no duplicated prompt here).
@@ -42,6 +49,12 @@ _DEFAULT_CONTRACT_PATH = os.path.join(
 _REQUIRED_KEYS = ("edits", "deferred", "gate", "termination")
 _VALID_TERMINATION = {"ready_to_apply", "needs_reinvestigation", "needs_pm"}
 _STALE_STATUSES = {"stale", "not_found"}
+
+# Effectiveness-gate outcomes. An ineffective edit means the fix does not change
+# behavior, so the loop must re-investigate; an inconclusive review (the check
+# could not be obtained) instead defers the ready decision to a human.
+_INEFFECTIVE_TERMINATION = "needs_reinvestigation"
+_INCONCLUSIVE_TERMINATION = "needs_pm"
 
 
 def load_contract(contract_path: str | None = None) -> str:
@@ -116,6 +129,225 @@ def _validate_spec(spec: dict[str, Any]) -> list[str]:
     return problems
 
 
+def _normalize_ws(text: str) -> str:
+    """Collapse only insignificant whitespace (line endings, trailing/edge blanks).
+
+    Indentation is preserved on purpose — in languages like Python it is
+    significant — so this never mislabels a real change as a no-op; it only
+    catches diffs that are whitespace noise once line endings and trailing space
+    are normalized.
+    """
+    lines = (text or "").replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    return "\n".join(line.rstrip() for line in lines).strip()
+
+
+def _deterministic_noop_ids(spec: dict[str, Any]) -> list[str]:
+    """Edit ids whose replacement makes no textual difference (whitespace-normalized).
+
+    This is the cheap, certain half of the effectiveness gate. apply already
+    rejects an exact ``anchor_old == replacement_new``; here we also catch
+    whitespace-only "changes" and, crucially, use the finding to downgrade the
+    whole spec's termination rather than only flagging the single edit at apply.
+    """
+    noop: list[str] = []
+    for e in spec.get("edits") or []:
+        if not isinstance(e, dict):
+            continue
+        if _normalize_ws(e.get("anchor_old", "")) == _normalize_ws(e.get("replacement_new", "")):
+            noop.append(str(e.get("id", "?")))
+    return noop
+
+
+def build_review_prompt(honey_text: str, spec: dict[str, Any], codebase_root: str) -> str:
+    """Build the effectiveness-review prompt for a second, independent look.
+
+    The reviewer gets the honey (the reported symptom + the behavior the fix must
+    change) and the edits specify just authored, and judges — per edit, re-reading
+    live code as needed — whether each edit ACTUALLY changes the behavior the honey
+    identified (effective) and is consistent with the honey's conclusion (coherent).
+    An edit that is anchored correctly but functionally inert (a no-op assignment, a
+    guard whose condition can never be true, a value set to what it already is) is
+    effective=false: that is exactly the failure this review exists to catch.
+    """
+    edits = [e for e in (spec.get("edits") or []) if isinstance(e, dict)]
+    blocks = [
+        json.dumps({
+            "id": e.get("id"),
+            "file": e.get("file"),
+            "anchor_old": e.get("anchor_old"),
+            "replacement_new": e.get("replacement_new"),
+            "rationale": e.get("rationale"),
+        }, ensure_ascii=False, indent=2)
+        for e in edits
+    ]
+    edits_json = "\n".join(blocks) if blocks else "(no edits)"
+    return f"""[Role] You are an INDEPENDENT effectiveness reviewer for Hivework's specify stage. \
+You did not author these edits. Your only job is to catch edits that are anchored \
+correctly but do not actually fix anything. Do not rewrite the edits; only judge them.
+
+[Codebase root — re-read LIVE files from here]
+{codebase_root}
+
+[The honey — the reported symptom and the behavior the fix must change]
+{honey_text}
+
+[The proposed edits to judge]
+{edits_json}
+
+[Judge each edit]
+For every edit decide two booleans:
+- effective: would applying this edit actually change the behavior the honey identified \
+as wrong? An edit that is functionally inert — a no-op assignment, a guard whose \
+condition can never be true, a value set to what it already is, a change with no runtime \
+effect — is effective=false EVEN THOUGH its anchor is valid. Re-open the live files to \
+judge reachability and effect; do not assume.
+- coherent: is the edit consistent with the honey's conclusion (it does not contradict \
+what the investigation concluded)?
+
+[Output contract] Output ONLY this JSON object. No prose, no text outside the JSON.
+{{
+  "reviews": [
+    {{ "id": "<edit id>", "effective": true, "coherent": true, "reason": "<one line>" }}
+  ]
+}}
+"""
+
+
+def review_effectiveness(
+    honey_text: str,
+    spec: dict[str, Any],
+    codebase_root: str,
+    model: str,
+    provider: str,
+    ledger=None,
+    provider_kwargs: dict | None = None,
+) -> tuple[dict[str, dict], bool]:
+    """Second pass: ask a worker to judge each edit's effectiveness/coherence.
+
+    Returns ``(judgments_by_id, inconclusive)``. ``inconclusive`` is True when the
+    review could not be obtained or parsed — the caller then defers the ready
+    decision to a human rather than silently trusting the original claim. This
+    function never raises: a flaky review must not crash specify or lose the honey.
+    """
+    edits = [e for e in (spec.get("edits") or []) if isinstance(e, dict)]
+    if not edits:
+        return {}, False  # nothing to review
+
+    prompt = build_review_prompt(honey_text, spec, codebase_root)
+    logger.info("Running specify effectiveness review (%d edits, independent pass)...",
+                len(edits))
+    try:
+        wr = call_worker(provider, model, prompt, cwd=codebase_root, timeout=600,
+                         **(provider_kwargs or {}))
+    except Exception as e:  # subprocess timeout, provider error, etc.
+        logger.warning("specify: effectiveness review worker failed: %s", e)
+        return {}, True
+
+    if ledger is not None:
+        ledger.record_call("specify", "specify_review", provider, model,
+                           prompt=prompt, output=wr.stdout, latency_s=wr.latency_s,
+                           ok=wr.exit_code == 0,
+                           err=wr.stderr[:200] if wr.exit_code != 0 else "")
+
+    try:
+        parsed = extract_first_json(wr.stdout)
+    except ValueError:
+        logger.warning("specify: effectiveness review produced no parseable JSON")
+        return {}, True
+
+    reviews = parsed.get("reviews") if isinstance(parsed, dict) else None
+    if not isinstance(reviews, list):
+        logger.warning("specify: effectiveness review JSON missing a 'reviews' list")
+        return {}, True
+
+    judgments: dict[str, dict] = {}
+    for r in reviews:
+        if isinstance(r, dict) and r.get("id") is not None:
+            judgments[str(r["id"])] = r
+    return judgments, False
+
+
+def _apply_effectiveness_gate(
+    spec: dict[str, Any],
+    noop_ids: list[str],
+    judgments: dict[str, dict],
+    inconclusive: bool,
+) -> dict[str, Any]:
+    """Downgrade a ready spec that contains ineffective edits or could not be verified.
+
+    - An edit flagged a deterministic no-op, or judged ``effective=false`` /
+      ``coherent=false`` by the review, is ineffective → a ready_to_apply spec is
+      downgraded to needs_reinvestigation (the fix does not work; loop back).
+    - If no edit is flagged but the review was inconclusive (worker failed /
+      unparseable), a ready_to_apply spec is downgraded to needs_pm: effectiveness
+      could not be confirmed, so a human decides rather than the tool vouching.
+    - The spec is never upgraded; only a ready claim is guarded.
+    """
+    edits = [e for e in (spec.get("edits") or []) if isinstance(e, dict)]
+    noop_set = {str(x) for x in noop_ids}
+    ineffective: dict[str, str] = {}
+    for e in edits:
+        eid = str(e.get("id", "?"))
+        if eid in noop_set:
+            ineffective[eid] = "no-op (whitespace-normalized anchor == replacement)"
+            continue
+        j = judgments.get(eid)
+        if isinstance(j, dict):
+            if j.get("effective") is False:
+                ineffective[eid] = "review: ineffective — " + str(j.get("reason", "")).strip()
+            elif j.get("coherent") is False:
+                ineffective[eid] = "review: incoherent — " + str(j.get("reason", "")).strip()
+
+    spec["effectiveness"] = {
+        "inconclusive": inconclusive,
+        "ineffective_ids": sorted(ineffective),
+    }
+    # Annotate the flagged edits so the proposal / audit trail shows why.
+    for e in edits:
+        eid = str(e.get("id", "?"))
+        if eid in ineffective:
+            e["effectiveness"] = {"ok": False, "reason": ineffective[eid]}
+
+    if spec.get("termination") != "ready_to_apply":
+        return spec  # never upgrade — only a ready claim needs guarding
+
+    if ineffective:
+        logger.warning("specify: edits %s do not change the reported behavior but "
+                       "termination=ready_to_apply — overriding to %s",
+                       sorted(ineffective), _INEFFECTIVE_TERMINATION)
+        spec["termination"] = _INEFFECTIVE_TERMINATION
+        note = "effectiveness gate: " + "; ".join(
+            f"{k} {v}" for k, v in sorted(ineffective.items()))
+    elif inconclusive:
+        logger.warning("specify: effectiveness review inconclusive — downgrading "
+                       "ready_to_apply to %s (human must confirm)", _INCONCLUSIVE_TERMINATION)
+        spec["termination"] = _INCONCLUSIVE_TERMINATION
+        note = ("effectiveness gate: review inconclusive — human must confirm the "
+                "edits change the reported behavior before applying")
+    else:
+        return spec
+
+    prev = str(spec.get("notes", "")).strip()
+    spec["notes"] = f"{prev} {note}".strip() if prev else note
+    return spec
+
+
+def _review_and_gate(
+    spec: dict[str, Any],
+    honey_text: str,
+    codebase_root: str,
+    model: str,
+    provider: str,
+    ledger=None,
+    provider_kwargs: dict | None = None,
+) -> dict[str, Any]:
+    """Run both halves of the effectiveness gate and adjust the spec's termination."""
+    noop_ids = _deterministic_noop_ids(spec)
+    judgments, inconclusive = review_effectiveness(
+        honey_text, spec, codebase_root, model, provider, ledger, provider_kwargs)
+    return _apply_effectiveness_gate(spec, noop_ids, judgments, inconclusive)
+
+
 def run_specify(
     honey_path: str,
     codebase_root: str,
@@ -125,12 +357,18 @@ def run_specify(
     provider: str = "copilot",
     ledger=None,
     provider_kwargs: dict | None = None,
+    review: bool = True,
 ) -> dict[str, Any]:
     """Run the specify stage: honey + live code → edit-spec JSON.
 
     Calls a single author worker, extracts the first complete JSON object from its
-    stdout, enforces Stage-1 invariants, writes the spec to ``output_path`` as the
-    SSOT JSON, and returns the parsed dict.
+    stdout, enforces Stage-1 invariants, runs the effectiveness gate, writes the
+    spec to ``output_path`` as the SSOT JSON, and returns the parsed dict.
+
+    The effectiveness gate (``review=True``, default) is a second, independent pass
+    that downgrades a ready_to_apply spec whose edits do not actually change the
+    reported behavior (see ``_review_and_gate``). It costs one extra worker call;
+    pass ``review=False`` to skip it.
 
     Raises:
         ValueError: if the author produced no parseable JSON object.
@@ -154,6 +392,12 @@ def run_specify(
 
     spec = extract_first_json(wr.stdout)  # raises ValueError if no JSON found
     spec = _normalize_spec(spec)
+
+    # Effectiveness gate: a second, independent pass that refuses to present edits
+    # which are anchored but do not change the reported behavior as ready.
+    if review:
+        spec = _review_and_gate(spec, honey_text, codebase_root, model, provider,
+                                ledger, provider_kwargs)
 
     problems = _validate_spec(spec)
     if problems:
