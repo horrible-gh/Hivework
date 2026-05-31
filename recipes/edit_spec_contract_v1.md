@@ -17,6 +17,7 @@ Test each fix direction in the honey against one question: "can this be expresse
 - YES → it goes into `edits[]`.
 - NO → it goes into `deferred[]` with a reason; it stays as investigation/surface, NOT an edit. Do not force it.
   Reasons: "not_expressible_as_edit" (it is a direction, not a concrete change) | "needs_runtime" (needs execution evidence to decide) | "policy_direction" (business/architecture decision, not a local edit) | "multi_file_design" (a coordinated cross-file change that is a design task, not a local before→after).
+- SPECIAL CASE — the honey's premise is FALSE, not merely stale: if, on reading live code, the "bug" simply does not exist — the code already does the right thing (e.g. the honey says "rename column X→Y" but the live table actually uses X), or the cited file/schema/migration is absent — then there is NO edit to make and it is NOT a cross-file design task. Record it in `deferred[]` with reason "not_expressible_as_edit", stays_as "investigation", set termination = "needs_reinvestigation", and in `notes` state plainly that live code CONTRADICTS the honey's premise, citing the live file:line you found. Do NOT reach for "multi_file_design" as a catch-all when the real situation is "no bug here — the honey was wrong".
 
 [Stage-1 safety] `gate.apply` is ALWAYS false at this stage. specify proposes; the PM applies. Auto-apply behind the gate is a later promotion, not now. Never write to the target codebase yourself.
 

@@ -26,6 +26,7 @@ from hive.conflict_scan import scan_conflicts
 from hive.reconcile import run_reconcile_loop
 from hive.assemble import run_assemble
 from hive.specify import run_specify
+from hive.apply import run_apply
 
 
 def _force_utf8_io() -> None:
@@ -390,6 +391,42 @@ def run_specify_command(args: argparse.Namespace) -> None:
     logger.info("=" * 60)
 
 
+def run_apply_command(args: argparse.Namespace) -> None:
+    """Execute the standalone apply stage: edit-spec JSON → proposal (propose only).
+
+    This runs after specify has produced an edit-spec. apply calls no worker: it
+    re-verifies each anchor against the LIVE codebase, renders unified diffs, and
+    emits a proposal. It is Stage-1 propose-only — nothing is written to the
+    target codebase.
+    """
+    logger = logging.getLogger("hive")
+
+    logger.info("=" * 60)
+    logger.info("Hivework apply — edit-spec → proposal (Stage-1: propose only)")
+    logger.info("  spec:     %s", args.spec)
+    logger.info("  codebase: %s", args.codebase or "(from spec's codebase_root)")
+    logger.info("  output:   %s", args.out or "(none — stdout summary only)")
+    logger.info("=" * 60)
+
+    proposal = run_apply(
+        spec_path=args.spec,
+        codebase_root=args.codebase,
+        output_path=args.out,
+    )
+
+    logger.info("=" * 60)
+    logger.info("Apply complete: %s — %d/%d edits applicable",
+                "READY" if proposal["ready"] else "NOT READY",
+                proposal["n_applicable"], proposal["n_edits"])
+    if args.out:
+        logger.info("  Proposal: %s", args.out)
+    logger.info("=" * 60)
+
+    # Non-zero exit when not ready so a caller (or chained pipeline) can branch.
+    if not proposal["ready"]:
+        sys.exit(2)
+
+
 def main() -> None:
     """CLI entry point."""
     _force_utf8_io()
@@ -477,6 +514,30 @@ def main() -> None:
         help="Enable debug logging",
     )
 
+    # 'apply' sub-command — render an edit-spec into a proposal (Stage-1: propose only)
+    apply_parser = subparsers.add_parser(
+        "apply",
+        help="Render an edit-spec into a unified-diff proposal against live code "
+             "(propose only — never writes)",
+    )
+    apply_parser.add_argument(
+        "--spec", required=True,
+        help="Path to the edit-spec JSON produced by specify (the SSOT)",
+    )
+    apply_parser.add_argument(
+        "--codebase", default=None,
+        help="Root of the LIVE codebase (default: the spec's codebase_root). "
+             "Anchors are re-verified here, not trusted from the spec.",
+    )
+    apply_parser.add_argument(
+        "--out", default=None,
+        help="Output path for the proposal markdown (default: none, summary to log)",
+    )
+    apply_parser.add_argument(
+        "-v", "--verbose", action="store_true",
+        help="Enable debug logging",
+    )
+
     args = parser.parse_args()
 
     if args.command is None:
@@ -489,6 +550,8 @@ def main() -> None:
         run_pipeline(args)
     elif args.command == "specify":
         run_specify_command(args)
+    elif args.command == "apply":
+        run_apply_command(args)
 
 
 if __name__ == "__main__":
