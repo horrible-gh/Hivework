@@ -27,6 +27,7 @@ from hive.reconcile import run_reconcile_loop
 from hive.assemble import run_assemble
 from hive.specify import run_specify
 from hive.apply import run_apply
+from hive.commit import run_propose, run_commit
 from hive import backup as backup_store
 
 
@@ -446,6 +447,111 @@ def run_apply_command(args: argparse.Namespace) -> None:
         sys.exit(3)
 
 
+def run_commit_plan_command(args: argparse.Namespace) -> None:
+    """Execute the commit-plan stage: live git working tree → commit-plan JSON.
+
+    A single author worker reads the live ``git status`` plus the commit-plan
+    contract and groups the changes into atomic conventional commits. Propose-only:
+    nothing is committed. The output plan JSON is the SSOT consumed by ``commit``.
+    """
+    logger = logging.getLogger("hive")
+    cfg = load_config()
+    cfg.apply_cli_model(args.model)
+
+    provider_kwargs: dict[str, str] = {}
+    if cfg.copilot.exe:
+        provider_kwargs["exe"] = cfg.copilot.exe
+    if cfg.copilot.allow:
+        provider_kwargs["allow_flag"] = cfg.copilot.allow
+
+    role = cfg.role("commit")
+
+    logger.info("=" * 60)
+    logger.info("Hivework commit-plan — git working tree → commit-plan (propose only)")
+    logger.info("  repo:     %s", args.repo)
+    logger.info("  output:   %s", args.out)
+    logger.info("  contract: %s", args.contract or "(default) recipes/commit_plan_contract_v1.md")
+    logger.info("  author:   %s/%s", role.provider, role.model)
+    if args.feedback or args.prev_plan:
+        logger.info("  revising: prev_plan=%s feedback=%s",
+                    args.prev_plan or "(none)", "yes" if args.feedback else "no")
+    logger.info("=" * 60)
+
+    ldg = open_ledger(cfg.ledger.enabled, cfg.ledger.db_path)
+    ldg.start_run(seed=args.repo, codebase=args.repo,
+                  model_queen=role.model, model_swarm=role.model)
+    plan: dict = {}
+    try:
+        plan = run_propose(
+            repo_root=args.repo,
+            output_path=args.out,
+            contract_path=args.contract,
+            model=role.model,
+            provider=role.provider,
+            ledger=ldg,
+            provider_kwargs=provider_kwargs,
+            prev_plan_path=args.prev_plan,
+            feedback=args.feedback,
+        )
+        ldg.finish_run(honey_path=args.out,
+                       axes_n=len(plan.get("commits") or []), status="done")
+    except Exception:
+        ldg.finish_run(status="failed")
+        raise
+    finally:
+        ldg.close()
+
+    logger.info("=" * 60)
+    logger.info("Commit-plan complete: %d commits, termination=%s",
+                len(plan.get("commits") or []), plan.get("termination", "?"))
+    logger.info("  Commit-plan (SSOT): %s", args.out)
+    logger.info("=" * 60)
+
+
+def run_commit_command(args: argparse.Namespace) -> None:
+    """Execute the commit stage: commit-plan JSON → proposal (+ optional write).
+
+    This calls no worker: it re-verifies each planned commit against the LIVE git
+    state, renders a proposal table, and (by default) does nothing else. With
+    ``--write`` and a READY plan, the commits are created scoped to their pathspecs,
+    all-or-nothing (a mid-sequence failure soft-resets HEAD back). A non-ready plan
+    is never committed.
+    """
+    logger = logging.getLogger("hive")
+
+    mode = "WRITE (create commits)" if args.write else "dry run"
+    logger.info("=" * 60)
+    logger.info("Hivework commit — commit-plan → proposal (%s)", mode)
+    logger.info("  plan:     %s", args.plan)
+    logger.info("  repo:     %s", args.repo or "(from plan's repo_root)")
+    logger.info("  output:   %s", args.out or "(none — stdout summary only)")
+    logger.info("=" * 60)
+
+    proposal = run_commit(
+        plan_path=args.plan,
+        repo_root=args.repo,
+        output_path=args.out,
+        write=args.write,
+    )
+
+    logger.info("=" * 60)
+    logger.info("Commit complete: %s — %d/%d commits committable",
+                "READY" if proposal["ready"] else "NOT READY",
+                proposal["n_committable"], proposal["n_commits"])
+    if args.out:
+        logger.info("  Proposal: %s", args.out)
+    logger.info("=" * 60)
+
+    # Non-zero exit when not ready so a caller (or chained pipeline) can branch.
+    if not proposal["ready"]:
+        sys.exit(2)
+
+    # Ready but the commit itself failed and was rolled back — distinct exit.
+    write = proposal.get("write")
+    if args.write and write and not write.get("ok"):
+        sys.exit(3)
+
+
 def run_restore_command(args: argparse.Namespace) -> None:
     """Restore a backup bundle, undoing an earlier ``apply --write``."""
     logger = logging.getLogger("hive")
@@ -589,6 +695,70 @@ def main() -> None:
         help="Enable debug logging",
     )
 
+    # 'commit-plan' sub-command — author a commit-plan from the live git tree
+    commit_plan_parser = subparsers.add_parser(
+        "commit-plan",
+        help="Group the repo's uncommitted changes into a commit-plan JSON "
+             "(propose only — never commits)",
+    )
+    commit_plan_parser.add_argument(
+        "--repo", required=True,
+        help="Root of the git work tree whose changes to group into commits",
+    )
+    commit_plan_parser.add_argument(
+        "--out", required=True,
+        help="Output path for the commit-plan JSON (the SSOT)",
+    )
+    commit_plan_parser.add_argument(
+        "--contract", default=None,
+        help="Path to the commit-plan contract (default: recipes/commit_plan_contract_v1.md)",
+    )
+    commit_plan_parser.add_argument(
+        "--feedback", default=None,
+        help="PM feedback to revise a rejected plan (use with --prev-plan)",
+    )
+    commit_plan_parser.add_argument(
+        "--prev-plan", default=None,
+        help="Path to a previously rejected commit-plan JSON to revise",
+    )
+    commit_plan_parser.add_argument(
+        "--model", default=None,
+        help="Model override for the commit author (default: per-role config, haiku)",
+    )
+    commit_plan_parser.add_argument(
+        "-v", "--verbose", action="store_true",
+        help="Enable debug logging",
+    )
+
+    # 'commit' sub-command — execute a commit-plan against live git (dry run / --write)
+    commit_parser = subparsers.add_parser(
+        "commit",
+        help="Re-verify a commit-plan against live git and render a proposal "
+             "(dry run; --write creates the commits)",
+    )
+    commit_parser.add_argument(
+        "--plan", required=True,
+        help="Path to the commit-plan JSON produced by commit-plan (the SSOT)",
+    )
+    commit_parser.add_argument(
+        "--repo", default=None,
+        help="Root of the git work tree (default: the plan's repo_root). "
+             "Commits are re-verified here, not trusted from the plan.",
+    )
+    commit_parser.add_argument(
+        "--out", default=None,
+        help="Output path for the proposal markdown (default: none, summary to log)",
+    )
+    commit_parser.add_argument(
+        "--write", action="store_true",
+        help="Create the commits for a READY plan (default: dry run). Each commit "
+             "is scoped to its pathspecs; not-ready plans are never committed.",
+    )
+    commit_parser.add_argument(
+        "-v", "--verbose", action="store_true",
+        help="Enable debug logging",
+    )
+
     # 'restore' sub-command — undo an apply --write from its backup bundle
     restore_parser = subparsers.add_parser(
         "restore",
@@ -621,6 +791,10 @@ def main() -> None:
         run_specify_command(args)
     elif args.command == "apply":
         run_apply_command(args)
+    elif args.command == "commit-plan":
+        run_commit_plan_command(args)
+    elif args.command == "commit":
+        run_commit_command(args)
     elif args.command == "restore":
         run_restore_command(args)
 

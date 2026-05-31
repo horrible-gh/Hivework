@@ -122,6 +122,76 @@ python hive.py restore --bundle <bundle-dir>   # path is printed in the proposal
 python hive.py restore --latest                # most recent bundle in the store
 ```
 
+## 4. commit — group changes into atomic commits, and optionally commit
+
+A second, independent two-stage pair that mirrors `specify → apply`, applied to git.
+It turns a messy working tree into a sequence of clean, atomic
+[Conventional Commits](https://www.conventionalcommits.org/) and then — only on a
+human-held switch — creates them.
+
+```
+commit-plan   git working tree + contract → commit-plan (JSON, SSOT)  ← single author, calls a model
+     │
+     ▼
+commit        commit-plan → re-verify vs live git → proposal [→ git commit]  ← no worker call, deterministic
+```
+
+Hivework owns its own commit policy
+(`recipes/commit_plan_contract_v1.md`) — it does **not** depend on any external rule
+document at runtime.
+
+### 4.1 commit-plan — author the plan (propose only)
+
+A single author worker reads the live `git status` and the contract, then groups the
+changes into atomic commits. Nothing is committed.
+
+```powershell
+python hive.py commit-plan `
+  --repo <git work tree> `
+  --out <commit_plan.json> `
+  [--feedback "consolidate the docs into one commit"] [--prev-plan <old.json>] `
+  [--contract recipes\commit_plan_contract_v1.md] [--model <model>] [-v]
+```
+
+- The commit author defaults to **haiku** (`hive.config.json` role `commit`), a tier
+  above the gpt-5-mini swarm, since grouping wants more judgement.
+- Rejected a plan? Re-run with `--prev-plan <old.json> --feedback "..."` to revise
+  rather than start blind (e.g. "too many doc commits — merge them").
+- `gate.commit` in the plan is model-authored and is always forced `false`. The
+  author never authorizes the write.
+
+### 4.2 commit — re-verify and (optionally) commit
+
+Reads the plan (SSOT), **re-verifies every commit against the live git state**, and
+renders a proposal table. Calls no worker. Default is a dry run.
+
+```powershell
+python hive.py commit `
+  --plan <commit_plan.json> `
+  [--repo <git work tree>] `   # defaults to the plan's repo_root
+  [--out <proposal.md>] `
+  [--write] `                  # actually create the commits
+  [-v]
+```
+
+Behaviour:
+
+- **A commit is committable** only when its message is `type(scope): description`
+  (English, allowed type), every file is currently changed in git, and no file is
+  assigned to more than one commit (no hunk-splitting). `leftover` (changed files in
+  no commit) is computed and surfaced.
+- **ready verdict** = `termination == ready_to_commit` AND every commit committable.
+- **`--write` only fires on a READY plan.** Each commit is created scoped to its
+  pathspecs (`git add -- <files>` then `git commit -- <files> -m …`) so out-of-scope
+  changes never leak in. The sequence is **all-or-nothing**: files are re-checked as
+  still-changed at write time, and a mid-sequence failure soft-resets HEAD back to
+  where it started (working-tree changes preserved — git is the undo, no backup
+  bundle needed).
+- Exit codes: **2** when not ready, **0** when ready (and, with `--write`, the commit
+  succeeded), **3** when ready but the commit failed and was rolled back.
+
+Approval is just re-running with `--write`: review the dry-run table, then commit.
+
 ## Tests
 
 ```powershell
@@ -134,10 +204,12 @@ python -m pytest -q
 hive/
   decompose.py  fanout.py  parse.py  conflict_scan.py  reconcile.py  assemble.py
   specify.py    apply.py    backup.py
+  commit.py
   config.py     ledger.py   providers.py
 recipes/
-  edit_spec_contract_v1.md   # specify's output contract (also the author's role prompt)
+  edit_spec_contract_v1.md     # specify's output contract (also the author's role prompt)
+  commit_plan_contract_v1.md   # commit-plan's output contract (also the author's role prompt)
 tests/
-hive.py                      # CLI entry point (run / specify / apply / restore)
-hive.config.json             # per-role provider/model config
+hive.py                        # CLI entry point (run / specify / apply / commit-plan / commit / restore)
+hive.config.json               # per-role provider/model config
 ```

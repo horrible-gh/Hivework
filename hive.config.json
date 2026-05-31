@@ -3,7 +3,8 @@
     "queen":    { "provider": "copilot", "model": "gpt-5-mini" },
     "swarm":    { "provider": "copilot", "model": "gpt-5-mini" },
     "assemble": { "provider": "copilot", "model": "gpt-5-mini" },
-    "specify":  { "provider": "copilot", "model": "gpt-5-mini" }
+    "specify":  { "provider": "copilot", "model": "gpt-5-mini" },
+    "commit":   { "provider": "copilot", "model": "claude-haiku-4.5" }
   },
   "copilot": { "exe": null, "allow": "--allow-all", "timeout_sec": 300 },
   "ledger":  { "enabled": true, "db_path": "hive_ledger.db" },

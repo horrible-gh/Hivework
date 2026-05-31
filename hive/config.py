@@ -18,6 +18,9 @@ _DEFAULTS: dict[str, Any] = {
         "swarm":    {"provider": "copilot", "model": "gpt-5-mini"},
         "assemble": {"provider": "copilot", "model": "gpt-5-mini"},
         "specify":  {"provider": "copilot", "model": "gpt-5-mini"},
+        # Commit author defaults to haiku (a tier up): grouping changes into clean
+        # atomic commits wants more judgement than the gpt-5-mini swarm default.
+        "commit":   {"provider": "copilot", "model": "claude-haiku-4.5"},
     },
     "copilot": {"exe": None, "allow": "--allow-all", "timeout_sec": 300},
     "ledger":  {"enabled": True, "db_path": "hive_ledger.db"},
@@ -67,12 +70,14 @@ class Config:
     swarm: RoleConfig = field(default_factory=RoleConfig)
     assemble_role: RoleConfig = field(default_factory=RoleConfig)
     specify: RoleConfig = field(default_factory=RoleConfig)
+    commit: RoleConfig = field(
+        default_factory=lambda: RoleConfig(model="claude-haiku-4.5"))
     copilot: CopilotConfig = field(default_factory=CopilotConfig)
     ledger: LedgerConfig = field(default_factory=LedgerConfig)
     apply: ApplyConfig = field(default_factory=ApplyConfig)
 
     def role(self, name: str) -> RoleConfig:
-        """Return the RoleConfig for a given role name ('queen', 'swarm', 'assemble', 'specify')."""
+        """Return the RoleConfig for a role ('queen', 'swarm', 'assemble', 'specify', 'commit')."""
         if name == "assemble":
             return self.assemble_role
         return getattr(self, name, RoleConfig())
@@ -81,7 +86,8 @@ class Config:
         """Apply a CLI --model override to all roles (preserves --model semantics)."""
         if model is None:
             return
-        for role in (self.queen, self.swarm, self.assemble_role, self.specify):
+        for role in (self.queen, self.swarm, self.assemble_role, self.specify,
+                     self.commit):
             role.model = model
 
 
@@ -116,15 +122,17 @@ def load_config(path: str | None = None) -> Config:
     ledger_raw = merged.get("ledger", {})
     apply_raw = merged.get("apply", {})
 
-    def _role(name: str) -> RoleConfig:
+    def _role(name: str, default_model: str = "gpt-5-mini") -> RoleConfig:
         r = roles.get(name, {})
-        return RoleConfig(provider=r.get("provider", "copilot"), model=r.get("model", "gpt-5-mini"))
+        return RoleConfig(provider=r.get("provider", "copilot"),
+                          model=r.get("model", default_model))
 
     return Config(
         queen=_role("queen"),
         swarm=_role("swarm"),
         assemble_role=_role("assemble"),
         specify=_role("specify"),
+        commit=_role("commit", default_model="claude-haiku-4.5"),
         copilot=CopilotConfig(
             exe=copilot_raw.get("exe"),
             allow=copilot_raw.get("allow", "--allow-all"),
