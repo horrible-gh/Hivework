@@ -221,6 +221,27 @@ class TestExtractFirstJsonEdgeCases(unittest.TestCase):
         self.assertTrue(result["ok"])
         self.assertIn("{braces}", result["msg"])
 
+    def test_brace_fragment_in_trace_before_json(self):
+        """A shell snippet with braces in the tool-trace must not be mistaken
+        for the comb JSON (regression: digest decompose run grabbed
+        ``ForEach-Object { $_.Name }`` and failed to parse it)."""
+        raw = (
+            "● List files (shell)\n"
+            "  │ Get-ChildItem | ForEach-Object { $_.Name }\n"
+            "  └ 40 lines...\n\n"
+            '{"fanout_decision": "fanout", "tasks": [{"id": "G1"}]}\n'
+        )
+        result = extract_first_json(raw)
+        self.assertEqual(result["fanout_decision"], "fanout")
+        self.assertEqual(result["tasks"][0]["id"], "G1")
+
+    def test_small_valid_json_noise_before_comb(self):
+        """A small valid JSON object echoed in a trace must not win over the
+        larger real comb object that follows."""
+        raw = '● echo {"x": 1}\n{"axis_id": "D2", "findings": [1, 2, 3]}'
+        result = extract_first_json(raw)
+        self.assertEqual(result["axis_id"], "D2")
+
 
 if __name__ == "__main__":
     unittest.main()
