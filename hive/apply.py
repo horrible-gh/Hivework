@@ -51,6 +51,10 @@ ANCHOR_AMBIGUOUS = "anchor_ambiguous"
 ALREADY_APPLIED = "already_applied"
 FILE_MISSING = "file_missing"
 NO_CHANGE = "no_change"
+# create_file branch (additive — apply.py also creates new files, not only edits)
+CREATE_OK = "create_ok"          # target absent + content non-empty → applicable
+FILE_EXISTS = "file_exists"      # create_file target already on disk → not applicable
+EMPTY_CONTENT = "empty_content"  # content empty/whitespace-only → not applicable
 
 
 def load_spec(spec_path: str) -> dict[str, Any]:
@@ -75,6 +79,22 @@ def render_unified_diff(rel_path: str, original: str, modified: str) -> str:
     return "".join(diff)
 
 
+def render_creation_diff(rel_path: str, content: str) -> str:
+    """Render a unified diff for a brand-new file (``/dev/null`` → content).
+
+    The DERIVED human view of a ``create_file`` edit: a full-file addition,
+    labelled the git way so it reads like a real patch.
+    """
+    diff = difflib.unified_diff(
+        [],
+        content.splitlines(keepends=True),
+        fromfile="/dev/null",
+        tofile=f"b/{rel_path}",
+        n=3,
+    )
+    return "".join(diff)
+
+
 def evaluate_edit(edit: dict[str, Any], codebase_root: str) -> dict[str, Any]:
     """Re-verify one edit against LIVE code and render its diff.
 
@@ -84,6 +104,7 @@ def evaluate_edit(edit: dict[str, Any], codebase_root: str) -> dict[str, Any]:
     """
     edit_id = edit.get("id", "?")
     rel_path = edit.get("file", "")
+    kind = edit.get("kind", "edit")
     anchor_old = edit.get("anchor_old", "")
     replacement_new = edit.get("replacement_new", "")
 
@@ -104,6 +125,30 @@ def evaluate_edit(edit: dict[str, Any], codebase_root: str) -> dict[str, Any]:
         return result
 
     abs_path = os.path.join(codebase_root, rel_path)
+
+    # create_file branch — MUST precede the anchor logic. An empty anchor would
+    # mis-evaluate on the anchor path (``"".count("")`` quirk). Applicability is
+    # INVERTED: a create_file edit is applicable only when the target is ABSENT.
+    # os.path.exists (not isfile) so a directory collision is caught here too,
+    # matching the write-time re-check in write_edits.
+    if kind == "create_file":
+        content = edit.get("content", "")
+        if os.path.exists(abs_path):
+            result["status"] = FILE_EXISTS
+            result["messages"].append(
+                f"create_file target already exists: {rel_path} — refusing to "
+                "clobber without an anchor review")
+            return result
+        if not content or not content.strip():
+            result["status"] = EMPTY_CONTENT
+            result["messages"].append(
+                "create_file content is empty or whitespace-only — inert edit")
+            return result
+        result["status"] = CREATE_OK
+        result["applicable"] = True
+        result["diff"] = render_creation_diff(rel_path, content)
+        return result
+
     if not os.path.isfile(abs_path):
         result["status"] = FILE_MISSING
         result["messages"].append(f"file not found under codebase root: {rel_path}")
@@ -236,12 +281,21 @@ def write_edits(
     }
 
     edits = [e for e in (spec.get("edits") or []) if isinstance(e, dict)]
+
+    # Modified paths (anchor edits) are snapshotted; created paths are recorded
+    # in the manifest so a restore deletes them (they have no original bytes).
     rel_paths: list[str] = []
+    created_paths: list[str] = []
     for e in edits:
         rel = e.get("file", "")
-        if rel and rel not in rel_paths:
+        if not rel:
+            continue
+        if e.get("kind", "edit") == "create_file":
+            if rel not in created_paths:
+                created_paths.append(rel)
+        elif rel not in rel_paths:
             rel_paths.append(rel)
-    if not edits or not rel_paths:
+    if not edits or (not rel_paths and not created_paths):
         result["reason"] = "spec has no writable edits"
         return result
 
@@ -251,12 +305,13 @@ def write_edits(
     try:
         bundle = backup_store.create_bundle(
             backup_root, spec.get("_spec_path", "spec"), codebase_root,
-            rel_paths, ttl_hours)
+            rel_paths, ttl_hours, created_paths=created_paths)
     except OSError as e:
         result["reason"] = f"could not snapshot originals for backup: {e}"
         return result
     result["bundle"] = bundle["dir"]
     originals: dict[str, str] = bundle["originals"]
+    created_written: list[str] = []  # create_file paths written so far (for rollback)
 
     def _rollback() -> None:
         for rel, text in originals.items():
@@ -266,15 +321,37 @@ def write_edits(
                     f.write(text)
             except OSError as e:
                 logger.error("rollback failed for %s: %s", rel, e)
+        for rel in created_written:
+            try:
+                os.remove(os.path.join(codebase_root, rel))
+            except OSError as e:
+                logger.error("rollback: could not delete created file %s: %s", rel, e)
         result["rolled_back"] = True
 
     written: list[str] = []
     for edit in edits:
         rel = edit.get("file", "")
-        anchor_old = edit.get("anchor_old", "")
-        replacement_new = edit.get("replacement_new", "")
         abs_path = os.path.join(codebase_root, rel)
 
+        if edit.get("kind", "edit") == "create_file":
+            # Re-verify the target is still absent at write time.
+            if os.path.exists(abs_path):
+                result["reason"] = (
+                    f"{edit.get('id', '?')} ({rel}): create_file target already "
+                    "exists at write time — rolled back")
+                _rollback()
+                return result
+            content = edit.get("content", "")
+            os.makedirs(os.path.dirname(abs_path) or ".", exist_ok=True)
+            with open(abs_path, "w", encoding="utf-8") as f:
+                f.write(content)
+            created_written.append(rel)
+            if rel not in written:
+                written.append(rel)
+            continue
+
+        anchor_old = edit.get("anchor_old", "")
+        replacement_new = edit.get("replacement_new", "")
         with open(abs_path, "r", encoding="utf-8") as f:
             text = f.read()
         occurrences = text.count(anchor_old) if anchor_old else 0

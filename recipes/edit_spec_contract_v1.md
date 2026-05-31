@@ -60,3 +60,43 @@ Test each fix direction in the honey against one question: "can this be expresse
 - If every actionable fix landed in `deferred[]` (nothing was expressible as an edit), set termination = "needs_reinvestigation" and say so in notes; do not invent edits to fill the array.
 - An edit whose anchor_status is "stale" or "not_found" must NOT be presented as ready: set termination = "needs_reinvestigation".
 - EFFECTIVENESS: every edit must actually change the behavior the honey identified. An edit that is anchored correctly but functionally inert — a no-op assignment, a guard whose condition can never be true, a value set to what it already is, a whitespace-only change — is NOT a fix. Do not emit it as an edit, and never set termination = "ready_to_apply" for it. specify enforces this after you author: a deterministic no-op check plus an independent effectiveness review downgrade a ready spec whose edits do not change the reported behavior (to needs_reinvestigation), and defer a ready claim that cannot be verified to a human (needs_pm).
+
+## [Edit kinds — anchor edit vs create_file]
+
+### Two kinds
+
+| `kind` value | When to use |
+|---|---|
+| absent or `"edit"` | The target file already exists. You are replacing a span of text in it (the anchor model above). |
+| `"create_file"` | The target file does not exist yet. You are writing it from scratch. |
+
+Choose based solely on whether the file is present in the live codebase at specify time. If it exists, use an anchor edit. If it is absent, use `create_file`. Never use `create_file` to overwrite an existing file.
+
+### Fields for a `create_file` edit
+
+| Field | Required | Rule |
+|---|---|---|
+| `id` | ✔ | Unique edit identifier in the spec (`"E1"`, `"E2"`, …). |
+| `kind` | ✔ | Must be the string `"create_file"`. |
+| `file` | ✔ | Path relative to `codebase_root`. Must NOT resolve to an existing path at apply time. |
+| `content` | ✔ | Full text of the new file. Must be non-empty (an empty file is inert). |
+| `rationale` | ✔ | One line: why creating this file fixes the symptom. |
+| `confidence` | ✔ | `"high"` / `"medium"` / `"low"`. |
+| `anchor_old` | — | Omit (or empty). There is no anchor for a new file. |
+| `anchor_status` | — | Omit. Anchor verification does not apply to `create_file`. |
+| `replacement_new` | — | Omit. `content` carries the new file text — `replacement_new` is the anchor-pair half and would falsely couple a new file to the anchor model. |
+
+Applicability (apply enforces both): (1) the target path must be ABSENT under `codebase_root`; (2) `content` must contain at least one non-whitespace character.
+
+### Example
+
+```json
+{
+  "id": "E3",
+  "kind": "create_file",
+  "file": "src/utils/slugify.ts",
+  "content": "export function slugify(s) {\n  return s.toLowerCase().replace(/\\s+/g, '-');\n}\n",
+  "rationale": "Centralises slug logic referenced in three call sites that currently inline the same regex.",
+  "confidence": "high"
+}
+```

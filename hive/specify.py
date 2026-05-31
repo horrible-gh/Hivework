@@ -79,6 +79,9 @@ def build_specify_prompt(honey_text: str, contract_text: str, codebase_root: str
 [Input honey — lower each fix direction into the edit-spec contracted above]
 Re-open every file you touch under the codebase root and lift `anchor_old` from
 the CURRENT text byte-for-byte. Do NOT trust code quoted in the honey below.
+When the honey calls for a brand-new file that does not yet exist in the codebase,
+emit a `create_file` edit (kind + content, no anchor) per the contract rather than
+forcing an anchor edit against an existing file.
 
 {honey_text}
 """
@@ -142,20 +145,35 @@ def _normalize_ws(text: str) -> str:
 
 
 def _deterministic_noop_ids(spec: dict[str, Any]) -> list[str]:
-    """Edit ids whose replacement makes no textual difference (whitespace-normalized).
+    """Edit ids that make no textual difference — kind-aware.
 
-    This is the cheap, certain half of the effectiveness gate. apply already
-    rejects an exact ``anchor_old == replacement_new``; here we also catch
-    whitespace-only "changes" and, crucially, use the finding to downgrade the
+    The cheap, certain half of the effectiveness gate; the finding downgrades the
     whole spec's termination rather than only flagging the single edit at apply.
+
+    - Anchor edits (no ``kind`` / ``kind="edit"``): flagged when whitespace-
+      normalized ``anchor_old == replacement_new`` (apply also rejects the exact
+      equality; here we additionally catch whitespace-only "changes").
+    - ``create_file`` edits: the anchor==replacement test does NOT apply (both
+      fields are absent, so it would always compare ``"" == ""``). A create_file
+      edit is inert only when its ``content`` is empty/whitespace-only — mirroring
+      apply.py ``evaluate_edit``'s EMPTY_CONTENT rejection.
     """
     noop: list[str] = []
     for e in spec.get("edits") or []:
         if not isinstance(e, dict):
             continue
-        if _normalize_ws(e.get("anchor_old", "")) == _normalize_ws(e.get("replacement_new", "")):
+        if e.get("kind", "edit") == "create_file":
+            content = e.get("content", "")
+            if not content or not content.strip():
+                noop.append(str(e.get("id", "?")))
+        elif _normalize_ws(e.get("anchor_old", "")) == _normalize_ws(e.get("replacement_new", "")):
             noop.append(str(e.get("id", "?")))
     return noop
+
+
+# How many lines of a create_file's content to surface to the effectiveness
+# reviewer — enough to judge "non-empty and on-target" without ballooning the prompt.
+_REVIEW_CONTENT_MAX_LINES = 40
 
 
 def build_review_prompt(honey_text: str, spec: dict[str, Any], codebase_root: str) -> str:
@@ -165,21 +183,41 @@ def build_review_prompt(honey_text: str, spec: dict[str, Any], codebase_root: st
     change) and the edits specify just authored, and judges — per edit, re-reading
     live code as needed — whether each edit ACTUALLY changes the behavior the honey
     identified (effective) and is consistent with the honey's conclusion (coherent).
-    An edit that is anchored correctly but functionally inert (a no-op assignment, a
-    guard whose condition can never be true, a value set to what it already is) is
-    effective=false: that is exactly the failure this review exists to catch.
+
+    Anchor edits: an edit that is anchored correctly but functionally inert (a no-op
+    assignment, a guard whose condition can never be true, a value set to what it
+    already is) is effective=false — exactly the failure this review exists to catch.
+
+    create_file edits: the block carries ``content`` (truncated to
+    _REVIEW_CONTENT_MAX_LINES lines) instead of the absent anchor fields, so the
+    reviewer can judge whether the new file is genuinely non-empty and on-target.
     """
     edits = [e for e in (spec.get("edits") or []) if isinstance(e, dict)]
-    blocks = [
-        json.dumps({
-            "id": e.get("id"),
-            "file": e.get("file"),
-            "anchor_old": e.get("anchor_old"),
-            "replacement_new": e.get("replacement_new"),
-            "rationale": e.get("rationale"),
-        }, ensure_ascii=False, indent=2)
-        for e in edits
-    ]
+    blocks = []
+    for e in edits:
+        if e.get("kind", "edit") == "create_file":
+            content = e.get("content") or ""
+            lines = content.splitlines()
+            if len(lines) > _REVIEW_CONTENT_MAX_LINES:
+                content_display = "\n".join(lines[:_REVIEW_CONTENT_MAX_LINES]) + "\n(truncated)"
+            else:
+                content_display = content
+            block = {
+                "id": e.get("id"),
+                "kind": "create_file",
+                "file": e.get("file"),
+                "content": content_display,
+                "rationale": e.get("rationale"),
+            }
+        else:
+            block = {
+                "id": e.get("id"),
+                "file": e.get("file"),
+                "anchor_old": e.get("anchor_old"),
+                "replacement_new": e.get("replacement_new"),
+                "rationale": e.get("rationale"),
+            }
+        blocks.append(json.dumps(block, ensure_ascii=False, indent=2))
     edits_json = "\n".join(blocks) if blocks else "(no edits)"
     return f"""[Role] You are an INDEPENDENT effectiveness reviewer for Hivework's specify stage. \
 You did not author these edits. Your only job is to catch edits that are anchored \
@@ -195,12 +233,16 @@ correctly but do not actually fix anything. Do not rewrite the edits; only judge
 {edits_json}
 
 [Judge each edit]
-For every edit decide two booleans:
-- effective: would applying this edit actually change the behavior the honey identified \
-as wrong? An edit that is functionally inert — a no-op assignment, a guard whose \
-condition can never be true, a value set to what it already is, a change with no runtime \
-effect — is effective=false EVEN THOUGH its anchor is valid. Re-open the live files to \
-judge reachability and effect; do not assume.
+For every edit decide two booleans, applying the criterion that matches the edit's kind:
+- effective:
+  - Anchor edit (kind "edit" or absent): would applying this edit actually change the \
+behavior the honey identified as wrong? An edit that is functionally inert — a no-op \
+assignment, a guard whose condition can never be true, a value set to what it already is, \
+a change with no runtime effect — is effective=false EVEN THOUGH its anchor is valid. \
+Re-open the live files to judge reachability and effect; do not assume.
+  - create_file edit (kind "create_file"): effective=true when a non-empty file is created \
+in direct response to the honey's directions; effective=false if the content is empty or \
+whitespace-only, or the honey did not ask for a new file at this path.
 - coherent: is the edit consistent with the honey's conclusion (it does not contradict \
 what the investigation concluded)?
 
@@ -289,7 +331,10 @@ def _apply_effectiveness_gate(
     for e in edits:
         eid = str(e.get("id", "?"))
         if eid in noop_set:
-            ineffective[eid] = "no-op (whitespace-normalized anchor == replacement)"
+            if e.get("kind", "edit") == "create_file":
+                ineffective[eid] = "no-op (create_file content is empty or whitespace-only)"
+            else:
+                ineffective[eid] = "no-op (whitespace-normalized anchor == replacement)"
             continue
         j = judgments.get(eid)
         if isinstance(j, dict):
