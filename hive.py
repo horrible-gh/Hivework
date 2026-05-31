@@ -27,6 +27,7 @@ from hive.reconcile import run_reconcile_loop
 from hive.assemble import run_assemble
 from hive.specify import run_specify
 from hive.apply import run_apply
+from hive import backup as backup_store
 
 
 def _force_utf8_io() -> None:
@@ -392,26 +393,38 @@ def run_specify_command(args: argparse.Namespace) -> None:
 
 
 def run_apply_command(args: argparse.Namespace) -> None:
-    """Execute the standalone apply stage: edit-spec JSON → proposal (propose only).
+    """Execute the standalone apply stage: edit-spec JSON → proposal (+ optional write).
 
     This runs after specify has produced an edit-spec. apply calls no worker: it
     re-verifies each anchor against the LIVE codebase, renders unified diffs, and
-    emits a proposal. It is Stage-1 propose-only — nothing is written to the
-    target codebase.
+    emits a proposal. By default it is propose-only — nothing is written.
+
+    With ``--write`` and a READY proposal, the edits are applied to the live
+    codebase after the originals are snapshotted into a scratch backup bundle
+    (all-or-nothing, with rollback). A non-ready proposal is never written.
     """
     logger = logging.getLogger("hive")
+    cfg = load_config()
+    backup_root = cfg.apply.backup_root()
+    ttl_hours = cfg.apply.backup_ttl_hours
 
+    mode = "WRITE (apply to live code)" if args.write else "propose only"
     logger.info("=" * 60)
-    logger.info("Hivework apply — edit-spec → proposal (Stage-1: propose only)")
+    logger.info("Hivework apply — edit-spec → proposal (%s)", mode)
     logger.info("  spec:     %s", args.spec)
     logger.info("  codebase: %s", args.codebase or "(from spec's codebase_root)")
     logger.info("  output:   %s", args.out or "(none — stdout summary only)")
+    if args.write:
+        logger.info("  backups:  %s (ttl %dh)", backup_root, ttl_hours)
     logger.info("=" * 60)
 
     proposal = run_apply(
         spec_path=args.spec,
         codebase_root=args.codebase,
         output_path=args.out,
+        write=args.write,
+        backup_root=backup_root if args.write else None,
+        ttl_hours=ttl_hours,
     )
 
     logger.info("=" * 60)
@@ -425,6 +438,38 @@ def run_apply_command(args: argparse.Namespace) -> None:
     # Non-zero exit when not ready so a caller (or chained pipeline) can branch.
     if not proposal["ready"]:
         sys.exit(2)
+
+    # Ready but the write itself failed (e.g. anchor collided at write time and
+    # everything was rolled back) — distinct exit so callers don't treat it as done.
+    write = proposal.get("write")
+    if args.write and write and not write.get("ok"):
+        sys.exit(3)
+
+
+def run_restore_command(args: argparse.Namespace) -> None:
+    """Restore a backup bundle, undoing an earlier ``apply --write``."""
+    logger = logging.getLogger("hive")
+    cfg = load_config()
+    backup_root = cfg.apply.backup_root()
+
+    bundle = args.bundle
+    if not bundle and args.latest:
+        bundle = backup_store.latest_bundle(backup_root)
+        if not bundle:
+            logger.error("No backup bundles found under %s", backup_root)
+            sys.exit(1)
+    if not bundle:
+        logger.error("Provide --bundle <dir> or --latest")
+        sys.exit(1)
+
+    manifest = backup_store.load_manifest(bundle)
+    logger.info("Restoring bundle %s", bundle)
+    logger.info("  codebase_root: %s", manifest.get("codebase_root"))
+    logger.info("  files:         %d", len(manifest.get("files", [])))
+    restored = backup_store.restore_bundle(bundle)
+    for path in restored:
+        logger.info("  restored: %s", path)
+    logger.info("Restore complete: %d file(s)", len(restored))
 
 
 def main() -> None:
@@ -534,6 +579,30 @@ def main() -> None:
         help="Output path for the proposal markdown (default: none, summary to log)",
     )
     apply_parser.add_argument(
+        "--write", action="store_true",
+        help="Apply a READY proposal's edits to the live codebase (default: propose "
+             "only). Originals are backed up to a scratch bundle first; not-ready "
+             "proposals are never written.",
+    )
+    apply_parser.add_argument(
+        "-v", "--verbose", action="store_true",
+        help="Enable debug logging",
+    )
+
+    # 'restore' sub-command — undo an apply --write from its backup bundle
+    restore_parser = subparsers.add_parser(
+        "restore",
+        help="Restore files from an apply --write backup bundle (undo a write)",
+    )
+    restore_parser.add_argument(
+        "--bundle", default=None,
+        help="Path to the backup bundle directory to restore from",
+    )
+    restore_parser.add_argument(
+        "--latest", action="store_true",
+        help="Restore the most recent backup bundle in the store",
+    )
+    restore_parser.add_argument(
         "-v", "--verbose", action="store_true",
         help="Enable debug logging",
     )
@@ -552,6 +621,8 @@ def main() -> None:
         run_specify_command(args)
     elif args.command == "apply":
         run_apply_command(args)
+    elif args.command == "restore":
+        run_restore_command(args)
 
 
 if __name__ == "__main__":

@@ -6,5 +6,6 @@
     "specify":  { "provider": "copilot", "model": "gpt-5-mini" }
   },
   "copilot": { "exe": null, "allow": "--allow-all", "timeout_sec": 300 },
-  "ledger":  { "enabled": true, "db_path": "hive_ledger.db" }
+  "ledger":  { "enabled": true, "db_path": "hive_ledger.db" },
+  "apply":   { "backup_dir": ".apply_backups", "backup_ttl_hours": 168 }
 }

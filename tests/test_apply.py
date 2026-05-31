@@ -195,5 +195,80 @@ class TestRunApply(unittest.TestCase):
         self.assertTrue(proposal["ready"])
 
 
+class TestRunApplyWrite(unittest.TestCase):
+    """--write path: applies READY edits, backs up, rolls back, refuses non-ready."""
+
+    def setUp(self):
+        self.root = tempfile.mkdtemp()
+        self.target = os.path.join(self.root, "a.py")
+        self._original = "before\nx = 1\nafter\n"
+        with open(self.target, "w", encoding="utf-8") as f:
+            f.write(self._original)
+        self.tmp = tempfile.mkdtemp()
+        self.spec_path = os.path.join(self.tmp, "spec.json")
+        self.out = os.path.join(self.tmp, "proposal.md")
+        self.backup_root = tempfile.mkdtemp()
+
+    def _write_spec(self, spec):
+        with open(self.spec_path, "w", encoding="utf-8") as f:
+            json.dump(spec, f)
+
+    def _read_target(self):
+        with open(self.target, encoding="utf-8") as f:
+            return f.read()
+
+    def test_write_applies_ready_edit_and_backs_up(self):
+        self._write_spec(_spec([_edit("x = 1", "x = 2")], codebase_root=self.root))
+        proposal = apply.run_apply(
+            self.spec_path, output_path=self.out, write=True,
+            backup_root=self.backup_root, ttl_hours=24)
+        self.assertEqual(self._read_target(), "before\nx = 2\nafter\n")
+        w = proposal["write"]
+        self.assertTrue(w["ok"])
+        self.assertIn("a.py", w["written"])
+        # Backup bundle holds the pre-write original.
+        self.assertTrue(os.path.isdir(w["bundle"]))
+        saved = os.path.join(w["bundle"], "files", "a.py")
+        with open(saved, encoding="utf-8") as f:
+            self.assertEqual(f.read(), self._original)
+        with open(self.out, encoding="utf-8") as f:
+            self.assertIn("WRITTEN to live codebase", f.read())
+
+    def test_not_ready_proposal_is_never_written(self):
+        # Drifted second edit makes the proposal not ready → no write at all.
+        self._write_spec(_spec([
+            _edit("x = 1", "x = 2", eid="E1"),
+            _edit("gone = 0", "gone = 1", eid="E2"),
+        ], codebase_root=self.root))
+        proposal = apply.run_apply(
+            self.spec_path, write=True, backup_root=self.backup_root)
+        self.assertFalse(proposal["ready"])
+        self.assertEqual(self._read_target(), self._original)  # untouched
+        self.assertFalse(proposal["write"]["attempted"])
+
+    def test_default_is_propose_only(self):
+        self._write_spec(_spec([_edit("x = 1", "x = 2")], codebase_root=self.root))
+        proposal = apply.run_apply(self.spec_path)  # write defaults to False
+        self.assertEqual(self._read_target(), self._original)
+        self.assertIsNone(proposal["write"])
+
+    def test_write_without_backup_root_raises(self):
+        self._write_spec(_spec([_edit("x = 1", "x = 2")], codebase_root=self.root))
+        with self.assertRaises(ValueError):
+            apply.run_apply(self.spec_path, write=True)
+
+    def test_multiple_edits_same_file_compose(self):
+        with open(self.target, "w", encoding="utf-8") as f:
+            f.write("a = 1\nb = 2\n")
+        self._write_spec(_spec([
+            _edit("a = 1", "a = 10", eid="E1"),
+            _edit("b = 2", "b = 20", eid="E2"),
+        ], codebase_root=self.root))
+        proposal = apply.run_apply(
+            self.spec_path, write=True, backup_root=self.backup_root)
+        self.assertTrue(proposal["write"]["ok"])
+        self.assertEqual(self._read_target(), "a = 10\nb = 20\n")
+
+
 if __name__ == "__main__":
     unittest.main()

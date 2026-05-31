@@ -4,3 +4,4 @@
 /*.txt
 __pycache__
 hive_ledger.db
+/.apply_backups/

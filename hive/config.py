@@ -21,9 +21,12 @@ _DEFAULTS: dict[str, Any] = {
     },
     "copilot": {"exe": None, "allow": "--allow-all", "timeout_sec": 300},
     "ledger":  {"enabled": True, "db_path": "hive_ledger.db"},
+    "apply":   {"backup_dir": ".apply_backups", "backup_ttl_hours": 168},
 }
 
 _DEFAULT_CONFIG_PATH = os.path.join(os.path.dirname(__file__), "..", "hive.config.json")
+# Hivework repo root — relative config paths (e.g. apply.backup_dir) resolve here.
+_REPO_ROOT = os.path.dirname(os.path.abspath(_DEFAULT_CONFIG_PATH))
 
 
 @dataclass
@@ -46,6 +49,19 @@ class LedgerConfig:
 
 
 @dataclass
+class ApplyConfig:
+    """Settings for ``apply --write`` — the scratch backup / undo window."""
+    backup_dir: str = ".apply_backups"
+    backup_ttl_hours: int = 168
+
+    def backup_root(self) -> str:
+        """Absolute backup root; a relative backup_dir resolves under the repo root."""
+        if os.path.isabs(self.backup_dir):
+            return self.backup_dir
+        return os.path.join(_REPO_ROOT, self.backup_dir)
+
+
+@dataclass
 class Config:
     queen: RoleConfig = field(default_factory=RoleConfig)
     swarm: RoleConfig = field(default_factory=RoleConfig)
@@ -53,6 +69,7 @@ class Config:
     specify: RoleConfig = field(default_factory=RoleConfig)
     copilot: CopilotConfig = field(default_factory=CopilotConfig)
     ledger: LedgerConfig = field(default_factory=LedgerConfig)
+    apply: ApplyConfig = field(default_factory=ApplyConfig)
 
     def role(self, name: str) -> RoleConfig:
         """Return the RoleConfig for a given role name ('queen', 'swarm', 'assemble', 'specify')."""
@@ -97,6 +114,7 @@ def load_config(path: str | None = None) -> Config:
     roles = merged.get("roles", {})
     copilot_raw = merged.get("copilot", {})
     ledger_raw = merged.get("ledger", {})
+    apply_raw = merged.get("apply", {})
 
     def _role(name: str) -> RoleConfig:
         r = roles.get(name, {})
@@ -115,5 +133,9 @@ def load_config(path: str | None = None) -> Config:
         ledger=LedgerConfig(
             enabled=bool(ledger_raw.get("enabled", True)),
             db_path=ledger_raw.get("db_path", "hive_ledger.db"),
+        ),
+        apply=ApplyConfig(
+            backup_dir=apply_raw.get("backup_dir", ".apply_backups"),
+            backup_ttl_hours=int(apply_raw.get("backup_ttl_hours", 168)),
         ),
     )
