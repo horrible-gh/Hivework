@@ -25,6 +25,7 @@ from hive.parse import parse_comb_file
 from hive.conflict_scan import scan_conflicts
 from hive.reconcile import run_reconcile_loop
 from hive.assemble import run_assemble
+from hive.specify import run_specify
 
 
 def _force_utf8_io() -> None:
@@ -66,6 +67,7 @@ def run_pipeline(args: argparse.Namespace) -> None:
     queen_role = cfg.queen
     swarm_role = cfg.swarm
     assemble_role = cfg.role("assemble")
+    specify_role = cfg.role("specify")
 
     # Setup workdir
     workdir = args.workdir or os.path.join(os.path.dirname(args.out), "hive_workdir")
@@ -84,6 +86,8 @@ def run_pipeline(args: argparse.Namespace) -> None:
     logger.info("  queen:    %s/%s", queen_role.provider, queen_role.model)
     logger.info("  swarm:    %s/%s", swarm_role.provider, swarm_role.model)
     logger.info("  assemble: %s/%s", assemble_role.provider, assemble_role.model)
+    if args.specify:
+        logger.info("  specify:  %s/%s (chained)", specify_role.provider, specify_role.model)
     logger.info("=" * 60)
 
     ldg = open_ledger(cfg.ledger.enabled, cfg.ledger.db_path)
@@ -264,6 +268,40 @@ def run_pipeline(args: argparse.Namespace) -> None:
             provider_kwargs=provider_kwargs,
         )
 
+        # ────────────────────────────────────────────────────────────
+        # STAGE ⑦ specify (optional, chained via --specify)
+        # ────────────────────────────────────────────────────────────
+        if args.specify and (
+            not honey_path or not os.path.exists(honey_path)
+            or os.path.getsize(honey_path) == 0
+        ):
+            logger.warning("Skipping chained specify: no usable honey at %r "
+                           "(assemble produced nothing)", honey_path)
+        elif args.specify:
+            logger.info("─" * 60)
+            logger.info("STAGE ⑦ specify (chained — honey → edit-spec, propose only)")
+            logger.info("─" * 60)
+            spec_out = args.spec_out or (os.path.splitext(args.out)[0] + ".edit_spec.json")
+            try:
+                spec = run_specify(
+                    honey_path=honey_path,
+                    codebase_root=args.codebase,
+                    output_path=spec_out,
+                    contract_path=args.contract,
+                    model=specify_role.model,
+                    provider=specify_role.provider,
+                    ledger=ldg,
+                    provider_kwargs=provider_kwargs,
+                )
+                logger.info("Edit-spec: %s (%d edits, %d deferred, termination=%s)",
+                            spec_out, len(spec.get("edits") or []),
+                            len(spec.get("deferred") or []), spec.get("termination", "?"))
+            except Exception as e:
+                # The honey is the valuable artifact and is already on disk; a
+                # specify hiccup must not lose it. Surface, but don't fail the run.
+                logger.error("Chained specify failed (honey is intact at %s): %s",
+                             honey_path, e)
+
         ldg.finish_run(
             honey_path=honey_path,
             axes_n=len(final_combs),
@@ -290,6 +328,65 @@ def run_pipeline(args: argparse.Namespace) -> None:
     logger.info("  Reconcile rounds: %d", rounds_used)
     logger.info("  Remaining conflicts: %d", len(remaining_conflicts))
     logger.info("  Parse errors: %d", len(parse_errors))
+    logger.info("=" * 60)
+
+
+def run_specify_command(args: argparse.Namespace) -> None:
+    """Execute the standalone specify stage: honey + live code → edit-spec JSON.
+
+    This runs after a honey exists (from `hive run`, or an existing NR honey).
+    It is a single-author stage and Stage-1 propose-only: nothing is written to
+    the target codebase.
+    """
+    logger = logging.getLogger("hive")
+    cfg = load_config()
+    cfg.apply_cli_model(args.model)
+
+    provider_kwargs: dict[str, str] = {}
+    if cfg.copilot.exe:
+        provider_kwargs["exe"] = cfg.copilot.exe
+    if cfg.copilot.allow:
+        provider_kwargs["allow_flag"] = cfg.copilot.allow
+
+    role = cfg.role("specify")
+
+    logger.info("=" * 60)
+    logger.info("Hivework specify — honey → edit-spec (Stage-1: propose only)")
+    logger.info("  honey:    %s", args.honey)
+    logger.info("  codebase: %s", args.codebase)
+    logger.info("  output:   %s", args.out)
+    logger.info("  contract: %s", args.contract or "(default) recipes/edit_spec_contract_v1.md")
+    logger.info("  author:   %s/%s", role.provider, role.model)
+    logger.info("=" * 60)
+
+    ldg = open_ledger(cfg.ledger.enabled, cfg.ledger.db_path)
+    ldg.start_run(seed=args.honey, codebase=args.codebase,
+                  model_queen=role.model, model_swarm=role.model)
+    spec: dict = {}
+    try:
+        spec = run_specify(
+            honey_path=args.honey,
+            codebase_root=args.codebase,
+            output_path=args.out,
+            contract_path=args.contract,
+            model=role.model,
+            provider=role.provider,
+            ledger=ldg,
+            provider_kwargs=provider_kwargs,
+        )
+        ldg.finish_run(honey_path=args.out, axes_n=len(spec.get("edits") or []),
+                       status="done")
+    except Exception:
+        ldg.finish_run(status="failed")
+        raise
+    finally:
+        ldg.close()
+
+    logger.info("=" * 60)
+    logger.info("Specify complete: %d edits, %d deferred, termination=%s",
+                len(spec.get("edits") or []), len(spec.get("deferred") or []),
+                spec.get("termination", "?"))
+    logger.info("  Edit-spec (SSOT): %s", args.out)
     logger.info("=" * 60)
 
 
@@ -334,6 +431,48 @@ def main() -> None:
         help="Model for copilot workers (default: per-role config, gpt-5-mini)",
     )
     run_parser.add_argument(
+        "--specify", action="store_true",
+        help="Chain the specify stage after assemble: honey → edit-spec (propose only)",
+    )
+    run_parser.add_argument(
+        "--spec-out", default=None,
+        help="Output path for the chained edit-spec (default: <out>.edit_spec.json)",
+    )
+    run_parser.add_argument(
+        "--contract", default=None,
+        help="Path to the edit-spec contract for --specify (default: recipes/edit_spec_contract_v1.md)",
+    )
+    run_parser.add_argument(
+        "-v", "--verbose", action="store_true",
+        help="Enable debug logging",
+    )
+
+    # 'specify' sub-command — lower a honey into an edit-spec (Stage-1: propose only)
+    spec_parser = subparsers.add_parser(
+        "specify",
+        help="Lower an assembled honey into an applicable edit-spec JSON (propose only)",
+    )
+    spec_parser.add_argument(
+        "--honey", required=True,
+        help="Path to the assembled honey markdown (investigation report)",
+    )
+    spec_parser.add_argument(
+        "--codebase", required=True,
+        help="Root of the LIVE codebase — anchors are lifted from here, not the honey",
+    )
+    spec_parser.add_argument(
+        "--out", required=True,
+        help="Output path for the edit-spec JSON (the SSOT)",
+    )
+    spec_parser.add_argument(
+        "--contract", default=None,
+        help="Path to the edit-spec contract (default: recipes/edit_spec_contract_v1.md)",
+    )
+    spec_parser.add_argument(
+        "--model", default=None,
+        help="Model override for the specify author (default: per-role config)",
+    )
+    spec_parser.add_argument(
         "-v", "--verbose", action="store_true",
         help="Enable debug logging",
     )
@@ -348,6 +487,8 @@ def main() -> None:
 
     if args.command == "run":
         run_pipeline(args)
+    elif args.command == "specify":
+        run_specify_command(args)
 
 
 if __name__ == "__main__":

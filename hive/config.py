@@ -17,6 +17,7 @@ _DEFAULTS: dict[str, Any] = {
         "queen":    {"provider": "copilot", "model": "gpt-5-mini"},
         "swarm":    {"provider": "copilot", "model": "gpt-5-mini"},
         "assemble": {"provider": "copilot", "model": "gpt-5-mini"},
+        "specify":  {"provider": "copilot", "model": "gpt-5-mini"},
     },
     "copilot": {"exe": None, "allow": "--allow-all", "timeout_sec": 300},
     "ledger":  {"enabled": True, "db_path": "hive_ledger.db"},
@@ -49,11 +50,12 @@ class Config:
     queen: RoleConfig = field(default_factory=RoleConfig)
     swarm: RoleConfig = field(default_factory=RoleConfig)
     assemble_role: RoleConfig = field(default_factory=RoleConfig)
+    specify: RoleConfig = field(default_factory=RoleConfig)
     copilot: CopilotConfig = field(default_factory=CopilotConfig)
     ledger: LedgerConfig = field(default_factory=LedgerConfig)
 
     def role(self, name: str) -> RoleConfig:
-        """Return the RoleConfig for a given role name ('queen', 'swarm', 'assemble')."""
+        """Return the RoleConfig for a given role name ('queen', 'swarm', 'assemble', 'specify')."""
         if name == "assemble":
             return self.assemble_role
         return getattr(self, name, RoleConfig())
@@ -62,7 +64,7 @@ class Config:
         """Apply a CLI --model override to all roles (preserves --model semantics)."""
         if model is None:
             return
-        for role in (self.queen, self.swarm, self.assemble_role):
+        for role in (self.queen, self.swarm, self.assemble_role, self.specify):
             role.model = model
 
 
@@ -104,6 +106,7 @@ def load_config(path: str | None = None) -> Config:
         queen=_role("queen"),
         swarm=_role("swarm"),
         assemble_role=_role("assemble"),
+        specify=_role("specify"),
         copilot=CopilotConfig(
             exe=copilot_raw.get("exe"),
             allow=copilot_raw.get("allow", "--allow-all"),
