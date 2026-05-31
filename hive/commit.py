@@ -387,6 +387,38 @@ def build_commit_proposal(plan: dict[str, Any], repo_root: str) -> dict[str, Any
     }
 
 
+def _stage_commit_paths(repo_root: str, files: list[str]) -> tuple[bool, str]:
+    """Stage exactly ``files`` into the index — additions, modifications, AND deletions.
+
+    ``git add`` cannot stage a path that is gitignored-but-present on disk ("paths are
+    ignored") and fatals on a pathspec matching nothing in the worktree ("did not
+    match any files"). Both happen when a commit removes a tracked file that has become
+    gitignored (e.g. a regenerated ``__pycache__`` file that was ``git rm --cached``'d).
+
+    So split the paths: a path that is absent OR currently gitignored is a REMOVAL —
+    stage it with ``git rm --cached`` (drops it from the index, keeps the on-disk file);
+    everything else is an add/modify staged with ``git add``. Scope is preserved (only
+    these pathspecs are touched).
+    """
+    removals: list[str] = []
+    adds: list[str] = []
+    for rel in files:
+        absent = not os.path.exists(os.path.join(repo_root, rel))
+        ignored = (not absent) and _git(
+            repo_root, ["check-ignore", "-q", "--", rel]).returncode == 0
+        (removals if (absent or ignored) else adds).append(rel)
+
+    if adds:
+        r = _git(repo_root, ["add", "--", *adds])
+        if r.returncode != 0:
+            return False, f"git add failed — {r.stderr.strip()}"
+    if removals:
+        r = _git(repo_root, ["rm", "-r", "--cached", "--ignore-unmatch", "--", *removals])
+        if r.returncode != 0:
+            return False, f"git rm --cached failed — {r.stderr.strip()}"
+    return True, ""
+
+
 def execute_commits(plan: dict[str, Any], repo_root: str) -> dict[str, Any]:
     """Run ``git add``/``git commit`` for every commit of a READY plan, scoped.
 
@@ -445,13 +477,24 @@ def execute_commits(plan: dict[str, Any], repo_root: str) -> dict[str, Any]:
         message = c.get("message", "")
         files = _commit_files(c)
 
-        add = _git(repo_root, ["add", "--", *files])
-        if add.returncode != 0:
-            result["reason"] = f"{cid}: git add failed — {add.stderr.strip()}"
+        # Clean the index so this commit captures EXACTLY its own paths (scoping),
+        # stage just this commit's changes, then commit the INDEX (no pathspec).
+        # Committing the index — not `git commit -- <paths>` — is what makes a DELETION
+        # of a still-present, now-ignored file actually land: a pathspec commit re-reads
+        # those paths from the worktree and would keep the file.
+        reset = _git(repo_root, ["reset", "-q"])
+        if reset.returncode != 0:
+            result["reason"] = f"{cid}: git reset (unstage) failed — {reset.stderr.strip()}"
             _rollback()
             return result
 
-        com = _git(repo_root, ["commit", "-m", message, "--", *files])
+        ok, err = _stage_commit_paths(repo_root, files)
+        if not ok:
+            result["reason"] = f"{cid}: {err}"
+            _rollback()
+            return result
+
+        com = _git(repo_root, ["commit", "-m", message])
         if com.returncode != 0:
             result["reason"] = f"{cid}: git commit failed — {com.stderr.strip()}"
             _rollback()
