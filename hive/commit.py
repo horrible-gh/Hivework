@@ -104,6 +104,25 @@ def changed_paths(repo_root: str) -> set[str]:
     return paths
 
 
+def staged_paths(repo_root: str) -> set[str]:
+    """Return paths currently staged in the index vs HEAD (forward-slashed, rel).
+
+    Staged content is the PM's *explicit* intent to commit — it must not be silently
+    dropped. Renames/copies contribute the destination path. Uses ``--name-status``
+    against HEAD; on an unborn branch the index is compared against the empty tree, so
+    the first-ever staged files are still reported.
+    """
+    res = _git(repo_root, ["diff", "--cached", "--name-status"], check=True)
+    paths: set[str] = set()
+    for raw in res.stdout.splitlines():
+        if not raw.strip():
+            continue
+        # "X<TAB>path" or, for renames/copies, "Rxxx<TAB>old<TAB>new".
+        rel = raw.split("\t")[-1]  # destination for R/C; the path otherwise
+        paths.add(_unquote_path(rel))
+    return paths
+
+
 def _unquote_path(path: str) -> str:
     """Normalize a porcelain path: strip C-style quoting, use forward slashes."""
     path = path.strip()
@@ -135,9 +154,16 @@ def load_contract(contract_path: str | None = None) -> str:
 def _git_context(repo_root: str) -> str:
     """Render the live git state given to the author (status + a stat summary)."""
     status = _git(repo_root, ["status", "--porcelain"], check=True).stdout
+    staged = _git(repo_root, ["diff", "--cached", "--name-status"]).stdout
     stat = _git(repo_root, ["diff", "--stat", "HEAD"]).stdout
     untracked = _git(repo_root, ["status", "--short", "--untracked-files=all"]).stdout
     parts = ["[git status --porcelain]", status or "(clean)", ""]
+    parts += ["[staged paths — git diff --cached --name-status]",
+              "These are ALREADY staged = the PM's explicit intent to commit. "
+              "Each MUST be assigned to a commit; never route a staged path to "
+              "leftover. A staged deletion (D) of a generated file is a deliberate "
+              "untracking — commit it as chore.",
+              staged or "(nothing staged)", ""]
     if stat.strip():
         parts += ["[git diff --stat HEAD]", stat, ""]
     parts += ["[git status --short -uall]", untracked or "(none)"]
@@ -303,6 +329,7 @@ def build_commit_proposal(plan: dict[str, Any], repo_root: str) -> dict[str, Any
     gate = plan.get("gate") if isinstance(plan.get("gate"), dict) else {}
 
     changed = changed_paths(repo_root)
+    staged = staged_paths(repo_root)
 
     # Detect files claimed by more than one commit (hunk-split / double assignment).
     seen: dict[str, int] = {}
@@ -355,7 +382,12 @@ def build_commit_proposal(plan: dict[str, Any], repo_root: str) -> dict[str, Any
             "messages": messages,
         })
 
-    leftover = sorted(changed - covered)
+    leftover_set = changed - covered
+    leftover = sorted(leftover_set)
+    # Staged paths the plan leaves uncommitted are dangerous, not benign: execute_commits
+    # runs `git reset` before each commit to scope the index, which would silently revert
+    # this staged work (a staged `git rm --cached` deletion becomes re-tracked). Block.
+    staged_leftover = sorted(leftover_set & staged)
 
     reasons: list[str] = []
     if termination != "ready_to_commit":
@@ -365,6 +397,11 @@ def build_commit_proposal(plan: dict[str, Any], repo_root: str) -> dict[str, Any
     for r in commit_results:
         if not r["committable"]:
             reasons.append(f"{r['id']}: {r['status']}")
+    if staged_leftover:
+        reasons.append(
+            "staged but assigned to no commit — committing would silently revert "
+            "this staged work via the index reset (e.g. a `git rm --cached` deletion "
+            "becomes re-tracked); assign it to a commit: " + ", ".join(staged_leftover))
     if gate.get("commit") is True:
         reasons.append("gate.commit was True — ignored (write is human-held)")
 
@@ -372,6 +409,7 @@ def build_commit_proposal(plan: dict[str, Any], repo_root: str) -> dict[str, Any
         termination == "ready_to_commit"
         and bool(commit_results)
         and all(r["committable"] for r in commit_results)
+        and not staged_leftover
     )
 
     return {
@@ -381,6 +419,7 @@ def build_commit_proposal(plan: dict[str, Any], repo_root: str) -> dict[str, Any
         "termination": termination,
         "commits": commit_results,
         "leftover": leftover,
+        "staged_leftover": staged_leftover,
         "declared_leftover": plan.get("leftover") or [],
         "n_commits": len(commit_results),
         "n_committable": sum(1 for r in commit_results if r["committable"]),
@@ -578,6 +617,18 @@ def render_commit_proposal_markdown(proposal: dict[str, Any]) -> str:
             if write.get("rolled_back"):
                 lines.append("- created commits were rolled back "
                              "(`git reset --soft`); working tree preserved")
+        lines.append("")
+
+    if proposal.get("staged_leftover"):
+        lines.append("## ⚠ Staged but in no commit (would be reverted — fix the plan)")
+        lines.append("")
+        lines.append("These paths are staged (explicit commit intent) yet no commit "
+                     "covers them. The commit run resets the index per commit, so "
+                     "leaving them out silently reverts the staging. Assign each to a "
+                     "commit before writing.")
+        lines.append("")
+        for rel in proposal["staged_leftover"]:
+            lines.append(f"- `{rel}`")
         lines.append("")
 
     if proposal["leftover"]:

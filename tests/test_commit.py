@@ -22,6 +22,7 @@ from hive.commit import (
     execute_commits,
     render_commit_proposal_markdown,
     run_commit,
+    staged_paths,
     _normalize_plan,
 )
 
@@ -129,6 +130,67 @@ def test_leftover_is_computed(tmp_path):
     plan = _plan([{"id": "c1", "message": "feat(core): add a", "files": ["a.py"]}])
     proposal = build_commit_proposal(plan, repo)
     assert "scratch.txt" in proposal["leftover"]
+
+
+def _repo_with_staged_untracking(tmp_path):
+    """Repo where cache/x.pyc is a STAGED deletion (git rm --cached) still on disk,
+    and .gitignore is an untracked change. Mirrors the real __pycache__ case where the
+    PM stages an untracking before asking for a commit plan.
+    """
+    repo = _repo(tmp_path)
+    _write(repo, "cache/x.pyc", "y\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "-m", "track x.pyc")
+    _write(repo, ".gitignore", "cache/\n")          # untracked
+    _git(repo, "rm", "--cached", "-q", "cache/x.pyc")  # staged deletion, kept on disk
+    assert "cache/x.pyc" in staged_paths(repo)       # precondition
+    return repo
+
+
+def test_not_ready_when_staged_path_left_uncommitted(tmp_path):
+    """A staged path the plan drops (here the staged .pyc untracking) blocks the plan:
+    committing it would silently revert the staging via the per-commit index reset.
+    """
+    repo = _repo_with_staged_untracking(tmp_path)
+    plan = _plan([{"id": "c1", "message": "chore(git): ignore cache",
+                   "files": [".gitignore"]}])
+    proposal = build_commit_proposal(plan, repo)
+    assert proposal["ready"] is False
+    assert "cache/x.pyc" in proposal["staged_leftover"]
+    assert any("staged but assigned to no commit" in r
+               for r in proposal["not_ready_reasons"])
+
+
+def test_ready_when_staged_path_is_committed(tmp_path):
+    """Including the staged untracking in a commit is READY — the guard does not
+    over-block; it only fires on staged paths left out of the plan.
+    """
+    repo = _repo_with_staged_untracking(tmp_path)
+    plan = _plan([{"id": "c1", "message": "chore(git): stop tracking cache",
+                   "files": [".gitignore", "cache/x.pyc"]}])
+    proposal = build_commit_proposal(plan, repo)
+    assert proposal["ready"] is True
+    assert proposal["staged_leftover"] == []
+
+
+def test_write_refused_preserves_staged_untracking(tmp_path):
+    """End-to-end protection: a plan that omits the staged untracking is refused, so
+    the index reset never runs and the staged `git rm --cached` survives intact (the
+    original bug reverted it).
+    """
+    repo = _repo_with_staged_untracking(tmp_path)
+    plan = _plan([{"id": "c1", "message": "chore(git): ignore cache",
+                   "files": [".gitignore"]}])
+    plan_path = os.path.join(repo, "plan.json")
+    with open(plan_path, "w", encoding="utf-8") as f:
+        json.dump(plan, f)
+
+    proposal = run_commit(plan_path, repo_root=repo, write=True)
+    assert proposal["ready"] is False
+    assert proposal["write"]["attempted"] is False
+    # The staging survived: x.pyc is still untracked-in-index and still on disk.
+    assert _git(repo, "ls-files", "cache/x.pyc").stdout.strip() == ""
+    assert "cache/x.pyc" in staged_paths(repo)
 
 
 def test_not_ready_when_termination_needs_pm(tmp_path):
