@@ -25,6 +25,21 @@ from hive.providers import call_worker
 logger = logging.getLogger("hive.reconcile")
 
 
+def _is_reconcile_comb(comb: dict[str, Any]) -> bool:
+    """A reconcile round's own comb is a RESOLUTION, not an independent investigation
+    axis. Feeding it back into conflict detection as a new conflict *source* makes the
+    comb set — and the conflict count — grow every round instead of converging (N163:
+    47 → 57 → 73). It is excluded from detection but kept in the returned combs so
+    assemble still sees its findings.
+    """
+    return str(comb.get("axis_id", "")).upper().startswith("RECONCILE")
+
+
+def _detectable(combs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Combs eligible to be conflict *sources* — original axes, not reconcile verdicts."""
+    return [c for c in combs if not _is_reconcile_comb(c)]
+
+
 def build_reconcile_brief(conflicts: list[dict[str, Any]],
                           combs: list[dict[str, Any]]) -> str:
     """Build a re-investigation brief from detected conflicts.
@@ -115,7 +130,7 @@ def run_reconcile_loop(
 
     current_combs = list(combs)
     round_num = 0
-    conflicts = scan_conflicts(current_combs)
+    conflicts = scan_conflicts(_detectable(current_combs))
 
     while conflicts and round_num < round_cap:
         round_num += 1
@@ -172,8 +187,9 @@ def run_reconcile_loop(
             logger.error("  [reconcile] Round %d failed: %s", round_num, e)
             break
 
-        # Re-scan for remaining conflicts
-        conflicts = scan_conflicts(current_combs)
+        # Re-scan for remaining conflicts (reconcile combs are resolutions, not new
+        # conflict sources — exclude them so the count converges instead of growing).
+        conflicts = scan_conflicts(_detectable(current_combs))
         if not conflicts:
             logger.info("  [reconcile] All conflicts resolved in round %d!", round_num)
 
