@@ -55,6 +55,7 @@ def build_assemble_prompt(
     recipe_section3: str,
     seed_text: str,
     rounds_used: int = 0,
+    assemble_system: str | None = None,
 ) -> str:
     """Build the full prompt for the assemble worker.
 
@@ -64,14 +65,19 @@ def build_assemble_prompt(
         recipe_section3: Recipe §3 output format rules.
         seed_text: Original seed text.
         rounds_used: Number of reconcile rounds used.
+        assemble_system: Recipe-supplied assembler system prompt. When provided,
+            it replaces the default investigation ``ASSEMBLE_SYSTEM`` so a recipe
+            (e.g. a digest recipe) can drive a different output shape. When None,
+            the default investigation assembler is used.
 
     Returns:
         Full prompt string for copilot.
     """
+    system = assemble_system or ASSEMBLE_SYSTEM
     combs_json = json.dumps(combs, indent=2, ensure_ascii=False)
     conflicts_json = json.dumps(conflicts, indent=2, ensure_ascii=False) if conflicts else "[]"
 
-    return f"""{ASSEMBLE_SYSTEM}
+    return f"""{system}
 
 ## Recipe §3 (Exit — output-format rules):
 {recipe_section3}
@@ -114,6 +120,51 @@ def _extract_recipe_section3(recipe_path: str) -> str:
     return text
 
 
+def _extract_assemble_override(recipe_path: str) -> str | None:
+    """Return a recipe-supplied assembler system prompt, if the recipe has one.
+
+    A recipe may replace the default investigation assembler with its own by
+    including a heading whose text is ``ASSEMBLE SYSTEM OVERRIDE`` (any heading
+    level, case-insensitive) followed by a fenced code block holding the
+    override system prompt. Investigation recipes omit the section and fall back
+    to the default ``ASSEMBLE_SYSTEM``; a digest recipe supplies a digest
+    assembler so the same pipeline produces a digest, not an investigation.
+
+    Returns the override text, or None when absent/malformed.
+    """
+    with open(recipe_path, 'r', encoding='utf-8') as f:
+        lines = f.read().split('\n')
+
+    n = len(lines)
+    i = 0
+    while i < n:
+        stripped = lines[i].lstrip()
+        if (stripped.startswith('#')
+                and stripped.lstrip('#').strip().lower() == 'assemble system override'):
+            break
+        i += 1
+    else:
+        return None
+
+    # Advance to the opening fence (bail if another heading intervenes).
+    i += 1
+    while i < n and not lines[i].lstrip().startswith('```'):
+        if lines[i].lstrip().startswith('#'):
+            return None
+        i += 1
+    if i >= n:
+        return None
+
+    i += 1  # past the opening fence
+    body: list[str] = []
+    while i < n and not lines[i].lstrip().startswith('```'):
+        body.append(lines[i])
+        i += 1
+
+    text = '\n'.join(body).strip()
+    return text or None
+
+
 def run_assemble(
     combs: list[dict[str, Any]],
     conflicts: list[dict[str, Any]],
@@ -143,8 +194,13 @@ def run_assemble(
         Path to the written honey file.
     """
     recipe_section3 = _extract_recipe_section3(recipe_path)
+    assemble_system = _extract_assemble_override(recipe_path)
+    if assemble_system:
+        logger.info("Using recipe-supplied assemble system override (%d chars)",
+                    len(assemble_system))
     prompt = build_assemble_prompt(
-        combs, conflicts, recipe_section3, seed_text, rounds_used
+        combs, conflicts, recipe_section3, seed_text, rounds_used,
+        assemble_system=assemble_system,
     )
 
     logger.info("Running assemble worker...")
