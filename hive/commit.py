@@ -404,8 +404,12 @@ def _stage_commit_paths(repo_root: str, files: list[str]) -> tuple[bool, str]:
     adds: list[str] = []
     for rel in files:
         absent = not os.path.exists(os.path.join(repo_root, rel))
+        # --no-index: report a match on the .gitignore RULES alone, so a tracked file
+        # that now matches an ignore rule (the thing we want to untrack) is detected as
+        # a removal. Plain check-ignore never flags a tracked path, which would misroute
+        # it to `git add` and re-track it.
         ignored = (not absent) and _git(
-            repo_root, ["check-ignore", "-q", "--", rel]).returncode == 0
+            repo_root, ["check-ignore", "--no-index", "-q", "--", rel]).returncode == 0
         (removals if (absent or ignored) else adds).append(rel)
 
     if adds:
