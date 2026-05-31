@@ -14,6 +14,23 @@ Hivework does not depend on any external rule document at runtime.)
 
 ---
 
+## 0. Staged changes are committed intent — priority, never leftover
+
+The live git state marks which paths are **already staged** (porcelain column 1 ≠
+space; also listed in the `[staged paths]` block). A staged path is the PM's explicit
+statement *"this goes in the next commit."* Treat it as a first-class priority:
+
+- **Every staged path MUST be assigned to a commit.** Never route a staged path to
+  `leftover`, even if it looks like a generated artifact.
+- A **staged deletion** of a generated/ignored file (e.g. a `git rm --cached` of
+  `__pycache__/*.pyc` that is still on disk) is a *deliberate untracking*. Commit it —
+  typically `chore(git): stop tracking <area>` — do not drop it as a "build artifact."
+- `leftover` is **only** for unstaged or untracked changes you are deliberately not
+  committing yet. If something is staged, the PM already decided; honor that.
+
+(The deterministic stage refuses to commit — NOT READY — if any staged path is left
+uncommitted, because the per-commit index reset would silently revert that staging.)
+
 ## 1. Commit boundary — one commit = one purpose
 
 - **One commit = one task or one coherent purpose.** Do not bundle unrelated work.
@@ -65,6 +82,10 @@ chore(deps): bump pytest to 8.x
 If some changed files should **not** be committed now (scratch files, unrelated
 in-progress work, generated artifacts), list them under `leftover` with a short
 reason instead of forcing them into a commit.
+
+**Eligibility:** only *unstaged* or *untracked* changes may go to `leftover`. A
+**staged** path is committed intent (see §0) and must be assigned to a commit — it is
+never leftover-eligible, regardless of file type.
 
 ---
 

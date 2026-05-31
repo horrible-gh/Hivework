@@ -199,6 +199,35 @@ Behaviour:
 
 Approval is just re-running with `--write`: review the dry-run table, then commit.
 
+## 5. digest — summarise a corpus into one document (reuses `run`)
+
+`digest` is not a separate verb — it is `run` pointed at a **digest recipe** instead of an
+investigation recipe. The same 6-stage pipeline (decompose → fan-out → … → assemble) then performs
+**faithful, lossy compression** of a corpus of M items into one structured digest, rather than a
+root-cause investigation. What flips the behaviour is the recipe: a digest recipe carries an
+`ASSEMBLE SYSTEM OVERRIDE` section (a fenced block) whose text replaces the default investigation
+assembler with a digest assembler. Investigation recipes omit that section and are unaffected.
+
+```powershell
+# 1. Stage the corpus: put each item (one markdown file per item) in a folder.
+#    digest has no --corpus flag yet, so --codebase points at that folder.
+# 2. Run with the digest recipe:
+python hive.py run `
+  --seed     <seed.md> `              # say "this is a DIGEST run; each file in the root is one item"
+  --recipe   recipes\recipe_digest.md `
+  --codebase <corpus_folder> `        # the staged folder of items
+  --out      <digest.md> `
+  --round-cap 1
+```
+
+The digest recipe embeds one **profile** (the scenario test-run profile) that fixes the four domain
+seams — grouping key, sub-digest schema, merge granularity, output shape. To digest a different
+kind of corpus, swap the `ACTIVE PROFILE` section; the engine never changes.
+
+Output is a digest document: per-domain roll-up tables, an overall coverage map (every item → group,
+proving zero orphans), an open-questions/contradictions block, and a metadata line. No fixes, no
+recommendations — only faithful compression.
+
 ## Tests
 
 ```powershell
@@ -216,6 +245,7 @@ hive/
 recipes/
   recipe_code_bug.md           # investigation recipe card (find a root cause)
   recipe_code_feature.md       # creation recipe card (build a new feature → create_file edits)
+  recipe_digest.md             # digest recipe card (faithful compression of a corpus) + ASSEMBLE SYSTEM OVERRIDE
   edit_spec_contract_v1.md     # specify's output contract (also the author's role prompt)
   commit_plan_contract_v1.md   # commit-plan's output contract (also the author's role prompt)
 tests/
