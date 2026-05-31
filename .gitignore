@@ -1,8 +1,33 @@
+# Claude / local
 /.claude/
+
+# Smoke fixtures (local only)
 /smoke/
-/hive/__pycache__/
-/test/__pycache__/
-/*.txt
-__pycache__
-hive_ledger.db
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+build/
+dist/
+
+# Virtual envs
+.venv/
+venv/
+env/
+
+# Hive runtime artifacts
+hive_ledger.db*
+hive_workdir/
 /.apply_backups/
+# decompose debug dumps written to the run cwd
+/decompose_prompt_last.txt
+/decompose_raw_last.txt
+
+# OS / editor cruft
+.DS_Store
+Thumbs.db
+.idea/
