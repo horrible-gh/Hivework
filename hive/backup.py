@@ -50,6 +50,7 @@ def create_bundle(
     rel_paths: list[str],
     ttl_hours: int,
     now: datetime | None = None,
+    created_paths: list[str] | None = None,
 ) -> dict[str, Any]:
     """Snapshot ``rel_paths`` (originals) into a fresh bundle; return its record.
 
@@ -57,6 +58,11 @@ def create_bundle(
     ``restore_bundle`` reproduces the exact pre-write state. Returns a dict with
     ``dir`` (bundle path), ``originals`` (rel -> original text, for in-process
     rollback), and the manifest.
+
+    ``created_paths`` lists files that do not yet exist and will be written by
+    this run. They have no bytes to snapshot, so the bundle records them under
+    the ``"created"`` manifest key; ``restore_bundle`` deletes them on undo
+    rather than rewriting original content.
     """
     now = now or _now()
     stamp = now.strftime(_STAMP_FMT)
@@ -68,6 +74,10 @@ def create_bundle(
         bundle_dir = os.path.join(backup_root, f"{stamp}_{suffix}_{n}")
         n += 1
     files_dir = os.path.join(bundle_dir, FILES_SUBDIR)
+    # Create the bundle dir explicitly: a create_file-only run has no rel_paths to
+    # snapshot, so the per-file makedirs below never fires and the manifest write
+    # would land in a missing directory.
+    os.makedirs(bundle_dir, exist_ok=True)
 
     originals: dict[str, str] = {}
     saved: list[str] = []
@@ -82,6 +92,8 @@ def create_bundle(
             f.write(text)
         saved.append(rel)
 
+    created: list[str] = list(created_paths) if created_paths else []
+
     expires = now + timedelta(hours=ttl_hours)
     manifest = {
         "created_utc": now.strftime(_STAMP_FMT),
@@ -90,12 +102,13 @@ def create_bundle(
         "spec": os.path.abspath(spec_path),
         "codebase_root": os.path.abspath(codebase_root),
         "files": saved,
+        "created": created,   # paths to DELETE on restore (no original bytes)
     }
     with open(os.path.join(bundle_dir, MANIFEST_NAME), "w", encoding="utf-8") as f:
         json.dump(manifest, f, indent=2, ensure_ascii=False)
 
-    logger.info("Backup bundle created: %s (%d files, expires %s)",
-                bundle_dir, len(saved), manifest["expires_utc"])
+    logger.info("Backup bundle created: %s (%d modified, %d created, expires %s)",
+                bundle_dir, len(saved), len(created), manifest["expires_utc"])
     return {"dir": bundle_dir, "originals": originals, "manifest": manifest}
 
 
@@ -106,7 +119,13 @@ def load_manifest(bundle_dir: str) -> dict[str, Any]:
 
 
 def restore_bundle(bundle_dir: str) -> list[str]:
-    """Copy every saved file back over the codebase; return restored abs paths."""
+    """Copy every saved file back over the codebase; delete any created files.
+
+    Modified files (``manifest["files"]``) are restored by overwrite. Created
+    files (``manifest["created"]``) had no original bytes, so they are restored
+    by deletion; a missing created file is skipped (idempotent). Empty parent
+    dirs are not pruned, matching the modified-file behaviour.
+    """
     manifest = load_manifest(bundle_dir)
     root = manifest["codebase_root"]
     files_dir = os.path.join(bundle_dir, FILES_SUBDIR)
@@ -117,7 +136,16 @@ def restore_bundle(bundle_dir: str) -> list[str]:
         os.makedirs(os.path.dirname(abs_dst), exist_ok=True)
         shutil.copyfile(abs_src, abs_dst)
         restored.append(abs_dst)
-    logger.info("Restored %d files from %s", len(restored), bundle_dir)
+    for rel in manifest.get("created", []):
+        abs_dst = os.path.join(root, rel)
+        try:
+            os.remove(abs_dst)
+            restored.append(abs_dst)
+        except FileNotFoundError:
+            logger.warning("restore: created file already absent, skipping: %s", rel)
+        except OSError as exc:
+            logger.error("restore: could not delete created file %s: %s", rel, exc)
+    logger.info("Restored %d file(s) from %s", len(restored), bundle_dir)
     return restored
 
 
