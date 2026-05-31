@@ -56,6 +56,13 @@ _STALE_STATUSES = {"stale", "not_found"}
 _INEFFECTIVE_TERMINATION = "needs_reinvestigation"
 _INCONCLUSIVE_TERMINATION = "needs_pm"
 
+# Decisiveness gate: a conservatively-authored needs_pm spec is promoted to
+# ready_to_apply only when every edit clears these bars (never a blanket drop).
+_DECISIVE_CONFIDENCE = {"high", "medium"}
+# Deferred reasons that are "optional/surface" — they do not contradict the edits,
+# so their presence must not block applying an independently-verified edit.
+_OPTIONAL_DEFERRED_REASONS = {"policy_direction", "not_expressible_as_edit", "multi_file_design"}
+
 
 def load_contract(contract_path: str | None = None) -> str:
     """Load the edit-spec authoring contract (the specify author's role prompt)."""
@@ -377,6 +384,65 @@ def _apply_effectiveness_gate(
     return spec
 
 
+def _apply_decisiveness_gate(spec: dict[str, Any]) -> dict[str, Any]:
+    """Promote a conservatively-authored needs_pm spec to ready_to_apply.
+
+    ``termination`` must reflect whether the edits in ``edits[]`` are safe to APPLY,
+    not whether the whole investigation is closed. A specify author often sets
+    needs_pm because the honey surfaced optional/policy directions (which land in
+    ``deferred[]``) even though the concrete edits are anchor-verified and passed the
+    effectiveness review. The effectiveness gate only ever downgrades, so without this
+    there is no path to ready_to_apply and apply refuses an otherwise-safe fix.
+
+    This never lowers a bar on its own. It promotes needs_pm -> ready_to_apply ONLY
+    when every edit is verified/effective/confident AND every deferred item is optional
+    (not a contradiction of the edits). ``needs_reinvestigation`` is never promoted
+    (that means the fix does not work); an existing ``ready_to_apply`` is left untouched.
+    """
+    if spec.get("termination") != "needs_pm":
+        return spec
+
+    # The promotion stands on the effectiveness review having actually run and been
+    # conclusive — that is the evidence. No conclusive review => no promotion.
+    eff = spec.get("effectiveness")
+    if not isinstance(eff, dict) or eff.get("inconclusive"):
+        return spec
+    ineffective = {str(x) for x in (eff.get("ineffective_ids") or [])}
+
+    edits = [e for e in (spec.get("edits") or []) if isinstance(e, dict)]
+    if not edits:
+        return spec
+    for e in edits:
+        if str(e.get("id", "?")) in ineffective:
+            return spec
+        if str(e.get("confidence", "")).lower() not in _DECISIVE_CONFIDENCE:
+            return spec
+        if e.get("kind", "edit") == "create_file":
+            content = e.get("content", "")
+            if not content or not content.strip():
+                return spec
+        elif str(e.get("anchor_status", "")).lower() != "verified":
+            return spec
+
+    deferred = spec.get("deferred") if isinstance(spec.get("deferred"), list) else []
+    for d in deferred:
+        if not isinstance(d, dict):
+            return spec
+        if str(d.get("reason", "")).lower() not in _OPTIONAL_DEFERRED_REASONS:
+            return spec
+
+    spec["termination"] = "ready_to_apply"
+    note = ("decisiveness gate: promoted needs_pm -> ready_to_apply — every edit is "
+            "verified/effective and confident; deferred items remain surfaced as "
+            "optional for the PM")
+    prev = str(spec.get("notes", "")).strip()
+    spec["notes"] = f"{prev} {note}".strip() if prev else note
+    logger.info("specify: decisiveness gate promoted needs_pm -> ready_to_apply "
+                "(%d verified/effective edit(s), %d optional deferred)",
+                len(edits), len(deferred))
+    return spec
+
+
 def _review_and_gate(
     spec: dict[str, Any],
     honey_text: str,
@@ -443,6 +509,10 @@ def run_specify(
     if review:
         spec = _review_and_gate(spec, honey_text, codebase_root, model, provider,
                                 ledger, provider_kwargs)
+
+    # Decisiveness gate: a verified+effective edit must be applyable even when the
+    # honey also surfaced optional/policy directions (which sit in deferred[]).
+    spec = _apply_decisiveness_gate(spec)
 
     problems = _validate_spec(spec)
     if problems:

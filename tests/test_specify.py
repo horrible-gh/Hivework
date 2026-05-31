@@ -271,6 +271,78 @@ class TestRunSpecifyWithReview(unittest.TestCase):
         self.assertEqual(spec["termination"], "needs_pm")
 
 
+class TestDecisivenessGate(unittest.TestCase):
+    """specify._apply_decisiveness_gate — guarded needs_pm -> ready_to_apply promotion."""
+
+    def _needs_pm(self, **over):
+        spec = {
+            "edits": [{
+                "id": "E1", "file": "a.py",
+                "anchor_old": "x = 1", "replacement_new": "x = 2",
+                "confidence": "medium", "anchor_status": "verified",
+            }],
+            "deferred": [{"issue": "optional UX option", "reason": "policy_direction"}],
+            "termination": "needs_pm",
+            "effectiveness": {"inconclusive": False, "ineffective_ids": []},
+            "notes": "PM please confirm authoritative UX",
+        }
+        spec.update(over)
+        return spec
+
+    def test_promotes_verified_effective_with_policy_deferred(self):
+        out = specify._apply_decisiveness_gate(self._needs_pm())
+        self.assertEqual(out["termination"], "ready_to_apply")
+        self.assertIn("decisiveness gate", out["notes"])
+
+    def test_create_file_edit_promotes(self):
+        spec = self._needs_pm(edits=[{
+            "id": "E1", "kind": "create_file", "file": "new.py",
+            "content": "x = 1\n", "confidence": "medium",
+        }])
+        self.assertEqual(
+            specify._apply_decisiveness_gate(spec)["termination"], "ready_to_apply")
+
+    def test_low_confidence_blocks(self):
+        spec = self._needs_pm()
+        spec["edits"][0]["confidence"] = "low"
+        self.assertEqual(specify._apply_decisiveness_gate(spec)["termination"], "needs_pm")
+
+    def test_ineffective_id_blocks(self):
+        spec = self._needs_pm()
+        spec["effectiveness"]["ineffective_ids"] = ["E1"]
+        self.assertEqual(specify._apply_decisiveness_gate(spec)["termination"], "needs_pm")
+
+    def test_inconclusive_blocks(self):
+        spec = self._needs_pm()
+        spec["effectiveness"]["inconclusive"] = True
+        self.assertEqual(specify._apply_decisiveness_gate(spec)["termination"], "needs_pm")
+
+    def test_non_optional_deferred_blocks(self):
+        spec = self._needs_pm()
+        spec["deferred"] = [{"issue": "x", "reason": "needs_runtime"}]
+        self.assertEqual(specify._apply_decisiveness_gate(spec)["termination"], "needs_pm")
+
+    def test_missing_effectiveness_key_blocks(self):
+        spec = self._needs_pm()
+        del spec["effectiveness"]
+        self.assertEqual(specify._apply_decisiveness_gate(spec)["termination"], "needs_pm")
+
+    def test_unverified_anchor_blocks(self):
+        spec = self._needs_pm()
+        spec["edits"][0]["anchor_status"] = "stale"
+        self.assertEqual(specify._apply_decisiveness_gate(spec)["termination"], "needs_pm")
+
+    def test_never_upgrades_needs_reinvestigation(self):
+        spec = self._needs_pm(termination="needs_reinvestigation")
+        self.assertEqual(
+            specify._apply_decisiveness_gate(spec)["termination"], "needs_reinvestigation")
+
+    def test_leaves_ready_untouched(self):
+        spec = self._needs_pm(termination="ready_to_apply")
+        self.assertEqual(
+            specify._apply_decisiveness_gate(spec)["termination"], "ready_to_apply")
+
+
 class TestConfigSpecifyRole(unittest.TestCase):
     def test_specify_role_exists(self):
         cfg = load_config()
