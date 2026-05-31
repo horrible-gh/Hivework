@@ -69,8 +69,18 @@ def _check_root_cause_mismatch(combs: list[dict[str, Any]]) -> list[dict[str, An
 def _signals_disagree(sig_a: str, sig_b: str) -> bool:
     """Determine if two root_cause_signal strings meaningfully disagree.
 
-    They agree if one is a substring of the other (same root cause, different
-    verbosity), or if they reference the same file:line. They disagree otherwise.
+    A real root_cause conflict means two axes point at the SAME locus but draw
+    DIFFERENT conclusions. In a MECE fan-out the axes deliberately investigate
+    different facets (FE / BE / CSS / predicate …), so merely having different
+    signals is the NORMAL case, not a conflict — flagging those produced a flood of
+    spurious conflicts (N163: 47 from 12 axes).
+
+    So they disagree only when BOTH cite file:line refs AND those refs OVERLAP (same
+    locus) AND the signals are not substring-equal (different conclusion about that
+    locus). If a shared locus cannot be established — either side has no file:line
+    ref, or the refs do not overlap — the axes are about different things and are NOT
+    in conflict. (Tradeoff: a rare prose-only "same bug, different words" conflict may
+    be missed; termination_divergence and unresolved_conditional still run.)
     """
     a_norm = sig_a.strip().lower()
     b_norm = sig_b.strip().lower()
@@ -78,14 +88,11 @@ def _signals_disagree(sig_a: str, sig_b: str) -> bool:
         return False
     if a_norm in b_norm or b_norm in a_norm:
         return False
-    # Extract file:line references for comparison
     a_refs = _extract_file_line_refs(a_norm)
     b_refs = _extract_file_line_refs(b_norm)
-    if a_refs and b_refs:
-        # If there's meaningful overlap in file:line refs, they agree
-        if a_refs & b_refs:
-            return False
-    return True
+    if not a_refs or not b_refs:
+        return False  # no shared locus can be established → complementary, not a conflict
+    return bool(a_refs & b_refs)  # same locus + different conclusion → genuine disagreement
 
 
 def _extract_file_line_refs(text: str) -> set[str]:

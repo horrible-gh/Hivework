@@ -124,20 +124,49 @@ class TestConflictScanSynthetic(unittest.TestCase):
         conflicts = scan_conflicts(combs)
         self.assertEqual(len(conflicts), 0)
 
-    def test_root_cause_mismatch(self):
-        """Two axes with different root_cause_signal should conflict."""
+    def test_root_cause_mismatch_same_locus(self):
+        """Two axes citing the SAME file:line but DIFFERENT conclusions conflict."""
         combs = [
             {"axis_id": "A", "termination": "resolved",
-             "root_cause_signal": "foo.py:10 — bug here",
+             "root_cause_signal": "foo.py:10 — null guard missing",
              "findings": []},
             {"axis_id": "B", "termination": "resolved",
-             "root_cause_signal": "bar.py:99 — different bug",
+             "root_cause_signal": "foo.py:10 — wrong default value",
              "findings": []},
         ]
         conflicts = scan_conflicts(combs)
         mismatch = [c for c in conflicts if c["type"] == "root_cause_mismatch"]
         self.assertGreater(len(mismatch), 0,
-                           "Different root_cause_signals should trigger mismatch")
+                           "Same locus + different conclusion should conflict")
+
+    def test_complementary_signals_no_mismatch(self):
+        """Different loci (a MECE fan-out) are complementary, NOT a conflict.
+
+        This is the over-detection fix: axes investigating different facets carry
+        different signals by design and must not be flagged as conflicting.
+        """
+        combs = [
+            {"axis_id": "A", "termination": "resolved",
+             "root_cause_signal": "foo.py:10 — FE badge issue", "findings": []},
+            {"axis_id": "B", "termination": "resolved",
+             "root_cause_signal": "bar.py:99 — BE endpoint issue", "findings": []},
+        ]
+        conflicts = scan_conflicts(combs)
+        mismatch = [c for c in conflicts if c["type"] == "root_cause_mismatch"]
+        self.assertEqual(len(mismatch), 0,
+                         "Different loci should be complementary, not a conflict")
+
+    def test_refless_signals_no_mismatch(self):
+        """Signals with no file:line ref cannot establish a shared locus → no conflict."""
+        combs = [
+            {"axis_id": "A", "termination": "resolved",
+             "root_cause_signal": "something is wrong in the UI", "findings": []},
+            {"axis_id": "B", "termination": "resolved",
+             "root_cause_signal": "the backend is misbehaving", "findings": []},
+        ]
+        conflicts = scan_conflicts(combs)
+        mismatch = [c for c in conflicts if c["type"] == "root_cause_mismatch"]
+        self.assertEqual(len(mismatch), 0)
 
     def test_termination_divergence_with_cross_refs(self):
         """Resolved vs needs_pm with cross-reference should trigger divergence."""
