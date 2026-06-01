@@ -347,7 +347,8 @@ def review_effectiveness(
         ledger.record_call("specify", "specify_review", provider, model,
                            prompt=prompt, output=wr.stdout, latency_s=wr.latency_s,
                            ok=wr.exit_code == 0,
-                           err=wr.stderr[:200] if wr.exit_code != 0 else "")
+                           err=wr.stderr[:200] if wr.exit_code != 0 else "",
+                           real_tokens=wr.real_tokens)
 
     try:
         parsed = extract_first_json(wr.stdout)
@@ -553,7 +554,8 @@ def run_specify(
         ledger.record_call("specify", "specify", provider, model,
                            prompt=prompt, output=wr.stdout, latency_s=wr.latency_s,
                            ok=wr.exit_code == 0,
-                           err=wr.stderr[:200] if wr.exit_code != 0 else "")
+                           err=wr.stderr[:200] if wr.exit_code != 0 else "",
+                           real_tokens=wr.real_tokens)
 
     spec = extract_first_json(wr.stdout)  # raises ValueError if no JSON found
     spec = _normalize_spec(spec)

@@ -168,7 +168,8 @@ def run_reconcile_loop(
                 ledger.record_call("queen", reconcile_id, provider, model,
                                    prompt=prompt, output=result.stdout, latency_s=result.latency_s,
                                    comb_path=comb_path, ok=result.exit_code == 0,
-                                   err=result.stderr[:200] if result.exit_code != 0 else "")
+                                   err=result.stderr[:200] if result.exit_code != 0 else "",
+                                   real_tokens=result.real_tokens)
 
             with open(comb_path, 'w', encoding='utf-8') as f:
                 f.write(result.stdout)

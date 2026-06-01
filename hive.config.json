@@ -5,7 +5,7 @@
     "assemble": { "provider": "copilot", "model": "gpt-5-mini" },
     "specify":  { "provider": "copilot", "model": "gpt-5-mini" },
     "commit":   { "provider": "copilot", "model": "gpt-5-mini" },
-    "judge":    { "provider": "copilot", "model": "gpt-5-mini" }
+    "judge":    { "provider": "deepinfra", "model": "openai/gpt-oss-120b" }
   },
   "copilot": { "exe": null, "allow": "--allow-all", "timeout_sec": 300 },
   "ledger":  { "enabled": true, "db_path": "hive_ledger.db" },

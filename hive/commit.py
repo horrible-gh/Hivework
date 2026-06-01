@@ -279,7 +279,8 @@ def run_propose(
         ledger.record_call("commit", "commit-plan", provider, model,
                            prompt=prompt, output=wr.stdout, latency_s=wr.latency_s,
                            ok=wr.exit_code == 0,
-                           err=wr.stderr[:200] if wr.exit_code != 0 else "")
+                           err=wr.stderr[:200] if wr.exit_code != 0 else "",
+                           real_tokens=wr.real_tokens)
 
     plan = extract_first_json(wr.stdout)  # raises ValueError if no JSON found
     plan = _normalize_plan(plan, repo_root)

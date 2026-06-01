@@ -164,7 +164,8 @@ def run_decompose(
         ledger.record_call("queen", "decompose", provider, model,
                            prompt=prompt, output=wr.stdout, latency_s=wr.latency_s,
                            ok=wr.exit_code == 0,
-                           err=wr.stderr[:200] if wr.exit_code != 0 else "")
+                           err=wr.stderr[:200] if wr.exit_code != 0 else "",
+                           real_tokens=wr.real_tokens)
 
     # Persist raw output so decompose failures are never blind (was: no dump).
     dump_path = os.path.join(os.getcwd(), "decompose_raw_last.txt")

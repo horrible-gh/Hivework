@@ -206,7 +206,8 @@ def _call_and_parse(provider: str, model: str, prompt: str, *, cwd: str,
         ledger.record_call("judge", axis_id, provider, model,
                            prompt=prompt, output=wr.stdout, latency_s=wr.latency_s,
                            ok=wr.exit_code == 0,
-                           err=wr.stderr[:200] if wr.exit_code != 0 else "")
+                           err=wr.stderr[:200] if wr.exit_code != 0 else "",
+                           real_tokens=wr.real_tokens)
 
     try:
         return extract_first_json(wr.stdout)

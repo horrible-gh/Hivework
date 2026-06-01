@@ -35,6 +35,10 @@ class WorkerResult:
     stderr: str
     exit_code: int
     latency_s: float
+    # EXACT total token count when the provider reports it (HTTP providers like
+    # deepinfra via response.usage). None for copilot — the CLI exposes no token
+    # counts. Feeds the ledger's real_tokens column (ledger.py docstring).
+    real_tokens: int | None = None
 
 
 def _call_copilot(model, prompt, cwd, timeout, exe=None, allow_flag="--allow-all",
@@ -65,10 +69,76 @@ def _call_copilot(model, prompt, cwd, timeout, exe=None, allow_flag="--allow-all
                         exit_code=result.returncode, latency_s=latency_s)
 
 
+def _call_deepinfra(model, prompt, cwd=None, timeout=120, *, system=None,
+                    temperature=0.2, max_tokens=1024, reasoning_effort=None,
+                    api_key_env="DEEPINFRA_TOKEN",
+                    base_url="https://api.deepinfra.com/v1/openai",
+                    available_tools=None, **_ignored) -> WorkerResult:
+    """Call a DeepInfra OpenAI-compatible chat model (e.g. ``openai/gpt-oss-120b``).
+
+    HTTP via the openai SDK, not subprocess. Unlike copilot this returns EXACT
+    token counts (``response.usage.total_tokens``), surfaced on
+    ``WorkerResult.real_tokens`` for the ledger's real_tokens column.
+
+    Tool-OFF single-shot path: the model has no access to the local filesystem,
+    so ``cwd`` and ``available_tools`` are accepted only for ``call_worker``
+    signature parity and ignored (a non-empty ``available_tools`` is meaningless
+    here and logged at debug). Intended for the judge / review roles, where a
+    ~20s round-trip is acceptable.
+
+    Config errors (missing key, openai not installed) and API failures return a
+    WorkerResult with exit_code=1 and the message on stderr — matching the
+    copilot handler's contract so callers' existing error handling applies.
+    """
+    if available_tools:
+        logger.debug("deepinfra: ignoring available_tools=%s (no local tool access)",
+                     available_tools)
+    api_key = os.environ.get(api_key_env)
+    if not api_key:
+        msg = f"{api_key_env} not set in environment"
+        logger.warning("deepinfra: %s", msg)
+        return WorkerResult(stdout="", stderr=msg, exit_code=1, latency_s=0.0)
+    try:
+        from openai import OpenAI
+    except ImportError:
+        msg = "openai package not installed (pip install openai)"
+        logger.warning("deepinfra: %s", msg)
+        return WorkerResult(stdout="", stderr=msg, exit_code=1, latency_s=0.0)
+
+    messages = []
+    if system:
+        messages.append({"role": "system", "content": system})
+    messages.append({"role": "user", "content": prompt})
+    extra: dict = {}
+    if reasoning_effort:
+        extra["reasoning_effort"] = reasoning_effort
+
+    logger.debug("call_worker deepinfra: model=%s timeout=%d", model, timeout)
+    client = OpenAI(api_key=api_key, base_url=base_url, timeout=timeout)
+    t0 = time.monotonic()
+    try:
+        resp = client.chat.completions.create(
+            model=model, messages=messages, temperature=temperature,
+            max_tokens=max_tokens, **extra)
+    except Exception as e:
+        latency_s = time.monotonic() - t0
+        logger.warning("deepinfra call failed (%.1fs): %s", latency_s, e)
+        return WorkerResult(stdout="", stderr=str(e), exit_code=1, latency_s=latency_s)
+    latency_s = time.monotonic() - t0
+
+    content = resp.choices[0].message.content or ""
+    usage = getattr(resp, "usage", None)
+    real_tokens = getattr(usage, "total_tokens", None) if usage is not None else None
+    _tee_call(model, latency_s, 0, "")
+    return WorkerResult(stdout=content, stderr="", exit_code=0,
+                        latency_s=latency_s, real_tokens=real_tokens)
+
+
 # Extension point: add new providers here.
 # Handler signature: (model, prompt, cwd, timeout, **kwargs) -> WorkerResult
 _REGISTRY: dict = {
     "copilot": _call_copilot,
+    "deepinfra": _call_deepinfra,
 }
 
 

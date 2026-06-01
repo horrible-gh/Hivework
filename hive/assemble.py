@@ -213,7 +213,8 @@ def run_assemble(
         ledger.record_call("assemble", "assemble", provider, model,
                            prompt=prompt, output=wr.stdout, latency_s=wr.latency_s,
                            ok=wr.exit_code == 0,
-                           err=wr.stderr[:200] if wr.exit_code != 0 else "")
+                           err=wr.stderr[:200] if wr.exit_code != 0 else "",
+                           real_tokens=wr.real_tokens)
 
     # The assemble worker outputs markdown directly (not JSON)
     # Strip any leading tool-trace lines (● lines)
