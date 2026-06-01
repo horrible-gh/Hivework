@@ -476,9 +476,49 @@ def render_proposal_markdown(proposal: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def _resolve_effective_root(spec: dict[str, Any], candidate_roots: list[str]) -> str:
+    """Choose the single base root the spec's target files actually live under.
+
+    Code and design docs often live in separate trees (e.g. a ``FlowGate`` source
+    checkout vs. a ``Documents/.../FlowGate`` design-doc tree). investigate is told
+    about both (``--codebase`` + ``--docs``) and resolves a doc anchor under the
+    docs tree, so specify records *that* tree as the spec's ``codebase_root``. apply
+    must not lose this: a caller that passes only ``--codebase <source>`` would
+    otherwise resolve a doc edit's path against the source tree and report
+    ``file_missing`` for every anchor.
+
+    We probe each anchor (non-create) edit's file against the candidate roots in
+    order and return the root under which the most files resolve. ``create_file``
+    edits are absent by design and don't vote. When nothing resolves we return the
+    first candidate, preserving today's ``file_missing`` behaviour rather than
+    guessing. A single resolved root is returned so the write/backup path stays
+    single-root (a spec whose files genuinely straddle two trees keeps the first
+    candidate; the unresolved files surface as ``file_missing``, never a wrong write).
+    """
+    roots: list[str] = []
+    for r in candidate_roots:
+        if r and r not in roots:
+            roots.append(r)
+    if not roots:
+        return ""
+    anchor_files = [
+        e.get("file", "") for e in (spec.get("edits") or [])
+        if isinstance(e, dict) and e.get("kind", "edit") != "create_file" and e.get("file")
+    ]
+    if not anchor_files or len(roots) == 1:
+        return roots[0]
+    best_root, best_hits = roots[0], -1
+    for r in roots:
+        hits = sum(1 for rel in anchor_files if os.path.isfile(os.path.join(r, rel)))
+        if hits > best_hits:
+            best_root, best_hits = r, hits
+    return best_root
+
+
 def run_apply(
     spec_path: str,
     codebase_root: str | None = None,
+    docs_root: str | None = None,
     output_path: str | None = None,
     write: bool = False,
     backup_root: str | None = None,
@@ -498,6 +538,8 @@ def run_apply(
     Args:
         spec_path: Path to the edit-spec JSON produced by specify.
         codebase_root: Live codebase root. Defaults to the spec's ``codebase_root``.
+        docs_root: Optional separate design-doc tree, used as an additional base to
+            resolve an edit's file path when code and docs live in different trees.
         output_path: Where to write the proposal markdown. If None, nothing is
             written to disk and the caller uses the returned dict.
         write: When True, apply a READY proposal's edits to the live codebase.
@@ -513,7 +555,13 @@ def run_apply(
     spec = load_spec(spec_path)
     spec["_spec_path"] = spec_path  # so a backup bundle can name itself after the spec
 
-    root = codebase_root or spec.get("codebase_root")
+    # Resolve where the spec's files actually live. Candidates, in priority order:
+    # an explicit --codebase, an explicit --docs (separate design-doc tree), and the
+    # tree specify recorded in the spec. Whichever holds the anchor files wins, so
+    # apply works whether the caller points --codebase at the code or the docs tree.
+    root = _resolve_effective_root(
+        spec, [codebase_root or "", docs_root or "", spec.get("codebase_root") or ""]
+    )
     if not root:
         raise ValueError(
             "codebase_root not provided and not present in the edit-spec; "

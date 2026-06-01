@@ -530,6 +530,7 @@ def run_apply_command(args: argparse.Namespace) -> None:
     logger.info("Hivework apply — edit-spec → proposal (%s)", mode)
     logger.info("  spec:     %s", args.spec)
     logger.info("  codebase: %s", args.codebase or "(from spec's codebase_root)")
+    logger.info("  docs:     %s", args.docs or "(none)")
     logger.info("  output:   %s", args.out or "(none — stdout summary only)")
     if args.write:
         logger.info("  backups:  %s (ttl %dh)", backup_root, ttl_hours)
@@ -538,6 +539,7 @@ def run_apply_command(args: argparse.Namespace) -> None:
     proposal = run_apply(
         spec_path=args.spec,
         codebase_root=args.codebase,
+        docs_root=args.docs,
         output_path=args.out,
         write=args.write,
         backup_root=backup_root if args.write else None,
@@ -850,6 +852,12 @@ def main() -> None:
         "--codebase", default=None,
         help="Root of the LIVE codebase (default: the spec's codebase_root). "
              "Anchors are re-verified here, not trusted from the spec.",
+    )
+    apply_parser.add_argument(
+        "--docs", default=None,
+        help="Root of the design docs, when they live in a separate tree from the "
+             "code (mirrors investigate's --docs). Used as an additional base to "
+             "resolve an edit's file path when it is not found under --codebase.",
     )
     apply_parser.add_argument(
         "--out", default=None,
