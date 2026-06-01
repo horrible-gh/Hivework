@@ -51,6 +51,33 @@ class TestConfigDefaults(unittest.TestCase):
         self.assertEqual(self.cfg.judge.max_axes, 3)
         self.assertEqual(self.cfg.judge.max_parallel, 2)
 
+    def test_safety_allow_swarm_default_true(self):
+        # Absence preserves today's behavior: the swarm run path stays available.
+        self.assertTrue(self.cfg.safety.allow_swarm)
+
+
+class TestConfigSafety(unittest.TestCase):
+    """The swarm kill-switch: safety.allow_swarm gates the run path."""
+
+    def _load(self, raw):
+        tmpdir = tempfile.mkdtemp()
+        path = os.path.join(tmpdir, "hive.config.json")
+        with open(path, "w") as f:
+            json.dump(raw, f)
+        return load_config(path=path)
+
+    def test_allow_swarm_false_honored(self):
+        cfg = self._load({"safety": {"allow_swarm": False}})
+        self.assertFalse(cfg.safety.allow_swarm)
+
+    def test_allow_swarm_true_honored(self):
+        cfg = self._load({"safety": {"allow_swarm": True}})
+        self.assertTrue(cfg.safety.allow_swarm)
+
+    def test_missing_safety_defaults_true(self):
+        cfg = self._load({"judge": {"max_axes": 2}})
+        self.assertTrue(cfg.safety.allow_swarm)
+
 
 class TestConfigPartialFile(unittest.TestCase):
     """Partial config file: only override swarm model; others stay default."""

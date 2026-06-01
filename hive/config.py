@@ -32,6 +32,9 @@ _DEFAULTS: dict[str, Any] = {
     # for ≤1 re-search per axis (≤2 model calls: 1 judge + ≤1 re-judge); these
     # knobs surface that budget in config so spend is controllable, not hidden.
     "judge":   {"max_calls_per_axis": 2, "max_axes": 3, "max_parallel": 2},
+    # Cost guard-rails. allow_swarm=false makes `hive.py run` refuse to launch the
+    # open-ended swarm (fan-out + reconcile) and point at the cheap investigate path.
+    "safety":  {"allow_swarm": True},
 }
 
 _DEFAULT_CONFIG_PATH = os.path.join(os.path.dirname(__file__), "..", "hive.config.json")
@@ -72,6 +75,20 @@ class ApplyConfig:
 
 
 @dataclass
+class SafetyConfig:
+    """Cost guard-rails enforced by the CLI before any spend.
+
+    ``allow_swarm`` gates the open-ended swarm ``run`` path (fan-out drones +
+    reconcile re-investigation). When false, ``hive.py run`` refuses to start and
+    points the operator at the cheap ``investigate`` path — a config kill-switch
+    against accidentally launching the multi-worker, per-internal-turn-billed
+    swarm. Default true preserves today's behavior; set false in
+    ``hive.config.json`` to lock the swarm off unless deliberately re-enabled.
+    """
+    allow_swarm: bool = True
+
+
+@dataclass
 class JudgeConfig:
     """Cost caps for the JUDGE-directed follow-up loop (M004 §4 budget).
 
@@ -100,6 +117,7 @@ class Config:
     ledger: LedgerConfig = field(default_factory=LedgerConfig)
     apply: ApplyConfig = field(default_factory=ApplyConfig)
     judge: JudgeConfig = field(default_factory=JudgeConfig)
+    safety: SafetyConfig = field(default_factory=SafetyConfig)
 
     def role(self, name: str) -> RoleConfig:
         """Return the RoleConfig for a role ('queen', 'swarm', 'assemble', 'specify', 'commit', 'judge')."""
@@ -149,6 +167,7 @@ def load_config(path: str | None = None) -> Config:
     ledger_raw = merged.get("ledger", {})
     apply_raw = merged.get("apply", {})
     judge_raw = merged.get("judge", {})
+    safety_raw = merged.get("safety", {})
 
     def _role(name: str, default_model: str = "gpt-5-mini") -> RoleConfig:
         r = roles.get(name, {})
@@ -179,5 +198,8 @@ def load_config(path: str | None = None) -> Config:
             max_calls_per_axis=int(judge_raw.get("max_calls_per_axis", 2)),
             max_axes=int(judge_raw.get("max_axes", 3)),
             max_parallel=int(judge_raw.get("max_parallel", 2)),
+        ),
+        safety=SafetyConfig(
+            allow_swarm=bool(safety_raw.get("allow_swarm", True)),
         ),
     )
