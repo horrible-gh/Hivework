@@ -68,6 +68,23 @@ Format: `type(scope): description`
 - Forbidden: non-English messages; a bare task id with no description; a `type` that
   contradicts the actual change.
 
+### Choosing the type when a change could be more than one
+
+A change is often arguably `fix` *or* `feat` (or `refactor`). This is normal and is
+**never** a reason to stop and ask a human. Choosing a commit type is always within
+your authority — pick the best fit with this tie-break and proceed:
+
+1. Changes user-visible behaviour to correct something that was wrong/broken → `fix`.
+2. Adds a capability or behaviour that did not exist before → `feat`.
+3. Internal restructuring, no behaviour change → `refactor`; config/build/deps →
+   `chore`; docs only → `docs`; tests only → `test`; formatting only → `style`.
+4. Still torn between `fix` and `feat`? Prefer `fix` when the change makes an existing
+   feature behave as intended; prefer `feat` when it introduces new intended
+   behaviour. Then commit — the type is a label, not a blocker.
+
+Do **NOT** set `termination: needs_pm` because you are unsure of the type. Pick one and
+emit `ready_to_commit`.
+
 Examples:
 
 ```
@@ -120,9 +137,13 @@ Rules for the JSON:
 - `termination`:
   - `ready_to_commit` — the plan covers the intended changes cleanly and can be
     executed as-is.
-  - `needs_pm` — the grouping is genuinely ambiguous (e.g. you cannot tell which task
-    a file belongs to) and you want a human decision before committing. Explain why in
-    a commit `note` or a `leftover` reason.
+  - `needs_pm` — reserve for a GENUINE grouping/ownership ambiguity a human must
+    resolve before committing: you cannot tell which task a file belongs to, two staged
+    changes express conflicting intent, or a file's changes cannot be assigned cleanly.
+    Explain why in a commit `note` or a `leftover` reason. This should be **rare** — a
+    well-formed working tree groups cleanly and terminates `ready_to_commit`.
+    **Not** a reason for `needs_pm`: uncertainty about the commit *type* (fix vs feat
+    etc.) — choose per §4 and emit `ready_to_commit`.
 - Do not include files that are not in the working tree's change set.
 - The same file must not appear in more than one commit, nor in both a commit and
   `leftover`.
