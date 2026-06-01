@@ -81,8 +81,18 @@ def run_investigate(
     tasks = decompose_result.get("tasks", []) or []
     leaves = _leaf_axes(tasks)
     judged = leaves[: cfg.judge.max_axes]
-    logger.info("decompose → %d axes (%d leaf, judging %d, cap max_axes=%d)",
+    logger.info("decompose → %d axes (%d leaf, judging %d, ceiling max_axes=%d)",
                 len(tasks), len(leaves), len(judged), cfg.judge.max_axes)
+    # Truncation is a correctness risk, not just a cost note: leaf axes past the
+    # ceiling are dropped by position (no priority ordering), so a decisive
+    # grep-once axis can be silently cut (N164: css_rules). Surface which axes
+    # got dropped at WARNING so the operator can raise max_axes or re-scope.
+    if len(leaves) > cfg.judge.max_axes:
+        dropped = [t.get("id") or t.get("name") or "?" for t in leaves[cfg.judge.max_axes:]]
+        logger.warning(
+            "max_axes ceiling (%d) < leaf axes (%d): DROPPING %d un-judged axes %s "
+            "— a decisive axis may be among them; raise judge.max_axes in hive.config.json",
+            cfg.judge.max_axes, len(leaves), len(dropped), dropped)
 
     # ── ②..③ per axis: bridge → local retrieve (free) → JUDGE (budgeted).
     verdicts: list[dict[str, Any]] = []

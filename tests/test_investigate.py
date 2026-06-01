@@ -114,6 +114,52 @@ class TestInvestigateWiring(unittest.TestCase):
             self.assertEqual(result["axes_judged"], 1)
             self.assertEqual(judge_cw.call_count, 1)
 
+    # N164 regression: 5 leaf axes, a decisive one (css_rules) last in order.
+    # The old cap (3) sliced leaves[:3] and silently dropped css_rules; the
+    # runaway-ceiling default (12) must judge every leaf so the decisive axis
+    # survives. Order matters — css_rules is positioned past the old cap.
+    _FIVE_LEAVES = json.dumps({
+        "fanout_decision": "fanout", "reason": "x",
+        "steps": [["a1", "a2", "a3", "a4", "css_rules"]],
+        "tasks": [
+            {"id": "a1", "title": "t1", "depends_on": [], "brief": "b1"},
+            {"id": "a2", "title": "t2", "depends_on": [], "brief": "b2"},
+            {"id": "a3", "title": "t3", "depends_on": [], "brief": "b3"},
+            {"id": "a4", "title": "t4", "depends_on": [], "brief": "b4"},
+            {"id": "css_rules", "title": "color def", "depends_on": [],
+             "brief": "grep .wf-step.wf-undecided color rule"},
+        ],
+    })
+
+    def _run_five(self, cfg):
+        with tempfile.TemporaryDirectory() as td:
+            out = os.path.join(td, "v.json")
+            with mock.patch("hive.decompose.call_worker", return_value=_wr(self._FIVE_LEAVES)), \
+                 mock.patch("hive.judge.call_worker", return_value=_wr(VERDICT_OUT)), \
+                 mock.patch("hive.investigate.retrieve", side_effect=_fake_retrieve):
+                return INV.run_investigate(
+                    seed_text="x", recipe_path=None, code_root=td,
+                    docs_root=None, output_path=out, cfg=cfg, ledger=None,
+                )
+
+    def test_decisive_axis_not_dropped_under_default_ceiling(self):
+        cfg = load_config()           # default max_axes=12 (runaway-ceiling)
+        cfg.judge.max_calls_per_axis = 1
+        result = self._run_five(cfg)
+        self.assertEqual(result["axes_judged"], 5)
+        self.assertIn("css_rules", {v["axis_id"] for v in result["verdicts"]})
+
+    def test_truncation_warns_and_lists_dropped(self):
+        cfg = load_config()
+        cfg.judge.max_calls_per_axis = 1
+        cfg.judge.max_axes = 3        # force the old cap → css_rules dropped
+        with self.assertLogs("hive.investigate", level="WARNING") as cm:
+            result = self._run_five(cfg)
+        self.assertEqual(result["axes_judged"], 3)
+        joined = "\n".join(cm.output)
+        self.assertIn("css_rules", joined)
+        self.assertIn("DROPPING", joined)
+
 
 class TestRenderLocalHoney(unittest.TestCase):
     """The free verdict→honey seam that lets the cheap path feed specify."""
