@@ -88,8 +88,14 @@ class Ledger:
 
     def record_call(self, stage: str, axis_id: str, provider: str, model: str,
                     prompt: str, output: str, latency_s: float,
-                    comb_path: str = "", ok: bool = True, err: str = "") -> None:
-        """Insert a worker_calls row. Computes in_chars, out_chars, est_tokens from text."""
+                    comb_path: str = "", ok: bool = True, err: str = "",
+                    real_tokens: int | None = None) -> None:
+        """Insert a worker_calls row. Computes in_chars, out_chars, est_tokens from text.
+
+        ``real_tokens``: EXACT total token count when the provider reports it
+        (e.g. deepinfra via response.usage). None for copilot, which exposes no
+        token counts — leaving the column NULL as before.
+        """
         if self._conn is None or self._run_id is None:
             return
         in_chars = len(prompt)
@@ -103,10 +109,11 @@ class Ledger:
                 "  latency_s, comb_path, ok, err)"
                 " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (self._run_id, stage, axis_id, provider, model,
-                 in_chars, out_chars, est_tokens, None,
+                 in_chars, out_chars, est_tokens, real_tokens,
                  latency_s, comb_path, int(ok), err))
             self._conn.commit()
-            self._calls.append({"in_chars": in_chars, "out_chars": out_chars, "est": est_tokens})
+            self._calls.append({"in_chars": in_chars, "out_chars": out_chars,
+                                "est": est_tokens, "real": real_tokens})
         except Exception as e:
             logger.warning("Ledger: record_call failed: %s", e)
 
@@ -120,13 +127,17 @@ class Ledger:
         total_in = sum(c["in_chars"] for c in self._calls)
         total_out = sum(c["out_chars"] for c in self._calls)
         total_est = sum(c["est"] for c in self._calls)
+        # Sum real tokens only over calls that reported them; stays NULL when no
+        # provider did (e.g. a copilot-only run), preserving prior behavior.
+        reals = [c["real"] for c in self._calls if c.get("real") is not None]
+        total_real = sum(reals) if reals else None
         try:
             self._conn.execute(
                 "UPDATE runs SET axes_n=?, rounds=?, conflicts_n=?, remaining_n=?, parse_errs=?,"
                 " total_in_chars=?, total_out_chars=?, total_est_tokens=?, total_real_tokens=?,"
                 " elapsed_s=?, honey_path=?, status=? WHERE id=?",
                 (axes_n, rounds, conflicts_n, remaining_n, parse_errs,
-                 total_in, total_out, total_est, None,
+                 total_in, total_out, total_est, total_real,
                  elapsed_s, honey_path, status, self._run_id))
             self._conn.commit()
         except Exception as e:

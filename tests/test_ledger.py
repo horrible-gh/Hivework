@@ -108,6 +108,39 @@ class TestLedgerInsertAndAggregate(unittest.TestCase):
         conn.close()
         self.assertIsNone(row[0])
 
+    def test_real_tokens_stored_when_provided(self):
+        """A provider that reports usage (e.g. deepinfra) populates real_tokens."""
+        self.ldg.record_call("judge", "A", "deepinfra", "openai/gpt-oss-120b",
+                             prompt="p", output="o", latency_s=1.0, real_tokens=206)
+        conn = sqlite3.connect(self.db_path)
+        row = conn.execute("SELECT real_tokens FROM worker_calls").fetchone()
+        conn.close()
+        self.assertEqual(row[0], 206)
+
+    def test_finish_run_total_real_tokens_sums_reported(self):
+        """total_real_tokens sums only calls that reported tokens; copilot adds nothing."""
+        self.ldg.record_call("judge", "A", "deepinfra", "openai/gpt-oss-120b",
+                             prompt="p", output="o", latency_s=1.0, real_tokens=200)
+        self.ldg.record_call("judge", "B", "deepinfra", "openai/gpt-oss-120b",
+                             prompt="p", output="o", latency_s=1.0, real_tokens=50)
+        self.ldg.record_call("swarm", "C", "copilot", "gpt-5-mini",
+                             prompt="p", output="o", latency_s=1.0)  # no real_tokens
+        self.ldg.finish_run()
+        conn = sqlite3.connect(self.db_path)
+        row = conn.execute("SELECT total_real_tokens FROM runs").fetchone()
+        conn.close()
+        self.assertEqual(row[0], 250)
+
+    def test_finish_run_total_real_tokens_null_when_none_reported(self):
+        """A copilot-only run leaves total_real_tokens NULL (prior behavior preserved)."""
+        self.ldg.record_call("swarm", "A", "copilot", "gpt-5-mini",
+                             prompt="p", output="o", latency_s=1.0)
+        self.ldg.finish_run()
+        conn = sqlite3.connect(self.db_path)
+        row = conn.execute("SELECT total_real_tokens FROM runs").fetchone()
+        conn.close()
+        self.assertIsNone(row[0])
+
     def test_finish_run_updates_status(self):
         self.ldg.finish_run(honey_path="/out/honey.md", axes_n=3, rounds=1,
                             conflicts_n=2, remaining_n=0, parse_errs=0, status="done")
