@@ -22,11 +22,21 @@ class WorkerResult:
     latency_s: float
 
 
-def _call_copilot(model, prompt, cwd, timeout, exe=None, allow_flag="--allow-all") -> WorkerResult:
-    """Call the copilot CLI. Prompt sent via stdin (never -p) to avoid cp932 truncation."""
+def _call_copilot(model, prompt, cwd, timeout, exe=None, allow_flag="--allow-all",
+                  available_tools=None) -> WorkerResult:
+    """Call the copilot CLI. Prompt sent via stdin (never -p) to avoid cp932 truncation.
+
+    ``available_tools``: when not None, restrict the model to exactly this tool
+    list via ``--available-tools=<csv>``. An empty list disables ALL tools,
+    forcing a single-shot completion (no file/shell access). The JUDGE uses this
+    to rule on the supplied bundle instead of turning into an agentic explorer —
+    which both defeats the retrieval redesign and blows the timeout.
+    """
     if exe is None:
         exe = shutil.which("copilot.cmd") or shutil.which("copilot") or "copilot"
     cmd = [exe, allow_flag, "--model", model]
+    if available_tools is not None:
+        cmd.append("--available-tools=" + ",".join(available_tools))
     logger.debug("call_worker copilot: model=%s cwd=%s timeout=%d", model, cwd, timeout)
     t0 = time.monotonic()
     result = subprocess.run(cmd, input=prompt, capture_output=True, text=True,
