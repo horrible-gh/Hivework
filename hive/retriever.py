@@ -109,6 +109,70 @@ def _norm_glob(g: str, root: str) -> str:
     return gn
 
 
+def _count_glob_files(g: str, root: str, cap: int) -> int:
+    """How many files does this glob actually match under ``root``?
+
+    Uses ``rg --files -g`` (the same glob engine the real search uses, via the
+    same :func:`_norm_glob`), counting up to ``cap + 1`` lines so an enormous
+    over-glob is cheap to detect (we never need the exact count past the cap).
+    """
+    out = _run(["rg", "--files", "-g", _norm_glob(g, root), "."], cwd=root)
+    n = 0
+    for _ in out.splitlines():
+        n += 1
+        if n > cap:
+            break
+    return n
+
+
+def _validate_globs(globs: list[str], root: str,
+                    overbroad_files: int = 2000) -> tuple[list[str], dict[str, Any]]:
+    """Drop garbage / over-broad queen globs by probing the real tree (free).
+
+    The queen emits globs *blind* to the repo, so two failure modes corrupt the
+    bundle (M004 follow-up findings):
+
+      * **Garbage** — a non-path the queen mistook for one, e.g. git-log fields
+        ``message/author/date`` lowered to ``message/author/date/**/*``. It is
+        structurally indistinguishable from a real ``a/b/c`` path, so no text
+        filter catches it — but it matches **0 files**, so existence does.
+      * **Over-glob** — a ``**/*``-ish scope matching thousands of files. The
+        bundle is snippet-bounded, but *which* snippets survive then depends on
+        noise, not the axis. If a narrower usable glob exists, the over-glob only
+        dilutes — drop it.
+
+    Partition by match count and keep the usable ones; fall back to over-broad
+    globs only when nothing narrower exists, and to whole-tree (``[]``) only when
+    every glob is garbage (a guaranteed-empty bundle is the worse outcome).
+
+    Pure-local and deterministic — no model call. Returns ``(kept, diag)``.
+    """
+    usable: list[str] = []
+    overbroad: list[str] = []
+    empty: list[str] = []
+    counts: dict[str, int] = {}
+    for g in globs:
+        n = _count_glob_files(g, root, overbroad_files)
+        counts[g] = n
+        if n == 0:
+            empty.append(g)
+        elif n > overbroad_files:
+            overbroad.append(g)
+        else:
+            usable.append(g)
+
+    if usable:
+        kept = usable
+    elif overbroad:
+        kept = overbroad  # no narrow scope — keep over-glob; density ranks it
+    else:
+        kept = []         # all garbage — search whole tree over guaranteed-empty
+    diag = {"kept": kept, "dropped_empty": empty,
+            "dropped_overbroad": overbroad if usable else [],
+            "counts": counts}
+    return kept, diag
+
+
 def _ripgrep(keyword: str, globs: list[str], root: str,
              max_hits: int = 40) -> list[dict[str, Any]]:
     """ripgrep one keyword constrained to globs. Returns [{file,line,text}]."""
@@ -323,7 +387,8 @@ def _follow_calls(snippets: list[dict[str, Any]], globs: list[str], root: str,
 
 def retrieve(plan: SearchPlan, code_root: str, docs_root: str | None = None,
              k: int = 6, top_files: int = 8,
-             blame_files: int = 3, max_hops: int = 2) -> dict[str, Any]:
+             blame_files: int = 3, max_hops: int = 2,
+             overbroad_files: int = 2000) -> dict[str, Any]:
     """Run the full local FIND for one axis. Pure local, zero model cost.
 
     Args:
@@ -333,14 +398,21 @@ def retrieve(plan: SearchPlan, code_root: str, docs_root: str | None = None,
         k: ±lines read around each hit.
         top_files: max distinct files to pull code windows from.
         blame_files: max files to run git blame/log on.
+        overbroad_files: a glob matching more than this many files is treated as
+            over-broad and dropped when a narrower glob exists.
     """
+    # 0. validate the queen's globs against the real tree (free): drop garbage
+    #    (0-match) and over-broad globs so the snippet budget windows the axis,
+    #    not noise. Whole-tree fallback only if every glob is garbage.
+    globs, glob_diag = _validate_globs(plan.file_globs, code_root, overbroad_files)
+
     # 1. ripgrep every keyword across globs → raw call_sites, keep ALL hit
     #    lines per file (not just first) so dense late regions stay reachable.
     call_sites: list[dict[str, Any]] = []
     file_hits: dict[str, set[str]] = defaultdict(set)       # file -> keywords
     file_lines: dict[str, list[tuple[int, str]]] = defaultdict(list)  # (line,kw)
     for kw in plan.keywords:
-        for h in _ripgrep(kw, plan.file_globs, code_root):
+        for h in _ripgrep(kw, globs, code_root):
             h["keyword"] = kw
             call_sites.append(h)
             file_hits[h["file"]].add(kw)
@@ -372,7 +444,7 @@ def retrieve(plan: SearchPlan, code_root: str, docs_root: str | None = None,
     code_snippets = _merge_windows(raw_snips)
 
     # 3b. follow call-chains out of the code snippets (1-2 hops, local & free).
-    call_chain = _follow_calls(code_snippets, plan.file_globs, code_root,
+    call_chain = _follow_calls(code_snippets, globs, code_root,
                                k, max_hops) if max_hops > 0 else []
 
     # 4. git blame/log on the highest-ranked files, around their densest region.
@@ -429,6 +501,8 @@ def retrieve(plan: SearchPlan, code_root: str, docs_root: str | None = None,
             "call_chain": len(call_chain),
             "design_excerpts": len(design_excerpts),
             "ranked_files": ranked[:top_files],
+            "globs_used": globs,
+            "glob_validation": glob_diag,
         },
     }
 
@@ -448,7 +522,7 @@ def retrieve_followup(need: FollowupNeed, code_root: str,
     meant to be merged with the first-pass bundle before the re-judge. Stays
     within the §4 budget of ≤1 follow-up per axis (≤2 model calls total).
     """
-    globs = need.file_globs
+    globs, glob_diag = _validate_globs(need.file_globs, code_root)
     seeds: list[dict[str, Any]] = []
     seen_defs: set[str] = set()
 
@@ -492,5 +566,7 @@ def retrieve_followup(need: FollowupNeed, code_root: str,
             "greps": len(need.greps),
             "seeds": len(seeds),
             "call_chain": len(call_chain),
+            "globs_used": globs,
+            "glob_validation": glob_diag,
         },
     }

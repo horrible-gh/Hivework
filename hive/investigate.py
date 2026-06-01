@@ -92,6 +92,11 @@ def run_investigate(
         st = bundle.get("stats", {})
         logger.info("   FIND: %s hits → %s snippets, %s call-chain",
                     st.get("raw_hits"), st.get("snippets"), st.get("call_chain"))
+        gv = st.get("glob_validation", {})
+        if gv.get("dropped_empty") or gv.get("dropped_overbroad"):
+            logger.info("   glob-guard: kept=%s dropped_empty=%s dropped_overbroad=%s",
+                        gv.get("kept"), gv.get("dropped_empty"),
+                        gv.get("dropped_overbroad"))
 
         logger.info("③ JUDGE [%s] (%s/%s, ≤%d calls)", sp.axis_id,
                     judge_role.provider, judge_role.model,
