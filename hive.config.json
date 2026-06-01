@@ -4,6 +4,7 @@
     "swarm":    { "provider": "copilot", "model": "gpt-5-mini" },
     "assemble": { "provider": "copilot", "model": "gpt-5-mini" },
     "specify":  { "provider": "copilot", "model": "gpt-5-mini" },
+    "review":   { "provider": "deepinfra", "model": "openai/gpt-oss-120b" },
     "commit":   { "provider": "copilot", "model": "gpt-5-mini" },
     "judge":    { "provider": "deepinfra", "model": "openai/gpt-oss-120b" }
   },

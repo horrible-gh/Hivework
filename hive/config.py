@@ -18,6 +18,13 @@ _DEFAULTS: dict[str, Any] = {
         "swarm":    {"provider": "copilot", "model": "gpt-5-mini"},
         "assemble": {"provider": "copilot", "model": "gpt-5-mini"},
         "specify":  {"provider": "copilot", "model": "gpt-5-mini"},
+        # Effectiveness reviewer (specify's second pass). A tool-OFF single-shot
+        # judgement — the edit diff (anchor_old→replacement_new) and, since the
+        # anchor-grounding pre-flight, the current values are all in the prompt —
+        # so it is a prime candidate to move OFF the per-internal-turn-billed
+        # copilot onto deepinfra (mirrors judge). Default mirrors specify (copilot)
+        # so behaviour is unchanged until hive.config.json opts into deepinfra.
+        "review":   {"provider": "copilot", "model": "gpt-5-mini"},
         # Commit author defaults to haiku (a tier up): grouping changes into clean
         # atomic commits wants more judgement than the gpt-5-mini swarm default.
         "commit":   {"provider": "copilot", "model": "claude-haiku-4.5"},
@@ -115,6 +122,7 @@ class Config:
     swarm: RoleConfig = field(default_factory=RoleConfig)
     assemble_role: RoleConfig = field(default_factory=RoleConfig)
     specify: RoleConfig = field(default_factory=RoleConfig)
+    review: RoleConfig = field(default_factory=RoleConfig)
     commit: RoleConfig = field(
         default_factory=lambda: RoleConfig(model="claude-haiku-4.5"))
     judge_role: RoleConfig = field(
@@ -126,7 +134,7 @@ class Config:
     safety: SafetyConfig = field(default_factory=SafetyConfig)
 
     def role(self, name: str) -> RoleConfig:
-        """Return the RoleConfig for a role ('queen', 'swarm', 'assemble', 'specify', 'commit', 'judge')."""
+        """Return the RoleConfig for a role ('queen', 'swarm', 'assemble', 'specify', 'review', 'commit', 'judge')."""
         if name == "assemble":
             return self.assemble_role
         if name == "judge":
@@ -138,7 +146,7 @@ class Config:
         if model is None:
             return
         for role in (self.queen, self.swarm, self.assemble_role, self.specify,
-                     self.commit, self.judge_role):
+                     self.review, self.commit, self.judge_role):
             role.model = model
 
 
@@ -185,6 +193,7 @@ def load_config(path: str | None = None) -> Config:
         swarm=_role("swarm"),
         assemble_role=_role("assemble"),
         specify=_role("specify"),
+        review=_role("review"),
         commit=_role("commit", default_model="claude-haiku-4.5"),
         judge_role=_role("judge", default_model="claude-sonnet-4.5"),
         copilot=CopilotConfig(

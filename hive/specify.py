@@ -33,6 +33,7 @@ contract stays the single source of authoring rules (no duplicated prompt here).
 import json
 import logging
 import os
+import re
 from typing import Any
 
 from hive.parse import extract_first_json
@@ -44,6 +45,11 @@ logger = logging.getLogger("hive.specify")
 _DEFAULT_CONTRACT_PATH = os.path.join(
     os.path.dirname(__file__), "..", "recipes", "edit_spec_contract_v1.md"
 )
+
+# Providers whose author worker has live file-system tools. An author on any other
+# provider (e.g. deepinfra) is a tool-OFF single-shot call and must lift anchors
+# from the grounding pre-flight's "Anchor ground truth" block, not by reading files.
+_TOOL_PROVIDERS = frozenset({"copilot"})
 
 # Structural expectations for the emitted edit-spec JSON.
 _REQUIRED_KEYS = ("edits", "deferred", "gate", "termination")
@@ -71,7 +77,124 @@ def load_contract(contract_path: str | None = None) -> str:
         return f.read()
 
 
-def _docs_root_block(docs_root: str | None) -> str:
+# ── Anchor-grounding pre-flight (NR164/NR165/TR891 systematic gap) ──────────────
+# The honey carries the LOCATION of the bug (judge file:line) but not the VALUE at
+# it: e.g. CSS_RULES grounded ``DocWorkflow.vue:89-101`` yet never quoted the
+# actual ``color`` of ``.wf-step.wf-undecided``. The author then re-anchors a
+# location whose current value it never saw, and the effectiveness reviewer cannot
+# judge whether the edit turns grey→blue — so a correct fix dies as
+# needs_reinvestigation. The fix (the constructive form of the deferred grounding
+# gate): before authoring, lift the CURRENT live text at each cited file:line into
+# the honey so the value is on the table for BOTH the author and the reviewer.
+# Pure-local, free, deterministic, never raises — an unresolvable or already-quoted
+# citation is simply skipped (it never fabricates).
+
+# A path-like token ending in an extension, then ``:line`` or ``:lo-hi``. The
+# required extension is what stops a log timestamp ("21:33:01") or a bare
+# "name:42" from matching — only real file citations resolve.
+_CITATION_RE = re.compile(
+    r"([A-Za-z0-9_][A-Za-z0-9_./\\-]*\.[A-Za-z0-9]+):(\d+)(?:-(\d+))?")
+
+_GROUND_MAX_ANCHORS = 12       # cap lifts so a citation-heavy honey can't balloon
+_GROUND_MAX_LINES = 40         # per-anchor line cap (a huge range is clamped)
+_GROUND_MIN_LINE_CHARS = 8     # lines shorter than this don't vote in the dedup guard
+
+
+def _read_lines(path: str, lo: int, hi: int) -> str:
+    """Read 1-based line range [lo, hi] from a file. '' on any error/empty."""
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            all_lines = f.readlines()
+    except OSError:
+        return ""
+    lo = max(1, lo)
+    hi = min(len(all_lines), hi)
+    if hi < lo:
+        return ""
+    return "".join(all_lines[lo - 1:hi])
+
+
+def _already_grounded(text: str, honey_text: str) -> bool:
+    """True when the honey already quotes this snippet's substance (dedup guard).
+
+    Only substantial lines vote, so a snippet whose every meaningful line already
+    appears in the honey is not re-lifted (e.g. an assemble-authored honey that
+    quoted the code). A snippet with no substantial line is treated as not-present.
+    """
+    sig = [ln.strip() for ln in text.splitlines()
+           if len(ln.strip()) >= _GROUND_MIN_LINE_CHARS]
+    return bool(sig) and all(ln in honey_text for ln in sig)
+
+
+def ground_anchors(honey_text: str, codebase_root: str,
+                   docs_root: str | None = None,
+                   *, max_anchors: int = _GROUND_MAX_ANCHORS,
+                   max_lines: int = _GROUND_MAX_LINES) -> tuple[str, dict[str, Any]]:
+    """Lift the CURRENT live text at each ``file:line`` the honey cites into the honey.
+
+    Returns ``(enriched_honey, diag)`` where ``diag`` records lifted / skipped /
+    unresolved citations for logging. Citations are resolved against the code tree
+    first, then the docs tree. Already-quoted or unresolvable citations are skipped.
+    Pure-local and free — no model call — and never raises.
+    """
+    seen: set[tuple[str, int, int]] = set()
+    lifted: list[dict[str, Any]] = []
+    skipped_present: list[str] = []
+    unresolved: list[str] = []
+    roots = [("code", codebase_root)] + ([("docs", docs_root)] if docs_root else [])
+
+    for m in _CITATION_RE.finditer(honey_text):
+        rel = m.group(1).replace("\\", "/").lstrip("/")
+        lo = int(m.group(2))
+        hi = int(m.group(3)) if m.group(3) else lo
+        if hi < lo:
+            lo, hi = hi, lo
+        truncated = hi - lo + 1 > max_lines
+        if truncated:
+            hi = lo + max_lines - 1
+        key = (rel, lo, hi)
+        if key in seen:
+            continue
+        seen.add(key)
+
+        text, tree = "", ""
+        for label, root in roots:
+            if root and os.path.isfile(os.path.join(root, rel)):
+                text = _read_lines(os.path.join(root, rel), lo, hi)
+                tree = label
+                break
+        if not text.strip():
+            unresolved.append(f"{rel}:{lo}-{hi}")
+            continue
+        if _already_grounded(text, honey_text):
+            skipped_present.append(f"{rel}:{lo}-{hi}")
+            continue
+        lifted.append({"cite": f"{rel}:{lo}-{hi}", "tree": tree,
+                       "text": text, "truncated": truncated})
+        if len(lifted) >= max_anchors:
+            break
+
+    diag = {"lifted": [x["cite"] for x in lifted],
+            "skipped_present": skipped_present, "unresolved": unresolved}
+    if not lifted:
+        return honey_text, diag
+
+    parts = [
+        honey_text, "",
+        "## Anchor ground truth (CURRENT live text at each cited location)", "",
+        "The fix directions above give LOCATIONS but not always the VALUES at them. "
+        "Below is the text lifted live from those lines. Author the edit so it changes "
+        "these VALUES (do not merely re-anchor at the same location), and judge "
+        "effectiveness against them. Re-confirm byte-for-byte before anchoring.", "",
+    ]
+    for x in lifted:
+        trunc = " (truncated)" if x["truncated"] else ""
+        parts += [f"--- {x['cite']} (under {x['tree']} root){trunc}",
+                  "```", x["text"].rstrip("\n"), "```", ""]
+    return "\n".join(parts), diag
+
+
+def _docs_root_block(docs_root: str | None, grounded_only: bool = False) -> str:
     """Prompt fragment telling the author about a separate design-doc tree.
 
     Design docs (PM-facing D/P/L specs) commonly live in a tree separate from the
@@ -80,17 +203,25 @@ def _docs_root_block(docs_root: str | None) -> str:
     nearest-looking source file. This block makes the docs tree visible and tells
     the author to PREFER it when the honey's directive is about a document, and to
     emit ``file`` relative to whichever tree actually holds the target.
+
+    Under ``grounded_only`` (a tool-OFF author) the doc anchor, like a code anchor,
+    is lifted from the injected ground-truth block rather than by opening the file.
     """
     if not docs_root:
         return ""
+    lift = (
+        "the doc's CURRENT text is in the \"Anchor ground truth\" block below (grounding "
+        "resolves doc citations against this tree too) — lift `anchor_old` from there"
+        if grounded_only else
+        "open it there (docs root + the path the honey cites) and lift `anchor_old` from "
+        "the CURRENT text byte-for-byte")
     return f"""
 [Design-docs root — a SEPARATE tree from the code]
 {docs_root}
 When the honey's fix direction targets a design document (e.g. a Markdown D/P/L
-spec), the file lives under this docs root, NOT the codebase root. Open it there
-(docs root + the path the honey cites) and lift `anchor_old` from the CURRENT text
-byte-for-byte. Prefer the design document over any source file when the directive
-is about the document. Emit `file` as the path relative to the tree that holds it.
+spec), the file lives under this docs root, NOT the codebase root: {lift}.
+Prefer the design document over any source file when the directive is about the
+document. Emit `file` as the path relative to the tree that holds it.
 """
 
 
@@ -117,24 +248,50 @@ def _stamp_root(spec: dict[str, Any], codebase_root: str, docs_root: str | None)
 
 
 def build_specify_prompt(honey_text: str, contract_text: str, codebase_root: str,
-                         docs_root: str | None = None) -> str:
+                         docs_root: str | None = None,
+                         grounded_only: bool = False) -> str:
     """Build the full prompt for the single specify author.
 
     The contract is the role/system prompt; the honey is the input to lower; the
-    codebase_root tells the author where the LIVE code is. Anchors must be lifted
-    from there byte-for-byte, never copied from the (possibly stale) honey. When
-    ``docs_root`` is given, a separate design-doc tree is also made visible so a
-    document-update direction is not mis-lowered onto the nearest source file.
+    codebase_root tells the author where the LIVE code is. When ``docs_root`` is
+    given, a separate design-doc tree is also made visible so a document-update
+    direction is not mis-lowered onto the nearest source file.
+
+    Two authoring modes:
+
+    - tool-ON (``grounded_only=False``, the copilot author): the author re-opens
+      each live file and lifts ``anchor_old`` byte-for-byte, trusting nothing the
+      honey quotes.
+    - tool-OFF (``grounded_only=True``, a single-shot deepinfra author): the author
+      has NO file tools, so it lifts ``anchor_old`` from the deterministically
+      live-lifted "Anchor ground truth" block the grounding pre-flight injected, and
+      defers any direction whose value is not grounded rather than guessing. This is
+      what lets the author move off the per-internal-turn-billed copilot (the
+      retrieve→judge cost pattern applied to ground→author).
     """
+    if grounded_only:
+        lift_block = (
+            "[Input honey — lower each fix direction into the edit-spec contracted above]\n"
+            "You have NO file-system tools and CANNOT open files. The "
+            "\"Anchor ground truth\" section in the honey below carries the CURRENT live "
+            "text at each cited location, lifted deterministically from disk — treat it "
+            "as authoritative and lift `anchor_old` from THERE byte-for-byte (set "
+            "anchor_status=verified only for an anchor copied from that section). If a "
+            "value you must anchor is NOT present in the ground truth, put that direction "
+            "in `deferred[]` (reason: \"anchor_not_grounded\") rather than guessing — never "
+            "fabricate an anchor from the honey's prose.")
+    else:
+        lift_block = (
+            "[Input honey — lower each fix direction into the edit-spec contracted above]\n"
+            "Re-open every file you touch (under the codebase root, or the docs root when "
+            "the direction targets a design document) and lift `anchor_old` from the "
+            "CURRENT text byte-for-byte. Do NOT trust code quoted in the honey below.")
     return f"""{contract_text}
 
 [Codebase root — read LIVE files from here]
 {codebase_root}
-{_docs_root_block(docs_root)}
-[Input honey — lower each fix direction into the edit-spec contracted above]
-Re-open every file you touch (under the codebase root, or the docs root when the
-direction targets a design document) and lift `anchor_old` from the CURRENT text
-byte-for-byte. Do NOT trust code quoted in the honey below.
+{_docs_root_block(docs_root, grounded_only=grounded_only)}
+{lift_block}
 When the honey calls for a brand-new file that does not yet exist in the codebase,
 emit a `create_file` edit (kind + content, no anchor) per the contract rather than
 forcing an anchor edit against an existing file.
@@ -230,6 +387,16 @@ def _deterministic_noop_ids(spec: dict[str, Any]) -> list[str]:
 # How many lines of a create_file's content to surface to the effectiveness
 # reviewer — enough to judge "non-empty and on-target" without ballooning the prompt.
 _REVIEW_CONTENT_MAX_LINES = 40
+
+# One terse JSON-only retry for the effectiveness review (mirrors judge's lever):
+# now that the reviewer runs on a tool-OFF API provider (deepinfra), a stray prose
+# wrapper or fence would otherwise degrade a ready spec straight to needs_pm. The
+# retry is a transport reparse — recorded to the ledger (a real paid call) but it
+# does not multiply the review (still one logical effectiveness pass).
+_REVIEW_JSON_REMINDER = (
+    "\n\n[Retry] Your previous response could not be parsed as the required JSON. "
+    "Output ONLY the single JSON object with a \"reviews\" array as specified above — "
+    "no prose, no explanation, no markdown code fences, nothing before or after it.")
 
 
 def build_review_prompt(honey_text: str, spec: dict[str, Any], codebase_root: str,
@@ -328,44 +495,57 @@ def review_effectiveness(
     review could not be obtained or parsed — the caller then defers the ready
     decision to a human rather than silently trusting the original claim. This
     function never raises: a flaky review must not crash specify or lose the honey.
+
+    On an UNUSABLE response (no parseable JSON, or valid JSON lacking a ``reviews``
+    list) the review is retried ONCE with a terse JSON-only reminder (see
+    ``_REVIEW_JSON_REMINDER``) — both attempts are recorded to the ledger but it is
+    still one logical review pass. A worker-level failure (timeout / provider error)
+    is NOT retried. The retry matters most on tool-OFF API providers (deepinfra),
+    where a stray prose wrapper would otherwise needlessly downgrade a ready spec.
     """
     edits = [e for e in (spec.get("edits") or []) if isinstance(e, dict)]
     if not edits:
         return {}, False  # nothing to review
 
-    prompt = build_review_prompt(honey_text, spec, codebase_root, docs_root)
+    base_prompt = build_review_prompt(honey_text, spec, codebase_root, docs_root)
     logger.info("Running specify effectiveness review (%d edits, independent pass)...",
                 len(edits))
-    try:
-        wr = call_worker(provider, model, prompt, cwd=codebase_root, timeout=600,
-                         **(provider_kwargs or {}))
-    except Exception as e:  # subprocess timeout, provider error, etc.
-        logger.warning("specify: effectiveness review worker failed: %s", e)
-        return {}, True
+    attempt_prompt = base_prompt
+    for attempt in range(2):
+        try:
+            wr = call_worker(provider, model, attempt_prompt, cwd=codebase_root,
+                             timeout=600, **(provider_kwargs or {}))
+        except Exception as e:  # subprocess timeout, provider error, etc.
+            logger.warning("specify: effectiveness review worker failed: %s", e)
+            return {}, True
 
-    if ledger is not None:
-        ledger.record_call("specify", "specify_review", provider, model,
-                           prompt=prompt, output=wr.stdout, latency_s=wr.latency_s,
-                           ok=wr.exit_code == 0,
-                           err=wr.stderr[:200] if wr.exit_code != 0 else "",
-                           real_tokens=wr.real_tokens)
+        if ledger is not None:
+            ledger.record_call("specify", "specify_review", provider, model,
+                               prompt=attempt_prompt, output=wr.stdout,
+                               latency_s=wr.latency_s, ok=wr.exit_code == 0,
+                               err=wr.stderr[:200] if wr.exit_code != 0 else "",
+                               real_tokens=wr.real_tokens)
 
-    try:
-        parsed = extract_first_json(wr.stdout)
-    except ValueError:
-        logger.warning("specify: effectiveness review produced no parseable JSON")
-        return {}, True
+        try:
+            parsed = extract_first_json(wr.stdout)
+        except ValueError:
+            parsed = None
+        reviews = parsed.get("reviews") if isinstance(parsed, dict) else None
+        if isinstance(reviews, list):
+            judgments: dict[str, dict] = {}
+            for r in reviews:
+                if isinstance(r, dict) and r.get("id") is not None:
+                    judgments[str(r["id"])] = r
+            return judgments, False
 
-    reviews = parsed.get("reviews") if isinstance(parsed, dict) else None
-    if not isinstance(reviews, list):
-        logger.warning("specify: effectiveness review JSON missing a 'reviews' list")
-        return {}, True
-
-    judgments: dict[str, dict] = {}
-    for r in reviews:
-        if isinstance(r, dict) and r.get("id") is not None:
-            judgments[str(r["id"])] = r
-    return judgments, False
+        if attempt == 0:
+            logger.warning("specify: effectiveness review returned no usable 'reviews' JSON "
+                           "— retrying once with a JSON-only reminder")
+            attempt_prompt = base_prompt + _REVIEW_JSON_REMINDER
+        else:
+            logger.warning("specify: effectiveness review produced no usable JSON after retry "
+                           "— inconclusive")
+    return {}, True
 
 
 def _apply_effectiveness_gate(
@@ -524,6 +704,9 @@ def run_specify(
     provider_kwargs: dict | None = None,
     review: bool = True,
     docs_root: str | None = None,
+    ground: bool = True,
+    review_model: str | None = None,
+    review_provider: str | None = None,
 ) -> dict[str, Any]:
     """Run the specify stage: honey + live code → edit-spec JSON.
 
@@ -534,7 +717,11 @@ def run_specify(
     The effectiveness gate (``review=True``, default) is a second, independent pass
     that downgrades a ready_to_apply spec whose edits do not actually change the
     reported behavior (see ``_review_and_gate``). It costs one extra worker call;
-    pass ``review=False`` to skip it.
+    pass ``review=False`` to skip it. By default the reviewer runs on the SAME
+    provider/model as the author; pass ``review_provider``/``review_model`` to route
+    it elsewhere (e.g. deepinfra) — the reviewer is a tool-OFF single-shot judgement
+    (the edit diff and grounded anchor values are already in the prompt), so moving
+    it off the per-internal-turn-billed copilot is the chief specify cost lever.
 
     Raises:
         ValueError: if the author produced no parseable JSON object.
@@ -542,8 +729,33 @@ def run_specify(
     """
     with open(honey_path, "r", encoding="utf-8") as f:
         honey_text = f.read()
+
+    # A tool-OFF author (e.g. deepinfra) has no live files — it MUST rely on the
+    # grounding pre-flight, so force grounding on and switch the prompt to the
+    # grounded-only contract (lift anchors from the injected ground-truth block,
+    # defer what is not grounded). This is what moves the author off the
+    # per-internal-turn-billed copilot (ground→author mirrors judge's retrieve→judge).
+    grounded_only = provider not in _TOOL_PROVIDERS
+    if grounded_only and not ground:
+        logger.warning("specify: tool-OFF author on %s but ground=False — the author "
+                       "has no way to lift anchors; forcing grounding on", provider)
+        ground = True
+
+    # Anchor-grounding pre-flight: lift the CURRENT value at each cited file:line
+    # into the honey so the author writes a real change and the effectiveness
+    # reviewer can judge the behavioral delta (NR164/NR165/TR891 fix). Local/free.
+    if ground:
+        honey_text, gdiag = ground_anchors(honey_text, codebase_root, docs_root)
+        if gdiag["lifted"]:
+            logger.info("specify: anchor-grounding lifted %d cited location(s): %s",
+                        len(gdiag["lifted"]), gdiag["lifted"])
+        if gdiag["unresolved"]:
+            logger.debug("specify: anchor-grounding could not resolve %s",
+                         gdiag["unresolved"])
+
     contract_text = load_contract(contract_path)
-    prompt = build_specify_prompt(honey_text, contract_text, codebase_root, docs_root)
+    prompt = build_specify_prompt(honey_text, contract_text, codebase_root, docs_root,
+                                  grounded_only=grounded_only)
 
     logger.info("Running specify author (single, not fan-out)...")
     logger.debug("Prompt length: %d chars", len(prompt))
@@ -561,9 +773,11 @@ def run_specify(
     spec = _normalize_spec(spec)
 
     # Effectiveness gate: a second, independent pass that refuses to present edits
-    # which are anchored but do not change the reported behavior as ready.
+    # which are anchored but do not change the reported behavior as ready. The
+    # reviewer may run on a different (cheaper, tool-OFF) provider than the author.
     if review:
-        spec = _review_and_gate(spec, honey_text, codebase_root, model, provider,
+        spec = _review_and_gate(spec, honey_text, codebase_root,
+                                review_model or model, review_provider or provider,
                                 ledger, provider_kwargs, docs_root=docs_root)
 
     # Decisiveness gate: a verified+effective edit must be applyable even when the

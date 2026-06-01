@@ -434,11 +434,13 @@ def run_investigate_command(args: argparse.Namespace) -> None:
         logger.info("─" * 60)
         ldg2 = open_ledger(cfg.ledger.enabled, cfg.ledger.db_path)
         try:
+            review_role = cfg.role("review")
             spec = run_specify(
                 honey_path=honey_path, codebase_root=args.codebase,
                 docs_root=args.docs,
                 output_path=spec_out, contract_path=args.contract,
                 model=specify_role.model, provider=specify_role.provider,
+                review_model=review_role.model, review_provider=review_role.provider,
                 ledger=ldg2, provider_kwargs=provider_kwargs,
             )
             logger.info("Edit-spec: %s (%d edits, %d deferred, termination=%s)",
@@ -469,6 +471,7 @@ def run_specify_command(args: argparse.Namespace) -> None:
         provider_kwargs["allow_flag"] = cfg.copilot.allow
 
     role = cfg.role("specify")
+    review_role = cfg.role("review")
 
     logger.info("=" * 60)
     logger.info("Hivework specify — honey → edit-spec (Stage-1: propose only)")
@@ -478,6 +481,7 @@ def run_specify_command(args: argparse.Namespace) -> None:
     logger.info("  output:   %s", args.out)
     logger.info("  contract: %s", args.contract or "(default) recipes/edit_spec_contract_v1.md")
     logger.info("  author:   %s/%s", role.provider, role.model)
+    logger.info("  reviewer: %s/%s", review_role.provider, review_role.model)
     logger.info("=" * 60)
 
     ldg = open_ledger(cfg.ledger.enabled, cfg.ledger.db_path)
@@ -493,6 +497,8 @@ def run_specify_command(args: argparse.Namespace) -> None:
             contract_path=args.contract,
             model=role.model,
             provider=role.provider,
+            review_model=review_role.model,
+            review_provider=review_role.provider,
             ledger=ldg,
             provider_kwargs=provider_kwargs,
         )

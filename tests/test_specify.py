@@ -68,6 +68,22 @@ class TestBuildPrompt(unittest.TestCase):
         # The "lift anchors from live code" instruction must be present.
         self.assertIn("byte-for-byte", prompt)
 
+    def test_grounded_only_prompt_is_tool_off(self):
+        # tool-OFF author: lift from the ground-truth block, never re-open files.
+        prompt = specify.build_specify_prompt(
+            honey_text="H", contract_text="C", codebase_root=r"C:\code",
+            grounded_only=True)
+        self.assertIn("NO file-system tools", prompt)
+        self.assertIn("Anchor ground truth", prompt)
+        self.assertIn("anchor_not_grounded", prompt)
+        self.assertNotIn("Re-open every file", prompt)
+
+    def test_tool_on_prompt_reopens_files(self):
+        prompt = specify.build_specify_prompt(
+            honey_text="H", contract_text="C", codebase_root=r"C:\code")
+        self.assertIn("Re-open every file", prompt)
+        self.assertNotIn("NO file-system tools", prompt)
+
     def test_no_docs_block_when_docs_root_absent(self):
         prompt = specify.build_specify_prompt(
             honey_text="H", contract_text="C", codebase_root=r"C:\code")
@@ -342,8 +358,67 @@ class TestRunSpecifyWithReview(unittest.TestCase):
         self.assertIn("E1", on_disk["effectiveness"]["ineffective_ids"])
 
     def test_unparseable_review_downgrades_to_needs_pm(self):
-        spec = self._run(json.dumps(_READY_SPEC), "● no parseable json here\n")
+        # Unusable on BOTH the attempt and the retry → inconclusive → needs_pm.
+        with mock.patch.object(specify, "call_worker",
+                               side_effect=[_wr(json.dumps(_READY_SPEC)),
+                                            _wr("● no json\n"), _wr("still no json\n")]):
+            spec = specify.run_specify(
+                honey_path=self.honey, codebase_root=self.tmp,
+                output_path=self.out, contract_path=self.contract)
         self.assertEqual(spec["termination"], "needs_pm")
+
+
+class TestReviewJsonRetry(unittest.TestCase):
+    """The effectiveness review retries once on unusable JSON (mirrors judge)."""
+
+    SPEC = _READY_SPEC
+
+    def test_retry_recovers_and_keeps_ready(self):
+        # 1st review = prose (unusable) → retry with reminder → valid reviews.
+        seq = [_wr("Here is my assessment, the edit looks fine."),
+               _wr(_review([{"id": "E1", "effective": True, "coherent": True}]))]
+        with mock.patch.object(specify, "call_worker", side_effect=seq) as cw:
+            judgments, inconclusive = specify.review_effectiveness(
+                "honey", self.SPEC, "/code", "openai/gpt-oss-120b", "deepinfra")
+        self.assertEqual(cw.call_count, 2)              # one retry happened
+        self.assertFalse(inconclusive)
+        self.assertIn("E1", judgments)
+
+    def test_retry_prompt_carries_reminder(self):
+        seq = [_wr("no json"),
+               _wr(_review([{"id": "E1", "effective": True, "coherent": True}]))]
+        with mock.patch.object(specify, "call_worker", side_effect=seq) as cw:
+            specify.review_effectiveness("honey", self.SPEC, "/code",
+                                         "m", "deepinfra")
+        self.assertNotIn("[Retry]", cw.call_args_list[0].args[2])
+        self.assertIn("[Retry]", cw.call_args_list[1].args[2])
+
+    def test_missing_reviews_list_triggers_retry(self):
+        # Valid JSON but no 'reviews' array is also unusable → retry.
+        seq = [_wr(json.dumps({"verdict": "ok"})),
+               _wr(_review([{"id": "E1", "effective": True, "coherent": True}]))]
+        with mock.patch.object(specify, "call_worker", side_effect=seq) as cw:
+            judgments, inconclusive = specify.review_effectiveness(
+                "honey", self.SPEC, "/code", "m", "deepinfra")
+        self.assertEqual(cw.call_count, 2)
+        self.assertFalse(inconclusive)
+
+    def test_worker_exception_not_retried(self):
+        with mock.patch.object(specify, "call_worker",
+                               side_effect=RuntimeError("boom")) as cw:
+            judgments, inconclusive = specify.review_effectiveness(
+                "honey", self.SPEC, "/code", "m", "deepinfra")
+        self.assertEqual(cw.call_count, 1)             # transport failure: no retry
+        self.assertTrue(inconclusive)
+
+    def test_both_attempts_recorded_to_ledger(self):
+        led = mock.Mock()
+        seq = [_wr("garbage"),
+               _wr(_review([{"id": "E1", "effective": True, "coherent": True}]))]
+        with mock.patch.object(specify, "call_worker", side_effect=seq):
+            specify.review_effectiveness("honey", self.SPEC, "/code", "m",
+                                         "deepinfra", ledger=led)
+        self.assertEqual(led.record_call.call_count, 2)  # paid retry recorded
 
 
 class TestDecisivenessGate(unittest.TestCase):
@@ -418,12 +493,212 @@ class TestDecisivenessGate(unittest.TestCase):
             specify._apply_decisiveness_gate(spec)["termination"], "ready_to_apply")
 
 
+class TestGroundAnchors(unittest.TestCase):
+    """Anchor-grounding pre-flight: lift CURRENT live values at cited file:line
+    into the honey (NR164/NR165/TR891 — location present, value absent)."""
+
+    def setUp(self):
+        self.code = tempfile.mkdtemp()
+        comp = os.path.join(self.code, "client", "src")
+        os.makedirs(comp, exist_ok=True)
+        # The CSS rule whose VALUE the honey never quoted (grey, not blue).
+        with open(os.path.join(comp, "DocWorkflow.vue"), "w", encoding="utf-8") as f:
+            f.write("\n".join([
+                "line1", "line2", "line3",
+                ".wf-step.wf-undecided {", "  color: #999999;", "}",
+            ]) + "\n")
+
+    def test_lifts_value_at_cited_location(self):
+        honey = "## Fix directions\n- target: client/src/DocWorkflow.vue:4-6\n"
+        out, diag = specify.ground_anchors(honey, self.code)
+        self.assertIn("client/src/DocWorkflow.vue:4-6", diag["lifted"])
+        self.assertIn("color: #999999;", out)          # the VALUE is now in the honey
+        self.assertIn("Anchor ground truth", out)
+
+    def test_no_citation_leaves_honey_unchanged(self):
+        honey = "## Fix directions\n- change the undecided step color to blue.\n"
+        out, diag = specify.ground_anchors(honey, self.code)
+        self.assertEqual(out, honey)
+        self.assertEqual(diag["lifted"], [])
+
+    def test_unresolvable_citation_skipped_not_fabricated(self):
+        honey = "- target: client/src/Ghost.vue:10-12\n"
+        out, diag = specify.ground_anchors(honey, self.code)
+        self.assertEqual(out, honey)
+        self.assertIn("client/src/Ghost.vue:10-12", diag["unresolved"])
+
+    def test_already_quoted_value_is_not_relifted(self):
+        # honey already carries the exact line → dedup guard skips it.
+        honey = ("- target: client/src/DocWorkflow.vue:5-5\n"
+                 "current code:\n  color: #999999;\n")
+        out, diag = specify.ground_anchors(honey, self.code)
+        self.assertEqual(diag["lifted"], [])
+        self.assertIn("client/src/DocWorkflow.vue:5-5", diag["skipped_present"])
+
+    def test_resolves_against_docs_root(self):
+        docs = tempfile.mkdtemp()
+        d = os.path.join(docs, "210_design")
+        os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d, "D031.md"), "w", encoding="utf-8") as f:
+            f.write("# D031\n## policy\nthe action-bar must stay visible\n")
+        honey = "- target: 210_design/D031.md:3-3\n"
+        out, diag = specify.ground_anchors(honey, self.code, docs)
+        self.assertIn("the action-bar must stay visible", out)
+        self.assertIn("under docs root", out)
+
+    def test_range_clamped_to_max_lines(self):
+        big = os.path.join(self.code, "big.txt")
+        with open(big, "w", encoding="utf-8") as f:
+            f.write("\n".join(f"row{i}" for i in range(1, 200)) + "\n")
+        honey = "- target: big.txt:1-150\n"
+        out, diag = specify.ground_anchors(honey, self.code, max_lines=10)
+        self.assertIn("(truncated)", out)
+        self.assertIn("row1", out)
+        self.assertNotIn("row120", out)
+
+    def test_timestamp_is_not_a_citation(self):
+        # "21:33:01" has no file extension → must not be mistaken for file:line.
+        honey = "log at 21:33:01 says the step is grey\n"
+        out, diag = specify.ground_anchors(honey, self.code)
+        self.assertEqual(out, honey)
+        self.assertEqual(diag["lifted"], [])
+
+
+class TestRunSpecifyGrounding(unittest.TestCase):
+    """run_specify feeds the grounded honey to the author prompt."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        os.makedirs(os.path.join(self.tmp, "client"), exist_ok=True)
+        with open(os.path.join(self.tmp, "client", "View.vue"), "w",
+                  encoding="utf-8") as f:
+            f.write("a\nb\n.badge { color: #999999; }\nd\n")
+        self.honey = os.path.join(self.tmp, "honey.md")
+        with open(self.honey, "w", encoding="utf-8") as f:
+            f.write("## Fix directions\n- target: client/View.vue:3-3\n")
+        self.contract = os.path.join(self.tmp, "contract.md")
+        with open(self.contract, "w", encoding="utf-8") as f:
+            f.write("[Role] contract")
+        self.out = os.path.join(self.tmp, "spec.json")
+
+    def test_grounded_value_reaches_author_prompt(self):
+        bare = {"edits": [], "deferred": [], "gate": {"apply": False},
+                "termination": "needs_reinvestigation"}
+        with mock.patch.object(specify, "call_worker",
+                               return_value=_wr(json.dumps(bare))) as cw:
+            specify.run_specify(
+                honey_path=self.honey, codebase_root=self.tmp,
+                output_path=self.out, contract_path=self.contract, review=False)
+        author_prompt = cw.call_args_list[0].args[2]
+        self.assertIn("color: #999999;", author_prompt)
+        self.assertIn("Anchor ground truth", author_prompt)
+
+    def test_ground_false_skips_lift(self):
+        bare = {"edits": [], "deferred": [], "gate": {"apply": False},
+                "termination": "needs_reinvestigation"}
+        with mock.patch.object(specify, "call_worker",
+                               return_value=_wr(json.dumps(bare))) as cw:
+            specify.run_specify(
+                honey_path=self.honey, codebase_root=self.tmp,
+                output_path=self.out, contract_path=self.contract,
+                review=False, ground=False)
+        author_prompt = cw.call_args_list[0].args[2]
+        self.assertNotIn("Anchor ground truth", author_prompt)
+
+    def test_deepinfra_author_gets_grounded_only_prompt(self):
+        # A tool-OFF (deepinfra) author must get the grounded-only contract and
+        # grounding forced on, so it lifts from the ground-truth block not files.
+        bare = {"edits": [], "deferred": [], "gate": {"apply": False},
+                "termination": "needs_reinvestigation"}
+        with mock.patch.object(specify, "call_worker",
+                               return_value=_wr(json.dumps(bare))) as cw:
+            specify.run_specify(
+                honey_path=self.honey, codebase_root=self.tmp,
+                output_path=self.out, contract_path=self.contract,
+                review=False, provider="deepinfra", model="openai/gpt-oss-120b")
+        author_prompt = cw.call_args_list[0].args[2]
+        self.assertIn("NO file-system tools", author_prompt)
+        self.assertIn("color: #999999;", author_prompt)   # grounding forced on
+        self.assertNotIn("Re-open every file", author_prompt)
+
+    def test_deepinfra_author_grounding_forced_even_if_ground_false(self):
+        bare = {"edits": [], "deferred": [], "gate": {"apply": False},
+                "termination": "needs_reinvestigation"}
+        with mock.patch.object(specify, "call_worker",
+                               return_value=_wr(json.dumps(bare))) as cw:
+            specify.run_specify(
+                honey_path=self.honey, codebase_root=self.tmp,
+                output_path=self.out, contract_path=self.contract,
+                review=False, ground=False,
+                provider="deepinfra", model="openai/gpt-oss-120b")
+        author_prompt = cw.call_args_list[0].args[2]
+        self.assertIn("color: #999999;", author_prompt)   # forced on despite ground=False
+
+
+class TestReviewerProvider(unittest.TestCase):
+    """The effectiveness reviewer can run on a different provider than the author
+    (cost lever: move the tool-OFF single-shot review off copilot)."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.honey = os.path.join(self.tmp, "honey.md")
+        with open(self.honey, "w", encoding="utf-8") as f:
+            f.write("# honey\nSymptom: X. Fix: change x.\n")
+        self.contract = os.path.join(self.tmp, "contract.md")
+        with open(self.contract, "w", encoding="utf-8") as f:
+            f.write("[Role] contract")
+        self.out = os.path.join(self.tmp, "spec.json")
+
+    def test_reviewer_uses_its_own_provider(self):
+        seen = []
+
+        def fake(provider, model, prompt, cwd=None, timeout=300, **kw):
+            seen.append((provider, model))
+            # 1st call = author (spec), 2nd = review.
+            if len(seen) == 1:
+                return _wr(json.dumps(_READY_SPEC))
+            return _wr(_review([{"id": "E1", "effective": True, "coherent": True}]))
+
+        with mock.patch.object(specify, "call_worker", side_effect=fake):
+            spec = specify.run_specify(
+                honey_path=self.honey, codebase_root=self.tmp,
+                output_path=self.out, contract_path=self.contract,
+                model="gpt-5-mini", provider="copilot",
+                review_model="openai/gpt-oss-120b", review_provider="deepinfra")
+        self.assertEqual(seen[0], ("copilot", "gpt-5-mini"))      # author
+        self.assertEqual(seen[1], ("deepinfra", "openai/gpt-oss-120b"))  # reviewer
+        self.assertEqual(spec["termination"], "ready_to_apply")
+
+    def test_reviewer_defaults_to_author_provider(self):
+        seen = []
+
+        def fake(provider, model, prompt, cwd=None, timeout=300, **kw):
+            seen.append((provider, model))
+            if len(seen) == 1:
+                return _wr(json.dumps(_READY_SPEC))
+            return _wr(_review([{"id": "E1", "effective": True, "coherent": True}]))
+
+        with mock.patch.object(specify, "call_worker", side_effect=fake):
+            specify.run_specify(
+                honey_path=self.honey, codebase_root=self.tmp,
+                output_path=self.out, contract_path=self.contract,
+                model="gpt-5-mini", provider="copilot")  # no review_* → fall back
+        self.assertEqual(seen[1], ("copilot", "gpt-5-mini"))
+
+
 class TestConfigSpecifyRole(unittest.TestCase):
     def test_specify_role_exists(self):
         cfg = load_config()
         role = cfg.role("specify")
         self.assertEqual(role.provider, "copilot")
         self.assertTrue(role.model)
+
+    def test_review_role_routes_to_deepinfra(self):
+        # hive.config.json opts the reviewer onto deepinfra (cost lever).
+        cfg = load_config()
+        role = cfg.role("review")
+        self.assertEqual(role.provider, "deepinfra")
+        self.assertEqual(role.model, "openai/gpt-oss-120b")
 
     def test_cli_model_override_reaches_specify(self):
         cfg = load_config()
