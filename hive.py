@@ -28,6 +28,7 @@ from hive.assemble import run_assemble
 from hive.specify import run_specify
 from hive.apply import run_apply
 from hive.commit import run_propose, run_commit
+from hive.investigate import run_investigate
 from hive import backup as backup_store
 
 
@@ -334,6 +335,69 @@ def run_pipeline(args: argparse.Namespace) -> None:
     logger.info("=" * 60)
 
 
+def run_investigate_command(args: argparse.Namespace) -> None:
+    """Execute the cheap (M004) investigation path: decompose → bridge → retrieve → judge.
+
+    Replaces the open-ended swarm fan-out with one queen decomposition, zero-cost
+    local retrieval per axis, and a budgeted JUDGE verdict. The only spend is the
+    1 decompose call plus ≤ ``judge.max_calls_per_axis`` per judged axis over
+    ≤ ``judge.max_axes`` axes (all from hive.config.json).
+    """
+    logger = logging.getLogger("hive")
+    cfg = load_config()
+    cfg.apply_cli_model(args.model)
+
+    provider_kwargs: dict[str, str] = {}
+    if cfg.copilot.exe:
+        provider_kwargs["exe"] = cfg.copilot.exe
+    if cfg.copilot.allow:
+        provider_kwargs["allow_flag"] = cfg.copilot.allow
+
+    queen = cfg.queen
+    judge_role = cfg.role("judge")
+    default_globs = args.globs.split(",") if args.globs else None
+
+    logger.info("=" * 60)
+    logger.info("Hivework investigate — decompose → retrieve(local) → judge")
+    logger.info("  seed:     %s", args.seed)
+    logger.info("  codebase: %s", args.codebase)
+    logger.info("  docs:     %s", args.docs or "(none)")
+    logger.info("  output:   %s", args.out)
+    logger.info("  queen:    %s/%s", queen.provider, queen.model)
+    logger.info("  judge:    %s/%s (≤%d calls/axis, ≤%d axes)",
+                judge_role.provider, judge_role.model,
+                cfg.judge.max_calls_per_axis, cfg.judge.max_axes)
+    logger.info("=" * 60)
+
+    with open(args.seed, "r", encoding="utf-8") as f:
+        seed_text = f.read()
+
+    ldg = open_ledger(cfg.ledger.enabled, cfg.ledger.db_path)
+    ldg.start_run(seed=args.seed, codebase=args.codebase,
+                  model_queen=queen.model, model_swarm=judge_role.model)
+    result: dict = {}
+    try:
+        result = run_investigate(
+            seed_text=seed_text, recipe_path=args.recipe, code_root=args.codebase,
+            docs_root=args.docs, output_path=args.out, cfg=cfg, ledger=ldg,
+            provider_kwargs=provider_kwargs, default_globs=default_globs,
+        )
+        ldg.finish_run(honey_path=args.out, axes_n=result.get("axes_judged", 0),
+                       status="done")
+    except Exception:
+        ldg.finish_run(status="failed")
+        raise
+    finally:
+        ldg.close()
+
+    located = sum(1 for v in result.get("verdicts", []) if v["verdict"]["located"])
+    logger.info("=" * 60)
+    logger.info("Investigate complete: %d/%d axes located",
+                located, result.get("axes_judged", 0))
+    logger.info("  Report: %s (+ .md)", args.out)
+    logger.info("=" * 60)
+
+
 def run_specify_command(args: argparse.Namespace) -> None:
     """Execute the standalone specify stage: honey + live code → edit-spec JSON.
 
@@ -635,6 +699,46 @@ def main() -> None:
         help="Enable debug logging",
     )
 
+    # 'investigate' sub-command — the cheap path: decompose → retrieve(local) → judge
+    inv_parser = subparsers.add_parser(
+        "investigate",
+        help="Cheap investigation: decompose → local retrieve → judge verdicts "
+             "(replaces swarm fan-out; spend = 1 decompose + judge budget)",
+    )
+    inv_parser.add_argument(
+        "--seed", required=True,
+        help="Path to seed markdown file (investigation instruction)",
+    )
+    inv_parser.add_argument(
+        "--codebase", required=True,
+        help="Root path of the target codebase to investigate (local FIND scope)",
+    )
+    inv_parser.add_argument(
+        "--out", required=True,
+        help="Output path for the verdict report JSON (a sibling .md is also written)",
+    )
+    inv_parser.add_argument(
+        "--recipe", default=None,
+        help="Path to recipe card markdown (for decompose §1 fixed axes)",
+    )
+    inv_parser.add_argument(
+        "--docs", default=None,
+        help="Root of design docs (for design-excerpt retrieval); optional",
+    )
+    inv_parser.add_argument(
+        "--globs", default=None,
+        help="Comma-separated fallback file globs when an axis names no path "
+             "(e.g. 'server/**/*.py,client/**/*.vue')",
+    )
+    inv_parser.add_argument(
+        "--model", default=None,
+        help="Model override for all roles (default: per-role config)",
+    )
+    inv_parser.add_argument(
+        "-v", "--verbose", action="store_true",
+        help="Enable debug logging",
+    )
+
     # 'specify' sub-command — lower a honey into an edit-spec (Stage-1: propose only)
     spec_parser = subparsers.add_parser(
         "specify",
@@ -787,6 +891,8 @@ def main() -> None:
 
     if args.command == "run":
         run_pipeline(args)
+    elif args.command == "investigate":
+        run_investigate_command(args)
     elif args.command == "specify":
         run_specify_command(args)
     elif args.command == "apply":

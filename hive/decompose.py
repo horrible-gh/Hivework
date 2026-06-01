@@ -8,7 +8,9 @@ The decompose prompt template embeds:
   - The recipe §1 fixed-axis instructions
   - The seed (raw investigation instruction)
 
-Output: list of axis dicts [{axis_id, title, brief, depends_on}]
+Output: list of axis dicts [{id, title, brief, depends_on, search_plan}]
+where search_plan = {keywords, file_globs, doc_topics} is the blind seed the
+local retriever (hive.searchplan bridge) lowers into a SearchPlan.
 """
 
 import json
@@ -55,6 +57,16 @@ to orient the cut), but keep it minimal. Then output the decomposition JSON.
    fan out — return a single task and set fanout_decision = "single".
 5. Each task carries: id, one-line title, a 2-4 line concrete brief
    (what to find / scope / deliverable), and depends_on (list of ids).
+6. Each task ALSO carries a `search_plan` — the BLIND seed a local grep will use
+   to find that axis's evidence (a downstream FIND consumes it, no human reads
+   it). Fill it from the AXIS ITSELF; never from any answer you happen to know:
+   - `keywords`: 4-10 EXACT tokens a `grep` would hit — identifiers, symbol
+     names, SQL tokens (e.g. `type_code`, `group_head`, `ORDER BY`, `IS NULL`),
+     literal strings. NOT prose ("the head logic"); NOT generic words ("data").
+   - `file_globs`: 1-4 path scopes (e.g. `server/sql/queries/*.json`,
+     `server/modules/**/db/**/*.py`). Narrow to where the evidence lives.
+   - `doc_topics`: design-doc topics/codes for design axes (e.g. `D030`,
+     `head semantics`); [] for pure-code axes.
 
 ## Output format (STRICT) — return ONLY this JSON, no prose, no markdown fence:
 
@@ -63,7 +75,8 @@ to orient the cut), but keep it minimal. Then output the decomposition JSON.
   "reason": "one line: why this many axes / why this split",
   "steps": [["A","B","C"], ["F"]],
   "tasks": [
-    {"id": "A", "title": "...", "brief": "...", "depends_on": []}
+    {"id": "A", "title": "...", "brief": "...", "depends_on": [],
+     "search_plan": {"keywords": ["..."], "file_globs": ["..."], "doc_topics": ["..."]}}
   ]
 }
 
