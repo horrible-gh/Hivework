@@ -195,6 +195,54 @@ class TestRunApply(unittest.TestCase):
         self.assertTrue(proposal["ready"])
 
 
+class TestResolveEffectiveRoot(unittest.TestCase):
+    """Code and design docs in separate trees: apply must resolve an edit's file
+    against the tree it actually lives under, not blindly against --codebase
+    (T890: a doc edit-spec applied with --codebase <source> file_missing'd)."""
+
+    def setUp(self):
+        self.code = tempfile.mkdtemp()   # source tree (no doc file)
+        self.docs = tempfile.mkdtemp()   # design-doc tree (the doc file lives here)
+        os.makedirs(os.path.join(self.docs, "210_design"), exist_ok=True)
+        self.docfile = os.path.join("210_design", "D031.md")
+        with open(os.path.join(self.docs, self.docfile), "w", encoding="utf-8") as f:
+            f.write("before\nstate = old\nafter\n")
+        self.tmp = tempfile.mkdtemp()
+        self.spec_path = os.path.join(self.tmp, "spec.json")
+
+    def _write_spec(self, spec):
+        with open(self.spec_path, "w", encoding="utf-8") as f:
+            json.dump(spec, f)
+
+    def test_picks_root_holding_the_file_over_explicit_codebase(self):
+        # The runner passes --codebase <source>, but the file lives under docs.
+        spec = _spec([_edit("state = old", "state = new", file=self.docfile)],
+                     codebase_root=self.docs)
+        self._write_spec(spec)
+        proposal = apply.run_apply(self.spec_path, codebase_root=self.code)
+        self.assertTrue(proposal["ready"])
+        self.assertEqual(proposal["codebase_root"], os.path.abspath(self.docs))
+
+    def test_explicit_docs_root_resolves_doc_edit(self):
+        # Spec's own codebase_root is wrong/absent; --docs supplies the base.
+        spec = _spec([_edit("state = old", "state = new", file=self.docfile)],
+                     codebase_root=self.code)
+        self._write_spec(spec)
+        proposal = apply.run_apply(
+            self.spec_path, codebase_root=self.code, docs_root=self.docs)
+        self.assertTrue(proposal["ready"])
+        self.assertEqual(proposal["codebase_root"], os.path.abspath(self.docs))
+
+    def test_unresolvable_file_keeps_first_candidate_and_reports_missing(self):
+        spec = _spec([_edit("state = old", "state = new", file="nope/ghost.md")],
+                     codebase_root=self.code)
+        self._write_spec(spec)
+        proposal = apply.run_apply(self.spec_path, codebase_root=self.code)
+        self.assertFalse(proposal["ready"])
+        self.assertEqual(proposal["codebase_root"], os.path.abspath(self.code))
+        self.assertEqual(proposal["edits"][0]["status"], apply.FILE_MISSING)
+
+
 class TestRunApplyWrite(unittest.TestCase):
     """--write path: applies READY edits, backs up, rolls back, refuses non-ready."""
 
