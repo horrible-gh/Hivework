@@ -45,9 +45,13 @@ VERDICT_OUT = json.dumps({
 
 
 def _fake_retrieve(plan, code_root, docs_root=None, **kwargs):
+    # Include the file the stub verdict cites so the judge verdict is GROUNDED
+    # (a verdict citing a file absent from the bundle is downgraded by design).
     return {
         "axis_id": plan.axis_id,
-        "code_snippets": [], "call_chain": [], "call_sites": [],
+        "code_snippets": [{"file": "server/x.py", "lines": "8-14",
+                           "text": "def f(): ...", "hits": []}],
+        "call_chain": [], "call_sites": [],
         "git_history": [], "design_excerpts": [],
         "stats": {"raw_hits": 3, "snippets": 1, "call_chain": 0},
     }

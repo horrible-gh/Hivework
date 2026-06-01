@@ -177,10 +177,13 @@ class TestRunJudgeDegradation(unittest.TestCase):
                               model="gpt-5-mini", judge_cfg=JudgeConfig())
         self.assertFalse(res["verdict"].located)
 
-    def test_flaky_rejudge_keeps_first_verdict(self):
-        # call1 locates AND asks for a need; call2 returns junk → keep call1 verdict.
+    def test_flaky_rejudge_does_not_crash_or_fabricate(self):
+        # call1 locates an UNGROUNDED file + a need → re-judge runs; call2 is junk
+        # → the flaky-guard keeps call1's parsed verdict (no crash, calls=2), then
+        # the ungrounded localisation is downgraded rather than emitted as located.
         c1 = json.dumps({
-            "verdict": {"located": True, "file": "a.py", "lines": "1-2", "reason": "r"},
+            "verdict": {"located": True, "file": "server/ghost.py", "lines": "1-2",
+                        "reason": "r"},
             "need": {"symbols": ["s"], "greps": [], "file_globs": []}})
         seq = [_wr(c1), _wr("garbage no json")]
         with mock.patch.object(J, "call_worker", side_effect=seq), \
@@ -189,8 +192,68 @@ class TestRunJudgeDegradation(unittest.TestCase):
                               axis_globs=["g"], code_root="/x", provider="copilot",
                               model="gpt-5-mini", judge_cfg=JudgeConfig())
         self.assertEqual(res["calls_made"], 2)
-        self.assertTrue(res["verdict"].located)   # first verdict survived
-        self.assertEqual(res["verdict"].file, "a.py")
+        self.assertFalse(res["verdict"].located)        # ungrounded → downgraded
+        self.assertEqual(res["verdict"].file, "server/ghost.py")  # cited file preserved
+
+
+class TestGroundingGate(unittest.TestCase):
+    """The free local grounding gate: cost-skip on grounded, downgrade on hallucinated."""
+
+    def test_cost_gate_skips_rejudge_when_grounded(self):
+        # call1 locates a file that IS in the bundle AND asks for a need anyway —
+        # the grounded localisation is trusted, so the re-judge is skipped.
+        c1 = json.dumps({
+            "verdict": {"located": True, "file": "server/store.py",
+                        "lines": "1444-1453", "reason": "visible"},
+            "need": {"symbols": ["belt_and_suspenders"], "greps": [], "file_globs": []}})
+        with mock.patch.object(J, "call_worker", return_value=_wr(c1)) as cw, \
+             mock.patch.object(J, "retrieve_followup") as fu:
+            res = J.run_judge(plan_bundle=PLAN_BUNDLE, symptom="s", axis_globs=["g"],
+                              code_root="/x", provider="copilot", model="gpt-5-mini",
+                              judge_cfg=JudgeConfig(max_calls_per_axis=2))
+        self.assertEqual(res["calls_made"], 1)      # second call saved
+        self.assertEqual(cw.call_count, 1)
+        fu.assert_not_called()
+        self.assertTrue(res["verdict"].located)
+        self.assertEqual(res["verdict"].file, "server/store.py")
+
+    def test_hallucinated_verdict_downgraded_when_no_rejudge(self):
+        # located=true but the cited file is absent from the bundle, and no need →
+        # cannot re-judge → downgraded to located=false instead of emitted.
+        c1 = json.dumps({
+            "verdict": {"located": True, "file": "server/imaginary.py",
+                        "lines": "10-20", "reason": "guessed"},
+            "need": {"symbols": [], "greps": [], "file_globs": []}})
+        with mock.patch.object(J, "call_worker", return_value=_wr(c1)), \
+             mock.patch.object(J, "retrieve_followup") as fu:
+            res = J.run_judge(plan_bundle=PLAN_BUNDLE, symptom="s", axis_globs=["g"],
+                              code_root="/x", provider="copilot", model="gpt-5-mini",
+                              judge_cfg=JudgeConfig(max_calls_per_axis=2))
+        self.assertEqual(res["calls_made"], 1)
+        fu.assert_not_called()
+        self.assertFalse(res["verdict"].located)    # downgraded
+        self.assertIn("ungrounded", res["verdict"].reason)
+
+    def test_ungrounded_located_forces_rejudge(self):
+        # located but ungrounded WITH a need → re-judge fires (the gate does not
+        # let an invented file short-circuit); a grounded call2 becomes final.
+        c1 = json.dumps({
+            "verdict": {"located": True, "file": "server/nope.py", "lines": "1-2",
+                        "reason": "maybe"},
+            "need": {"symbols": ["get_linked_result_documents"], "greps": [],
+                     "file_globs": []}})
+        c2 = json.dumps({
+            "verdict": {"located": True, "file": "server/store.py",
+                        "lines": "1444-1453", "reason": "resolved"}})
+        with mock.patch.object(J, "call_worker", side_effect=[_wr(c1), _wr(c2)]), \
+             mock.patch.object(J, "retrieve_followup", return_value=FU_BUNDLE) as fu:
+            res = J.run_judge(plan_bundle=PLAN_BUNDLE, symptom="s", axis_globs=["g"],
+                              code_root="/x", provider="copilot", model="gpt-5-mini",
+                              judge_cfg=JudgeConfig(max_calls_per_axis=2))
+        self.assertEqual(res["calls_made"], 2)
+        fu.assert_called_once()
+        self.assertTrue(res["verdict"].located)
+        self.assertEqual(res["verdict"].file, "server/store.py")
 
 
 class TestLedgerRecording(unittest.TestCase):

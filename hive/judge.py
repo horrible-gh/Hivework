@@ -19,6 +19,16 @@ Budget (M004 §4, surfaced in hive.config.json ``judge``):
   documented "1 judge + ≤1 re-judge". The cap is enforced here, not hidden in a
   counter — operators dial it in config.
 
+Cost gate (the queen-1 vs judge-7 asymmetry fix): the second call is the only
+reducible spend, so a free LOCAL grounding check decides whether it is worth it.
+If call 1 already returned a ``located`` verdict whose file is *in the evidence
+bundle*, we trust it and skip the re-judge — the common success path drops from
+2 calls/axis to 1. Conversely, a ``located`` verdict citing a file the judge was
+never shown is a hallucination (the judge is tool-less); it is downgraded to
+``located=false`` and, if budget allows, the re-judge fires precisely there. So
+locality both lowers cost on grounded axes and raises quality on hallucinated
+ones — see ``_verdict_is_grounded``.
+
 Like specify's effectiveness review, JUDGE never raises: a flaky/unparseable
 model response degrades to ``located=false`` rather than crashing the pipeline.
 """
@@ -238,6 +248,54 @@ def _need_from(parsed: dict[str, Any] | None, axis_id: str,
                         file_globs=globs or list(default_globs))
 
 
+def _norm_path(p: str) -> str:
+    return (p or "").replace("\\", "/").strip().strip("/").lower()
+
+
+def _bundle_files(bundle: dict[str, Any]) -> set[str]:
+    """Every file the judge was actually SHOWN in this bundle.
+
+    The judge is tool-less and rules only on the bundle, so a verdict can be
+    *grounded* only in a file that appears here. A cited file absent from this
+    set was invented (hallucinated), not localised.
+    """
+    files: set[str] = set()
+    for key in ("code_snippets", "call_chain", "call_sites"):
+        for s in bundle.get(key) or []:
+            f = _norm_path(s.get("file", ""))
+            if f:
+                files.add(f)
+    for d in bundle.get("design_excerpts") or []:
+        f = _norm_path(d.get("doc", ""))
+        if f:
+            files.add(f)
+    for f in (bundle.get("stats") or {}).get("ranked_files") or []:
+        nf = _norm_path(f)
+        if nf:
+            files.add(nf)
+    return files
+
+
+def _path_aligns(a: str, b: str) -> bool:
+    """Path-segment-aligned equality or suffix (handles abs↔rel, basename-degrade)."""
+    return a == b or a.endswith("/" + b) or b.endswith("/" + a)
+
+
+def _verdict_is_grounded(verdict: "JudgeVerdict", bundle: dict[str, Any]) -> bool:
+    """Is a *located* verdict's cited file one the judge was actually shown?
+
+    Purely from the bundle (no disk/model) — deterministic and free. Used both as
+    a COST gate (a grounded localisation needs no second opinion → skip re-judge)
+    and an anti-hallucination gate (an ungrounded ``located`` is downgraded).
+    """
+    if not verdict.located:
+        return False
+    vf = _norm_path(verdict.file)
+    if not vf:
+        return False
+    return any(_path_aligns(vf, bf) for bf in _bundle_files(bundle))
+
+
 def _merge_followup(bundle: dict[str, Any], fu: dict[str, Any]) -> dict[str, Any]:
     """Merge follow-up seeds/call-chain into the first-pass bundle (re-judge input)."""
     merged = dict(bundle)
@@ -282,11 +340,18 @@ def run_judge(*, plan_bundle: dict[str, Any], symptom: str, axis_globs: list[str
     calls_made = 1
     verdict = _verdict_from(parsed1, axis_id)
     need = _need_from(parsed1, axis_id, axis_globs) if want_need else None
+    grounded1 = _verdict_is_grounded(verdict, plan_bundle)
     history.append({"stage": "judge1", "parsed": parsed1})
 
+    # ── Cost gate (the asymmetry fix): the re-judge is the only reducible call.
+    # Spend it only when it can change the answer — i.e. the judge asked for a
+    # follow-up AND we do NOT already hold a grounded localisation. A located
+    # verdict whose file is in the evidence is trusted as-is (saves the call); an
+    # ungrounded or unlocated one is exactly what the follow-up exists to fix.
+    check_bundle = plan_bundle
     followup_bundle = None
-    # ── Optional Call 2: re-judge the merged bundle, if budget + a need exist.
-    if want_need and need is not None and calls_made < max_calls:
+    if (want_need and need is not None and calls_made < max_calls
+            and not (verdict.located and grounded1)):
         followup_bundle = retrieve_followup(need, code_root, k=k, max_hops=max_hops)
         merged = _merge_followup(plan_bundle, followup_bundle)
         prompt2 = build_judge_prompt(axis_id, symptom, summarize_bundle(merged),
@@ -301,6 +366,19 @@ def run_judge(*, plan_bundle: dict[str, Any], symptom: str, axis_globs: list[str
         v2 = _verdict_from(parsed2, axis_id)
         if v2.raw:
             verdict = v2
+            check_bundle = merged
+
+    # ── Anti-hallucination downgrade: the judge has no tools, so a ``located``
+    # verdict citing a file it was never shown is invented, not localised. Never
+    # emit it as located — downgrade to located=false with a flagged reason.
+    if verdict.located and not _verdict_is_grounded(verdict, check_bundle):
+        logger.info("judge: [%s] verdict cites %s absent from evidence — downgraded",
+                    axis_id, verdict.file)
+        verdict = JudgeVerdict(
+            axis_id=axis_id, located=False, file=verdict.file, lines=verdict.lines,
+            reason="ungrounded (cited file absent from evidence bundle): "
+                   + (verdict.reason or ""),
+            raw=verdict.raw)
 
     return {
         "axis_id": axis_id,
