@@ -196,6 +196,55 @@ class TestRunJudgeDegradation(unittest.TestCase):
         self.assertEqual(res["verdict"].file, "server/ghost.py")  # cited file preserved
 
 
+class TestUnparseableRetry(unittest.TestCase):
+    """Unparseable output triggers ONE JSON-only retry, recorded but not budgeted."""
+
+    def test_retry_recovers_on_second_attempt(self):
+        # call1 emits prose (unparseable) → retry with reminder → clean verdict.
+        seq = [_wr("Sure, here's my analysis: the bug is ..."), _wr(VERDICT_NO_NEED)]
+        with mock.patch.object(J, "call_worker", side_effect=seq) as cw, \
+             mock.patch.object(J, "retrieve_followup") as fu:
+            res = J.run_judge(plan_bundle=PLAN_BUNDLE, symptom="s", axis_globs=["g"],
+                              code_root="/x", provider="deepinfra",
+                              model="openai/gpt-oss-120b",
+                              judge_cfg=JudgeConfig(max_calls_per_axis=2))
+        self.assertEqual(cw.call_count, 2)              # one retry happened
+        self.assertEqual(res["calls_made"], 1)          # but budget not advanced
+        fu.assert_not_called()
+        self.assertTrue(res["verdict"].located)
+
+    def test_retry_prompt_carries_reminder(self):
+        seq = [_wr("no json"), _wr(VERDICT_NO_NEED)]
+        with mock.patch.object(J, "call_worker", side_effect=seq) as cw, \
+             mock.patch.object(J, "retrieve_followup"):
+            J.run_judge(plan_bundle=PLAN_BUNDLE, symptom="s", axis_globs=["g"],
+                        code_root="/x", provider="deepinfra", model="m",
+                        judge_cfg=JudgeConfig(max_calls_per_axis=1))
+        first_prompt = cw.call_args_list[0].args[2]
+        retry_prompt = cw.call_args_list[1].args[2]
+        self.assertNotIn("[Retry]", first_prompt)
+        self.assertIn("[Retry]", retry_prompt)
+        self.assertTrue(retry_prompt.startswith(first_prompt))
+
+    def test_both_attempts_recorded_to_ledger(self):
+        led = mock.Mock()
+        seq = [_wr("garbage"), _wr(VERDICT_NO_NEED)]
+        with mock.patch.object(J, "call_worker", side_effect=seq), \
+             mock.patch.object(J, "retrieve_followup"):
+            J.run_judge(plan_bundle=PLAN_BUNDLE, symptom="s", axis_globs=["g"],
+                        code_root="/x", provider="deepinfra", model="m",
+                        judge_cfg=JudgeConfig(max_calls_per_axis=1), ledger=led)
+        self.assertEqual(led.record_call.call_count, 2)  # paid retry is recorded
+
+    def test_worker_exception_is_not_retried(self):
+        with mock.patch.object(J, "call_worker", side_effect=RuntimeError("boom")) as cw, \
+             mock.patch.object(J, "retrieve_followup"):
+            J.run_judge(plan_bundle=PLAN_BUNDLE, symptom="s", axis_globs=["g"],
+                        code_root="/x", provider="deepinfra", model="m",
+                        judge_cfg=JudgeConfig(max_calls_per_axis=1))
+        self.assertEqual(cw.call_count, 1)               # transport failure: no retry
+
+
 class TestGroundingGate(unittest.TestCase):
     """The free local grounding gate: cost-skip on grounded, downgrade on hallucinated."""
 

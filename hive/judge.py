@@ -57,6 +57,18 @@ _CALL_SITE_DEFS = 30
 _CALL_SITE_OTHER = 12
 _CALL_SITE_TEXT = 120
 
+# When the model returns prose, fenced, or garbled output that even the repair
+# pass in ``extract_first_json`` cannot salvage, one terse "JSON only" nudge
+# usually recovers a clean object. This retry lives INSIDE the logical judge
+# call: it is a real, paid model call (recorded to the ledger) but it does NOT
+# advance the per-axis budget — ``max_calls_per_axis`` gates the expensive
+# re-judge follow-up, not a transport-level reparse of the same verdict.
+_JSON_ONLY_REMINDER = (
+    "\n\n[Retry] Your previous response could not be parsed as JSON. Output ONLY "
+    "the single JSON object specified in the output contract above — no prose, no "
+    "explanation, no markdown code fences, nothing before or after it."
+)
+
 
 @dataclass
 class JudgeVerdict:
@@ -193,27 +205,43 @@ you need is not shown, ask for it in ``need`` rather than trying to fetch it.
 def _call_and_parse(provider: str, model: str, prompt: str, *, cwd: str,
                     axis_id: str, stage: str, ledger=None,
                     timeout: int = 180, provider_kwargs: dict | None = None,
+                    retry_on_unparseable: bool = True,
                     ) -> dict[str, Any] | None:
-    """Call the model, record to ledger, return parsed JSON (or None). Never raises."""
-    try:
-        wr = call_worker(provider, model, prompt, cwd=cwd, timeout=timeout,
-                         **(provider_kwargs or {}))
-    except Exception as e:  # timeout, provider error, etc.
-        logger.warning("judge: %s worker failed for %s: %s", stage, axis_id, e)
-        return None
+    """Call the model, record to ledger, return parsed JSON (or None). Never raises.
 
-    if ledger is not None:
-        ledger.record_call("judge", axis_id, provider, model,
-                           prompt=prompt, output=wr.stdout, latency_s=wr.latency_s,
-                           ok=wr.exit_code == 0,
-                           err=wr.stderr[:200] if wr.exit_code != 0 else "",
-                           real_tokens=wr.real_tokens)
+    On UNPARSEABLE output, retries once with a terse JSON-only reminder appended
+    (see ``_JSON_ONLY_REMINDER``): both attempts are recorded to the ledger as
+    'judge' calls, but the retry does not advance the caller's per-axis budget.
+    A worker-level failure (timeout / provider error) is NOT retried — it returns
+    ``None`` immediately, since a re-call is unlikely to fix transport breakage.
+    """
+    attempt_prompt = prompt
+    attempts = 2 if retry_on_unparseable else 1
+    for attempt in range(attempts):
+        try:
+            wr = call_worker(provider, model, attempt_prompt, cwd=cwd, timeout=timeout,
+                             **(provider_kwargs or {}))
+        except Exception as e:  # timeout, provider error, etc.
+            logger.warning("judge: %s worker failed for %s: %s", stage, axis_id, e)
+            return None
 
-    try:
-        return extract_first_json(wr.stdout)
-    except ValueError:
-        logger.warning("judge: %s produced no parseable JSON for %s", stage, axis_id)
-        return None
+        if ledger is not None:
+            ledger.record_call("judge", axis_id, provider, model,
+                               prompt=attempt_prompt, output=wr.stdout, latency_s=wr.latency_s,
+                               ok=wr.exit_code == 0,
+                               err=wr.stderr[:200] if wr.exit_code != 0 else "",
+                               real_tokens=wr.real_tokens)
+
+        try:
+            return extract_first_json(wr.stdout)
+        except ValueError:
+            if attempt + 1 < attempts:
+                logger.warning("judge: %s produced no parseable JSON for %s — "
+                               "retrying once with JSON-only reminder", stage, axis_id)
+                attempt_prompt = prompt + _JSON_ONLY_REMINDER
+            else:
+                logger.warning("judge: %s produced no parseable JSON for %s", stage, axis_id)
+    return None
 
 
 def _verdict_from(parsed: dict[str, Any] | None, axis_id: str) -> JudgeVerdict:
