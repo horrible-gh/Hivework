@@ -40,6 +40,17 @@ class TestConfigDefaults(unittest.TestCase):
     def test_copilot_exe_none(self):
         self.assertIsNone(self.cfg.copilot.exe)
 
+    def test_judge_role_model_sonnet(self):
+        self.assertEqual(self.cfg.role("judge").model, "claude-sonnet-4.5")
+
+    def test_judge_role_provider_copilot(self):
+        self.assertEqual(self.cfg.role("judge").provider, "copilot")
+
+    def test_judge_caps_defaults(self):
+        self.assertEqual(self.cfg.judge.max_calls_per_axis, 2)
+        self.assertEqual(self.cfg.judge.max_axes, 3)
+        self.assertEqual(self.cfg.judge.max_parallel, 2)
+
 
 class TestConfigPartialFile(unittest.TestCase):
     """Partial config file: only override swarm model; others stay default."""
@@ -65,6 +76,28 @@ class TestConfigPartialFile(unittest.TestCase):
         self.assertTrue(self.cfg.ledger.enabled)
 
 
+class TestConfigJudgePartial(unittest.TestCase):
+    """Overriding a single judge cap leaves the others at default."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        self.config_path = os.path.join(self.tmpdir, "hive.config.json")
+        partial = {"judge": {"max_calls_per_axis": 4}}
+        with open(self.config_path, "w") as f:
+            json.dump(partial, f)
+        self.cfg = load_config(path=self.config_path)
+
+    def test_overridden_cap(self):
+        self.assertEqual(self.cfg.judge.max_calls_per_axis, 4)
+
+    def test_other_caps_still_default(self):
+        self.assertEqual(self.cfg.judge.max_axes, 3)
+        self.assertEqual(self.cfg.judge.max_parallel, 2)
+
+    def test_judge_role_still_default(self):
+        self.assertEqual(self.cfg.role("judge").model, "claude-sonnet-4.5")
+
+
 class TestConfigCliOverride(unittest.TestCase):
     """CLI --model overrides all roles."""
 
@@ -74,6 +107,7 @@ class TestConfigCliOverride(unittest.TestCase):
         self.assertEqual(cfg.queen.model, "claude-opus-4.7")
         self.assertEqual(cfg.swarm.model, "claude-opus-4.7")
         self.assertEqual(cfg.role("assemble").model, "claude-opus-4.7")
+        self.assertEqual(cfg.role("judge").model, "claude-opus-4.7")
 
     def test_cli_model_none_no_change(self):
         cfg = load_config(path="/nonexistent/hive.config.json")

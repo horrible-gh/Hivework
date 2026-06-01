@@ -4,9 +4,11 @@
     "swarm":    { "provider": "copilot", "model": "gpt-5-mini" },
     "assemble": { "provider": "copilot", "model": "gpt-5-mini" },
     "specify":  { "provider": "copilot", "model": "gpt-5-mini" },
-    "commit":   { "provider": "copilot", "model": "gpt-5-mini" }
+    "commit":   { "provider": "copilot", "model": "gpt-5-mini" },
+    "judge":    { "provider": "copilot", "model": "gpt-5-mini" }
   },
   "copilot": { "exe": null, "allow": "--allow-all", "timeout_sec": 300 },
   "ledger":  { "enabled": true, "db_path": "hive_ledger.db" },
-  "apply":   { "backup_dir": ".apply_backups", "backup_ttl_hours": 168 }
+  "apply":   { "backup_dir": ".apply_backups", "backup_ttl_hours": 168 },
+  "judge":   { "max_calls_per_axis": 2, "max_axes": 3, "max_parallel": 2 }
 }
