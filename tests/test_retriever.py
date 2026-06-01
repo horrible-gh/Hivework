@@ -51,6 +51,26 @@ def test_root_with_trailing_slash_is_handled():
     assert _norm_glob(g, ROOT + "/") == "210_design/D031_*.md"
 
 
+# ── Doubled-separator collapse: the queen over-escapes a Windows path
+#    (``C:\\\\…`` → parsed ``C:\\…``), which ``\\``→``/`` turns into ``C://…`` — a
+#    doubled-slash glob rg matches against NOTHING (T890: D031 never retrieved).
+
+def test_doubled_backslash_glob_relativized():
+    # Parsed value of an over-escaped queen glob: every separator is two backslashes.
+    g = "C:\\\\workspace\\\\projects\\\\Documents\\\\projects\\\\FlowGate\\\\210_design\\\\D031_*.md"
+    assert _norm_glob(g, ROOT) == "210_design/D031_*.md"
+
+
+def test_doubled_forward_slash_glob_collapsed_and_relativized():
+    g = "C://workspace//projects//Documents//projects//FlowGate//210_design//**//D031_*.md"
+    assert _norm_glob(g, ROOT) == "210_design/**/D031_*.md"
+
+
+def test_doubled_slash_outside_root_degrades_to_basename():
+    g = "C://other//place//D031_*.md"
+    assert _norm_glob(g, ROOT) == "D031_*.md"
+
+
 # ── _validate_globs: existence-probe defence against garbage / over-broad globs.
 #    These run real ``rg --files`` against a temp tree, the only thing that can
 #    distinguish a structurally-valid non-path (``message/author/date``) from a
