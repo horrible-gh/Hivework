@@ -147,18 +147,17 @@ def _repo_with_staged_untracking(tmp_path):
     return repo
 
 
-def test_not_ready_when_staged_path_left_uncommitted(tmp_path):
-    """A staged path the plan drops (here the staged .pyc untracking) blocks the plan:
-    committing it would silently revert the staging via the per-commit index reset.
+def test_staged_path_left_uncommitted_is_surfaced_not_blocked(tmp_path):
+    """A staged path the plan drops no longer halts: staging is commit intent, so it
+    is surfaced (and swept into a final commit on --write), never a dead stop.
     """
     repo = _repo_with_staged_untracking(tmp_path)
     plan = _plan([{"id": "c1", "message": "chore(git): ignore cache",
                    "files": [".gitignore"]}])
     proposal = build_commit_proposal(plan, repo)
-    assert proposal["ready"] is False
+    assert proposal["ready"] is True
     assert "cache/x.pyc" in proposal["staged_leftover"]
-    assert any("staged but assigned to no commit" in r
-               for r in proposal["not_ready_reasons"])
+    assert not any("staged" in r for r in proposal["not_ready_reasons"])
 
 
 def test_ready_when_staged_path_is_committed(tmp_path):
@@ -173,10 +172,10 @@ def test_ready_when_staged_path_is_committed(tmp_path):
     assert proposal["staged_leftover"] == []
 
 
-def test_write_refused_preserves_staged_untracking(tmp_path):
-    """End-to-end protection: a plan that omits the staged untracking is refused, so
-    the index reset never runs and the staged `git rm --cached` survives intact (the
-    original bug reverted it).
+def test_write_sweeps_staged_untracking_into_commit(tmp_path):
+    """End-to-end: a plan that omits the staged untracking no longer halts — the
+    staged `git rm --cached` is swept into a final commit, honoring the staging
+    instead of silently reverting it (the original bug) or blocking on it.
     """
     repo = _repo_with_staged_untracking(tmp_path)
     plan = _plan([{"id": "c1", "message": "chore(git): ignore cache",
@@ -186,11 +185,14 @@ def test_write_refused_preserves_staged_untracking(tmp_path):
         json.dump(plan, f)
 
     proposal = run_commit(plan_path, repo_root=repo, write=True)
-    assert proposal["ready"] is False
-    assert proposal["write"]["attempted"] is False
-    # The staging survived: x.pyc is still untracked-in-index and still on disk.
+    assert proposal["ready"] is True
+    assert proposal["write"]["ok"] is True
+    # The untracking was committed: x.pyc is no longer tracked nor staged, and a
+    # dedicated sweep commit sits alongside the planned one.
     assert _git(repo, "ls-files", "cache/x.pyc").stdout.strip() == ""
-    assert "cache/x.pyc" in staged_paths(repo)
+    assert "cache/x.pyc" not in staged_paths(repo)
+    ids = [c["id"] for c in proposal["write"]["committed"]]
+    assert "c1" in ids and "staged-sweep" in ids
 
 
 def test_not_ready_when_termination_needs_pm(tmp_path):

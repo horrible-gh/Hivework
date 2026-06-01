@@ -57,6 +57,10 @@ _MESSAGE_RE = re.compile(
     r"^(?:" + "|".join(_ALLOWED_TYPES) + r")(?:\([a-z0-9._\-/]+\))?: .+"
 )
 
+# When the plan leaves a staged path unassigned, the execute stage sweeps it into
+# this final commit rather than halting — staging is explicit commit intent (§0).
+_SWEEP_MESSAGE = "chore: commit staged changes not grouped by the plan"
+
 # Per-commit applicability statuses (only "committable" can contribute to ready).
 COMMITTABLE = "committable"
 EMPTY_FILES = "empty_files"
@@ -385,9 +389,11 @@ def build_commit_proposal(plan: dict[str, Any], repo_root: str) -> dict[str, Any
 
     leftover_set = changed - covered
     leftover = sorted(leftover_set)
-    # Staged paths the plan leaves uncommitted are dangerous, not benign: execute_commits
-    # runs `git reset` before each commit to scope the index, which would silently revert
-    # this staged work (a staged `git rm --cached` deletion becomes re-tracked). Block.
+    # Staged paths the plan left out are NOT a blocker: staging is the operator's
+    # explicit "commit this" intent (§0), and the autonomous pipeline has no human
+    # standing by to resolve a halt. They are surfaced here and swept into a final
+    # commit by execute_commits (so they are honored, never silently reverted by the
+    # per-commit index reset, and never cause a dead stop).
     staged_leftover = sorted(leftover_set & staged)
 
     reasons: list[str] = []
@@ -398,11 +404,6 @@ def build_commit_proposal(plan: dict[str, Any], repo_root: str) -> dict[str, Any
     for r in commit_results:
         if not r["committable"]:
             reasons.append(f"{r['id']}: {r['status']}")
-    if staged_leftover:
-        reasons.append(
-            "staged but assigned to no commit — committing would silently revert "
-            "this staged work via the index reset (e.g. a `git rm --cached` deletion "
-            "becomes re-tracked); assign it to a commit: " + ", ".join(staged_leftover))
     if gate.get("commit") is True:
         reasons.append("gate.commit was True — ignored (write is human-held)")
 
@@ -410,7 +411,6 @@ def build_commit_proposal(plan: dict[str, Any], repo_root: str) -> dict[str, Any
         termination == "ready_to_commit"
         and bool(commit_results)
         and all(r["committable"] for r in commit_results)
-        and not staged_leftover
     )
 
     return {
@@ -492,6 +492,14 @@ def execute_commits(plan: dict[str, Any], repo_root: str) -> dict[str, Any]:
 
     orig_head = _head_commit(repo_root)
 
+    # Staging is explicit "commit this" intent (§0). Capture any staged path the
+    # plan did not assign BEFORE the per-commit index resets wipe the staging — we
+    # commit these in a final sweep rather than halt or silently revert them.
+    covered: set[str] = set()
+    for c in commits:
+        covered.update(_commit_files(c))
+    orphan_staged = sorted(staged_paths(repo_root) - covered)
+
     def _rollback() -> None:
         if orig_head is None:
             # Unborn branch: cannot soft-reset to a sha. Leave commits in place but
@@ -547,6 +555,28 @@ def execute_commits(plan: dict[str, Any], repo_root: str) -> dict[str, Any]:
         sha = _head_commit(repo_root) or "?"
         committed.append({"id": cid, "hash": sha, "message": message})
         logger.info("Committed %s %s — %s", cid, sha[:9], message)
+
+    # Sweep any staged path the plan left unassigned into one final commit —
+    # mechanical (no grouping judgment); staging already declared the intent.
+    if orphan_staged:
+        reset = _git(repo_root, ["reset", "-q"])
+        if reset.returncode != 0:
+            result["reason"] = f"staged-sweep: git reset failed — {reset.stderr.strip()}"
+            _rollback()
+            return result
+        ok, err = _stage_commit_paths(repo_root, orphan_staged)
+        if not ok:
+            result["reason"] = f"staged-sweep: {err}"
+            _rollback()
+            return result
+        com = _git(repo_root, ["commit", "-m", _SWEEP_MESSAGE])
+        if com.returncode != 0:
+            result["reason"] = f"staged-sweep: git commit failed — {com.stderr.strip()}"
+            _rollback()
+            return result
+        sha = _head_commit(repo_root) or "?"
+        committed.append({"id": "staged-sweep", "hash": sha, "message": _SWEEP_MESSAGE})
+        logger.info("Committed staged-sweep %s — %s", sha[:9], _SWEEP_MESSAGE)
 
     result["ok"] = True
     result["committed"] = committed
@@ -621,12 +651,12 @@ def render_commit_proposal_markdown(proposal: dict[str, Any]) -> str:
         lines.append("")
 
     if proposal.get("staged_leftover"):
-        lines.append("## ⚠ Staged but in no commit (would be reverted — fix the plan)")
+        lines.append("## Staged but in no commit — will be auto-committed")
         lines.append("")
         lines.append("These paths are staged (explicit commit intent) yet no commit "
-                     "covers them. The commit run resets the index per commit, so "
-                     "leaving them out silently reverts the staging. Assign each to a "
-                     "commit before writing.")
+                     "covers them. On `--write` they are swept into a final "
+                     f"`{_SWEEP_MESSAGE}` commit, so the staging is honored rather "
+                     "than silently reverted by the per-commit index reset.")
         lines.append("")
         for rel in proposal["staged_leftover"]:
             lines.append(f"- `{rel}`")
