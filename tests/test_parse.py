@@ -281,6 +281,49 @@ class TestRepairStrayEscapes(unittest.TestCase):
         self.assertEqual(result["file_globs"][0],
                          "C:\\workspace\\projects\\FlowGate\\**\\*.py")
 
+    def test_inline_over_escaped_elements_recovered(self):
+        # T890 follow-up: queen emitted the whole keyword array on ONE line, with
+        # bad ``\"..\"`` elements mixed in with well-formed ``"..."`` ones. The
+        # whole-line rule never fires here; the inline boundary rule must.
+        raw = (
+            '{\n'
+            '  "tasks": [\n'
+            '    {"id": "T6", "search_plan": {"keywords": '
+            '["action-bar", "ActionBar", \\"mode=\'info\'\\", '
+            '\\"mode=\'next\'\\", "R tab", "disabled"]}}\n'
+            '  ]\n'
+            '}\n'
+        )
+        result = extract_first_json(raw)
+        kws = result["tasks"][0]["search_plan"]["keywords"]
+        self.assertEqual(
+            kws,
+            ["action-bar", "ActionBar", "mode='info'", "mode='next'",
+             "R tab", "disabled"],
+        )
+
+    def test_genuine_in_value_escaped_quotes_preserved(self):
+        # A genuinely escaped quote inside a string value (preceded by ``=``, not
+        # at an array boundary) is valid JSON and must survive the repair pass
+        # untouched — even when the brief sits alongside a recoverable defect.
+        raw = (
+            '{\n'
+            '  "tasks": [\n'
+            '    {"id": "T2",\n'
+            '     "brief": "snippet showing mode assignment '
+            '(e.g. \'mode=\\"info\\"\') and disabled logic.",\n'
+            '     "search_plan": {"keywords": '
+            '[\\"mode=\'next\'\\", "disabled"]}}\n'
+            '  ]\n'
+            '}\n'
+        )
+        result = extract_first_json(raw)
+        task = result["tasks"][0]
+        self.assertIn('mode="info"', task["brief"])
+        self.assertEqual(
+            task["search_plan"]["keywords"], ["mode='next'", "disabled"]
+        )
+
     def test_unrecoverable_still_raises(self):
         with self.assertRaises(ValueError):
             extract_first_json('{"k": [\\"a\\", garbage notjson ]}')

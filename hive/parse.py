@@ -84,17 +84,36 @@ def _best_object(raw: str) -> tuple[dict[str, Any] | None, json.JSONDecodeError 
 # containing single quotes, which is invalid JSON and desyncs the brace scanner.
 _ESCAPED_ELEMENT_RE = re.compile(r'^(\s*)\\"(.*)\\"(\s*,?\s*)$')
 
+# The same defect, but emitted INLINE inside a single-line array, mixed with
+# well-formed elements: ``["a", \"mode='info'\", \"mode='next'\", "b"]``. The
+# whole-line rule above never fires here. We rewrite only ``\"value\"`` tokens
+# sitting at an array-element boundary — a ``[`` or ``,`` before and a ``,`` or
+# ``]`` after — which is where a delimiter quote belongs. A genuinely escaped
+# quote inside a string value (e.g. ``mode=\"info\"``, preceded by ``=``) is not
+# at a boundary and is therefore left intact. ``[^"\\\n]*`` keeps each match on
+# one line and stops at the closing token's backslash. (T890 follow-up: queen
+# emitted the keyword array on one line.)
+_INLINE_ESCAPED_ELEMENT_RE = re.compile(
+    r'(?<=[\[,])(\s*)\\"([^"\\\n]*)\\"(\s*)(?=\s*[,\]])'
+)
+
 
 def _repair_stray_escapes(raw: str) -> str:
-    """Best-effort, conservative repair of one recurring worker JSON defect.
+    """Best-effort, conservative repair of recurring worker JSON defects.
 
-    Rewrites only WHOLE-LINE array elements that begin with a backslash-escaped
-    delimiter quote (``\\"value\\"``) back to a plain JSON string (``"value"``).
-    Lines that start with a real ``"`` (e.g. a Windows path glob) never match, so
+    Rewrites array elements whose string-delimiter quotes were backslash-escaped
+    (``\\"value\\"``) back to plain JSON strings (``"value"``), in two shapes:
+
+    - whole-line pretty-printed elements (``          \\"value\\",``), and
+    - inline elements at an array boundary on a single line.
+
+    Both rules are deliberately narrow: a real ``"`` at the start of a line and a
+    genuinely escaped quote mid-value never match, so Windows-path globs and
     legitimately escaped in-string quotes are left untouched. This runs only as a
     fallback after strict parsing fails, and the result is re-validated by
     ``json.loads`` — a bad repair still raises rather than returning junk.
     """
+    raw = _INLINE_ESCAPED_ELEMENT_RE.sub(r'\1"\2"\3', raw)
     out: list[str] = []
     for line in raw.split("\n"):
         m = _ESCAPED_ELEMENT_RE.match(line)
