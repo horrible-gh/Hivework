@@ -155,5 +155,78 @@ class TestDeepInfraHandler(unittest.TestCase):
         self.assertNotIn("reasoning_effort", _FakeOpenAI.last_create_kwargs)
 
 
+def _run_codex(out_content=None, rc=0, stdout="(event trace)", model="gpt-5-codex",
+               **call_kwargs):
+    """Call the codex handler with subprocess.run patched. ``out_content`` (when
+    given) is written to the --output-last-message path, simulating codex's final
+    message; otherwise the temp file stays empty and the handler falls back to stdout."""
+    seen = {}
+
+    def fake_run(cmd, **kw):
+        seen["cmd"] = cmd
+        seen["kw"] = kw
+        if out_content is not None and "--output-last-message" in cmd:
+            p = cmd[cmd.index("--output-last-message") + 1]
+            with open(p, "w", encoding="utf-8") as f:
+                f.write(out_content)
+        proc = _FakeProc()
+        proc.returncode = rc
+        proc.stdout = stdout
+        return proc
+
+    with mock.patch.object(providers.shutil, "which", return_value="codex.cmd"), \
+         mock.patch.object(providers.subprocess, "run", side_effect=fake_run):
+        wr = providers.call_worker("codex", model, "do X", cwd="/x", timeout=30,
+                                   **call_kwargs)
+    return wr, seen
+
+
+class TestCodexHandler(unittest.TestCase):
+    def test_registered(self):
+        self.assertIn("codex", providers._REGISTRY)
+
+    def test_exec_cmd_construction(self):
+        _, seen = _run_codex()
+        cmd = seen["cmd"]
+        self.assertEqual(cmd[1], "exec")
+        self.assertIn("-", cmd)                       # stdin marker
+        self.assertIn("--model", cmd)
+        self.assertIn("gpt-5-codex", cmd)
+        self.assertEqual(cmd[cmd.index("--cd") + 1], "/x")
+        self.assertEqual(cmd[cmd.index("--sandbox") + 1], "read-only")
+        self.assertIn("--skip-git-repo-check", cmd)
+        self.assertIn("--output-last-message", cmd)
+
+    def test_prompt_piped_via_stdin(self):
+        _, seen = _run_codex()
+        self.assertEqual(seen["kw"].get("input"), "do X")
+
+    def test_final_message_file_becomes_stdout(self):
+        wr, _ = _run_codex(out_content='{"verdict": {"located": true}}')
+        self.assertEqual(wr.stdout, '{"verdict": {"located": true}}')
+        self.assertEqual(wr.exit_code, 0)
+
+    def test_falls_back_to_stdout_when_no_final_message(self):
+        wr, _ = _run_codex(out_content=None, stdout="trace only, no final")
+        self.assertEqual(wr.stdout, "trace only, no final")
+
+    def test_empty_model_omits_model_flag(self):
+        _, seen = _run_codex(model="")
+        self.assertNotIn("--model", seen["cmd"])
+
+    def test_copilot_kwargs_are_ignored(self):
+        # provider_kwargs carries copilot's exe/allow_flag/available_tools; codex
+        # must tolerate them (resolve its own exe, not copilot's) without error.
+        wr, seen = _run_codex(allow_flag="--allow-all", available_tools=[],
+                              exe="copilot.cmd")
+        self.assertEqual(seen["cmd"][0], "codex.cmd")   # codex exe, not copilot's
+        self.assertNotIn("--allow-all", seen["cmd"])
+        self.assertEqual(wr.exit_code, 0)
+
+    def test_nonzero_exit_surfaced(self):
+        wr, _ = _run_codex(out_content="{}", rc=2)
+        self.assertEqual(wr.exit_code, 2)
+
+
 if __name__ == "__main__":
     unittest.main()

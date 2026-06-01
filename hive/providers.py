@@ -8,7 +8,7 @@ Usage:
     result = call_worker("copilot", "gpt-5-mini", prompt, cwd=root, timeout=300)
     print(result.stdout, result.latency_s)
 """
-import os, shutil, subprocess, time, logging
+import os, shutil, subprocess, tempfile, time, logging
 from dataclasses import dataclass
 
 logger = logging.getLogger("hive.providers")
@@ -134,11 +134,81 @@ def _call_deepinfra(model, prompt, cwd=None, timeout=120, *, system=None,
                         latency_s=latency_s, real_tokens=real_tokens)
 
 
+def _call_codex(model, prompt, cwd=None, timeout=300, *, sandbox="read-only",
+                codex_exe=None, **_ignored) -> WorkerResult:
+    """Call the Codex CLI in non-interactive ``codex exec`` mode (tool-ON agentic).
+
+    The OpenAI-equivalent of the copilot worker: an agentic CLI that reads/explores
+    the live tree and emits a final message. Wired for the tool-ON roles
+    (queen / specify author), NOT the tool-OFF single-shot judge/review (those go to
+    deepinfra). On a ChatGPT subscription login Codex is flat-rate, so it sidesteps
+    copilot's per-internal-turn billing for exactly the stages that dominate cost.
+
+    Mechanics:
+      - the prompt is piped on stdin (``codex exec -`` reads instructions from stdin);
+      - ``--cd`` sets the working root; ``--sandbox read-only`` lets the agent
+        read/run but never write (specify is propose-only, the queen only explores),
+        so there are no approval prompts and no accidental edits;
+      - ``--output-last-message FILE`` captures the agent's FINAL message — we return
+        THAT as ``stdout``, not the event-trace stream, so ``extract_first_json`` sees
+        a clean comb without scraping tool-trace lines (cf. copilot's parse.py);
+      - ``--ephemeral`` / ``--skip-git-repo-check`` keep automation hygienic.
+
+    An empty ``model`` omits ``--model`` so Codex uses its configured default (lets a
+    caller route to Codex without pinning a model string). ``available_tools`` (a
+    copilot concept) has no clean Codex equivalent and is ignored — route tool-OFF
+    work to deepinfra. Token usage is not parsed yet (flat-rate subscription), so
+    ``real_tokens`` is None. A non-zero exit is surfaced on the WorkerResult,
+    matching the other handlers' contract; a timeout propagates like copilot's.
+    """
+    exe = codex_exe or shutil.which("codex.cmd") or shutil.which("codex") or "codex"
+    fd, out_path = tempfile.mkstemp(suffix=".codexmsg.txt")
+    os.close(fd)
+    cmd = [exe, "exec", "-", "--cd", cwd or ".", "--sandbox", sandbox,
+           "--skip-git-repo-check", "--color", "never", "--ephemeral",
+           "--output-last-message", out_path]
+    if model:
+        cmd[2:2] = ["--model", model]  # insert after "exec" (before the "-" stdin marker)
+    logger.debug("call_worker codex: model=%s cwd=%s sandbox=%s timeout=%d",
+                 model, cwd, sandbox, timeout)
+    t0 = time.monotonic()
+    try:
+        result = subprocess.run(cmd, input=prompt, capture_output=True, text=True,
+                                encoding="utf-8", errors="replace", cwd=cwd, timeout=timeout)
+    except BaseException:  # timeout / interrupt: clean up the temp file, then propagate
+        try:
+            os.remove(out_path)
+        except OSError:
+            pass
+        raise
+    latency_s = time.monotonic() - t0
+    # Read the final agent message (the comb), then clean up the temp file.
+    final = ""
+    try:
+        with open(out_path, "r", encoding="utf-8", errors="replace") as f:
+            final = f.read()
+    except OSError:
+        final = ""
+    try:
+        os.remove(out_path)
+    except OSError:
+        pass
+    if not final.strip():
+        final = result.stdout  # codex wrote no final message → fall back to stdout
+    if result.returncode != 0:
+        logger.warning("codex rc=%d (%.1fs) stderr: %s",
+                       result.returncode, latency_s, result.stderr[:500])
+    _tee_call(model, latency_s, result.returncode, result.stderr)
+    return WorkerResult(stdout=final, stderr=result.stderr,
+                        exit_code=result.returncode, latency_s=latency_s)
+
+
 # Extension point: add new providers here.
 # Handler signature: (model, prompt, cwd, timeout, **kwargs) -> WorkerResult
 _REGISTRY: dict = {
     "copilot": _call_copilot,
     "deepinfra": _call_deepinfra,
+    "codex": _call_codex,
 }
 
 
