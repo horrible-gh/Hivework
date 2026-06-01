@@ -1,12 +1,12 @@
 {
   "roles": {
     "queen":    { "provider": "copilot", "model": "gpt-5-mini" },
-    "swarm":    { "provider": "copilot", "model": "gpt-5-mini" },
-    "assemble": { "provider": "copilot", "model": "gpt-5-mini" },
-    "specify":  { "provider": "copilot", "model": "gpt-5-mini" },
+    "specify":  { "provider": "codex", "model": "gpt-5.4-mini" },
     "review":   { "provider": "deepinfra", "model": "openai/gpt-oss-120b" },
     "commit":   { "provider": "copilot", "model": "gpt-5-mini" },
-    "judge":    { "provider": "deepinfra", "model": "openai/gpt-oss-120b" }
+    "judge":    { "provider": "deepinfra", "model": "openai/gpt-oss-120b" },
+    "swarm":    { "provider": "deepinfra", "model": "openai/gpt-oss-120b" },
+    "assemble": { "provider": "copilot", "model": "gpt-5-mini" }
   },
   "copilot": { "exe": null, "allow": "--allow-all", "timeout_sec": 300 },
   "ledger":  { "enabled": true, "db_path": "hive_ledger.db" },
