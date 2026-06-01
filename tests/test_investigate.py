@@ -227,6 +227,41 @@ class TestRenderLocalHoney(unittest.TestCase):
         # the only grounded target belongs to T7, above the fabricate section
         self.assertNotIn("210_design/D031_x.md", tail)
 
+    def test_localisations_are_evidence_not_per_axis_edit_imperatives(self):
+        # T891: the renderer must NOT print "apply the requested change ... at this
+        # location" under every axis (that turned corroborating localisations into
+        # N competing edit imperatives, and the author followed the wrong one).
+        self.assertNotIn("apply the requested change above at this location",
+                         self.honey)
+        # The seed's scope must be elevated to BINDING, with precedence over any
+        # single localisation that conflicts with it.
+        self.assertIn("BINDING", self.honey)
+        self.assertIn("OVERRIDES", self.honey)
+        self.assertIn("not all are edit sites", self.honey)
+
+    def test_same_file_loci_grouped_with_convergence_note(self):
+        # Two axes locating different lines in the SAME file (the T891 shape:
+        # placeholder div vs v-for :class in DocWorkflow.vue) must be grouped and
+        # a convergence note emitted so the author sees the co-location explicitly.
+        result = {
+            "axes_total": 2, "axes_judged": 2,
+            "verdicts": [
+                {"axis_id": "logs_review", "title": "placeholder",
+                 "verdict": {"located": True, "file": "client/DocWorkflow.vue",
+                             "lines": "9-15", "reason": "placeholder renders gray"}},
+                {"axis_id": "async_pipeline", "title": "binding",
+                 "verdict": {"located": True, "file": "client/DocWorkflow.vue",
+                             "lines": "35-47", "reason": "v-for omits current"}},
+            ],
+        }
+        honey = render_local_honey(result, "make ONLY the placeholder div blue")
+        self.assertIn("Convergence", honey)
+        self.assertIn("logs_review", honey)
+        self.assertIn("async_pipeline", honey)
+        # both loci surfaced
+        self.assertIn("9-15", honey)
+        self.assertIn("35-47", honey)
+
     def test_no_located_yields_defer_note(self):
         result = {"axes_total": 1, "axes_judged": 1, "verdicts": [
             {"axis_id": "X", "title": "t",

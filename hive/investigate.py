@@ -175,9 +175,20 @@ def render_local_honey(result: dict[str, Any], seed_text: str) -> str:
     REQUESTED CHANGE (the seed) and the GROUNDED LOCATIONS (judge file:lines +
     reason). We template those deterministically — no model, no ``assemble`` call.
 
-    Located verdicts become fix-direction sections; unlocated/downgraded ones are
-    listed as "no confident localisation" so the specify author neither fabricates
-    an edit there nor silently drops the axis.
+    Located verdicts become grounded LOCALISATIONS (evidence), not per-axis edit
+    imperatives; unlocated/downgraded ones are listed as "no confident
+    localisation" so the specify author neither fabricates an edit there nor
+    silently drops the axis.
+
+    Why localisations are framed as evidence, not as one fix-direction each
+    (T891): the fan-out axes investigate the SAME requested change from different
+    angles. When they locate DIFFERENT loci, an earlier rendering printed "apply
+    the requested change above at this location" under EVERY axis — turning
+    corroborating localisations into N competing edit imperatives. The author then
+    followed a localisation that contradicted the seed's tightly-scoped directive
+    (anchored a v-for :class instead of the named placeholder div). So the seed's
+    stated scope is made BINDING and given precedence over any single localisation,
+    and same-file loci are grouped so convergence is visible without fabricating.
     """
     verdicts = result.get("verdicts", []) or []
     located = [v for v in verdicts if v.get("verdict", {}).get("located")]
@@ -194,25 +205,49 @@ def render_local_honey(result: dict[str, Any], seed_text: str) -> str:
         "",
         seed_text.strip(),
         "",
-        "## Fix directions (grounded localisations)",
+        "## Grounded localisations (investigation evidence — NOT a list of edit sites)",
         "",
-        "Each section is a judge-confirmed location for the requested change. "
-        "Per the edit-spec contract, RE-OPEN each file and lift `anchor_old` from "
-        "the CURRENT text byte-for-byte — the line ranges below are the judge's "
-        "grounding, not authoritative anchors.",
+        "Independent investigation axes located the code below relevant to the "
+        "Requested change above. They TRIANGULATE the relevant code — each is "
+        "EVIDENCE, not an instruction to edit at that line. Author the MINIMAL "
+        "edit(s) that satisfy the Requested change, treating its stated scope as "
+        "BINDING:",
+        "",
+        "- When the Requested change names a specific element / anchor / file to "
+        "change — or names something NOT to touch — that scope OVERRIDES any "
+        "localisation below that points elsewhere: a conflicting localisation is "
+        "context, not a target.",
+        "- Several axes may converge on ONE locus (a strong signal) or land on "
+        "DIFFERENT loci (they cover different angles — most are corroborating "
+        "context, not all are edit sites). Do NOT author one edit per localisation.",
+        "- Per the edit-spec contract, RE-OPEN each file and lift `anchor_old` from "
+        "the CURRENT text byte-for-byte — the line ranges are the judge's grounding, "
+        "not authoritative anchors.",
         "",
     ]
     if located:
+        # Group by file so same-file loci sit together and convergence is visible.
+        by_file: dict[str, list[dict[str, Any]]] = {}
         for v in located:
-            vd = v.get("verdict", {})
-            out += [
-                f"### {v.get('axis_id', '?')} — {v.get('title', '')}".rstrip(" —"),
-                f"- target: {vd.get('file', '')}:{vd.get('lines', '')}",
-                f"- grounding / reason: {vd.get('reason', '')}",
-                "- fix direction: apply the requested change above at this location "
-                "(author the concrete edit/new content per the contract).",
-                "",
-            ]
+            by_file.setdefault(v.get("verdict", {}).get("file", ""), []).append(v)
+        converged = [f for f, vs in by_file.items() if f and len(vs) > 1]
+        if converged:
+            out += ["### Convergence (≥2 axes on the same file — a stronger prior)"]
+            for f in converged:
+                axes = ", ".join(v.get("axis_id", "?") for v in by_file[f])
+                loci = "; ".join(v.get("verdict", {}).get("lines", "") for v in by_file[f])
+                out.append(f"- {f}: axes [{axes}] at lines {loci} "
+                           "(confirm which locus the Requested change's scope names)")
+            out.append("")
+        for f, vs in by_file.items():
+            for v in vs:
+                vd = v.get("verdict", {})
+                out += [
+                    f"### {v.get('axis_id', '?')} — {v.get('title', '')}".rstrip(" —"),
+                    f"- location: {vd.get('file', '')}:{vd.get('lines', '')}",
+                    f"- why relevant: {vd.get('reason', '')}",
+                    "",
+                ]
     else:
         out += ["_No axis produced a grounded localisation. specify should defer "
                 "rather than fabricate an edit._", ""]
