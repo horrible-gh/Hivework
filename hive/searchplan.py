@@ -80,9 +80,12 @@ def _norm_glob(p: str) -> str:
     """Normalise a raw path token into a ripgrep glob.
 
     Wildcards and extensioned files pass through; a bare directory becomes a
-    recursive ``dir/**/*`` so its whole subtree is in scope.
+    recursive ``dir/**/*`` so its whole subtree is in scope. Runs of ``/`` are
+    collapsed: an over-escaped Windows path (``C:\\\\…`` → ``C:\\…``) would
+    otherwise become a doubled-slash glob ``C://…`` that matches nothing (T890).
     """
     p = p.strip().strip(".,;:)('\"").replace("\\", "/").rstrip("/")
+    p = re.sub(r"/{2,}", "/", p)
     if not p:
         return ""
     if "*" in p or _EXT_RE.search(p):

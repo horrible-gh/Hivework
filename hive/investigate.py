@@ -68,6 +68,10 @@ def run_investigate(
     pk = dict(provider_kwargs or {})
 
     # ── ① decompose (queen, 1 call) — now also emits per-axis search_plan.
+    # Stable, pipeline-agnostic stage marker for external watchdogs: the mode→
+    # pipeline routing means a "create" task runs here (no "STAGE ② fan-out"), so
+    # monitors grep ``[HIVE_STAGE]`` (self-describing) rather than a run-only label.
+    logger.info("[HIVE_STAGE] pipeline=investigate stage=1 name=decompose")
     logger.info("① decompose (queen %s/%s)", queen.provider, queen.model)
     decompose_result = run_decompose(
         seed_text=seed_text, recipe_path=recipe_path, codebase_root=code_root,
@@ -85,6 +89,8 @@ def run_investigate(
     for task in judged:
         sp = task_to_searchplan(task, default_globs=default_globs)
         symptom = str(task.get("brief") or task.get("title") or sp.axis_id)
+        logger.info("[HIVE_STAGE] pipeline=investigate stage=2 name=retrieve axis=%s",
+                    sp.axis_id)
         logger.info("② retrieve [%s] keywords=%d globs=%d (local, free)",
                     sp.axis_id, len(sp.keywords), len(sp.file_globs))
         bundle = retrieve(sp, code_root, docs_root, k=k,
@@ -98,6 +104,8 @@ def run_investigate(
                         gv.get("kept"), gv.get("dropped_empty"),
                         gv.get("dropped_overbroad"))
 
+        logger.info("[HIVE_STAGE] pipeline=investigate stage=3 name=judge axis=%s",
+                    sp.axis_id)
         logger.info("③ JUDGE [%s] (%s/%s, ≤%d calls)", sp.axis_id,
                     judge_role.provider, judge_role.model,
                     cfg.judge.max_calls_per_axis)

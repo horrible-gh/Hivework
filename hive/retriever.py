@@ -99,9 +99,15 @@ def _norm_glob(g: str, root: str) -> str:
     Fix: an absolute glob *under* ``root`` becomes root-relative; an absolute
     glob *outside* ``root`` (un-relativizable) degrades to its basename pattern,
     which ``rg -g`` matches at any depth. Already-relative globs pass through.
+
+    Separator hygiene: the queen periodically over-escapes a Windows path
+    (``C:\\\\…`` → the parsed value ``C:\\…`` with doubled backslashes), which
+    ``\\``→``/`` turns into ``C://…`` — a doubled-slash glob ``rg`` matches against
+    NOTHING (observed: T890, D031 never retrieved). Collapse runs of ``/`` so the
+    glob is matchable. (Drive paths only — no UNC ``//host`` in scope here.)
     """
-    gn = g.replace("\\", "/")
-    rn = root.replace("\\", "/").rstrip("/")
+    gn = re.sub(r"/{2,}", "/", g.replace("\\", "/"))
+    rn = re.sub(r"/{2,}", "/", root.replace("\\", "/")).rstrip("/")
     if gn.lower().startswith(rn.lower() + "/"):
         return gn[len(rn) + 1:]
     if re.match(r"^[A-Za-z]:/", gn) or gn.startswith("/"):
