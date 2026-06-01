@@ -77,6 +77,60 @@ class TestEvaluateEdit(unittest.TestCase):
         self.assertEqual(r["status"], apply.ANCHOR_AMBIGUOUS)
         self.assertFalse(r["applicable"])
 
+    # ── post-apply verification: unique anchor but broken result (T889) ──────────
+
+    def test_overlap_anchor_duplicates_following_lines(self):
+        # anchor ends mid-block; replacement re-states the lines that FOLLOW it →
+        # applying duplicates them (the exact shape that crashed in T889's E1).
+        self._write("a.py",
+                    "if head is not None:\n"
+                    "    out['title'] = head.get('title')\n"
+                    "    out['status'] = head.get('status')\n"
+                    "    out['kind'] = head.get('kind')\n"
+                    "elif other_condition_holds:\n"
+                    "    fallback_value = compute_default()\n")
+        anchor = ("if head is not None:\n"
+                  "    out['title'] = head.get('title')\n")
+        repl = ("if head is not None:\n"
+                "    out['title'] = head.get('title')\n"
+                "    out['status'] = head.get('status')\n"
+                "    out['kind'] = head.get('kind')\n"
+                "elif other_condition_holds:\n"
+                "    fallback_value = compute_default()\n"
+                "    extra_added = True\n")
+        r = apply.evaluate_edit(_edit(anchor, repl), self.root)
+        self.assertEqual(r["status"], apply.POST_APPLY_BROKEN)
+        self.assertFalse(r["applicable"])
+        self.assertTrue(any("duplicate" in m for m in r["messages"]))
+
+    def test_python_syntax_break_is_caught(self):
+        self._write("a.py", "def f():\n    return 1\n")
+        r = apply.evaluate_edit(
+            _edit("    return 1", "    return (1"), self.root)  # unbalanced paren
+        self.assertEqual(r["status"], apply.POST_APPLY_BROKEN)
+        self.assertFalse(r["applicable"])
+        self.assertTrue(any("compile" in m for m in r["messages"]))
+
+    def test_vue_template_dotvalue_is_caught(self):
+        self._write("c.vue",
+                    "<template>\n"
+                    "  <div :class=\"flag ? 'on' : ''\"></div>\n"
+                    "</template>\n"
+                    "<script setup>\nconst flag = computed(() => true)\n</script>\n")
+        r = apply.evaluate_edit(
+            _edit("flag ? 'on' : ''", "flag.value ? 'on' : ''", file="c.vue"),
+            self.root)
+        self.assertEqual(r["status"], apply.POST_APPLY_BROKEN)
+        self.assertFalse(r["applicable"])
+        self.assertTrue(any(".value" in m for m in r["messages"]))
+
+    def test_clean_edit_still_applicable(self):
+        # a normal, sound edit must still pass the new checks.
+        self._write("a.py", "x = 1\ny = 2\n")
+        r = apply.evaluate_edit(_edit("x = 1", "x = 42"), self.root)
+        self.assertEqual(r["status"], apply.APPLICABLE)
+        self.assertTrue(r["applicable"])
+
     def test_missing_anchor(self):
         self._write("a.py", "totally different\n")
         r = apply.evaluate_edit(_edit("x = 1", "x = 2"), self.root)

@@ -36,6 +36,9 @@ import difflib
 import json
 import logging
 import os
+import py_compile
+import re
+import tempfile
 from typing import Any
 
 from hive import backup as backup_store
@@ -55,6 +58,7 @@ NO_CHANGE = "no_change"
 CREATE_OK = "create_ok"          # target absent + content non-empty → applicable
 FILE_EXISTS = "file_exists"      # create_file target already on disk → not applicable
 EMPTY_CONTENT = "empty_content"  # content empty/whitespace-only → not applicable
+POST_APPLY_BROKEN = "post_apply_broken"  # anchor unique but the applied result is broken
 
 
 def load_spec(spec_path: str) -> dict[str, Any]:
@@ -95,12 +99,101 @@ def render_creation_diff(rel_path: str, content: str) -> str:
     return "".join(diff)
 
 
+def _template_dotvalue_count(text: str) -> int:
+    """Count ``<ident>.value`` occurrences inside the ``<template>`` of a Vue SFC.
+
+    In Vue 3 ``<script setup>`` refs/computed are auto-unwrapped in the template, so
+    ``foo.value`` written there reads ``.value`` off the already-unwrapped value
+    (``undefined``). A template should therefore never contain ``<ref>.value``.
+    """
+    m = re.search(r"<template[^>]*>(.*)</template>", text, re.DOTALL | re.IGNORECASE)
+    region = m.group(1) if m else ""
+    return len(re.findall(r"\b[A-Za-z_$][\w$]*\.value\b", region))
+
+
+def _distinctive(line: str) -> bool:
+    """A line carrying enough signal to flag as a duplicate (excludes trivia).
+
+    Trivial structural lines (``)``, ``},``, ``else:``, ``pass``) recur all over a
+    file and would false-match the overlap check; a distinctive line is ≥6 chars
+    of stripped content and contains an identifier-ish token.
+    """
+    s = line.strip()
+    return len(s) >= 6 and re.search(r"[A-Za-z_]\w\w", s) is not None
+
+
+def _post_apply_defects(rel_path: str, file_text: str, anchor_old: str,
+                        replacement_new: str, modified: str) -> list[str]:
+    """Deterministic, env-free checks that the dry-applied result isn't broken.
+
+    A unique anchor only proves *where* the edit lands, not that the result is
+    sound — the gap that let Hive call a crashing edit "READY, applicable" (T889):
+    an anchor that ended mid-block while the replacement re-stated the lines that
+    FOLLOW it (→ duplicated block + a None-branch attribute access that still
+    *parses*), and a Vue ``<template>`` edit that introduced ref ``.value``. These
+    checks run no model and need no project environment; they raise the floor
+    (no broken edit ships as READY) without judging whether the fix is correct.
+
+    Returns a list of defect messages — empty means clean.
+    """
+    defects: list[str] = []
+
+    # 1. Anchor-boundary overlap → duplication. A sound replacement rewrites the
+    #    anchored span; it must not re-emit the lines that already FOLLOW the
+    #    anchor (those stay in the file → duplicated). The signature is precise:
+    #    replacement_new reproduces the CONTIGUOUS run of code lines immediately
+    #    after the anchor. We compare only *distinctive* lines (≥6 chars with an
+    #    identifier) so trivial lines like ``)`` / ``else:`` can't false-match, and
+    #    require a prefix run ≥2 so a lone coincidental line doesn't trip it.
+    pos = file_text.find(anchor_old)
+    if anchor_old and pos != -1:
+        after = file_text[pos + len(anchor_old):]
+        after_distinct = [ln for ln in after.splitlines() if _distinctive(ln)][:8]
+        repl_lines = {ln for ln in replacement_new.splitlines() if _distinctive(ln)}
+        run = 0
+        for ln in after_distinct:
+            if ln in repl_lines:
+                run += 1
+            else:
+                break
+        if run >= 2:
+            defects.append(
+                f"anchor likely too short: replacement re-emits {run} line(s) that "
+                f"already follow the anchor (e.g. {after_distinct[0].strip()[:60]!r})"
+                " — applying would duplicate them")
+
+    # 2. Vue SFC: flag ``.value`` this edit INTRODUCES into the <template> region.
+    if rel_path.endswith(".vue"):
+        before_n = _template_dotvalue_count(file_text)
+        after_n = _template_dotvalue_count(modified)
+        if after_n > before_n:
+            defects.append(
+                f"edit introduces `.value` inside <template> ({before_n}→{after_n}); "
+                "Vue auto-unwraps refs there, so `.value` evaluates to undefined")
+
+    # 3. Python: the applied file must still compile.
+    if rel_path.endswith(".py"):
+        with tempfile.TemporaryDirectory() as d:
+            src = os.path.join(d, "edited.py")
+            with open(src, "w", encoding="utf-8") as f:
+                f.write(modified)
+            try:
+                py_compile.compile(src, cfile=os.path.join(d, "out.pyc"),
+                                   doraise=True)
+            except py_compile.PyCompileError as e:
+                defects.append(f"applied file fails to compile: "
+                               f"{str(e.msg).strip()[:160]}")
+
+    return defects
+
+
 def evaluate_edit(edit: dict[str, Any], codebase_root: str) -> dict[str, Any]:
     """Re-verify one edit against LIVE code and render its diff.
 
     Returns a result dict describing applicability. The edit is ``applicable``
-    only when ``anchor_old`` occurs exactly once in the current file; the diff is
-    rendered for that single, unambiguous replacement.
+    only when ``anchor_old`` occurs exactly once in the current file AND the
+    dry-applied result passes :func:`_post_apply_defects`; the diff is rendered
+    for that single, unambiguous replacement.
     """
     edit_id = edit.get("id", "?")
     rel_path = edit.get("file", "")
@@ -166,9 +259,19 @@ def evaluate_edit(edit: dict[str, Any], codebase_root: str) -> dict[str, Any]:
 
     if occurrences == 1:
         modified = file_text.replace(anchor_old, replacement_new, 1)
+        result["diff"] = render_unified_diff(rel_path, file_text, modified)
+
+        # Anchor is unique — but is the APPLIED result sound? Re-verify deterministically.
+        defects = _post_apply_defects(
+            rel_path, file_text, anchor_old, replacement_new, modified)
+        if defects:
+            result["status"] = POST_APPLY_BROKEN
+            result["applicable"] = False
+            result["messages"].extend(defects)
+            return result
+
         result["status"] = APPLICABLE
         result["applicable"] = True
-        result["diff"] = render_unified_diff(rel_path, file_text, modified)
         if str(edit.get("anchor_status", "")).lower() != "verified":
             # Live matches, but specify did not mark it verified — surface, don't block.
             result["messages"].append(
