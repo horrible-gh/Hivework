@@ -68,6 +68,56 @@ class TestBuildPrompt(unittest.TestCase):
         # The "lift anchors from live code" instruction must be present.
         self.assertIn("byte-for-byte", prompt)
 
+    def test_no_docs_block_when_docs_root_absent(self):
+        prompt = specify.build_specify_prompt(
+            honey_text="H", contract_text="C", codebase_root=r"C:\code")
+        self.assertNotIn("Design-docs root", prompt)
+
+    def test_docs_block_present_when_docs_root_given(self):
+        prompt = specify.build_specify_prompt(
+            honey_text="H", contract_text="C", codebase_root=r"C:\code",
+            docs_root=r"C:\docs\tree")
+        self.assertIn("Design-docs root", prompt)
+        self.assertIn(r"C:\docs\tree", prompt)
+        # The author must be told to prefer the doc over the nearest source file.
+        self.assertIn("Prefer the design document", prompt)
+
+
+class TestStampRoot(unittest.TestCase):
+    """codebase_root is stamped with the tree that actually holds the edited
+    files, so apply resolves a doc edit even without --docs on the apply call."""
+
+    def setUp(self):
+        self.code = tempfile.mkdtemp()
+        self.docs = tempfile.mkdtemp()
+        os.makedirs(os.path.join(self.docs, "210_design"), exist_ok=True)
+        with open(os.path.join(self.docs, "210_design", "D031.md"), "w",
+                  encoding="utf-8") as f:
+            f.write("doc body\n")
+
+    def _spec(self, file):
+        return {"edits": [{"id": "E1", "file": file, "kind": "edit",
+                           "anchor_old": "a", "replacement_new": "b"}]}
+
+    def test_doc_edit_stamps_docs_root(self):
+        spec = self._spec(os.path.join("210_design", "D031.md"))
+        self.assertEqual(specify._stamp_root(spec, self.code, self.docs), self.docs)
+
+    def test_code_edit_stamps_codebase_root(self):
+        with open(os.path.join(self.code, "a.py"), "w", encoding="utf-8") as f:
+            f.write("x = 1\n")
+        spec = self._spec("a.py")
+        self.assertEqual(specify._stamp_root(spec, self.code, self.docs), self.code)
+
+    def test_no_docs_root_returns_codebase(self):
+        spec = self._spec("whatever.md")
+        self.assertEqual(specify._stamp_root(spec, self.code, None), self.code)
+
+    def test_create_file_only_spec_returns_codebase(self):
+        spec = {"edits": [{"id": "E1", "file": "new.md", "kind": "create_file",
+                           "content": "x"}]}
+        self.assertEqual(specify._stamp_root(spec, self.code, self.docs), self.code)
+
 
 class TestNormalizeSpec(unittest.TestCase):
     def test_forces_apply_false(self):
