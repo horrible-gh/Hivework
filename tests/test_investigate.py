@@ -160,6 +160,36 @@ class TestInvestigateWiring(unittest.TestCase):
         self.assertIn("css_rules", joined)
         self.assertIn("DROPPING", joined)
 
+    # N165 docs=(none) confound: an axis carries doc_topics but no docs tree was
+    # supplied → the design channel is silently skipped. Surface it at WARNING.
+    _DOC_AXIS = json.dumps({
+        "fanout_decision": "fanout", "reason": "x",
+        "steps": [["design_ssot"]],
+        "tasks": [
+            {"id": "design_ssot", "title": "design ssot", "depends_on": [],
+             "brief": "confirm the D030 action-bar policy in the design doc",
+             "search_plan": {"keywords": ["action-bar"],
+                             "file_globs": ["Documents/projects/FlowGate/210_design/**"],
+                             "doc_topics": ["action-bar policy"]}},
+        ],
+    })
+
+    def test_warns_when_doc_topics_but_no_docs_root(self):
+        cfg = load_config()
+        cfg.judge.max_calls_per_axis = 1
+        with tempfile.TemporaryDirectory() as td:
+            out = os.path.join(td, "v.json")
+            with mock.patch("hive.decompose.call_worker", return_value=_wr(self._DOC_AXIS)), \
+                 mock.patch("hive.judge.call_worker", return_value=_wr(VERDICT_OUT)), \
+                 mock.patch("hive.investigate.retrieve", side_effect=_fake_retrieve), \
+                 self.assertLogs("hive.investigate", level="WARNING") as cm:
+                INV.run_investigate(
+                    seed_text="x", recipe_path=None, code_root=td,
+                    docs_root=None, output_path=out, cfg=cfg, ledger=None)
+        joined = "\n".join(cm.output)
+        self.assertIn("--docs", joined)
+        self.assertIn("design-doc channel is DISABLED", joined)
+
 
 class TestRenderLocalHoney(unittest.TestCase):
     """The free verdict→honey seam that lets the cheap path feed specify."""

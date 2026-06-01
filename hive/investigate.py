@@ -96,9 +96,22 @@ def run_investigate(
 
     # ── ②..③ per axis: bridge → local retrieve (free) → JUDGE (budgeted).
     verdicts: list[dict[str, Any]] = []
+    warned_no_docs = False
     for task in judged:
         sp = task_to_searchplan(task, default_globs=default_globs)
         symptom = str(task.get("brief") or task.get("title") or sp.axis_id)
+        # docs=(none) confound (N165): the queen produced doc_topics for an axis
+        # but no docs tree was supplied, so the entire design-doc channel is
+        # silently skipped and any doc-targeting glob degrades into a code-tree
+        # search. Surface it once at WARNING — a missing --docs is an invocation
+        # bug, not a localisation result.
+        if docs_root is None and sp.doc_topics and not warned_no_docs:
+            logger.warning(
+                "docs_root not supplied (--docs) but axes carry doc_topics "
+                "(first: [%s] topics=%s): the design-doc channel is DISABLED and "
+                "doc-targeted globs fall back to the code tree. Pass --docs <dir> "
+                "to enable design retrieval.", sp.axis_id, sp.doc_topics)
+            warned_no_docs = True
         logger.info("[HIVE_STAGE] pipeline=investigate stage=2 name=retrieve axis=%s",
                     sp.axis_id)
         logger.info("② retrieve [%s] keywords=%d globs=%d (local, free)",
