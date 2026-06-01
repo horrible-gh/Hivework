@@ -217,6 +217,31 @@ class TestRunSpecify(unittest.TestCase):
         with self.assertRaises(ValueError):
             self._run("● Read a.py\n  └ nothing parseable here\n")
 
+    def test_author_echoed_codebase_root_is_overridden_to_docs(self):
+        # The author worker echoes the prompt's CODE root into the spec, but the
+        # edit targets a doc that lives under docs_root. The deterministic stamp
+        # must overwrite the untrusted author value so apply can resolve the path.
+        docs = tempfile.mkdtemp()
+        os.makedirs(os.path.join(docs, "210_design"), exist_ok=True)
+        rel = os.path.join("210_design", "D031.md")
+        with open(os.path.join(docs, rel), "w", encoding="utf-8") as f:
+            f.write("doc body\n")
+        leaky = {
+            "edits": [{"id": "E1", "file": rel, "kind": "edit",
+                       "anchor_old": "doc body", "replacement_new": "doc body!",
+                       "anchor_status": "verified"}],
+            "deferred": [], "gate": {"apply": False},
+            "termination": "ready_to_apply",
+            "codebase_root": self.tmp,  # author echoed the CODE root (wrong)
+        }
+        with mock.patch.object(specify, "call_worker",
+                               return_value=_wr(json.dumps(leaky))):
+            spec = specify.run_specify(
+                honey_path=self.honey, codebase_root=self.tmp,
+                output_path=self.out, contract_path=self.contract,
+                review=False, docs_root=docs)
+        self.assertEqual(spec["codebase_root"], os.path.abspath(docs))
+
 
 class TestDeterministicNoop(unittest.TestCase):
     def test_whitespace_only_change_is_noop(self):

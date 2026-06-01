@@ -573,13 +573,16 @@ def run_specify(
         logger.warning("specify: edit-spec has structural problems: %s", "; ".join(problems))
 
     # Record provenance so a derived diff / reconcile loop can trace this back.
-    # Stamp codebase_root with the tree that actually holds the edited files: for a
-    # design-doc edit the anchors live under docs_root, not the code tree. This keeps
-    # the spec self-consistent so apply resolves the paths even if the caller never
-    # passes --docs to apply (apply joins file paths against this codebase_root).
+    # FORCE codebase_root to the tree that actually holds the edited files (probed
+    # deterministically): for a design-doc edit the anchors live under docs_root,
+    # not the code tree. We overwrite rather than setdefault because the author
+    # worker routinely echoes the prompt's code root into the spec — an untrusted
+    # value (worker output is a draft). Stamping the real root keeps the spec
+    # self-consistent so apply resolves the paths even when the caller never passes
+    # --docs to apply (apply joins file paths against this codebase_root).
     spec.setdefault("source_honey", honey_path)
-    spec.setdefault("codebase_root",
-                    os.path.abspath(_stamp_root(spec, codebase_root, docs_root)))
+    spec["codebase_root"] = os.path.abspath(
+        _stamp_root(spec, codebase_root, docs_root))
 
     os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
     with open(output_path, "w", encoding="utf-8") as f:
