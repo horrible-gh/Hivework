@@ -169,6 +169,24 @@ def test_partition_routes_relative_docs_glob_and_strips_basename():
     assert doc_g == ["projects/FlowGate/210_design/**", "**/FlowGate/**"]
 
 
+def test_partition_routes_relative_docs_glob_under_deep_docs_root():
+    # T891: the launcher default docs_root is the per-project tree
+    # '.../Documents/projects/FlowGate' (basename 'FlowGate'), so the queen's
+    # relative glob carries a MULTI-segment overlap ('Documents/projects/FlowGate')
+    # whose FIRST segment is 'Documents', not the basename. The single-basename
+    # strip never matched it and every doc glob leaked to code (design_excerpts
+    # permanently empty). The longest contiguous suffix-overlap must be stripped.
+    code = "C:/workspace/projects/FlowGate"
+    docs = "C:/workspace/projects/Documents/projects/FlowGate"
+    code_g, doc_g = _partition_globs(
+        ["client/src/components/**/*.vue",
+         "Documents/projects/FlowGate/210_design/**",
+         "Documents/projects/FlowGate/**/*.md"],
+        code, docs)
+    assert code_g == ["client/src/components/**/*.vue"]
+    assert doc_g == ["210_design/**", "**/*.md"]
+
+
 def test_partition_relative_docs_is_noop_without_docs_root():
     # No docs tree → nothing to route to; the relative glob stays code-side (and
     # will be dropped as empty there). Guards against misrouting when --docs absent.

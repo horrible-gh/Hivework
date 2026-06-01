@@ -130,33 +130,51 @@ def _abs_under(glob: str, root: str | None) -> bool:
 
 
 def _rel_under_docs(glob: str, docs_root: str | None) -> str | None:
-    """Recognise a *relative* glob the queen rooted at ``docs_root``'s PARENT.
+    """Recognise a *relative* glob the queen rooted ABOVE ``docs_root``.
 
-    The queen emits design-doc targets relative to the workspace root — the
-    parent of both ``code_root`` and ``docs_root`` — so they arrive carrying
-    ``docs_root``'s basename as their leading segment (e.g.
-    ``Documents/projects/FlowGate/210_design/**`` when ``docs_root`` ends in
-    ``/Documents``; observed N165 D030_CHECK/DESIGN_SSOT). Such a glob is NOT
-    absolute, so :func:`_abs_under` never routes it to the docs channel; it leaks
-    to the code tree, matches nothing, and the design SSOT is silently dropped.
+    The queen emits design-doc targets relative to the workspace root — an
+    ancestor of both ``code_root`` and ``docs_root`` — so they arrive carrying
+    one or more of ``docs_root``'s own trailing path segments as their leading
+    segments (e.g. ``Documents/projects/FlowGate/210_design/**``). Such a glob is
+    NOT absolute, so :func:`_abs_under` never routes it to the docs channel; it
+    leaks to the code tree, matches nothing, and the design SSOT is silently
+    dropped.
 
-    Return the glob made docs-root-relative (leading basename segment stripped,
-    e.g. ``projects/FlowGate/210_design/**``) so ``rg -g`` matches it under
-    ``docs_root``; or ``None`` if ``glob`` is not such a glob. Absolute globs are
-    left to :func:`_abs_under`.
+    The leading overlap can be more than one segment: how many depends on how
+    DEEP ``docs_root`` is.
+
+      * Shallow ``docs_root`` ending in ``/Documents`` → the glob's single leading
+        ``Documents`` overlaps (N165 D030_CHECK/DESIGN_SSOT).
+      * Deep ``docs_root`` ending in ``/Documents/projects/FlowGate`` (the launcher
+        default for a per-project docs tree) → the glob's leading
+        ``Documents/projects/FlowGate`` *all three* overlap. The original
+        single-basename strip ("FlowGate" only) never matched a glob whose first
+        segment is "Documents", so every doc glob leaked to code and
+        ``design_excerpts`` was permanently empty (observed T891).
+
+    Strip the LONGEST leading run of glob segments that is a contiguous SUFFIX of
+    ``docs_root``'s path, and return the remainder made docs-root-relative (e.g.
+    ``210_design/**``) so ``rg -g`` matches it under ``docs_root``; or ``None`` if
+    no such overlap exists (a real code glob is left code-side). Longest-first is
+    the more specific, safer match; the 1-segment case is exactly the prior
+    behaviour. Absolute globs are left to :func:`_abs_under`.
     """
     if not docs_root:
         return None
     g = re.sub(r"/{2,}", "/", glob.replace("\\", "/")).lstrip("/")
     if re.match(r"^[A-Za-z]:/", g):           # absolute — _abs_under's job
         return None
-    base = os.path.basename(
-        re.sub(r"/{2,}", "/", docs_root.replace("\\", "/")).rstrip("/"))
-    if not base:
+    root_segs = [s for s in re.sub(r"/{2,}", "/", docs_root.replace("\\", "/"))
+                 .rstrip("/").split("/") if s]
+    g_segs = [s for s in g.split("/") if s]
+    if not root_segs or not g_segs:
         return None
-    first, sep, rest = g.partition("/")
-    if sep and rest and first.lower() == base.lower():
-        return rest
+    # Largest j where the first j glob segments equal the last j docs_root
+    # segments (case-insensitive for Windows). Bounded so the remainder stays
+    # non-empty — a glob that is ONLY the overlap names the dir, not a target.
+    for j in range(min(len(root_segs), len(g_segs) - 1), 0, -1):
+        if [s.lower() for s in g_segs[:j]] == [s.lower() for s in root_segs[-j:]]:
+            return "/".join(g_segs[j:])
     return None
 
 
