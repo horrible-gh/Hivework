@@ -31,7 +31,11 @@ _DEFAULTS: dict[str, Any] = {
     # Cost caps for the JUDGE-directed follow-up loop. The retriever is built
     # for ≤1 re-search per axis (≤2 model calls: 1 judge + ≤1 re-judge); these
     # knobs surface that budget in config so spend is controllable, not hidden.
-    "judge":   {"max_calls_per_axis": 2, "max_axes": 3, "max_parallel": 2},
+    # max_axes is a RUNAWAY-CEILING, not an aggressive cap: with a cheap judge
+    # provider, judging all leaf axes costs cents, so we judge every leaf up to
+    # this ceiling. A low cap (was 3) silently dropped decisive grep-once axes
+    # past position N (N164: css_rules cut → specify ran blind → self-reversal).
+    "judge":   {"max_calls_per_axis": 2, "max_axes": 12, "max_parallel": 2},
     # Cost guard-rails. allow_swarm=false makes `hive.py run` refuse to launch the
     # open-ended swarm (fan-out + reconcile) and point at the cheap investigate path.
     "safety":  {"allow_swarm": True},
@@ -94,12 +98,14 @@ class JudgeConfig:
 
     The retriever's follow-up mechanism is built for ≤1 re-search per axis
     (``max_calls_per_axis`` model calls: 1 judge + ≤1 re-judge). ``max_axes``
-    bounds how many axes a single run will judge, and ``max_parallel`` caps
-    concurrent judge calls — surfacing the whole budget here so spend is
-    controllable rather than hidden in a counter.
+    is a runaway-ceiling on judged leaf axes (not an aggressive cap): a cheap
+    judge provider makes judging every leaf cost cents, so the ceiling is high
+    enough to cover a normal decompose (5–10 leaves) and only guards against a
+    pathological axis explosion. ``max_parallel`` caps concurrent judge calls —
+    surfacing the whole budget here so spend is controllable rather than hidden.
     """
     max_calls_per_axis: int = 2
-    max_axes: int = 3
+    max_axes: int = 12
     max_parallel: int = 2
 
 
@@ -196,7 +202,7 @@ def load_config(path: str | None = None) -> Config:
         ),
         judge=JudgeConfig(
             max_calls_per_axis=int(judge_raw.get("max_calls_per_axis", 2)),
-            max_axes=int(judge_raw.get("max_axes", 3)),
+            max_axes=int(judge_raw.get("max_axes", 12)),
             max_parallel=int(judge_raw.get("max_parallel", 2)),
         ),
         safety=SafetyConfig(

@@ -48,7 +48,9 @@ class TestConfigDefaults(unittest.TestCase):
 
     def test_judge_caps_defaults(self):
         self.assertEqual(self.cfg.judge.max_calls_per_axis, 2)
-        self.assertEqual(self.cfg.judge.max_axes, 3)
+        # max_axes is a runaway-ceiling (judge every leaf up to this), not an
+        # aggressive cap — raised from 3 after N164 (decisive axis cut at cap).
+        self.assertEqual(self.cfg.judge.max_axes, 12)
         self.assertEqual(self.cfg.judge.max_parallel, 2)
 
     def test_safety_allow_swarm_default_true(self):
@@ -118,7 +120,7 @@ class TestConfigJudgePartial(unittest.TestCase):
         self.assertEqual(self.cfg.judge.max_calls_per_axis, 4)
 
     def test_other_caps_still_default(self):
-        self.assertEqual(self.cfg.judge.max_axes, 3)
+        self.assertEqual(self.cfg.judge.max_axes, 12)
         self.assertEqual(self.cfg.judge.max_parallel, 2)
 
     def test_judge_role_still_default(self):
