@@ -28,7 +28,7 @@ from hive.assemble import run_assemble
 from hive.specify import run_specify
 from hive.apply import run_apply
 from hive.commit import run_propose, run_commit
-from hive.investigate import run_investigate
+from hive.investigate import render_local_honey, run_investigate
 from hive import backup as backup_store
 
 
@@ -61,6 +61,21 @@ def run_pipeline(args: argparse.Namespace) -> None:
     logger = logging.getLogger("hive")
     cfg = load_config()
     cfg.apply_cli_model(args.model)
+
+    # ── Cost guard-rail (safety.allow_swarm): refuse the open-ended swarm before
+    #    spending a single credit. The swarm fan-out (one agentic drone per axis,
+    #    billed per internal turn) is the run path's blow-up risk; when it is
+    #    locked off in config, route the operator to the cheap investigate path
+    #    rather than silently launching drones.
+    if not cfg.safety.allow_swarm:
+        logger.error("=" * 60)
+        logger.error("Swarm `run` path is DISABLED by config (safety.allow_swarm=false).")
+        logger.error("This blocks fan-out + reconcile drones (the cost/​hang risk).")
+        logger.error("Use the cheap path instead:")
+        logger.error("  python hive.py investigate --specify --seed <s> --codebase <r> --out <o>")
+        logger.error("To deliberately allow the swarm, set safety.allow_swarm=true in hive.config.json.")
+        logger.error("=" * 60)
+        raise SystemExit(2)
 
     provider_kwargs: dict[str, str] = {}
     if cfg.copilot.exe:
@@ -396,6 +411,43 @@ def run_investigate_command(args: argparse.Namespace) -> None:
                 located, result.get("axes_judged", 0))
     logger.info("  Report: %s (+ .md)", args.out)
     logger.info("=" * 60)
+
+    # ── Optional chained specify: cheap-path verdicts → LOCAL honey → edit-spec.
+    #    No assemble model call — the honey is templated from the verdicts (free),
+    #    then the single specify author lowers it against live code. This is what
+    #    lets a create/edit task get its edit-spec WITHOUT swarm fan-out.
+    if getattr(args, "specify", False):
+        if located == 0:
+            logger.warning("Skipping chained specify: no located verdict to author "
+                           "an edit from (specify would have nothing to lower).")
+            return
+        honey_path = os.path.splitext(args.out)[0] + ".honey.md"
+        with open(honey_path, "w", encoding="utf-8") as f:
+            f.write(render_local_honey(result, seed_text))
+        logger.info("Local honey rendered (no assemble call): %s", honey_path)
+
+        specify_role = cfg.role("specify")
+        spec_out = args.spec_out or (os.path.splitext(args.out)[0] + ".edit_spec.json")
+        logger.info("─" * 60)
+        logger.info("specify (chained — local honey → edit-spec, propose only) %s/%s",
+                    specify_role.provider, specify_role.model)
+        logger.info("─" * 60)
+        ldg2 = open_ledger(cfg.ledger.enabled, cfg.ledger.db_path)
+        try:
+            spec = run_specify(
+                honey_path=honey_path, codebase_root=args.codebase,
+                output_path=spec_out, contract_path=args.contract,
+                model=specify_role.model, provider=specify_role.provider,
+                ledger=ldg2, provider_kwargs=provider_kwargs,
+            )
+            logger.info("Edit-spec: %s (%d edits, %d deferred, termination=%s)",
+                        spec_out, len(spec.get("edits") or []),
+                        len(spec.get("deferred") or []), spec.get("termination", "?"))
+        except Exception as e:
+            logger.error("Chained specify failed (verdicts + honey intact at %s): %s",
+                         honey_path, e)
+        finally:
+            ldg2.close()
 
 
 def run_specify_command(args: argparse.Namespace) -> None:
@@ -733,6 +785,21 @@ def main() -> None:
     inv_parser.add_argument(
         "--model", default=None,
         help="Model override for all roles (default: per-role config)",
+    )
+    inv_parser.add_argument(
+        "--specify", action="store_true",
+        help="Chain specify after the verdicts: render a LOCAL honey from the "
+             "verdicts (no assemble call) → edit-spec JSON (propose only)",
+    )
+    inv_parser.add_argument(
+        "--spec-out", default=None,
+        help="Output path for the chained --specify edit-spec "
+             "(default: <out>.edit_spec.json)",
+    )
+    inv_parser.add_argument(
+        "--contract", default=None,
+        help="Path to the edit-spec contract for --specify "
+             "(default: recipes/edit_spec_contract_v1.md)",
     )
     inv_parser.add_argument(
         "-v", "--verbose", action="store_true",
