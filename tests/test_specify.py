@@ -295,6 +295,25 @@ class TestEffectivenessGateUnit(unittest.TestCase):
             {"E1": {"effective": True, "coherent": False, "reason": "contradicts honey"}}, False)
         self.assertEqual(out["termination"], "needs_reinvestigation")
 
+    def test_over_scope_review_downgrades(self):
+        # T891 v2: the edit is effective and coherent but OVER-APPLIES (recoloured a
+        # shared rule the seed said to leave neutral), so in_scope=false must
+        # downgrade the ready spec exactly like an ineffective edit.
+        out = specify._apply_effectiveness_gate(
+            _fresh_ready(), [],
+            {"E1": {"effective": True, "coherent": True, "in_scope": False,
+                    "reason": "recolours shared .wf-undecided, regresses other steps"}},
+            False)
+        self.assertEqual(out["termination"], "needs_reinvestigation")
+        self.assertIn("E1", out["effectiveness"]["ineffective_ids"])
+        self.assertIn("over-scope", out["edits"][0]["effectiveness"]["reason"])
+
+    def test_in_scope_true_keeps_ready(self):
+        out = specify._apply_effectiveness_gate(
+            _fresh_ready(), [],
+            {"E1": {"effective": True, "coherent": True, "in_scope": True}}, False)
+        self.assertEqual(out["termination"], "ready_to_apply")
+
     def test_deterministic_noop_downgrades_even_if_review_says_ok(self):
         out = specify._apply_effectiveness_gate(
             _fresh_ready(), ["E1"], {"E1": {"effective": True, "coherent": True}}, False)
@@ -688,10 +707,11 @@ class TestReviewerProvider(unittest.TestCase):
 
 class TestConfigSpecifyRole(unittest.TestCase):
     def test_specify_role_exists(self):
+        # hive.config.json routes the specify author onto codex (gpt-5.4-mini).
         cfg = load_config()
         role = cfg.role("specify")
-        self.assertEqual(role.provider, "copilot")
-        self.assertTrue(role.model)
+        self.assertEqual(role.provider, "codex")
+        self.assertEqual(role.model, "gpt-5.4-mini")
 
     def test_review_role_routes_to_deepinfra(self):
         # hive.config.json opts the reviewer onto deepinfra (cost lever).

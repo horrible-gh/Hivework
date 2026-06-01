@@ -415,6 +415,14 @@ def build_review_prompt(honey_text: str, spec: dict[str, Any], codebase_root: st
     create_file edits: the block carries ``content`` (truncated to
     _REVIEW_CONTENT_MAX_LINES lines) instead of the absent anchor fields, so the
     reviewer can judge whether the new file is genuinely non-empty and on-target.
+
+    The review also judges ``in_scope`` — whether the edit changes ONLY what the
+    Requested change targets, or ALSO affects elements/behaviors the seed said to
+    leave unchanged. This is the complement of effectiveness: an edit can be fully
+    effective (it does turn the target blue) yet OVER-APPLY by recoloring a SHARED
+    rule the seed explicitly told it not to touch, regressing every other element
+    carrying that class (T891 v2). Effective+coherent both passed there; only an
+    explicit over-application check catches it.
     """
     edits = [e for e in (spec.get("edits") or []) if isinstance(e, dict)]
     blocks = []
@@ -457,7 +465,7 @@ correctly but do not actually fix anything. Do not rewrite the edits; only judge
 {edits_json}
 
 [Judge each edit]
-For every edit decide two booleans, applying the criterion that matches the edit's kind:
+For every edit decide three booleans, applying the criterion that matches the edit's kind:
 - effective:
   - Anchor edit (kind "edit" or absent): would applying this edit actually change the \
 behavior the honey identified as wrong? An edit that is functionally inert — a no-op \
@@ -469,11 +477,21 @@ in direct response to the honey's directions; effective=false if the content is 
 whitespace-only, or the honey did not ask for a new file at this path.
 - coherent: is the edit consistent with the honey's conclusion (it does not contradict \
 what the investigation concluded)?
+- in_scope: does the edit change ONLY what the Requested change targets, WITHOUT also \
+affecting elements or behaviors the seed said to leave unchanged? An edit that is \
+effective but OVER-APPLIES — it edits a SHARED rule / common helper / broad selector so \
+that elements beyond the single named target also change, especially when the Requested \
+change has an explicit "DO NOT touch / DO NOT modify / must stay …" boundary or names a \
+SINGLE target — is in_scope=false. Honor those boundaries literally: editing the exact \
+thing the seed forbade (e.g. recolouring the shared rule it said to keep neutral) is \
+in_scope=false EVEN THOUGH the named target does end up changed. A correctly narrow edit \
+that touches only the named target is in_scope=true.
 
 [Output contract] Output ONLY this JSON object. No prose, no text outside the JSON.
 {{
   "reviews": [
-    {{ "id": "<edit id>", "effective": true, "coherent": true, "reason": "<one line>" }}
+    {{ "id": "<edit id>", "effective": true, "coherent": true, "in_scope": true, \
+"reason": "<one line>" }}
   ]
 }}
 """
@@ -581,6 +599,11 @@ def _apply_effectiveness_gate(
                 ineffective[eid] = "review: ineffective — " + str(j.get("reason", "")).strip()
             elif j.get("coherent") is False:
                 ineffective[eid] = "review: incoherent — " + str(j.get("reason", "")).strip()
+            elif j.get("in_scope") is False:
+                # Effective+coherent but over-applies (edits a shared rule / broad
+                # selector beyond the seed's named target) — a regression, so loop
+                # back to re-author a narrower edit rather than ship it (T891 v2).
+                ineffective[eid] = "review: over-scope — " + str(j.get("reason", "")).strip()
 
     spec["effectiveness"] = {
         "inconclusive": inconclusive,
