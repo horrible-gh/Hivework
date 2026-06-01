@@ -566,6 +566,105 @@ def _follow_calls(snippets: list[dict[str, Any]], globs: list[str], root: str,
     return follows
 
 
+# A label / i18n reference inside a snippet:  callee('KEY')  or  callee("KEY").
+# The KEY's RENDERED text is what tells two otherwise-identical sibling elements
+# apart (T891: two `<div class="wf-undecided">` distinguishable only by
+# getLabel('R')->"요건정의" vs t('...undecided')->"미정"). The raw snippet shows
+# only the call, so a judge must GUESS what it renders to — and guesses
+# inconsistently across rounds, anchoring the wrong sibling.
+_REF_RE = re.compile(r"""([A-Za-z_$][\w.$]*)\s*\(\s*(['"])([^'"\n]{1,120})\2""")
+
+# Callees whose string argument is a label / i18n KEY worth resolving. Matched
+# against the callee's LAST dotted segment, case-insensitively. Kept tight on
+# purpose: resolving every ``f('x')`` would flood the bundle with the noise the
+# whole local-FIND budget exists to keep out — we add ONLY the discriminator.
+_LABEL_GETTERS = frozenset({
+    "t", "$t", "tc", "$tc", "te", "i18n", "translate", "tr", "trans",
+    "getlabel", "label", "gettext", "msg", "message", "getname",
+    "displayname", "title", "caption", "text", "name",
+})
+
+
+def _looks_like_label_ref(callee: str, key: str) -> bool:
+    """Worth resolving? A known label/i18n getter, or a dotted i18n-style key."""
+    if callee.split(".")[-1].lower() in _LABEL_GETTERS:
+        return True
+    return key.count(".") >= 1 and " " not in key
+
+
+def _extract_value(line: str, key: str) -> str | None:
+    """If ``line`` defines ``key`` as a quoted string value, return that value.
+
+    Matches ``KEY: "value"`` / ``'KEY' => 'value'`` / ``KEY = "value"`` shapes —
+    the common label-map / locale-file definition forms across JS/TS/JSON/Vue.
+    """
+    m = re.search(
+        r"['\"]?" + re.escape(key) + r"['\"]?\s*(?::|=>|=)\s*(['\"])(.+?)\1",
+        line)
+    return m.group(2) if m else None
+
+
+def _resolve_key(key: str, roots: list[str], max_vals: int = 4) -> list[dict[str, Any]]:
+    """Resolve a label/i18n KEY to its string value(s) by local grep (free).
+
+    Finds ``KEY : "value"`` definitions and collects the DISTINCT values. One
+    value = confident resolution; several = ambiguous, returned as candidates (the
+    judge still sees the options instead of guessing); none = nothing attached
+    (never invent a value — that would be the hallucination we are avoiding).
+    """
+    pat = r"['\"]?" + re.escape(key) + r"['\"]?\s*(?::|=>|=)"
+    seen: dict[str, dict[str, Any]] = {}
+    for root in roots:
+        if not root:
+            continue
+        for h in _ripgrep(pat, [], root, max_hits=20):
+            val = _extract_value(h["text"], key)
+            if val and val not in seen:
+                seen[val] = {"value": val, "source": f"{h['file']}:{h['line']}"}
+            if len(seen) >= max_vals:
+                break
+    return list(seen.values())
+
+
+def _resolve_discriminators(snippets: list[dict[str, Any]], code_root: str,
+                            docs_root: str | None) -> int:
+    """Attach resolved label/i18n values to snippets (T891 disambiguation).
+
+    Mutates each snippet in place, adding a ``resolved`` list when it contains
+    label/i18n references that resolve locally. Returns the total number of
+    references resolved (for stats). Pure-local, deterministic, zero model cost —
+    this is the cheap local READ the operator otherwise had to do by hand.
+    """
+    roots = [code_root, docs_root]
+    cache: dict[str, list[dict[str, Any]]] = {}
+    total = 0
+    for s in snippets:
+        refs: list[dict[str, Any]] = []
+        seen_in_snip: set[str] = set()
+        for m in _REF_RE.finditer(s.get("text", "")):
+            callee, key = m.group(1), m.group(3)
+            if not _looks_like_label_ref(callee, key):
+                continue
+            ref_str = f"{callee}('{key}')"
+            if ref_str in seen_in_snip:
+                continue
+            seen_in_snip.add(ref_str)
+            if key not in cache:
+                cache[key] = _resolve_key(key, roots)
+            vals = cache[key]
+            if vals:
+                refs.append({
+                    "ref": ref_str, "key": key,
+                    "values": [v["value"] for v in vals],
+                    "sources": [v["source"] for v in vals],
+                    "ambiguous": len(vals) > 1,
+                })
+        if refs:
+            s["resolved"] = refs
+            total += len(refs)
+    return total
+
+
 def retrieve(plan: SearchPlan, code_root: str, docs_root: str | None = None,
              k: int = 6, top_files: int = 8,
              blame_files: int = 3, max_hops: int = 2,
@@ -621,6 +720,14 @@ def retrieve(plan: SearchPlan, code_root: str, docs_root: str | None = None,
     # 3b. follow call-chains out of the code snippets (1-2 hops, local & free).
     call_chain = _follow_calls(code_snippets, globs, code_root,
                                k, max_hops) if max_hops > 0 else []
+
+    # 3c. resolve label/i18n references so near-identical sibling elements are
+    #     told apart by MEANING, not by the judge guessing what a call renders to
+    #     (T891: getLabel('R')->"요건정의" vs t('...undecided')->"미정"). The cheap
+    #     local READ the operator otherwise had to do by hand. Annotates snippets
+    #     (and any call-chain windows) with a `resolved` field in place.
+    resolved_refs = _resolve_discriminators(
+        code_snippets + call_chain, code_root, docs_root)
 
     # 4. git blame/log on the highest-ranked files, around their densest region.
     git_history = []
@@ -685,6 +792,7 @@ def retrieve(plan: SearchPlan, code_root: str, docs_root: str | None = None,
             "files_windowed": min(len(ranked), top_files),
             "snippets": len(code_snippets),
             "call_chain": len(call_chain),
+            "resolved_refs": resolved_refs,
             "design_excerpts": len(design_excerpts),
             "ranked_files": ranked[:top_files],
             "globs_used": globs,

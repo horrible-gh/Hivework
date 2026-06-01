@@ -11,7 +11,7 @@ import os
 
 from hive.retriever import (
     _norm_glob, _validate_globs, _partition_globs, _abs_under, _widen_globs,
-    retrieve, SearchPlan,
+    _looks_like_label_ref, _extract_value, retrieve, SearchPlan,
 )
 
 ROOT = "C:/workspace/projects/Documents/projects/FlowGate"
@@ -320,3 +320,82 @@ def test_retrieve_no_widening_when_first_pass_hits(tmp_path):
     out = retrieve(plan, root, max_hops=0)
     assert any("DocInfoPanel.vue" in s["file"] for s in out["code_snippets"])
     assert out["stats"]["glob_widening"] is None
+
+
+# --- label/i18n discriminator resolution: tell near-identical siblings apart ----
+#     (T891) by resolving getLabel('R')->"요건정의" / t('...undecided')->"미정"
+#     LOCALLY, so the judge picks by meaning instead of guessing — the cheap read
+#     the operator otherwise had to do by hand.
+
+def test_looks_like_label_ref_recognises_getters_and_i18n_keys():
+    assert _looks_like_label_ref("docTypeStore.getLabel", "R")
+    assert _looks_like_label_ref("t", "workflow.undecided")
+    assert _looks_like_label_ref("$t", "a.b.c")
+    # a plain function call with a string arg is NOT a label ref (noise to skip).
+    assert not _looks_like_label_ref("doStuff", "R")
+    assert not _looks_like_label_ref("open", "somefile")
+
+
+def test_extract_value_reads_label_map_and_locale_shapes():
+    assert _extract_value("const labels = { 'R': '요건정의', 'A': '승인' }", "R") == "요건정의"
+    assert _extract_value('  "workflow.undecided": "미정",', "workflow.undecided") == "미정"
+    assert _extract_value("R => 'requirements'", "R") == "requirements"
+    assert _extract_value("unrelated line", "R") is None
+
+
+def _make_sibling_label_tree(tmp_path):
+    """Two near-identical sibling elements distinguishable ONLY by their label
+    reference — the T891 shape — plus the local store/locale that resolve them."""
+    comp = tmp_path / "client" / "src" / "components"
+    comp.mkdir(parents=True)
+    (comp / "DocWorkflow.vue").write_text(
+        "<template>\n"
+        "  <div class='wf-undecided'>\n"
+        "    <span>{{ docTypeStore.getLabel('R') }}</span>\n"
+        "  </div>\n"
+        "  <div class='wf-undecided'>\n"
+        "    <span>{{ t('workflow.undecided') }}</span>\n"
+        "  </div>\n"
+        "</template>\n",
+        encoding="utf-8")
+    store = tmp_path / "client" / "src" / "stores"
+    store.mkdir(parents=True)
+    (store / "docType.ts").write_text(
+        "const labels = { 'R': '요건정의', 'A': '승인' }\n", encoding="utf-8")
+    locale = tmp_path / "client" / "src" / "locales"
+    locale.mkdir(parents=True)
+    (locale / "ko.json").write_text(
+        '{ "workflow.undecided": "미정" }\n', encoding="utf-8")
+    return str(tmp_path)
+
+
+def test_retrieve_resolves_sibling_label_discriminators(tmp_path):
+    root = _make_sibling_label_tree(tmp_path)
+    plan = SearchPlan(
+        axis_id="WF_HL",
+        keywords=["wf-undecided", "getLabel", "undecided"],
+        file_globs=["client/**/*.vue"],
+    )
+    out = retrieve(plan, root, max_hops=0)
+    resolved: dict[str, list[str]] = {}
+    for s in out["code_snippets"]:
+        for r in s.get("resolved", []):
+            resolved[r["key"]] = r["values"]
+    # both sibling labels resolved to their rendered text — the bundle now CARRIES
+    # the discriminator, so a downstream judge need not guess (or read source).
+    assert resolved.get("R") == ["요건정의"]
+    assert resolved.get("workflow.undecided") == ["미정"]
+    assert out["stats"]["resolved_refs"] >= 2
+
+
+def test_retrieve_does_not_invent_values_for_unresolvable_refs(tmp_path):
+    # No store/locale defines the key → nothing is attached (we never hallucinate
+    # a value; absence keeps the bundle honest).
+    comp = tmp_path / "src"
+    comp.mkdir(parents=True)
+    (comp / "X.vue").write_text(
+        "<span>{{ getLabel('ZZZ_UNDEFINED') }}</span>\n", encoding="utf-8")
+    plan = SearchPlan(axis_id="X", keywords=["getLabel"], file_globs=["src/**/*.vue"])
+    out = retrieve(plan, str(tmp_path), max_hops=0)
+    assert out["stats"]["resolved_refs"] == 0
+    assert all("resolved" not in s for s in out["code_snippets"])
