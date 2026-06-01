@@ -8,7 +8,7 @@ Usage:
     result = call_worker("copilot", "gpt-5-mini", prompt, cwd=root, timeout=300)
     print(result.stdout, result.latency_s)
 """
-import os, shutil, subprocess, tempfile, time, logging
+import os, shutil, signal, subprocess, tempfile, time, logging
 from dataclasses import dataclass
 
 logger = logging.getLogger("hive.providers")
@@ -41,6 +41,63 @@ class WorkerResult:
     real_tokens: int | None = None
 
 
+def _kill_tree(proc) -> None:
+    """Kill ``proc`` AND every descendant it spawned.
+
+    A bare ``proc.kill()`` only reaps the direct child. The agentic CLIs launch a
+    tree (copilot.cmd → node → agent; codex.cmd likewise), and the grandchildren
+    keep running — and keep billing per internal turn — if the parent alone dies.
+    Windows: ``taskkill /T`` walks the tree. POSIX: kill the whole process group
+    (the worker is started in its own session/group, see ``_run_capture``).
+    """
+    if proc.poll() is not None:
+        return
+    try:
+        if os.name == "nt":
+            subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                           capture_output=True)
+        else:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+    except Exception:  # best-effort reap; fall through to the direct kill below
+        pass
+    finally:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+
+
+def _run_capture(cmd, *, input=None, cwd=None, timeout=None) -> subprocess.CompletedProcess:
+    """``subprocess.run`` replacement that kills the WHOLE child tree on timeout
+    or interrupt — not just the direct child.
+
+    ``subprocess.run``'s own timeout kills only the immediate process, leaking the
+    node/agent grandchildren that dominate cost. Here we own the ``Popen`` handle,
+    start it in its own process group/session, and on ANY abort (TimeoutExpired,
+    KeyboardInterrupt, …) reap the entire tree before re-raising — so a timed-out
+    or Ctrl-C'd worker can't strand live drones. The exception still propagates,
+    so callers (e.g. fanout's ``except subprocess.TimeoutExpired``) are unchanged.
+    """
+    kwargs = dict(stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                  stderr=subprocess.PIPE, text=True, encoding="utf-8",
+                  errors="replace", cwd=cwd)
+    if os.name == "nt":
+        kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+    else:
+        kwargs["start_new_session"] = True
+    proc = subprocess.Popen(cmd, **kwargs)
+    try:
+        stdout, stderr = proc.communicate(input=input, timeout=timeout)
+    except BaseException:
+        _kill_tree(proc)
+        try:
+            proc.communicate(timeout=10)  # drain pipes / reap after the tree dies
+        except Exception:
+            pass
+        raise
+    return subprocess.CompletedProcess(cmd, proc.returncode, stdout, stderr)
+
+
 def _call_copilot(model, prompt, cwd, timeout, exe=None, allow_flag="--allow-all",
                   available_tools=None) -> WorkerResult:
     """Call the copilot CLI. Prompt sent via stdin (never -p) to avoid cp932 truncation.
@@ -58,8 +115,7 @@ def _call_copilot(model, prompt, cwd, timeout, exe=None, allow_flag="--allow-all
         cmd.append("--available-tools=" + ",".join(available_tools))
     logger.debug("call_worker copilot: model=%s cwd=%s timeout=%d", model, cwd, timeout)
     t0 = time.monotonic()
-    result = subprocess.run(cmd, input=prompt, capture_output=True, text=True,
-                            encoding="utf-8", errors="replace", cwd=cwd, timeout=timeout)
+    result = _run_capture(cmd, input=prompt, cwd=cwd, timeout=timeout)
     latency_s = time.monotonic() - t0
     if result.returncode != 0:
         logger.warning("copilot rc=%d (%.1fs) stderr: %s",
@@ -173,8 +229,7 @@ def _call_codex(model, prompt, cwd=None, timeout=300, *, sandbox="read-only",
                  model, cwd, sandbox, timeout)
     t0 = time.monotonic()
     try:
-        result = subprocess.run(cmd, input=prompt, capture_output=True, text=True,
-                                encoding="utf-8", errors="replace", cwd=cwd, timeout=timeout)
+        result = _run_capture(cmd, input=prompt, cwd=cwd, timeout=timeout)
     except BaseException:  # timeout / interrupt: clean up the temp file, then propagate
         try:
             os.remove(out_path)

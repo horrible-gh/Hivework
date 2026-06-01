@@ -26,7 +26,7 @@ def _capture_cmd(**call_kwargs):
         return _FakeProc()
 
     with mock.patch.object(providers.shutil, "which", return_value="copilot.cmd"), \
-         mock.patch.object(providers.subprocess, "run", side_effect=fake_run):
+         mock.patch.object(providers, "_run_capture", side_effect=fake_run):
         providers.call_worker("copilot", "gpt-5-mini", "hi", cwd="/x",
                               timeout=30, **call_kwargs)
     return seen["cmd"]
@@ -175,7 +175,7 @@ def _run_codex(out_content=None, rc=0, stdout="(event trace)", model="gpt-5-code
         return proc
 
     with mock.patch.object(providers.shutil, "which", return_value="codex.cmd"), \
-         mock.patch.object(providers.subprocess, "run", side_effect=fake_run):
+         mock.patch.object(providers, "_run_capture", side_effect=fake_run):
         wr = providers.call_worker("codex", model, "do X", cwd="/x", timeout=30,
                                    **call_kwargs)
     return wr, seen
@@ -226,6 +226,51 @@ class TestCodexHandler(unittest.TestCase):
     def test_nonzero_exit_surfaced(self):
         wr, _ = _run_codex(out_content="{}", rc=2)
         self.assertEqual(wr.exit_code, 2)
+
+
+class _FakeProcTree:
+    """Popen stand-in whose first communicate() times out, exercising the abort
+    path of _run_capture. Records whether the tree-kill ran."""
+    def __init__(self, killed):
+        self.pid = 4242
+        self.returncode = None
+        self._killed = killed
+        self._first = True
+
+    def communicate(self, input=None, timeout=None):
+        if self._first:
+            self._first = False
+            raise subprocess.TimeoutExpired(cmd="worker", timeout=timeout)
+        return ("", "")  # drain after kill
+
+    def poll(self):
+        return None  # still "running" so _kill_tree proceeds
+
+    def kill(self):
+        self._killed["direct"] = True
+
+
+class TestRunCaptureKillsTree(unittest.TestCase):
+    """The leak fix: a timed-out / interrupted worker must reap its WHOLE child
+    tree (copilot.cmd → node → agent), not just the direct child."""
+
+    def test_timeout_reaps_tree_then_reraises(self):
+        killed = {}
+        fp = _FakeProcTree(killed)
+
+        def fake_tree_reap(*a, **k):       # taskkill (Windows path)
+            killed["tree"] = True
+            return mock.Mock(returncode=0)
+
+        with mock.patch.object(providers.subprocess, "Popen", return_value=fp), \
+             mock.patch.object(providers.subprocess, "run", side_effect=fake_tree_reap), \
+             mock.patch.object(providers.os, "killpg", create=True,
+                               side_effect=lambda *a: killed.__setitem__("tree", True)):
+            with self.assertRaises(subprocess.TimeoutExpired):
+                providers._run_capture(["worker"], input="p", cwd="/x", timeout=1)
+
+        self.assertTrue(killed.get("tree"), "whole-tree kill (taskkill/killpg) must run")
+        self.assertTrue(killed.get("direct"), "direct child kill must also run")
 
 
 if __name__ == "__main__":
