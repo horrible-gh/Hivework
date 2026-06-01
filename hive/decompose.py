@@ -82,6 +82,11 @@ to orient the cut), but keep it minimal. Then output the decomposition JSON.
 
 `steps` = ordered list; each inner list is a set of task ids runnable in
 parallel. Lists run in sequence (step 2 may use step 1's outputs).
+
+[JSON validity] Emit STANDARD JSON. String values use plain double-quote
+delimiters — do NOT backslash-escape the delimiters themselves. A keyword like
+mode='next' is written `"mode='next'"`, NEVER `\\"mode='next'\\"`. Inside a
+value, prefer single quotes so no escaping is needed.
 """
 
 

@@ -133,6 +133,70 @@ def run_investigate(
     return result
 
 
+def render_local_honey(result: dict[str, Any], seed_text: str) -> str:
+    """Render investigate verdicts into a honey-shaped markdown — LOCAL, free.
+
+    This is the seam that lets the cheap path feed ``specify``: the swarm pipeline
+    pays an ``assemble`` model call to synthesise a honey, but ``specify`` only
+    consumes the honey as free prose — it re-anchors against LIVE code and trusts
+    nothing the honey quotes (``recipes/edit_spec_contract_v1.md`` cardinal rule).
+    So the honey just has to carry two things the verdicts already hold: the
+    REQUESTED CHANGE (the seed) and the GROUNDED LOCATIONS (judge file:lines +
+    reason). We template those deterministically — no model, no ``assemble`` call.
+
+    Located verdicts become fix-direction sections; unlocated/downgraded ones are
+    listed as "no confident localisation" so the specify author neither fabricates
+    an edit there nor silently drops the axis.
+    """
+    verdicts = result.get("verdicts", []) or []
+    located = [v for v in verdicts if v.get("verdict", {}).get("located")]
+    unlocated = [v for v in verdicts if not v.get("verdict", {}).get("located")]
+
+    out: list[str] = [
+        "# Hivework honey (local — rendered from investigate verdicts)",
+        "",
+        "- source: cheap path (decompose → retrieve(local) → judge), no assemble call",
+        f"- axes judged: {result.get('axes_judged', 0)}/{result.get('axes_total', 0)}; "
+        f"located: {len(located)}",
+        "",
+        "## Requested change / reported symptom",
+        "",
+        seed_text.strip(),
+        "",
+        "## Fix directions (grounded localisations)",
+        "",
+        "Each section is a judge-confirmed location for the requested change. "
+        "Per the edit-spec contract, RE-OPEN each file and lift `anchor_old` from "
+        "the CURRENT text byte-for-byte — the line ranges below are the judge's "
+        "grounding, not authoritative anchors.",
+        "",
+    ]
+    if located:
+        for v in located:
+            vd = v.get("verdict", {})
+            out += [
+                f"### {v.get('axis_id', '?')} — {v.get('title', '')}".rstrip(" —"),
+                f"- target: {vd.get('file', '')}:{vd.get('lines', '')}",
+                f"- grounding / reason: {vd.get('reason', '')}",
+                "- fix direction: apply the requested change above at this location "
+                "(author the concrete edit/new content per the contract).",
+                "",
+            ]
+    else:
+        out += ["_No axis produced a grounded localisation. specify should defer "
+                "rather than fabricate an edit._", ""]
+
+    if unlocated:
+        out += ["## Axes without a confident localisation (do NOT fabricate edits here)", ""]
+        for v in unlocated:
+            vd = v.get("verdict", {})
+            reason = vd.get("reason") or "not located"
+            out.append(f"- {v.get('axis_id', '?')} — {v.get('title', '')}: {reason}")
+        out.append("")
+
+    return "\n".join(out)
+
+
 def _write_report(result: dict[str, Any], output_path: str) -> None:
     """Write the verdict report as JSON, plus a sibling markdown summary table."""
     os.makedirs(os.path.dirname(os.path.abspath(output_path)) or ".", exist_ok=True)

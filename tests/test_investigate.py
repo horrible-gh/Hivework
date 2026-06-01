@@ -17,6 +17,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from hive import investigate as INV
 from hive.config import load_config
 from hive.providers import WorkerResult
+from hive.investigate import render_local_honey
 
 
 def _wr(stdout: str) -> WorkerResult:
@@ -112,6 +113,50 @@ class TestInvestigateWiring(unittest.TestCase):
                 )
             self.assertEqual(result["axes_judged"], 1)
             self.assertEqual(judge_cw.call_count, 1)
+
+
+class TestRenderLocalHoney(unittest.TestCase):
+    """The free verdict→honey seam that lets the cheap path feed specify."""
+
+    RESULT = {
+        "axes_total": 3, "axes_judged": 2,
+        "verdicts": [
+            {"axis_id": "T7", "title": "Anchor in D031",
+             "verdict": {"located": True, "file": "210_design/D031_x.md",
+                         "lines": "69-81", "reason": "unique heading"}},
+            {"axis_id": "T4", "title": "regression",
+             "verdict": {"located": False, "file": "", "lines": "",
+                         "reason": "ungrounded"}},
+        ],
+    }
+    SEED = "Add a short Korean paragraph to D031 recording the action-bar policy."
+
+    def setUp(self):
+        self.honey = render_local_honey(self.RESULT, self.SEED)
+
+    def test_seed_carried_as_requested_change(self):
+        self.assertIn("Requested change", self.honey)
+        self.assertIn("Korean paragraph", self.honey)
+
+    def test_located_axis_becomes_fix_direction(self):
+        self.assertIn("210_design/D031_x.md:69-81", self.honey)
+        self.assertIn("unique heading", self.honey)
+
+    def test_unlocated_axis_flagged_not_fabricated(self):
+        # T4 (unlocated) must appear under the "do NOT fabricate" section, after
+        # the fix-directions block — never promoted to a grounded fix direction.
+        self.assertIn("do NOT fabricate", self.honey)
+        tail = self.honey.split("do NOT fabricate", 1)[1]
+        self.assertIn("T4", tail)
+        # the only grounded target belongs to T7, above the fabricate section
+        self.assertNotIn("210_design/D031_x.md", tail)
+
+    def test_no_located_yields_defer_note(self):
+        result = {"axes_total": 1, "axes_judged": 1, "verdicts": [
+            {"axis_id": "X", "title": "t",
+             "verdict": {"located": False, "file": "", "lines": "", "reason": "n/a"}}]}
+        honey = render_local_honey(result, "do something")
+        self.assertIn("defer", honey.lower())
 
 
 if __name__ == "__main__":
