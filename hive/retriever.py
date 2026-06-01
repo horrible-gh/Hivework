@@ -115,6 +115,41 @@ def _norm_glob(g: str, root: str) -> str:
     return gn
 
 
+def _abs_under(glob: str, root: str | None) -> bool:
+    """True when ``glob`` is an absolute path nested under ``root``.
+
+    Used to route the queen's globs to the tree they actually point at: a glob
+    under ``docs_root`` must be probed/searched against the docs tree, not the
+    code tree (separator-normalized, case-insensitive for Windows drives).
+    """
+    if not root:
+        return False
+    g = re.sub(r"/{2,}", "/", glob.replace("\\", "/"))
+    r = re.sub(r"/{2,}", "/", root.replace("\\", "/")).rstrip("/")
+    return g.lower().startswith(r.lower() + "/")
+
+
+def _partition_globs(globs: list[str], code_root: str,
+                     docs_root: str | None) -> tuple[list[str], list[str]]:
+    """Split the axis globs into (code-tree globs, docs-tree globs).
+
+    The queen routinely lowers a design-doc target into ``file_globs`` as an
+    ABSOLUTE path under the docs tree (e.g. ``C:/…/Documents/…/D031_*.md``). Those
+    globs match nothing under ``code_root`` — so validating/searching them there
+    silently drops the doc and the judge rules on a bundle that never contained it
+    (T890: 0/3 axes located). A glob under ``docs_root`` (and not also under
+    ``code_root``) is routed to the docs channel; everything else stays code-side.
+    """
+    code_g: list[str] = []
+    doc_g: list[str] = []
+    for g in globs:
+        if _abs_under(g, docs_root) and not _abs_under(g, code_root):
+            doc_g.append(g)
+        else:
+            code_g.append(g)
+    return code_g, doc_g
+
+
 def _count_glob_files(g: str, root: str, cap: int) -> int:
     """How many files does this glob actually match under ``root``?
 
@@ -407,10 +442,13 @@ def retrieve(plan: SearchPlan, code_root: str, docs_root: str | None = None,
         overbroad_files: a glob matching more than this many files is treated as
             over-broad and dropped when a narrower glob exists.
     """
-    # 0. validate the queen's globs against the real tree (free): drop garbage
-    #    (0-match) and over-broad globs so the snippet budget windows the axis,
-    #    not noise. Whole-tree fallback only if every glob is garbage.
-    globs, glob_diag = _validate_globs(plan.file_globs, code_root, overbroad_files)
+    # 0. Route each glob to the tree it actually points at, THEN validate the
+    #    code-tree globs against the real tree (free): drop garbage (0-match) and
+    #    over-broad globs so the snippet budget windows the axis, not noise.
+    #    Whole-tree fallback only if every glob is garbage. Docs-tree globs are
+    #    handled by the design-doc channel below (step 5), not searched in code.
+    code_globs, doc_globs = _partition_globs(plan.file_globs, code_root, docs_root)
+    globs, glob_diag = _validate_globs(code_globs, code_root, overbroad_files)
 
     # 1. ripgrep every keyword across globs → raw call_sites, keep ALL hit
     #    lines per file (not just first) so dense late regions stay reachable.
@@ -463,13 +501,24 @@ def retrieve(plan: SearchPlan, code_root: str, docs_root: str | None = None,
     #    and cap to top_files, same density discipline as code — otherwise a
     #    generic topic ("head") floods the bundle with hundreds of md hits and
     #    blows the token budget the whole redesign exists to protect.
+    #    The grep scope is the queen's explicit docs-tree globs when she gave any
+    #    (so a "edit D031" axis actually pulls D031), else the whole docs tree.
+    #    With explicit doc targets we also grep the axis KEYWORDS, not just the
+    #    (often generic) doc_topics, so the relevant section lands in the bundle.
     design_excerpts: list[dict[str, Any]] = []
-    if docs_root and plan.doc_topics:
+    doc_scope = doc_globs or ["*.md"]
+    doc_terms = list(plan.doc_topics)
+    if doc_globs:
+        doc_terms += [kw for kw in plan.keywords if kw not in doc_terms]
+    if not doc_terms:
+        doc_terms = list(plan.keywords)
+    doc_k = max(k, 12)  # docs need a wider window to capture the enclosing heading
+    if docs_root and doc_terms and (plan.doc_topics or doc_globs):
         doc_topics_hit: dict[str, set[str]] = defaultdict(set)
         doc_first_line: dict[str, dict[str, int]] = defaultdict(dict)
         doc_hit_count: dict[str, int] = defaultdict(int)
-        for topic in plan.doc_topics:
-            for h in _ripgrep(topic, ["*.md"], docs_root, max_hits=20):
+        for topic in doc_terms:
+            for h in _ripgrep(topic, doc_scope, docs_root, max_hits=20):
                 doc_topics_hit[h["file"]].add(topic)
                 doc_first_line[h["file"]].setdefault(topic, h["line"])
                 doc_hit_count[h["file"]] += 1
@@ -481,7 +530,7 @@ def retrieve(plan: SearchPlan, code_root: str, docs_root: str | None = None,
         raw_doc_snips: list[dict[str, Any]] = []
         for d in ranked_docs[:top_files]:
             for topic, ln in doc_first_line[d].items():
-                w = _read_window(docs_root, d, ln, k)
+                w = _read_window(docs_root, d, ln, doc_k)
                 raw_doc_snips.append({
                     "file": d, "lines": w["lines"], "text": w["text"],
                     "hits": [topic],

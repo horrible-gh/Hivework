@@ -9,7 +9,9 @@ because stubs never exercised real ``rg`` glob semantics on absolute paths.
 """
 import os
 
-from hive.retriever import _norm_glob, _validate_globs
+from hive.retriever import (
+    _norm_glob, _validate_globs, _partition_globs, _abs_under, retrieve, SearchPlan,
+)
 
 ROOT = "C:/workspace/projects/Documents/projects/FlowGate"
 
@@ -128,3 +130,44 @@ def test_usable_globs_pass_through(tmp_path):
     root = _make_tree(tmp_path)
     kept, _ = _validate_globs(["server/sql/*.json", "server/mod/**/*"], root)
     assert kept == ["server/sql/*.json", "server/mod/**/*"]
+
+
+# --- glob routing: docs-tree globs must not be probed against the code tree -----
+
+def test_partition_routes_docs_glob_to_docs(tmp_path):
+    code = str(tmp_path / "code")
+    docs = str(tmp_path / "docs_tree")
+    code_g, doc_g = _partition_globs(
+        ["server/mod/**/*.py",
+         f"{docs}/210_design/D031_*.md".replace("\\", "/")],
+        code, docs)
+    assert code_g == ["server/mod/**/*.py"]
+    assert doc_g == [f"{docs}/210_design/D031_*.md".replace("\\", "/")]
+
+
+def test_abs_under_handles_separators_and_case():
+    assert _abs_under("C:/a/b/x.md", "c:\\a\\b")
+    assert not _abs_under("C:/a/b/x.md", "C:/a/c")
+    assert not _abs_under("rel/x.md", "C:/a")
+
+
+def test_retrieve_routes_doc_glob_to_docs_tree(tmp_path):
+    # The queen lowered a design-doc target into file_globs as an ABSOLUTE path
+    # under the docs tree. It must be retrieved from docs, not silently dropped
+    # for matching nothing under code_root (T890: 0/3 axes located).
+    code = tmp_path / "code"
+    (code / "src").mkdir(parents=True)
+    (code / "src" / "view.ts").write_text("mode = 'next'\n", encoding="utf-8")
+    docs = tmp_path / "docs_tree" / "210_design"
+    docs.mkdir(parents=True)
+    (docs / "D031_ssot.md").write_text(
+        "# D031\n## section\nin_progress override note\n", encoding="utf-8")
+    plan = SearchPlan(
+        axis_id="locate_d031",
+        keywords=["in_progress", "override"],
+        file_globs=[f"{tmp_path}/docs_tree/210_design/D031_*.md".replace("\\", "/")],
+        doc_topics=[],
+    )
+    out = retrieve(plan, str(code), str(tmp_path / "docs_tree"))
+    docs_hit = [e["doc"] for e in out["design_excerpts"]]
+    assert any("D031_ssot.md" in d for d in docs_hit)
