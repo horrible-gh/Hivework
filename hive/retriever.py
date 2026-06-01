@@ -126,6 +126,43 @@ def _read_window(root: str, relpath: str, line: int, k: int) -> dict[str, Any]:
     return {"lines": f"{lo + 1}-{hi}", "text": text[:2000]}
 
 
+def _read_def_body(root: str, relpath: str, line: int,
+                   max_lines: int = 60) -> dict[str, Any]:
+    """Read a whole def/class body starting at ``line`` (1-based).
+
+    A fixed ±k window centred on a ``def`` reaches only the signature, not the
+    bug that lives deeper in the body — exactly why the judge-directed follow-up
+    must hand the re-judge the *function*, not a slice (M004 §6: store.py bug at
+    1446 sat below the def±6 window). We read from the def line until the first
+    later non-blank line whose indent is ≤ the def's indent (a sibling def/class
+    or module-level statement ends the body), capped at ``max_lines``.
+
+    Falls back to a small forward window if ``line`` is not actually a def.
+    """
+    abspath = os.path.join(root, relpath)
+    try:
+        with open(abspath, "r", encoding="utf-8", errors="replace") as f:
+            all_lines = f.readlines()
+    except OSError:
+        return {"lines": f"{line}", "text": ""}
+    idx = line - 1
+    if not (0 <= idx < len(all_lines)):
+        return {"lines": f"{line}", "text": ""}
+    def_indent = len(all_lines[idx]) - len(all_lines[idx].lstrip())
+    hi = idx + 1
+    for j in range(idx + 1, min(len(all_lines), idx + max_lines)):
+        ln = all_lines[j]
+        if not ln.strip():
+            hi = j + 1
+            continue
+        indent = len(ln) - len(ln.lstrip())
+        if indent <= def_indent:
+            break
+        hi = j + 1
+    text = "".join(all_lines[idx:hi])
+    return {"lines": f"{line}-{hi}", "text": text[:2400]}
+
+
 def _merge_windows(snips: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Collapse overlapping ±k windows in the same file into one snippet."""
     by_file: dict[str, list[dict[str, Any]]] = defaultdict(list)
@@ -376,7 +413,7 @@ def retrieve(plan: SearchPlan, code_root: str, docs_root: str | None = None,
 
 def retrieve_followup(need: FollowupNeed, code_root: str,
                       k: int = 6, max_hops: int = 2,
-                      max_per_seed: int = 4) -> dict[str, Any]:
+                      max_per_seed: int = 10) -> dict[str, Any]:
     """One bounded, JUDGE-directed local re-search (M004 §2 step-3).
 
     Unlike :func:`retrieve` (whose follow is seeded by keyword *density* and so
@@ -399,18 +436,22 @@ def retrieve_followup(need: FollowupNeed, code_root: str,
             seen_defs.add(key)
             seeds.append(snip)
 
-    # 1. resolve each named symbol → its definition window.
+    # 1. resolve each named symbol → its full def/class BODY (not a ±k slice —
+    #    the bug the judge is chasing usually lives below the signature).
     for sym in need.symbols:
         for h in _ripgrep(rf"def {sym}\b", globs, code_root,
                           max_hits=max_per_seed):
-            w = _read_window(code_root, h["file"], h["line"], k)
+            w = _read_def_body(code_root, h["file"], h["line"])
             _add({"file": h["file"], "lines": w["lines"], "text": w["text"],
                   "symbol": sym, "via": "need-symbol"})
 
-    # 2. locate each requested grep pattern → window around the hit.
+    # 2. locate each requested grep pattern → body window if the hit is a def,
+    #    else a ±k window around the hit line.
     for pat in need.greps:
         for h in _ripgrep(pat, globs, code_root, max_hits=max_per_seed):
-            w = _read_window(code_root, h["file"], h["line"], k)
+            is_def = h["text"].lstrip().startswith(("def ", "async def "))
+            w = (_read_def_body(code_root, h["file"], h["line"]) if is_def
+                 else _read_window(code_root, h["file"], h["line"], k))
             _add({"file": h["file"], "lines": w["lines"], "text": w["text"],
                   "symbol": pat, "via": "need-grep"})
 
