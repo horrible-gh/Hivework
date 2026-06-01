@@ -8,10 +8,25 @@ Usage:
     result = call_worker("copilot", "gpt-5-mini", prompt, cwd=root, timeout=300)
     print(result.stdout, result.latency_s)
 """
-import shutil, subprocess, time, logging
+import os, shutil, subprocess, time, logging
 from dataclasses import dataclass
 
 logger = logging.getLogger("hive.providers")
+
+
+def _tee_call(model, latency_s, exit_code, stderr) -> None:
+    """When HIVE_CALL_LOG is set, append the per-call copilot footer (carries the
+    'AI Credits N.NN' line on stderr) to that file. Lets a run's true credit spend
+    be summed from disk without relying on a manual account-balance read."""
+    path = os.environ.get("HIVE_CALL_LOG")
+    if not path:
+        return
+    try:
+        with open(path, "a", encoding="utf-8", errors="replace") as f:
+            f.write(f"\n=== call model={model} latency={latency_s:.1f}s "
+                    f"exit={exit_code} ===\n{stderr}\n")
+    except OSError:
+        pass
 
 
 @dataclass
@@ -45,6 +60,7 @@ def _call_copilot(model, prompt, cwd, timeout, exe=None, allow_flag="--allow-all
     if result.returncode != 0:
         logger.warning("copilot rc=%d (%.1fs) stderr: %s",
                        result.returncode, latency_s, result.stderr[:500])
+    _tee_call(model, latency_s, result.returncode, result.stderr)
     return WorkerResult(stdout=result.stdout, stderr=result.stderr,
                         exit_code=result.returncode, latency_s=latency_s)
 

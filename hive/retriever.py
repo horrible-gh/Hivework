@@ -87,12 +87,34 @@ def _run(cmd: list[str], cwd: str, timeout: int = 30) -> str:
         return ""
 
 
+def _norm_glob(g: str, root: str) -> str:
+    """Make a search-plan glob matchable by ``rg -g``.
+
+    ``rg -g`` matches its pattern against paths RELATIVE to the search root. The
+    queen routinely emits ABSOLUTE globs (e.g. ``C:/…/210_design/D031_*.md``);
+    rg never matches an absolute pattern against the relative paths it walks, so
+    every glob silently excludes everything — the whole FIND returns 0 hits and
+    the JUDGE ends up ruling on an empty bundle (observed: investigate_e2e run 1).
+
+    Fix: an absolute glob *under* ``root`` becomes root-relative; an absolute
+    glob *outside* ``root`` (un-relativizable) degrades to its basename pattern,
+    which ``rg -g`` matches at any depth. Already-relative globs pass through.
+    """
+    gn = g.replace("\\", "/")
+    rn = root.replace("\\", "/").rstrip("/")
+    if gn.lower().startswith(rn.lower() + "/"):
+        return gn[len(rn) + 1:]
+    if re.match(r"^[A-Za-z]:/", gn) or gn.startswith("/"):
+        return gn.rsplit("/", 1)[-1]
+    return gn
+
+
 def _ripgrep(keyword: str, globs: list[str], root: str,
              max_hits: int = 40) -> list[dict[str, Any]]:
     """ripgrep one keyword constrained to globs. Returns [{file,line,text}]."""
     cmd = ["rg", "--no-heading", "-n", "-i", "--max-count", str(max_hits)]
     for g in globs:
-        cmd += ["-g", g]
+        cmd += ["-g", _norm_glob(g, root)]
     cmd += ["-e", keyword, "."]
     out = _run(cmd, cwd=root)
     hits: list[dict[str, Any]] = []
