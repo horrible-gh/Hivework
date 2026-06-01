@@ -148,6 +148,12 @@ def run_fanout(
                                  **(provider_kwargs or {}))
             err_msg = result.stderr[:200] if result.exit_code != 0 else ""
 
+            # G8-race guard: combs_dir is created once before the pool launches, but
+            # call_worker above can run for minutes. If anything external removes the
+            # dir in that window (a concurrent run sharing the default workdir, tmp
+            # cleanup), the write below dies with FileNotFoundError and aborts the whole
+            # pipeline. Re-ensure the parent exists right before writing.
+            os.makedirs(combs_dir, exist_ok=True)
             with open(comb_path, 'w', encoding='utf-8') as f:
                 f.write(result.stdout)
             with open(err_path, 'w', encoding='utf-8') as f:
@@ -160,6 +166,7 @@ def run_fanout(
         except subprocess.TimeoutExpired:
             logger.error("  [fan-out] Axis %s TIMED OUT", axis_id)
             timeout_msg = f"TIMEOUT: worker for axis {axis_id} exceeded 600s limit"
+            os.makedirs(combs_dir, exist_ok=True)  # same G8-race guard (600s window)
             with open(comb_path, 'w', encoding='utf-8') as f:
                 f.write(timeout_msg)
             with open(err_path, 'w', encoding='utf-8') as f:
