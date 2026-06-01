@@ -16,12 +16,93 @@ local retriever (hive.searchplan bridge) lowers into a SearchPlan.
 import json
 import logging
 import os
+import subprocess
+from collections import Counter
 from typing import Any
 
 from hive.parse import extract_first_json
 from hive.providers import call_worker
 
 logger = logging.getLogger("hive.decompose")
+
+# ── Repo file tree given to the queen so axes anchor on REAL paths ─────────────
+# The decomposer fans out blind to the repo, so it guesses file_globs (wrong
+# extensions, frontend-only or backend-only coverage) and the local FIND windows
+# nothing (NR168: a frontend off-by-one whose Vue component the FE axis never
+# located because the seed only named backend anchors). Feeding the actual file
+# list — free, local, deterministic — lets the queen anchor globs on paths that
+# exist and cover BOTH trees. No model, no cost.
+_TREE_SKIP_EXT = frozenset({
+    ".png", ".jpg", ".jpeg", ".gif", ".svg", ".ico", ".webp", ".bmp",
+    ".woff", ".woff2", ".ttf", ".eot", ".otf",
+    ".mp4", ".mov", ".mp3", ".wav", ".pdf", ".zip", ".gz", ".tar", ".7z",
+    ".lock", ".map",
+})
+_TREE_SKIP_DIR = (
+    "node_modules/", ".git/", "dist/", "build/", "__pycache__/", ".venv/",
+    "venv/", "vendor/", ".next/", "coverage/", ".idea/", ".vscode/",
+)
+
+
+def _git_tracked_files(code_root: str) -> list[str]:
+    """Tracked files via ``git ls-files`` (respects .gitignore). [] on failure."""
+    try:
+        p = subprocess.run(
+            ["git", "-C", code_root, "ls-files"], capture_output=True, text=True,
+            encoding="utf-8", errors="replace", timeout=30)
+        if p.returncode == 0:
+            return [ln.strip() for ln in p.stdout.splitlines() if ln.strip()]
+    except (subprocess.SubprocessError, OSError):
+        pass
+    return []
+
+
+def _walk_files(code_root: str, cap: int = 20000) -> list[str]:
+    """Fallback when not a git repo: os.walk, pruning common noise dirs."""
+    skip = {".git", "node_modules", "__pycache__", ".venv", "venv", "dist",
+            "build", ".next", "vendor", "coverage", ".idea", ".vscode"}
+    out: list[str] = []
+    for dirpath, dirnames, filenames in os.walk(code_root):
+        dirnames[:] = [d for d in dirnames if d not in skip]
+        rel = os.path.relpath(dirpath, code_root).replace("\\", "/")
+        for fn in filenames:
+            out.append(fn if rel == "." else f"{rel}/{fn}")
+            if len(out) >= cap:
+                return out
+    return out
+
+
+def _tree_useful(path: str) -> bool:
+    """Drop binary/noise paths so the tree stays a navigable source map."""
+    p = path.lower()
+    if any(p.startswith(d) or f"/{d}" in p for d in _TREE_SKIP_DIR):
+        return False
+    return os.path.splitext(p)[1] not in _TREE_SKIP_EXT
+
+
+def build_repo_tree(code_root: str | None, max_lines: int = 400) -> str:
+    """Render a bounded, deterministic file map of ``code_root`` for the queen.
+
+    Lists tracked source files (``git ls-files``, else an os.walk fallback),
+    filtered of binaries. Under ``max_lines`` → the file list verbatim; over it →
+    a directory summary with file counts (still navigable, bounded). Free & local.
+    """
+    if not code_root:
+        return ""
+    files = _git_tracked_files(code_root) or _walk_files(code_root)
+    files = sorted(f.replace("\\", "/") for f in files if _tree_useful(f))
+    if not files:
+        return ""
+    if len(files) <= max_lines:
+        return "\n".join(files)
+    counts = Counter(os.path.dirname(f) or "." for f in files)
+    dir_lines = [f"{d}/  ({n} files)" for d, n in sorted(counts.items())]
+    if len(dir_lines) <= max_lines:
+        return ("# large repo — directories with file counts (grep within these "
+                "to confirm exact files):\n" + "\n".join(dir_lines))
+    top = Counter(f.split("/", 1)[0] for f in files)
+    return ("# very large repo — top-level areas with file counts:\n" +
+            "\n".join(f"{d}/  ({n} files)" for d, n in sorted(top.items())))
 
 # Fixed axes that recipe_code_bug.md §1 requires always present
 RECIPE_FIXED_AXES = """
@@ -41,8 +122,10 @@ micro-tasks that free-tier workers ("drones") can each finish in a single
 session, each producing a ~1 page brief.
 
 You do NOT perform the full investigation yourself — your deliverable is the
-PLAN, not the findings. You MAY take a quick look at the repo (a light ls/grep
-to orient the cut), but keep it minimal. Then output the decomposition JSON.
+PLAN, not the findings. A REPO FILE TREE is provided below — anchor your
+`search_plan.file_globs` on REAL paths from it (correct directories AND
+extensions); do not guess paths. If the request can span frontend and backend,
+make sure your axes cover BOTH trees. Then output the decomposition JSON.
 
 ## Rules for a good cut
 
@@ -90,23 +173,36 @@ value, prefer single quotes so no escaping is needed.
 """
 
 
-def build_decompose_prompt(seed_text: str, recipe_section1: str = "") -> str:
+def build_decompose_prompt(seed_text: str, recipe_section1: str = "",
+                           repo_tree: str = "") -> str:
     """Build the full prompt for the decompose worker.
 
     Args:
         seed_text: The raw seed instruction text.
         recipe_section1: Recipe §1 fixed-axis rules (if available).
+        repo_tree: A bounded file map of the target repo (build_repo_tree), so the
+            queen anchors file_globs on real paths instead of guessing.
 
     Returns:
         Full prompt string for copilot.
     """
     recipe_part = recipe_section1 if recipe_section1 else RECIPE_FIXED_AXES
+    tree_part = ""
+    if repo_tree:
+        tree_part = f"""
+═══════════════ REPO FILE TREE (these paths REALLY exist) ═══════════════
+Anchor every `search_plan.file_globs` on a REAL path below — correct directory
+AND extension. Do NOT guess paths. If the request spans frontend and backend,
+ensure your axes cover BOTH.
+{repo_tree}
+══════════════════════════════════════════════════════════════════════
+"""
     return f"""Your task RIGHT NOW: read the software investigation request below and break it into a parallel research plan, then reply with ONLY a JSON object. This is a real, concrete task — act on it immediately. Do not reply conversationally, do not say "I'm ready", do not ask what to do. The request is already here:
 
 ═══════════════ INVESTIGATION REQUEST (decompose THIS) ═══════════════
 {seed_text}
 ══════════════════════════════════════════════════════════════════════
-
+{tree_part}
 Now cut that request into independent micro-tasks (axes) for free-tier worker
 agents, following the rules and output schema below.
 
@@ -144,10 +240,14 @@ def run_decompose(
     if recipe_path and os.path.exists(recipe_path):
         recipe_section1 = _extract_recipe_section1(recipe_path)
 
-    prompt = build_decompose_prompt(seed_text, recipe_section1)
+    repo_tree = build_repo_tree(codebase_root)
+    prompt = build_decompose_prompt(seed_text, recipe_section1, repo_tree)
     logger.info("Running decompose worker...")
-    logger.info("Prompt length: %d chars (seed=%d, recipe§1=%d)",
-                len(prompt), len(seed_text), len(recipe_section1))
+    logger.info("Prompt length: %d chars (seed=%d, recipe§1=%d, tree=%d)",
+                len(prompt), len(seed_text), len(recipe_section1), len(repo_tree))
+    if repo_tree:
+        logger.info("repo tree: fed %d chars of real paths to the queen "
+                    "(anchors file_globs on existing files)", len(repo_tree))
 
     # Persist the exact prompt sent, so delivery problems are inspectable.
     try:
