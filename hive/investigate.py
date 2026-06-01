@@ -23,12 +23,15 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 from typing import Any
 
 from hive.decompose import run_decompose
 from hive.judge import run_judge
 from hive.retriever import retrieve
-from hive.searchplan import task_to_searchplan
+from hive.searchplan import (
+    extract_doc_topics, extract_globs, extract_keywords, task_to_searchplan,
+)
 
 logger = logging.getLogger("hive.investigate")
 
@@ -40,6 +43,86 @@ def _leaf_axes(tasks: list[dict[str, Any]]) -> list[dict[str, Any]]:
     they are not bug-localisation targets, so they get no JUDGE call.
     """
     return [t for t in tasks if not (t.get("depends_on") or [])]
+
+
+# A repo-relative path token the seed names AS A CONCRETE FILE (has an extension,
+# no wildcard) — e.g. ``client/src/.../DocWorkflow.vue``. Directory scopes and
+# ``**`` globs are not concrete-file anchors.
+_CONCRETE_FILE_RE = re.compile(r"\.[A-Za-z0-9]{1,6}$")
+
+
+def _seed_relevance(task: dict[str, Any], seed_basenames: set[str],
+                    seed_kw: set[str]) -> int:
+    """Score a decompose axis by how much it matches the SEED (free, deterministic).
+
+    The queen fans out blind to the answer and routinely scatters a single-line
+    change across a dozen unrelated axes (T891: a CSS class add drew SQL-drop and
+    getter-reactivity axes). Truncation at ``max_axes`` is by POSITION, so a
+    rabbit-hole axis can survive while the seed's own target is cut. Ranking by
+    seed-relevance before truncation floats the on-topic axes up and lets the
+    off-topic ones sink past the cap. Signal: the axis scopes a file the seed
+    named (strong), plus how many of the seed's grep keywords it reuses.
+    """
+    sp = task.get("search_plan") or {}
+    glob_blob = " ".join(str(g) for g in (sp.get("file_globs") or [])).lower()
+    text = (str(task.get("title", "")) + " " + str(task.get("brief", ""))).lower()
+    kws = {str(k).lower() for k in (sp.get("keywords") or [])}
+    score = 0
+    if any(bn in glob_blob or bn in text for bn in seed_basenames):
+        score += 3
+    score += len(kws & seed_kw)
+    return score
+
+
+def _prioritize_axes(leaves: list[dict[str, Any]], seed_text: str,
+                     *, max_keywords: int = 14) -> list[dict[str, Any]]:
+    """Re-order leaves by seed-relevance and inject the seed's own target axis.
+
+    Two deterministic, zero-cost guards against decompose non-determinism
+    (the T891 bottleneck — the engine fixes downstream of judge cannot help when
+    the investigation never locates the seed's named spot):
+
+      (a) PRIORITISE — sort the queen's leaves by :func:`_seed_relevance` so the
+          axes that match the seed survive the ``max_axes`` cap and the scattered
+          rabbit-hole axes sink past it (stable: ties keep the queen's order).
+      (b) INJECT — when the seed names a CONCRETE file (``Foo.vue``, not just a
+          directory), prepend a ``SEED_ANCHOR`` axis scoped to exactly that file
+          with the seed's own keywords, so a scattered decompose can never skip
+          the seed's target. It rides at the front, guaranteed past the cap.
+
+    Pure text extraction (reuses the searchplan bridge) — no model call, never
+    raises. When the seed names no concrete file, (b) is skipped and only (a)
+    applies; ranking still needs only the seed's keywords.
+    """
+    seed_files = [g for g in extract_globs(seed_text)
+                  if "*" not in g and _CONCRETE_FILE_RE.search(g)]
+    seed_kw = extract_keywords(seed_text)
+    seed_kw_set = {k.lower() for k in seed_kw}
+    seed_basenames = {os.path.basename(g).lower() for g in seed_files}
+
+    ranked = sorted(
+        leaves,
+        key=lambda t: _seed_relevance(t, seed_basenames, seed_kw_set),
+        reverse=True)
+
+    if not seed_files:
+        return ranked
+
+    seed_axis = {
+        "id": "SEED_ANCHOR",
+        "title": "seed-named target(s): "
+                 + ", ".join(os.path.basename(g) for g in seed_files),
+        "brief": ("Investigate the exact file/location the seed names for this "
+                  "change. Deterministically injected so a scattered decompose "
+                  "cannot skip the seed's own target."),
+        "depends_on": [],
+        "search_plan": {
+            "keywords": seed_kw[:max_keywords],
+            "file_globs": seed_files,
+            "doc_topics": extract_doc_topics(seed_text),
+        },
+    }
+    return [seed_axis] + ranked
 
 
 def run_investigate(
@@ -80,7 +163,15 @@ def run_investigate(
     )
     tasks = decompose_result.get("tasks", []) or []
     leaves = _leaf_axes(tasks)
+    # Deterministic, free guard against decompose non-determinism (T891): rank the
+    # leaves by seed-relevance and inject the seed's own named target as a front
+    # axis, BEFORE the position-based max_axes truncation — so a scattered queen
+    # cannot bury or skip the spot the seed explicitly points at.
+    leaves = _prioritize_axes(leaves, seed_text)
     judged = leaves[: cfg.judge.max_axes]
+    if judged and judged[0].get("id") == "SEED_ANCHOR":
+        logger.info("seed-anchor: injected front axis for seed-named target(s) %s",
+                    judged[0]["search_plan"]["file_globs"])
     logger.info("decompose → %d axes (%d leaf, judging %d, ceiling max_axes=%d)",
                 len(tasks), len(leaves), len(judged), cfg.judge.max_axes)
     # Truncation is a correctness risk, not just a cost note: leaf axes past the

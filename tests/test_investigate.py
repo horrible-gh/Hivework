@@ -17,7 +17,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from hive import investigate as INV
 from hive.config import load_config
 from hive.providers import WorkerResult
-from hive.investigate import render_local_honey
+from hive.investigate import render_local_honey, _prioritize_axes
 
 
 def _wr(stdout: str) -> WorkerResult:
@@ -268,6 +268,76 @@ class TestRenderLocalHoney(unittest.TestCase):
              "verdict": {"located": False, "file": "", "lines": "", "reason": "n/a"}}]}
         honey = render_local_honey(result, "do something")
         self.assertIn("defer", honey.lower())
+
+
+class TestPrioritizeAxes(unittest.TestCase):
+    """Deterministic seed-relevance ranking + seed-anchor injection (T891)."""
+
+    SEED = (
+        "in client/src/main/components/DocWorkflow.vue the placeholder div must "
+        "render blue like .wf-step.current (client/shared/app.css:341-342). "
+        "DO NOT modify the .wf-step.wf-undecided rule. Add the current class to "
+        "that placeholder, keep wf-current-clickable."
+    )
+
+    def _leaves(self):
+        return [
+            {"id": "sql_gate", "title": "drop wsi status",
+             "brief": "033_drop_wsi_status.sql status column",
+             "search_plan": {"keywords": ["status", "DROP"],
+                             "file_globs": ["server/sql/**/*.sql"]}},
+            {"id": "async_pipeline", "title": "class binding",
+             "brief": "DocWorkflow class binding omits current",
+             "search_plan": {"keywords": ["wf-current-clickable"],
+                             "file_globs": ["client/src/main/components/DocWorkflow.vue"]}},
+        ]
+
+    def test_seed_anchor_injected_at_front(self):
+        out = _prioritize_axes(self._leaves(), self.SEED)
+        self.assertEqual(out[0]["id"], "SEED_ANCHOR")
+        # scoped to the concrete file(s) the seed named, with seed keywords
+        self.assertIn("client/src/main/components/DocWorkflow.vue",
+                      out[0]["search_plan"]["file_globs"])
+        self.assertEqual(out[0]["depends_on"], [])
+
+    def test_rabbit_hole_axis_sinks_below_seed_relevant(self):
+        out = _prioritize_axes(self._leaves(), self.SEED)
+        order = [t["id"] for t in out]
+        # the on-topic queen axis outranks the unrelated SQL-drop axis
+        self.assertLess(order.index("async_pipeline"), order.index("sql_gate"))
+
+    def test_no_concrete_file_skips_injection(self):
+        # A seed naming no concrete file injects nothing (the SEED_ANCHOR guard is
+        # only for an explicitly-named file) and preserves the leaf set.
+        seed = "make the undecided step blue at rest"
+        out = _prioritize_axes(self._leaves(), seed)
+        self.assertNotIn("SEED_ANCHOR", [t["id"] for t in out])
+        self.assertEqual(len(out), len(self._leaves()))
+
+    def test_ranks_by_keyword_overlap_when_no_file(self):
+        # With no concrete file but an extractable (code-ish) keyword the seed
+        # shares with an axis, that axis still outranks the unrelated one.
+        seed = "the workflow_decided getter returns a stale value"
+        leaves = [
+            {"id": "noise", "title": "x", "brief": "unrelated",
+             "search_plan": {"keywords": ["zzz"], "file_globs": ["a/**/*.py"]}},
+            {"id": "match", "title": "y", "brief": "z",
+             "search_plan": {"keywords": ["workflow_decided"], "file_globs": ["b/**/*.py"]}},
+        ]
+        out = _prioritize_axes(leaves, seed)
+        self.assertNotIn("SEED_ANCHOR", [t["id"] for t in out])
+        order = [t["id"] for t in out]
+        self.assertLess(order.index("match"), order.index("noise"))
+
+    def test_anchor_survives_cap_when_rabbit_holes_would_truncate(self):
+        # 13 rabbit-hole leaves + a seed naming a file: even at max_axes=12 the
+        # SEED_ANCHOR rides at position 0 and is never truncated.
+        leaves = [{"id": f"R{i}", "title": "noise", "brief": "unrelated",
+                   "search_plan": {"keywords": ["zzz"], "file_globs": ["other/**/*.py"]}}
+                  for i in range(13)]
+        out = _prioritize_axes(leaves, self.SEED)
+        self.assertEqual(out[0]["id"], "SEED_ANCHOR")
+        self.assertEqual(out[:12][0]["id"], "SEED_ANCHOR")  # front of any cap window
 
 
 if __name__ == "__main__":
