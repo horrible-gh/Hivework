@@ -152,6 +152,65 @@ def test_abs_under_handles_separators_and_case():
     assert not _abs_under("rel/x.md", "C:/a")
 
 
+# --- relative doc globs rooted at docs_root's PARENT (N165) ---------------------
+
+def test_partition_routes_relative_docs_glob_and_strips_basename():
+    # Queen emits the design-doc target relative to the workspace root (parent of
+    # both trees), carrying docs_root's basename ('Documents') as leading segment.
+    # It must route to docs AND be rewritten docs-root-relative so rg matches it.
+    code = "C:/workspace/projects/flowgate"
+    docs = "C:/workspace/projects/Documents"
+    code_g, doc_g = _partition_globs(
+        ["client/src/**/*.vue",
+         "Documents/projects/FlowGate/210_design/**",
+         "Documents/**/FlowGate/**"],
+        code, docs)
+    assert code_g == ["client/src/**/*.vue"]
+    assert doc_g == ["projects/FlowGate/210_design/**", "**/FlowGate/**"]
+
+
+def test_partition_relative_docs_is_noop_without_docs_root():
+    # No docs tree → nothing to route to; the relative glob stays code-side (and
+    # will be dropped as empty there). Guards against misrouting when --docs absent.
+    code_g, doc_g = _partition_globs(
+        ["Documents/projects/FlowGate/**"], "C:/code", None)
+    assert doc_g == []
+    assert code_g == ["Documents/projects/FlowGate/**"]
+
+
+def test_partition_code_relative_glob_not_mistaken_for_docs():
+    # A normal code glob whose first segment differs from docs_root's basename
+    # stays code-side.
+    code_g, doc_g = _partition_globs(
+        ["server/**/*.py", "client/src/**"], "C:/code",
+        "C:/workspace/projects/Documents")
+    assert doc_g == []
+    assert code_g == ["server/**/*.py", "client/src/**"]
+
+
+def test_retrieve_routes_relative_doc_glob_to_docs_tree(tmp_path):
+    # End-to-end of the N165 D030_CHECK/DESIGN_SSOT failure: the doc glob arrives
+    # RELATIVE ('Documents/...'), rooted at the parent of the docs tree. It must
+    # still pull the design excerpt, not leak to the code tree and vanish.
+    code = tmp_path / "code"
+    (code / "src").mkdir(parents=True)
+    (code / "src" / "view.ts").write_text("mode = 'next'\n", encoding="utf-8")
+    docs_parent = tmp_path / "Documents"
+    design = docs_parent / "projects" / "FlowGate" / "210_design"
+    design.mkdir(parents=True)
+    (design / "D030_ssot.md").write_text(
+        "# D030\n## section\nin_progress override note\n", encoding="utf-8")
+    plan = SearchPlan(
+        axis_id="d030_check",
+        keywords=["in_progress", "override"],
+        file_globs=["Documents/projects/FlowGate/210_design/**"],
+        doc_topics=["override"],
+    )
+    out = retrieve(plan, str(code), str(docs_parent))
+    docs_hit = [e["doc"] for e in out["design_excerpts"]]
+    assert any("D030_ssot.md" in d for d in docs_hit)
+
+
 def test_retrieve_routes_doc_glob_to_docs_tree(tmp_path):
     # The queen lowered a design-doc target into file_globs as an ABSOLUTE path
     # under the docs tree. It must be retrieved from docs, not silently dropped

@@ -129,24 +129,66 @@ def _abs_under(glob: str, root: str | None) -> bool:
     return g.lower().startswith(r.lower() + "/")
 
 
+def _rel_under_docs(glob: str, docs_root: str | None) -> str | None:
+    """Recognise a *relative* glob the queen rooted at ``docs_root``'s PARENT.
+
+    The queen emits design-doc targets relative to the workspace root — the
+    parent of both ``code_root`` and ``docs_root`` — so they arrive carrying
+    ``docs_root``'s basename as their leading segment (e.g.
+    ``Documents/projects/FlowGate/210_design/**`` when ``docs_root`` ends in
+    ``/Documents``; observed N165 D030_CHECK/DESIGN_SSOT). Such a glob is NOT
+    absolute, so :func:`_abs_under` never routes it to the docs channel; it leaks
+    to the code tree, matches nothing, and the design SSOT is silently dropped.
+
+    Return the glob made docs-root-relative (leading basename segment stripped,
+    e.g. ``projects/FlowGate/210_design/**``) so ``rg -g`` matches it under
+    ``docs_root``; or ``None`` if ``glob`` is not such a glob. Absolute globs are
+    left to :func:`_abs_under`.
+    """
+    if not docs_root:
+        return None
+    g = re.sub(r"/{2,}", "/", glob.replace("\\", "/")).lstrip("/")
+    if re.match(r"^[A-Za-z]:/", g):           # absolute — _abs_under's job
+        return None
+    base = os.path.basename(
+        re.sub(r"/{2,}", "/", docs_root.replace("\\", "/")).rstrip("/"))
+    if not base:
+        return None
+    first, sep, rest = g.partition("/")
+    if sep and rest and first.lower() == base.lower():
+        return rest
+    return None
+
+
 def _partition_globs(globs: list[str], code_root: str,
                      docs_root: str | None) -> tuple[list[str], list[str]]:
     """Split the axis globs into (code-tree globs, docs-tree globs).
 
-    The queen routinely lowers a design-doc target into ``file_globs`` as an
-    ABSOLUTE path under the docs tree (e.g. ``C:/…/Documents/…/D031_*.md``). Those
-    globs match nothing under ``code_root`` — so validating/searching them there
-    silently drops the doc and the judge rules on a bundle that never contained it
-    (T890: 0/3 axes located). A glob under ``docs_root`` (and not also under
-    ``code_root``) is routed to the docs channel; everything else stays code-side.
+    The queen routinely lowers a design-doc target into ``file_globs`` pointing at
+    the docs tree, in two shapes:
+
+      * ABSOLUTE under the docs tree (e.g. ``C:/…/Documents/…/D031_*.md``) — routed
+        by :func:`_abs_under`; or
+      * RELATIVE, rooted at the docs tree's PARENT (e.g.
+        ``Documents/…/D031_*.md``) — routed by :func:`_rel_under_docs`, which also
+        rewrites it docs-root-relative so it actually matches there (N165).
+
+    Either way the glob matches nothing under ``code_root``, so validating/searching
+    it there silently drops the doc and the judge rules on a bundle that never
+    contained it (T890: 0/3 axes located). Docs-tree globs go to the docs channel;
+    everything else stays code-side.
     """
     code_g: list[str] = []
     doc_g: list[str] = []
     for g in globs:
         if _abs_under(g, docs_root) and not _abs_under(g, code_root):
             doc_g.append(g)
-        else:
-            code_g.append(g)
+            continue
+        rel = _rel_under_docs(g, docs_root)
+        if rel is not None:
+            doc_g.append(rel)
+            continue
+        code_g.append(g)
     return code_g, doc_g
 
 
