@@ -10,7 +10,8 @@ because stubs never exercised real ``rg`` glob semantics on absolute paths.
 import os
 
 from hive.retriever import (
-    _norm_glob, _validate_globs, _partition_globs, _abs_under, retrieve, SearchPlan,
+    _norm_glob, _validate_globs, _partition_globs, _abs_under, _widen_globs,
+    retrieve, SearchPlan,
 )
 
 ROOT = "C:/workspace/projects/Documents/projects/FlowGate"
@@ -171,3 +172,74 @@ def test_retrieve_routes_doc_glob_to_docs_tree(tmp_path):
     out = retrieve(plan, str(code), str(tmp_path / "docs_tree"))
     docs_hit = [e["doc"] for e in out["design_excerpts"]]
     assert any("D031_ssot.md" in d for d in docs_hit)
+
+
+# --- _widen_globs: drop the wrong-extension constraint, keep directory scope ----
+
+def test_widen_drops_extension_keeping_recursive_dir():
+    assert _widen_globs(["client/**/*.js"]) == ["client/**/*"]
+
+
+def test_widen_basename_extension_becomes_bare_wildcard():
+    assert _widen_globs(["*.tsx"]) == ["*"]
+
+
+def test_widen_specific_file_keeps_name_prefix():
+    assert _widen_globs(["a/b/Foo.vue"]) == ["a/b/Foo*"]
+
+
+def test_widen_extensionless_glob_unchanged():
+    assert _widen_globs(["client/**/*"]) == ["client/**/*"]
+
+
+def test_widen_dedupes_collapsing_globs():
+    # *.js and *.tsx both collapse to "*" → a single widened glob.
+    assert _widen_globs(["*.js", "*.tsx"]) == ["*"]
+
+
+# --- end-to-end: the T889 failure mode and its fallback recovery ---------------
+
+def _make_vue_tree(tmp_path):
+    """A Vue 3 + TS app: the real site is a .vue component; the only .js is a
+    stray build artefact that the keywords never touch (so the queen's .js glob
+    matches >0 files — passing the existence probe — yet retrieves nothing)."""
+    comp = tmp_path / "client" / "src" / "components"
+    comp.mkdir(parents=True)
+    (comp / "DocInfoPanel.vue").write_text(
+        "<script setup lang='ts'>\n"
+        "// isBehindWorkflowHead non-R path force-promotes the badge\n"
+        "const effectiveStatus = isBehindWorkflowHead ? 'wf_done' : status\n"
+        "</script>\n",
+        encoding="utf-8")
+    (tmp_path / "client" / "vite.config.js").write_text(
+        "export default { plugins: [] }\n", encoding="utf-8")
+    return str(tmp_path)
+
+
+def test_retrieve_recovers_when_queen_globs_wrong_extension(tmp_path):
+    # T889: queen emits .js/.tsx globs for a Vue3+TS tree → first pass finds 0
+    # snippets → extension-blind fallback widens and recovers the .vue site.
+    root = _make_vue_tree(tmp_path)
+    plan = SearchPlan(
+        axis_id="DIP_BADGE",
+        keywords=["isBehindWorkflowHead", "effectiveStatus", "wf_done"],
+        file_globs=["client/**/*.js", "*.tsx"],
+    )
+    out = retrieve(plan, root, max_hops=0)
+    files = [s["file"] for s in out["code_snippets"]]
+    assert any("DocInfoPanel.vue" in f for f in files)
+    widen = out["stats"]["glob_widening"]
+    assert widen is not None and widen["recovered"] is True
+
+
+def test_retrieve_no_widening_when_first_pass_hits(tmp_path):
+    # Correct-extension globs find the site directly → no fallback is attempted.
+    root = _make_vue_tree(tmp_path)
+    plan = SearchPlan(
+        axis_id="DIP_BADGE",
+        keywords=["isBehindWorkflowHead", "effectiveStatus"],
+        file_globs=["client/**/*.vue"],
+    )
+    out = retrieve(plan, root, max_hops=0)
+    assert any("DocInfoPanel.vue" in s["file"] for s in out["code_snippets"])
+    assert out["stats"]["glob_widening"] is None

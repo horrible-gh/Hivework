@@ -214,6 +214,86 @@ def _validate_globs(globs: list[str], root: str,
     return kept, diag
 
 
+def _widen_globs(globs: list[str]) -> list[str]:
+    """Drop each glob's file-EXTENSION constraint, keeping its directory scope.
+
+    The queen emits ``file_globs`` blind to the target stack, so she routinely
+    names the wrong extensions for a tree: e.g. ``client/**/*.js`` + ``*.tsx`` for
+    a Vue 3 + TypeScript app whose component layer is ``.vue``/``.ts`` (T889
+    forensics). :func:`_validate_globs` cannot catch this — a stray ``.js`` build
+    artefact makes the glob match >0 files, so it is not dropped as garbage — yet
+    the keyword search inside that scope never reaches the real ``.vue`` site and
+    the axis comes back with 0 code snippets.
+
+    Widening replaces the extension token of each glob's final segment with a
+    wildcard (``client/**/*.js`` → ``client/**/*``; ``*.tsx`` → ``*``;
+    ``a/b/Foo.vue`` → ``a/b/Foo*``), so a re-search keeps the directory locality
+    the queen got right while dropping the extension she got wrong. Deterministic,
+    free, and only ever run as a fallback (see :func:`retrieve`). Order-preserving
+    and de-duplicated.
+    """
+    widened: list[str] = []
+    for g in globs:
+        head, sep, tail = g.replace("\\", "/").rpartition("/")
+        if "." not in tail:
+            wide_tail = tail            # already extensionless — leave it alone
+        else:
+            base = tail.split(".", 1)[0]   # "*" from "*.js"; "Foo" from "Foo.vue"
+            wide_tail = base if base.endswith("*") else (base + "*" if base else "*")
+        wg = head + sep + wide_tail
+        if wg not in widened:
+            widened.append(wg)
+    return widened
+
+
+def _scan_code(keywords: list[str], globs: list[str], code_root: str,
+               k: int, top_files: int) -> dict[str, Any]:
+    """ripgrep keywords → rank files → window densest clusters (retrieve steps 1-3).
+
+    Factored out so :func:`retrieve` can run it a second time with widened globs
+    when the first pass returns 0 snippets (extension-blind fallback, T889).
+    """
+    call_sites: list[dict[str, Any]] = []
+    file_hits: dict[str, set[str]] = defaultdict(set)       # file -> keywords
+    file_lines: dict[str, list[tuple[int, str]]] = defaultdict(list)  # (line,kw)
+    for kw in keywords:
+        for h in _ripgrep(kw, globs, code_root):
+            h["keyword"] = kw
+            call_sites.append(h)
+            file_hits[h["file"]].add(kw)
+            file_lines[h["file"]].append((h["line"], kw))
+
+    hit_count: dict[str, int] = defaultdict(int)
+    for h in call_sites:
+        hit_count[h["file"]] += 1
+    ranked = sorted(
+        file_hits.keys(),
+        key=lambda f: (len(file_hits[f]), hit_count[f]),
+        reverse=True,
+    )
+
+    raw_snips: list[dict[str, Any]] = []
+    densest_line: dict[str, int] = {}  # file -> centroid of its top cluster
+    for f in ranked[:top_files]:
+        clusters = _cluster_lines(file_lines[f], k, max_clusters=2)
+        if clusters:
+            densest_line[f] = (clusters[0]["lo"] + clusters[0]["hi"]) // 2
+        for c in clusters:
+            w = _read_window(code_root, f, (c["lo"] + c["hi"]) // 2, k)
+            raw_snips.append({
+                "file": f, "lines": w["lines"], "text": w["text"],
+                "hits": c["kws"],
+            })
+    return {
+        "call_sites": call_sites,
+        "file_hits": file_hits,
+        "file_lines": file_lines,
+        "ranked": ranked,
+        "densest_line": densest_line,
+        "code_snippets": _merge_windows(raw_snips),
+    }
+
+
 def _ripgrep(keyword: str, globs: list[str], root: str,
              max_hits: int = 40) -> list[dict[str, Any]]:
     """ripgrep one keyword constrained to globs. Returns [{file,line,text}]."""
@@ -450,42 +530,33 @@ def retrieve(plan: SearchPlan, code_root: str, docs_root: str | None = None,
     code_globs, doc_globs = _partition_globs(plan.file_globs, code_root, docs_root)
     globs, glob_diag = _validate_globs(code_globs, code_root, overbroad_files)
 
-    # 1. ripgrep every keyword across globs → raw call_sites, keep ALL hit
-    #    lines per file (not just first) so dense late regions stay reachable.
-    call_sites: list[dict[str, Any]] = []
-    file_hits: dict[str, set[str]] = defaultdict(set)       # file -> keywords
-    file_lines: dict[str, list[tuple[int, str]]] = defaultdict(list)  # (line,kw)
-    for kw in plan.keywords:
-        for h in _ripgrep(kw, globs, code_root):
-            h["keyword"] = kw
-            call_sites.append(h)
-            file_hits[h["file"]].add(kw)
-            file_lines[h["file"]].append((h["line"], kw))
+    # 1-3. ripgrep keywords → rank files → window densest clusters.
+    scan = _scan_code(plan.keywords, globs, code_root, k, top_files)
 
-    # 2. rank files by keyword-coverage (distinct keywords) then total hits.
-    hit_count: dict[str, int] = defaultdict(int)
-    for h in call_sites:
-        hit_count[h["file"]] += 1
-    ranked = sorted(
-        file_hits.keys(),
-        key=lambda f: (len(file_hits[f]), hit_count[f]),
-        reverse=True,
-    )
+    # 3a. Extension-blind fallback (T889): the queen named extensions the tree
+    #     does not use (``*.js``/``*.tsx`` for a Vue 3 + TS app whose sites are
+    #     ``.vue``/``.ts``), so the scope was right but every snippet missed. When
+    #     the first pass found NOTHING, drop the extension constraint and re-search
+    #     ONCE. Deterministic & free; never touches the queen's (non-deterministic)
+    #     decompose. Adopt the wider result only if it actually recovers snippets.
+    widen_diag: dict[str, Any] | None = None
+    if not scan["code_snippets"] and globs:
+        wide_globs, wide_glob_diag = _validate_globs(
+            _widen_globs(globs), code_root, overbroad_files)
+        if set(wide_globs) != set(globs):
+            rescan = _scan_code(plan.keywords, wide_globs, code_root, k, top_files)
+            widen_diag = {"widened_globs": wide_globs, "from": globs,
+                          "recovered": bool(rescan["code_snippets"]),
+                          "validation": wide_glob_diag}
+            if rescan["code_snippets"]:
+                scan, globs = rescan, wide_globs
 
-    # 3. for top files, window the densest keyword CLUSTERS (top 2 per file).
-    raw_snips: list[dict[str, Any]] = []
-    densest_line: dict[str, int] = {}  # file -> centroid of its top cluster
-    for f in ranked[:top_files]:
-        clusters = _cluster_lines(file_lines[f], k, max_clusters=2)
-        if clusters:
-            densest_line[f] = (clusters[0]["lo"] + clusters[0]["hi"]) // 2
-        for c in clusters:
-            w = _read_window(code_root, f, (c["lo"] + c["hi"]) // 2, k)
-            raw_snips.append({
-                "file": f, "lines": w["lines"], "text": w["text"],
-                "hits": c["kws"],
-            })
-    code_snippets = _merge_windows(raw_snips)
+    call_sites = scan["call_sites"]
+    file_hits = scan["file_hits"]
+    file_lines = scan["file_lines"]
+    ranked = scan["ranked"]
+    densest_line = scan["densest_line"]
+    code_snippets = scan["code_snippets"]
 
     # 3b. follow call-chains out of the code snippets (1-2 hops, local & free).
     call_chain = _follow_calls(code_snippets, globs, code_root,
@@ -558,6 +629,7 @@ def retrieve(plan: SearchPlan, code_root: str, docs_root: str | None = None,
             "ranked_files": ranked[:top_files],
             "globs_used": globs,
             "glob_validation": glob_diag,
+            "glob_widening": widen_diag,
         },
     }
 
