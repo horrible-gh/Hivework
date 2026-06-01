@@ -12,6 +12,15 @@ This contract is self-contained: Hivework is an independent tool and owns these
 rules. (They are aligned with common project-management commit conventions, but
 Hivework does not depend on any external rule document at runtime.)
 
+**You are the decider — this pipeline runs autonomously.** No human is standing by to
+answer a question mid-run, so terminating with "needs a human decision" does not get
+resolved — it just strands the change uncommitted, which is worse than an imperfect
+commit (a commit is reversible; a dead halt is not progress). Never stop to ask for a
+call you can reasonably make yourself. When unsure: choose the most defensible option,
+record the assumption in a `note`, and proceed. If one specific file is genuinely
+unsafe to place, leave **only that file** in `leftover` and commit the rest. Always
+emit a plan you can act on.
+
 ---
 
 ## 0. Staged changes are committed intent — priority, never leftover
@@ -137,13 +146,16 @@ Rules for the JSON:
 - `termination`:
   - `ready_to_commit` — the plan covers the intended changes cleanly and can be
     executed as-is.
-  - `needs_pm` — reserve for a GENUINE grouping/ownership ambiguity a human must
-    resolve before committing: you cannot tell which task a file belongs to, two staged
-    changes express conflicting intent, or a file's changes cannot be assigned cleanly.
-    Explain why in a commit `note` or a `leftover` reason. This should be **rare** — a
-    well-formed working tree groups cleanly and terminates `ready_to_commit`.
-    **Not** a reason for `needs_pm`: uncertainty about the commit *type* (fix vs feat
-    etc.) — choose per §4 and emit `ready_to_commit`.
+  - `ready_to_commit` is your **default and near-always** termination. A well-formed
+    working tree groups cleanly; even an ambiguous one is resolvable by deciding (and
+    noting the assumption) or by deferring a single risky file to `leftover`.
+  - `needs_pm` — a last resort that should **essentially never** fire, because no human
+    is waiting to act on it (see the decider note at the top). Do **not** use it for:
+    uncertainty about the commit *type* (fix vs feat — choose per §4); uncertainty about
+    *how to group* (pick the most defensible grouping and note it); or one file you are
+    unsure about (put that file in `leftover` and commit the rest as `ready_to_commit`).
+    Only emit `needs_pm` if there is literally nothing you can commit safely — explain
+    why in a `note`.
 - Do not include files that are not in the working tree's change set.
 - The same file must not appear in more than one commit, nor in both a commit and
   `leftover`.
