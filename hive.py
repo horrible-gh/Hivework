@@ -436,6 +436,7 @@ def run_investigate_command(args: argparse.Namespace) -> None:
         try:
             spec = run_specify(
                 honey_path=honey_path, codebase_root=args.codebase,
+                docs_root=args.docs,
                 output_path=spec_out, contract_path=args.contract,
                 model=specify_role.model, provider=specify_role.provider,
                 ledger=ldg2, provider_kwargs=provider_kwargs,
@@ -473,6 +474,7 @@ def run_specify_command(args: argparse.Namespace) -> None:
     logger.info("Hivework specify — honey → edit-spec (Stage-1: propose only)")
     logger.info("  honey:    %s", args.honey)
     logger.info("  codebase: %s", args.codebase)
+    logger.info("  docs:     %s", args.docs or "(none)")
     logger.info("  output:   %s", args.out)
     logger.info("  contract: %s", args.contract or "(default) recipes/edit_spec_contract_v1.md")
     logger.info("  author:   %s/%s", role.provider, role.model)
@@ -486,6 +488,7 @@ def run_specify_command(args: argparse.Namespace) -> None:
         spec = run_specify(
             honey_path=args.honey,
             codebase_root=args.codebase,
+            docs_root=args.docs,
             output_path=args.out,
             contract_path=args.contract,
             model=role.model,
@@ -820,6 +823,12 @@ def main() -> None:
     spec_parser.add_argument(
         "--codebase", required=True,
         help="Root of the LIVE codebase — anchors are lifted from here, not the honey",
+    )
+    spec_parser.add_argument(
+        "--docs", default=None,
+        help="Root of the design docs, when they live in a separate tree from the "
+             "code (mirrors investigate's --docs). A document-update direction is "
+             "lowered against this tree instead of the nearest source file.",
     )
     spec_parser.add_argument(
         "--out", required=True,

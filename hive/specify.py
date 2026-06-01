@@ -71,21 +71,70 @@ def load_contract(contract_path: str | None = None) -> str:
         return f.read()
 
 
-def build_specify_prompt(honey_text: str, contract_text: str, codebase_root: str) -> str:
+def _docs_root_block(docs_root: str | None) -> str:
+    """Prompt fragment telling the author about a separate design-doc tree.
+
+    Design docs (PM-facing D/P/L specs) commonly live in a tree separate from the
+    code. The author worker runs with cwd=codebase_root and would otherwise never
+    see them — so a "edit the D031 design doc" direction gets mis-lowered onto the
+    nearest-looking source file. This block makes the docs tree visible and tells
+    the author to PREFER it when the honey's directive is about a document, and to
+    emit ``file`` relative to whichever tree actually holds the target.
+    """
+    if not docs_root:
+        return ""
+    return f"""
+[Design-docs root — a SEPARATE tree from the code]
+{docs_root}
+When the honey's fix direction targets a design document (e.g. a Markdown D/P/L
+spec), the file lives under this docs root, NOT the codebase root. Open it there
+(docs root + the path the honey cites) and lift `anchor_old` from the CURRENT text
+byte-for-byte. Prefer the design document over any source file when the directive
+is about the document. Emit `file` as the path relative to the tree that holds it.
+"""
+
+
+def _stamp_root(spec: dict[str, Any], codebase_root: str, docs_root: str | None) -> str:
+    """Pick which tree to record as the spec's ``codebase_root``.
+
+    Returns ``docs_root`` when the spec's anchor edits resolve under the docs tree
+    but not the code tree (a design-doc edit); otherwise ``codebase_root``. Probing
+    by file existence keeps this deterministic and avoids trusting the author's
+    own (possibly wrong) sense of which tree it edited. ``create_file`` edits are
+    absent by design and don't vote.
+    """
+    if not docs_root:
+        return codebase_root
+    anchor_files = [
+        e.get("file", "") for e in (spec.get("edits") or [])
+        if isinstance(e, dict) and e.get("kind", "edit") != "create_file" and e.get("file")
+    ]
+    if not anchor_files:
+        return codebase_root
+    in_docs = sum(1 for f in anchor_files if os.path.isfile(os.path.join(docs_root, f)))
+    in_code = sum(1 for f in anchor_files if os.path.isfile(os.path.join(codebase_root, f)))
+    return docs_root if in_docs > in_code else codebase_root
+
+
+def build_specify_prompt(honey_text: str, contract_text: str, codebase_root: str,
+                         docs_root: str | None = None) -> str:
     """Build the full prompt for the single specify author.
 
     The contract is the role/system prompt; the honey is the input to lower; the
     codebase_root tells the author where the LIVE code is. Anchors must be lifted
-    from there byte-for-byte, never copied from the (possibly stale) honey.
+    from there byte-for-byte, never copied from the (possibly stale) honey. When
+    ``docs_root`` is given, a separate design-doc tree is also made visible so a
+    document-update direction is not mis-lowered onto the nearest source file.
     """
     return f"""{contract_text}
 
 [Codebase root — read LIVE files from here]
 {codebase_root}
-
+{_docs_root_block(docs_root)}
 [Input honey — lower each fix direction into the edit-spec contracted above]
-Re-open every file you touch under the codebase root and lift `anchor_old` from
-the CURRENT text byte-for-byte. Do NOT trust code quoted in the honey below.
+Re-open every file you touch (under the codebase root, or the docs root when the
+direction targets a design document) and lift `anchor_old` from the CURRENT text
+byte-for-byte. Do NOT trust code quoted in the honey below.
 When the honey calls for a brand-new file that does not yet exist in the codebase,
 emit a `create_file` edit (kind + content, no anchor) per the contract rather than
 forcing an anchor edit against an existing file.
@@ -183,7 +232,8 @@ def _deterministic_noop_ids(spec: dict[str, Any]) -> list[str]:
 _REVIEW_CONTENT_MAX_LINES = 40
 
 
-def build_review_prompt(honey_text: str, spec: dict[str, Any], codebase_root: str) -> str:
+def build_review_prompt(honey_text: str, spec: dict[str, Any], codebase_root: str,
+                        docs_root: str | None = None) -> str:
     """Build the effectiveness-review prompt for a second, independent look.
 
     The reviewer gets the honey (the reported symptom + the behavior the fix must
@@ -232,7 +282,7 @@ correctly but do not actually fix anything. Do not rewrite the edits; only judge
 
 [Codebase root — re-read LIVE files from here]
 {codebase_root}
-
+{_docs_root_block(docs_root)}
 [The honey — the reported symptom and the behavior the fix must change]
 {honey_text}
 
@@ -270,6 +320,7 @@ def review_effectiveness(
     provider: str,
     ledger=None,
     provider_kwargs: dict | None = None,
+    docs_root: str | None = None,
 ) -> tuple[dict[str, dict], bool]:
     """Second pass: ask a worker to judge each edit's effectiveness/coherence.
 
@@ -282,7 +333,7 @@ def review_effectiveness(
     if not edits:
         return {}, False  # nothing to review
 
-    prompt = build_review_prompt(honey_text, spec, codebase_root)
+    prompt = build_review_prompt(honey_text, spec, codebase_root, docs_root)
     logger.info("Running specify effectiveness review (%d edits, independent pass)...",
                 len(edits))
     try:
@@ -451,11 +502,13 @@ def _review_and_gate(
     provider: str,
     ledger=None,
     provider_kwargs: dict | None = None,
+    docs_root: str | None = None,
 ) -> dict[str, Any]:
     """Run both halves of the effectiveness gate and adjust the spec's termination."""
     noop_ids = _deterministic_noop_ids(spec)
     judgments, inconclusive = review_effectiveness(
-        honey_text, spec, codebase_root, model, provider, ledger, provider_kwargs)
+        honey_text, spec, codebase_root, model, provider, ledger, provider_kwargs,
+        docs_root=docs_root)
     return _apply_effectiveness_gate(spec, noop_ids, judgments, inconclusive)
 
 
@@ -469,6 +522,7 @@ def run_specify(
     ledger=None,
     provider_kwargs: dict | None = None,
     review: bool = True,
+    docs_root: str | None = None,
 ) -> dict[str, Any]:
     """Run the specify stage: honey + live code → edit-spec JSON.
 
@@ -488,7 +542,7 @@ def run_specify(
     with open(honey_path, "r", encoding="utf-8") as f:
         honey_text = f.read()
     contract_text = load_contract(contract_path)
-    prompt = build_specify_prompt(honey_text, contract_text, codebase_root)
+    prompt = build_specify_prompt(honey_text, contract_text, codebase_root, docs_root)
 
     logger.info("Running specify author (single, not fan-out)...")
     logger.debug("Prompt length: %d chars", len(prompt))
@@ -508,7 +562,7 @@ def run_specify(
     # which are anchored but do not change the reported behavior as ready.
     if review:
         spec = _review_and_gate(spec, honey_text, codebase_root, model, provider,
-                                ledger, provider_kwargs)
+                                ledger, provider_kwargs, docs_root=docs_root)
 
     # Decisiveness gate: a verified+effective edit must be applyable even when the
     # honey also surfaced optional/policy directions (which sit in deferred[]).
@@ -519,8 +573,13 @@ def run_specify(
         logger.warning("specify: edit-spec has structural problems: %s", "; ".join(problems))
 
     # Record provenance so a derived diff / reconcile loop can trace this back.
+    # Stamp codebase_root with the tree that actually holds the edited files: for a
+    # design-doc edit the anchors live under docs_root, not the code tree. This keeps
+    # the spec self-consistent so apply resolves the paths even if the caller never
+    # passes --docs to apply (apply joins file paths against this codebase_root).
     spec.setdefault("source_honey", honey_path)
-    spec.setdefault("codebase_root", os.path.abspath(codebase_root))
+    spec.setdefault("codebase_root",
+                    os.path.abspath(_stamp_root(spec, codebase_root, docs_root)))
 
     os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
     with open(output_path, "w", encoding="utf-8") as f:
