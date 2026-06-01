@@ -243,5 +243,48 @@ class TestExtractFirstJsonEdgeCases(unittest.TestCase):
         self.assertEqual(result["axis_id"], "D2")
 
 
+class TestRepairStrayEscapes(unittest.TestCase):
+    """Recovery of a recurring worker defect: an array string element whose
+    delimiter quotes were backslash-escaped (T890 decompose failure)."""
+
+    def test_over_escaped_array_element_recovered(self):
+        # The exact shape that failed: a value containing single quotes was
+        # emitted as ``\"mode='next'\"`` — invalid JSON the strict scan rejects.
+        raw = (
+            '{\n'
+            '  "tasks": [\n'
+            '    {"id": "T4", "search_plan": {"keywords": [\n'
+            '      "0a0dd2d",\n'
+            "      \\\"mode='next'\\\",\n"
+            "      \\\"mode='info'\\\",\n"
+            '      "in_progress"\n'
+            '    ]}}\n'
+            '  ]\n'
+            '}\n'
+        )
+        result = extract_first_json(raw)
+        kws = result["tasks"][0]["search_plan"]["keywords"]
+        self.assertIn("mode='next'", kws)
+        self.assertIn("mode='info'", kws)
+        self.assertIn("0a0dd2d", kws)
+        self.assertIn("in_progress", kws)
+
+    def test_windows_path_globs_untouched_by_repair(self):
+        # A line that starts with a real ``"`` (e.g. an escaped Windows path)
+        # must not be mangled by the repair — and valid input never triggers it.
+        raw = (
+            '{"file_globs": [\n'
+            '  "C:\\\\workspace\\\\projects\\\\FlowGate\\\\**\\\\*.py"\n'
+            ']}\n'
+        )
+        result = extract_first_json(raw)
+        self.assertEqual(result["file_globs"][0],
+                         "C:\\workspace\\projects\\FlowGate\\**\\*.py")
+
+    def test_unrecoverable_still_raises(self):
+        with self.assertRaises(ValueError):
+            extract_first_json('{"k": [\\"a\\", garbage notjson ]}')
+
+
 if __name__ == "__main__":
     unittest.main()

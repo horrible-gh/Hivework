@@ -16,6 +16,7 @@ Returns the parsed dict, or raises ValueError on failure.
 """
 
 import json
+import re
 from typing import Any, Iterator
 
 
@@ -30,6 +31,11 @@ def extract_first_json(raw: str) -> dict[str, Any]:
     the largest block that decodes to an object. The comb is always the largest
     real JSON object; brace fragments and broken trailing JSON are skipped.
 
+    If nothing decodes, a single best-effort repair pass is tried (see
+    :func:`_repair_stray_escapes`) before giving up — workers periodically emit a
+    well-formed-looking object with one over-escaped string element, and a
+    paid-for decompose/comb call should not be thrown away over that.
+
     Args:
         raw: The raw stdout text from a copilot worker.
 
@@ -39,6 +45,25 @@ def extract_first_json(raw: str) -> dict[str, Any]:
     Raises:
         ValueError: If no balanced block decodes to a JSON object.
     """
+    obj, last_error = _best_object(raw)
+    if obj is not None:
+        return obj
+
+    repaired = _repair_stray_escapes(raw)
+    if repaired != raw:
+        obj, last_error = _best_object(repaired)
+        if obj is not None:
+            return obj
+
+    if last_error is not None:
+        raise ValueError(
+            f"Extracted JSON block failed to parse: {last_error}"
+        ) from last_error
+    raise ValueError("No complete top-level JSON object found in comb output")
+
+
+def _best_object(raw: str) -> tuple[dict[str, Any] | None, json.JSONDecodeError | None]:
+    """Return the largest top-level block that decodes to a dict (or None)."""
     best: dict[str, Any] | None = None
     best_len = -1
     last_error: json.JSONDecodeError | None = None
@@ -50,14 +75,33 @@ def extract_first_json(raw: str) -> dict[str, Any]:
             continue
         if isinstance(obj, dict) and len(block) > best_len:
             best, best_len = obj, len(block)
+    return best, last_error
 
-    if best is not None:
-        return best
-    if last_error is not None:
-        raise ValueError(
-            f"Extracted JSON block failed to parse: {last_error}"
-        ) from last_error
-    raise ValueError("No complete top-level JSON object found in comb output")
+
+# A pretty-printed array element whose string-delimiter quotes were themselves
+# backslash-escaped: ``          \"mode='next'\",`` instead of ``"mode='next'"``.
+# Observed from a real decompose worker (T890) — the model over-escaped a value
+# containing single quotes, which is invalid JSON and desyncs the brace scanner.
+_ESCAPED_ELEMENT_RE = re.compile(r'^(\s*)\\"(.*)\\"(\s*,?\s*)$')
+
+
+def _repair_stray_escapes(raw: str) -> str:
+    """Best-effort, conservative repair of one recurring worker JSON defect.
+
+    Rewrites only WHOLE-LINE array elements that begin with a backslash-escaped
+    delimiter quote (``\\"value\\"``) back to a plain JSON string (``"value"``).
+    Lines that start with a real ``"`` (e.g. a Windows path glob) never match, so
+    legitimately escaped in-string quotes are left untouched. This runs only as a
+    fallback after strict parsing fails, and the result is re-validated by
+    ``json.loads`` — a bad repair still raises rather than returning junk.
+    """
+    out: list[str] = []
+    for line in raw.split("\n"):
+        m = _ESCAPED_ELEMENT_RE.match(line)
+        if m and '\\"' not in m.group(2):
+            line = f'{m.group(1)}"{m.group(2)}"{m.group(3)}'
+        out.append(line)
+    return "\n".join(out)
 
 
 def _iter_top_level_objects(text: str) -> Iterator[str]:
