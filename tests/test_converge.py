@@ -167,6 +167,134 @@ class TestRunConverge(unittest.TestCase):
                            bundles=BUNDLES, provider="deepinfra", model="m")
         self.assertEqual(seen.get("available_tools"), [])
 
+
+# ── N172: undecidable → live DB data read → re-rule on fact ────────────────────
+import sqlite3
+import tempfile
+from hive.config import DbConnection
+
+# First pass: undecidable AND names the exact rows to read (data_reads). This is the
+# N172 shape — the verdict hinges on doc_review_status, which static evidence can't see.
+UNDECIDABLE_WITH_READS_OUT = json.dumps({
+    "converged": True,
+    "path": [{"node": "db_fn", "file": "db/workflow_sequences.py", "lines": "45-57",
+              "symbol": "get_effective_head"}],
+    "attributed_defect": {"node": "db_fn", "file": "db/workflow_sequences.py",
+                          "lines": "45-57", "why": "ORDER BY may mis-rank the head"},
+    "causal_check": {
+        "verdict": "undecidable",
+        "data_state_assumptions": ["depends on the head doc's doc_review_status"],
+        "trace": "if the head doc is unapproved it is included in the candidate set; "
+                 "static evidence does not show its stored review status.",
+        "need_data_state": ["doc_review_status for the failing head doc"],
+        "data_reads": [{"table": "documents",
+                        "where": {"doc_id": "D1"},
+                        "columns": ["doc_review_status"]}]},
+    "missing_link": {"between": ["handler", "db_fn"],
+                     "need": {"symbols": ["get_effective_head"], "greps": [], "file_globs": []}},
+})
+
+
+def _tmp_db_with_doc(review_status):
+    d = tempfile.mkdtemp()
+    path = os.path.join(d, "t.db")
+    c = sqlite3.connect(path)
+    c.execute("CREATE TABLE documents (doc_id TEXT, doc_review_status TEXT)")
+    c.execute("INSERT INTO documents VALUES ('D1', ?)", (review_status,))
+    c.commit(); c.close()
+    return DbConnection(kind="sqlite", path=path)
+
+
+class TestConvergeDataRead(unittest.TestCase):
+    """The undecidable→DB-read→re-rule loop. The DB read is REAL (temp sqlite); only
+    the model call is mocked."""
+
+    def test_undecidable_reads_db_and_rerules_contradicted(self):
+        """N172: real rows refute the band-aid → contradicted → NOT converged.
+
+        The missing-link band-aid re-pass must NOT run once the data has ruled.
+        """
+        prompts = []
+
+        def fake(provider, model, prompt, cwd=None, timeout=300, **kw):
+            prompts.append(prompt)
+            # pass 1: undecidable+reads ; pass 2 (has confirmed block): contradicted
+            return _wr(CONTRADICTED_OUT if "Confirmed data state" in prompt
+                       else UNDECIDABLE_WITH_READS_OUT)
+
+        db = _tmp_db_with_doc("wf_in_progress")
+        with mock.patch.object(C, "call_worker", side_effect=fake):
+            res = C.run_converge(seed_text="head off-by-one for D1",
+                                 verdicts=LOCATED_VERDICTS, bundles=BUNDLES,
+                                 provider="deepinfra", model="m",
+                                 code_root="/repo", db_conn=db)
+        # exactly two model calls: undecidable, then the fact-grounded re-pass
+        self.assertEqual(len(prompts), 2)
+        # the re-pass prompt carried the ACTUAL value read from the DB
+        self.assertIn("Confirmed data state", prompts[1])
+        self.assertIn("wf_in_progress", prompts[1])
+        # ruled on fact → contradicted, not converged (band-aid stopped)
+        self.assertFalse(res.converged)
+        self.assertEqual(res.causal_check["verdict"], "contradicted")
+
+    def test_undecidable_reads_db_and_rerules_consistent(self):
+        def fake(provider, model, prompt, cwd=None, timeout=300, **kw):
+            return _wr(CONVERGED_OUT if "Confirmed data state" in prompt
+                       else UNDECIDABLE_WITH_READS_OUT)
+
+        db = _tmp_db_with_doc("")
+        with mock.patch.object(C, "call_worker", side_effect=fake):
+            res = C.run_converge(seed_text="head off-by-one for D1",
+                                 verdicts=LOCATED_VERDICTS, bundles=BUNDLES,
+                                 provider="deepinfra", model="m",
+                                 code_root="/repo", db_conn=db)
+        self.assertTrue(res.converged)
+        self.assertEqual(res.causal_check["verdict"], "consistent")
+
+    def test_no_db_conn_leaves_undecidable_unresolved(self):
+        """Without a DB connection the data read is skipped — the static path stands."""
+        calls = []
+
+        def fake(provider, model, prompt, cwd=None, timeout=300, **kw):
+            calls.append(prompt)
+            return _wr(UNDECIDABLE_WITH_READS_OUT)
+
+        with mock.patch.object(C, "call_worker", side_effect=fake):
+            res = C.run_converge(seed_text="s", verdicts=LOCATED_VERDICTS,
+                                 bundles=BUNDLES, provider="deepinfra", model="m",
+                                 code_root="/repo", db_conn=None)
+        # no confirmed-state re-pass; missing-link re-pass may run but never a DB read
+        self.assertFalse(res.converged)
+        self.assertTrue(all("Confirmed data state" not in p for p in calls))
+
+    def test_db_read_failure_degrades_to_static(self):
+        """A read error (table not present) must not crash; verdict stays undecidable."""
+        bad_reads = json.loads(UNDECIDABLE_WITH_READS_OUT)
+        bad_reads["causal_check"]["data_reads"] = [
+            {"table": "no_such_table", "where": {"doc_id": "D1"}, "columns": ["x"]}]
+        bad_reads["missing_link"] = None
+        out = json.dumps(bad_reads)
+        db = _tmp_db_with_doc("wf_in_progress")
+        with mock.patch.object(C, "call_worker", return_value=_wr(out)):
+            res = C.run_converge(seed_text="s", verdicts=LOCATED_VERDICTS,
+                                 bundles=BUNDLES, provider="deepinfra", model="m",
+                                 code_root="/repo", db_conn=db)
+        self.assertFalse(res.converged)
+        self.assertEqual(res.causal_check["verdict"], "undecidable")
+
+    def test_fetch_data_state_renders_rows(self):
+        db = _tmp_db_with_doc("approved")
+        block = C._fetch_data_state(
+            [{"table": "documents", "where": {"doc_id": "D1"},
+              "columns": ["doc_review_status"]}], db)
+        self.assertIn("doc_review_status", block)
+        self.assertIn("approved", block)
+
+    def test_data_reads_parsed_into_causal_check(self):
+        res = C._result_from(json.loads(UNDECIDABLE_WITH_READS_OUT), set())
+        self.assertEqual(res.causal_check["data_reads"][0]["table"], "documents")
+        self.assertEqual(res.causal_check["data_reads"][0]["where"], {"doc_id": "D1"})
+
     def test_missing_link_names_the_hop(self):
         with mock.patch.object(C, "call_worker", return_value=_wr(MISSING_OUT)):
             res = C.run_converge(seed_text="s", verdicts=LOCATED_VERDICTS,

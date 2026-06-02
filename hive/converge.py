@@ -149,8 +149,16 @@ def _known_files(verdicts: list[dict[str, Any]], windows: list[dict[str, Any]]) 
 
 def build_converge_prompt(seed_text: str, located: list[dict[str, Any]],
                           unlocated: list[dict[str, Any]],
-                          windows: list[dict[str, Any]]) -> str:
-    """Build the single converge prompt: fragments + evidence → one path + one node."""
+                          windows: list[dict[str, Any]],
+                          data_state_block: str = "") -> str:
+    """Build the single converge prompt: fragments + evidence → one path + one node.
+
+    ``data_state_block`` is the optional ``[Confirmed data state]`` section: on the
+    re-pass after an ``undecidable`` first pass, the glue has READ the exact rows the
+    converger asked for from the live DB and renders them here as AUTHORITATIVE fact.
+    The model is told to rule on these real values, not on assumed ones — turning the
+    undecidable causal check into a decidable (consistent / contradicted) one.
+    """
     frag_lines = []
     for v in located:
         vd = v.get("verdict") or {}
@@ -175,6 +183,16 @@ def build_converge_prompt(seed_text: str, located: list[dict[str, Any]],
 
     unloc_block = f"\n[Axes that did NOT locate (context)]\n{unlocs}\n" if unlocs else ""
 
+    # On the re-pass, the actual rows the converger asked for have been read from the
+    # live DB. They are AUTHORITATIVE — rule on them, not on assumed values.
+    confirmed_block = ""
+    if data_state_block.strip():
+        confirmed_block = (
+            "\n[Confirmed data state — ACTUAL rows read from the live DB; these are "
+            "FACT, not assumptions. Re-run your cause→symptom check against THESE "
+            "values and rule consistent or contradicted accordingly. Do NOT return "
+            "undecidable for a field shown here.]\n" + data_state_block.strip() + "\n")
+
     return f"""[Role] You are the CONVERGER for a Hivework investigation. Independent \
 per-axis judges each localised ONE fragment of what is really a SINGLE call path \
 (typically endpoint → request handler → db function → SQL key / query → frontend \
@@ -191,7 +209,7 @@ produces the reported symptom (step 3 below is where you check that).
 
 [Reported scenario / seed]
 {_trunc(seed_text, 2000)}
-
+{confirmed_block}
 [Located fragments — each is ONE node candidate, from a different axis]
 {frags}
 {unloc_block}
@@ -215,8 +233,12 @@ claimed mis-ordering cannot occur) → verdict = "contradicted". The cause contr
 the symptom — do not pass it off as the defect.
    - The outcome DEPENDS on stored row state you cannot read from the static evidence \
 (which row has result_doc_id set, what review status it carries, …) → verdict = \
-"undecidable"; put the exact row state / fixture you would need in need_data_state. \
-Do NOT guess an attribution to fill the gap.
+"undecidable"; put the exact row state / fixture you would need in need_data_state, AND \
+— so the pipeline can FETCH it for you and re-rule on fact — emit machine-readable \
+``data_reads``: the precise table(s), the row selector (the column=value that picks the \
+row, taken from the scenario, e.g. the document id), and the column(s) whose value \
+decides the verdict. Use the EXACT table/column names visible in the evidence (the SQL \
+in queries.json names them). Do NOT guess an attribution to fill the gap.
 4. If — and only if — two adjacent nodes cannot be connected because a needed \
 callee/symbol is NOT shown in the evidence, set converged=false and NAME the missing \
 link instead of guessing.
@@ -234,7 +256,7 @@ finding to force a convergence.
     {{ "node": "endpoint|handler|db_fn|sql_key|fe|other", "file": "<repo-relative>", "lines": "<start-end>", "symbol": "<fn/route/key name>" }}
   ],
   "attributed_defect": {{ "node": "<which node above>", "file": "<repo-relative>", "lines": "<start-end>", "why": "<one line: the wrong behaviour here>" }},
-  "causal_check": {{ "verdict": "consistent|contradicted|undecidable", "data_state_assumptions": ["<the row/field values the scenario forces>"], "trace": "<what the attributed code outputs under those assumptions, and whether it reproduces the symptom>", "need_data_state": ["<when undecidable: the exact stored row state / fixture to confirm>"] }},
+  "causal_check": {{ "verdict": "consistent|contradicted|undecidable", "data_state_assumptions": ["<the row/field values the scenario forces>"], "trace": "<what the attributed code outputs under those assumptions, and whether it reproduces the symptom>", "need_data_state": ["<when undecidable: the exact stored row state / fixture to confirm>"], "data_reads": [ {{ "table": "<table name from the evidence>", "where": {{ "<key column>": "<row selector value from the scenario>" }}, "columns": ["<column(s) whose value decides the verdict>"] }} ] }},
   "missing_link": null
 }}
 
@@ -283,7 +305,33 @@ def _coerce_causal(d: Any) -> dict[str, Any] | None:
         "data_state_assumptions": [str(x) for x in (d.get("data_state_assumptions") or [])],
         "trace": str(d.get("trace", "") or ""),
         "need_data_state": [str(x) for x in (d.get("need_data_state") or [])],
+        "data_reads": _coerce_data_reads(d.get("data_reads")),
     }
+
+
+def _coerce_data_reads(raw: Any) -> list[dict[str, Any]]:
+    """Parse the converger's machine-readable ``data_reads`` into clean read specs.
+
+    Each spec is ``{table, where: {col: val}, columns: [..]}`` — the structured form
+    the dbread glue turns into one mechanical SELECT. Lenient: drops anything without a
+    table; identifier SAFETY is enforced later by hive.dbread (the anti-injection gate),
+    so here we only normalise shape, never trust it.
+    """
+    out: list[dict[str, Any]] = []
+    for r in raw if isinstance(raw, list) else []:
+        if not isinstance(r, dict):
+            continue
+        table = str(r.get("table", "") or "").strip()
+        if not table:
+            continue
+        where = r.get("where") if isinstance(r.get("where"), dict) else {}
+        columns = [str(c) for c in (r.get("columns") or []) if str(c).strip()]
+        out.append({
+            "table": table,
+            "where": {str(k): v for k, v in where.items()},
+            "columns": columns,
+        })
+    return out
 
 
 def _result_from(parsed: dict[str, Any] | None,
@@ -393,14 +441,15 @@ def _dedup_windows(windows: list[dict[str, Any]]) -> list[dict[str, Any]]:
 def _converge_once(seed_text: str, located: list[dict[str, Any]],
                    unlocated: list[dict[str, Any]], windows: list[dict[str, Any]],
                    known: set[str], provider: str, model: str, pk: dict[str, Any],
-                   ledger, timeout: int) -> ConvergeResult:
+                   ledger, timeout: int, data_state_block: str = "") -> ConvergeResult:
     """One logical converge call (with a transport-level JSON-only reparse). Never raises.
 
     The reparse retry handles a model that wrapped the JSON in prose — it is a
     transport reparse (both attempts recorded to the ledger, like judge) and does
-    NOT count against the missing-link budget the caller manages.
+    NOT count against the missing-link budget the caller manages. ``data_state_block``,
+    when given, injects the live-DB-confirmed rows so the re-pass rules on fact.
     """
-    prompt = build_converge_prompt(seed_text, located, unlocated, windows)
+    prompt = build_converge_prompt(seed_text, located, unlocated, windows, data_state_block)
     attempt_prompt = prompt
     parsed: dict[str, Any] | None = None
     for attempt in range(2):
@@ -431,12 +480,43 @@ def _converge_once(seed_text: str, located: list[dict[str, Any]],
     return _result_from(parsed, known)
 
 
+def _fetch_data_state(data_reads: list[dict[str, Any]], db_conn) -> str:
+    """Run the converger's ``data_reads`` against the live DB; render rows as fact lines.
+
+    Deterministic glue — NOT a model call. Each spec becomes ONE read-only SELECT via
+    hive.dbread (read-only by construction, identifier-validated). Any failure (no
+    driver, bad identifier, connect error) is logged and skipped, never raised: a
+    failed read just means that fact stays unconfirmed and the converge degrades to its
+    static result. Returns "" when nothing could be read.
+    """
+    try:
+        from hive.dbread import read_rows, DbReadError
+    except Exception as e:  # pragma: no cover - import guard
+        logger.warning("converge: dbread unavailable (%s) — skipping data read", e)
+        return ""
+    lines: list[str] = []
+    for spec in data_reads:
+        table = spec.get("table", "")
+        try:
+            rr = read_rows(db_conn, table, columns=spec.get("columns") or None,
+                           where=spec.get("where") or None, limit=20)
+        except DbReadError as e:
+            logger.warning("converge: data read on %r failed — skipping: %s", table, e)
+            continue
+        lines.append(f"- query: {rr.sql}")
+        if not rr.rows:
+            lines.append("  -> (no rows matched)")
+        for row in rr.rows:
+            lines.append("  -> " + ", ".join(f"{k}={v!r}" for k, v in row.items()))
+    return "\n".join(lines)
+
+
 def run_converge(*, seed_text: str, verdicts: list[dict[str, Any]],
                  bundles: list[dict[str, Any]], provider: str, model: str,
                  code_root: str | None = None, ledger=None,
                  provider_kwargs: dict | None = None, timeout: int = 180,
                  min_located: int = 2, max_calls: int = 2,
-                 k: int = 6, max_hops: int = 2) -> ConvergeResult:
+                 k: int = 6, max_hops: int = 2, db_conn=None) -> ConvergeResult:
     """Stitch the per-axis verdicts into one path. Tool-OFF; never raises.
 
     Budget (mirrors judge's retrieve→re-judge): ONE converge call, plus — ONLY when
@@ -468,11 +548,43 @@ def run_converge(*, seed_text: str, verdicts: list[dict[str, Any]],
                          provider, model, pk, ledger, timeout)
     logger.info("converge: %s", res.summary)
 
+    # ── Data-state read (N172): the converger came back UNDECIDABLE because the
+    # verdict hinges on a STORED row value static evidence can't determine — and it
+    # named the exact rows in causal_check.data_reads. If a read-only DB connection is
+    # configured for this codebase, FETCH those rows (deterministic glue, NOT a model
+    # call) and re-converge on FACT. This runs BEFORE the missing-link re-pass on
+    # purpose: in N172 the first pass was undecidable AND named a missing link, and the
+    # link re-pass rationalised a band-aid to "consistent" on an ASSUMED data state.
+    # Ruling on the real rows instead either confirms the cause (consistent) or refutes
+    # it (contradicted) — both beat the guess, and a contradiction correctly stops the
+    # band-aid. Read-only by construction; any read failure degrades to the static path.
+    data_ruled = False
+    cc = res.causal_check or {}
+    if (not res.converged and db_conn is not None
+            and cc.get("verdict") == "undecidable" and cc.get("data_reads")):
+        block = _fetch_data_state(cc.get("data_reads") or [], db_conn)
+        if block:
+            logger.info("converge: undecidable → read live DB for %d row-set(s), "
+                        "re-converging on fact", len(cc.get("data_reads") or []))
+            res2 = _converge_once(seed_text, located, unlocated, windows, known,
+                                  provider, model, pk, ledger, timeout,
+                                  data_state_block=block)
+            logger.info("converge: data re-pass → %s", res2.summary)
+            v2 = (res2.causal_check or {}).get("verdict")
+            # Adopt the fact-grounded re-pass on any real RULING (consistent OR
+            # contradicted) — fact wins over the undecidable guess either way. A
+            # still-undecidable re-pass (the read didn't cover the deciding field)
+            # keeps the original and lets the missing-link path try.
+            if v2 in ("consistent", "contradicted"):
+                res = res2
+                data_ruled = True
+
     # ── Conditional second pass: the principled "more" — fetch the link the model
     # said it lacked, then re-converge ONCE. Not a blind retry and not a bigger
     # model: a converger that already stitched the path is trusted as-is; one that
     # NAMED a missing hop is exactly what a free local follow-up can unblock.
-    if not res.converged and res.missing_link and code_root and max_calls > 1:
+    if (not res.converged and not data_ruled and res.missing_link
+            and code_root and max_calls > 1):
         need_d = res.missing_link.get("need") or {}
         symbols = [str(s) for s in (need_d.get("symbols") or [])]
         greps = [str(g) for g in (need_d.get("greps") or [])]
