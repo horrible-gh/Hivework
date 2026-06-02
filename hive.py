@@ -558,6 +558,7 @@ def run_apply_command(args: argparse.Namespace) -> None:
         write=args.write,
         backup_root=backup_root if args.write else None,
         ttl_hours=ttl_hours,
+        partial=getattr(args, "partial", False),
     )
 
     logger.info("=" * 60)
@@ -568,8 +569,21 @@ def run_apply_command(args: argparse.Namespace) -> None:
         logger.info("  Proposal: %s", args.out)
     logger.info("=" * 60)
 
+    # A successful --partial write is a success even though the spec is not globally
+    # ready: the individually-ready edits shipped. Exit 0 so the caller sees it.
+    if proposal.get("applied_partial"):
+        w = proposal.get("write") or {}
+        logger.info("Apply: PARTIAL write applied %d edit(s) %s; %d item(s) still "
+                    "unresolved", len(w.get("written", [])), w.get("applied_ids"),
+                    len(proposal["not_ready_reasons"]))
+        return
+
     # Non-zero exit when not ready so a caller (or chained pipeline) can branch.
     if not proposal["ready"]:
+        if proposal.get("partial_ready"):
+            logger.info("  %d edit(s) %s are individually ready — re-run with "
+                        "--partial to apply just those",
+                        len(proposal["writable_ids"]), proposal["writable_ids"])
         sys.exit(2)
 
     # Ready but the write itself failed (e.g. anchor collided at write time and
@@ -888,6 +902,12 @@ def main() -> None:
         help="Apply a READY proposal's edits to the live codebase (default: propose "
              "only). Originals are backed up to a scratch bundle first; not-ready "
              "proposals are never written.",
+    )
+    apply_parser.add_argument(
+        "--partial", action="store_true",
+        help="With --write on a NOT-READY proposal, apply just the individually "
+             "applicable + effective edits instead of nothing — so a verified fix "
+             "is not blocked by a deferred sibling. Unresolved items are reported.",
     )
     apply_parser.add_argument(
         "-v", "--verbose", action="store_true",

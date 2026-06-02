@@ -292,6 +292,10 @@ def run_investigate(
     # ── ②..③ per axis: bridge → local retrieve (free) → JUDGE (budgeted).
     verdicts: list[dict[str, Any]] = []
     warned_no_docs = False
+    # Seed-named, on-disk edit targets — passed to every axis's judge so a verdict
+    # citing one is grounded even when that axis's own retrieve didn't window it
+    # (Defect 4a: seed files aren't guaranteed in every per-axis bundle).
+    seed_files = {t["file"] for t in seed_edit_targets(seed_text, code_root, docs_root)}
     for task in judged:
         sp = task_to_searchplan(task, default_globs=default_globs)
         symptom = str(task.get("brief") or task.get("title") or sp.axis_id)
@@ -331,7 +335,7 @@ def run_investigate(
             plan_bundle=bundle, symptom=symptom, axis_globs=sp.file_globs,
             code_root=code_root, provider=judge_role.provider,
             model=judge_role.model, judge_cfg=cfg.judge, ledger=ledger,
-            provider_kwargs=pk, k=k,
+            provider_kwargs=pk, k=k, seed_files=seed_files,
         )
         v = jr["verdict"]
         logger.info("   verdict: located=%s %s:%s — %s",

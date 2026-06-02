@@ -582,6 +582,23 @@ class TestGroundAnchors(unittest.TestCase):
         self.assertEqual(out, honey)
         self.assertEqual(diag["lifted"], [])
 
+    def test_seed_target_gets_generous_forward_window(self):
+        # Defect 2 (T892): a seed cites an APPROXIMATE range (e.g. 4-6) but the real
+        # block to rewrite sits past it. A wide_files target lifts a forward window,
+        # so a downstream line the tight cap would truncate is still pulled in.
+        spec = os.path.join(self.code, "client", "src", "view.spec.ts")
+        with open(spec, "w", encoding="utf-8") as f:
+            f.write("\n".join(f"assert_{i} = {i}" for i in range(1, 80)) + "\n")
+        honey = "- target: client/src/view.spec.ts:4-6\n"
+        # Without wide: tight cap stops well before line 60.
+        narrow, _ = specify.ground_anchors(honey, self.code, max_lines=10)
+        self.assertNotIn("assert_60", narrow)
+        # With the file marked as a seed target: the forward window reaches it.
+        wide, diag = specify.ground_anchors(
+            honey, self.code, wide_files={"client/src/view.spec.ts"}, wide_lines=120)
+        self.assertIn("assert_60", wide)
+        self.assertIn("client/src/view.spec.ts", diag["lifted"][0])
+
 
 class TestRunSpecifyGrounding(unittest.TestCase):
     """run_specify feeds the grounded honey to the author prompt."""

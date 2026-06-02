@@ -334,10 +334,25 @@ def _merge_followup(bundle: dict[str, Any], fu: dict[str, Any]) -> dict[str, Any
     return merged
 
 
+def _cites_seed_file(cited: str, seed_files: set[str]) -> bool:
+    """True when a verdict's cited file is one of the seed's named (on-disk) targets.
+
+    Each axis runs its OWN retrieve, so a seed-named file present in one axis's
+    bundle can be ABSENT from another's. A verdict citing such a file is then
+    wrongly downgraded as 'absent from evidence' even though the file is real and
+    seed-relevant (T892 axis A cited workflowViewState.ts — a seed target — and
+    was dropped while axis C had it). Seed files are disk-confirmed upstream, so a
+    citation to one is grounded, not a hallucination.
+    """
+    vf = _norm_path(cited)
+    return bool(vf) and any(_path_aligns(vf, _norm_path(s)) for s in seed_files)
+
+
 def run_judge(*, plan_bundle: dict[str, Any], symptom: str, axis_globs: list[str],
               code_root: str, provider: str, model: str, judge_cfg,
               ledger=None, provider_kwargs: dict | None = None,
-              k: int = 6, max_hops: int = 2, timeout: int = 180) -> dict[str, Any]:
+              k: int = 6, max_hops: int = 2, timeout: int = 180,
+              seed_files: set[str] | None = None) -> dict[str, Any]:
     """End-to-end JUDGE for one axis: verdict (+ optional one re-judge after follow-up).
 
     Returns a comb dict::
@@ -400,14 +415,22 @@ def run_judge(*, plan_bundle: dict[str, Any], symptom: str, axis_globs: list[str
     # ── Anti-hallucination downgrade: the judge has no tools, so a ``located``
     # verdict citing a file it was never shown is invented, not localised. Never
     # emit it as located — downgrade to located=false with a flagged reason.
+    # EXCEPTION: a seed-named target is real and disk-confirmed upstream, so a
+    # citation to it is grounded even when this axis's own bundle didn't window it
+    # (Defect 4a — seed files aren't guaranteed in every axis's retrieve).
     if verdict.located and not _verdict_is_grounded(verdict, check_bundle):
-        logger.info("judge: [%s] verdict cites %s absent from evidence — downgraded",
-                    axis_id, verdict.file)
-        verdict = JudgeVerdict(
-            axis_id=axis_id, located=False, file=verdict.file, lines=verdict.lines,
-            reason="ungrounded (cited file absent from evidence bundle): "
-                   + (verdict.reason or ""),
-            raw=verdict.raw)
+        if seed_files and _cites_seed_file(verdict.file, seed_files):
+            logger.info("judge: [%s] cites seed-named file %s absent from this "
+                        "axis's bundle — grounded via seed target (kept located)",
+                        axis_id, verdict.file)
+        else:
+            logger.info("judge: [%s] verdict cites %s absent from evidence — downgraded",
+                        axis_id, verdict.file)
+            verdict = JudgeVerdict(
+                axis_id=axis_id, located=False, file=verdict.file, lines=verdict.lines,
+                reason="ungrounded (cited file absent from evidence bundle): "
+                       + (verdict.reason or ""),
+                raw=verdict.raw)
 
     return {
         "axis_id": axis_id,

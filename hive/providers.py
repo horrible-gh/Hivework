@@ -125,8 +125,19 @@ def _call_copilot(model, prompt, cwd, timeout, exe=None, allow_flag="--allow-all
                         exit_code=result.returncode, latency_s=latency_s)
 
 
+# A reasoning model (gpt-oss-120b) spends COMPLETION tokens on its hidden
+# reasoning before emitting the answer, so a tight cap truncates the JSON verdict
+# mid-stream → unbalanced object → unparseable, and the axis is dropped to
+# located=False even after the JSON-only retry (Defect 4b / T892 axis D: a large
+# bundle drove long reasoning that overran the old 1024 cap, twice). 4096 leaves
+# ample room for reasoning + the small JSON object; billed only for tokens the
+# model actually generates, so it is free on the common short path.
+_DEEPINFRA_MAX_TOKENS = 4096
+
+
 def _call_deepinfra(model, prompt, cwd=None, timeout=120, *, system=None,
-                    temperature=0.2, max_tokens=1024, reasoning_effort=None,
+                    temperature=0.2, max_tokens=_DEEPINFRA_MAX_TOKENS,
+                    reasoning_effort=None,
                     api_key_env="DEEPINFRA_TOKEN",
                     base_url="https://api.deepinfra.com/v1/openai",
                     available_tools=None, **_ignored) -> WorkerResult:

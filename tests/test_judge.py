@@ -283,6 +283,39 @@ class TestGroundingGate(unittest.TestCase):
         self.assertFalse(res["verdict"].located)    # downgraded
         self.assertIn("ungrounded", res["verdict"].reason)
 
+    def test_seed_named_file_absent_from_bundle_is_kept_located(self):
+        # Defect 4a (T892 axis A): a verdict cites a seed-named target that this
+        # axis's own retrieve did not window. It is real + disk-confirmed upstream,
+        # so it must NOT be downgraded as a hallucination when seed_files is passed.
+        c1 = json.dumps({
+            "verdict": {"located": True, "file": "client/src/view.ts",
+                        "lines": "186-189", "reason": "off-by-one"},
+            "need": {"symbols": [], "greps": [], "file_globs": []}})
+        with mock.patch.object(J, "call_worker", return_value=_wr(c1)), \
+             mock.patch.object(J, "retrieve_followup") as fu:
+            res = J.run_judge(plan_bundle=PLAN_BUNDLE, symptom="s", axis_globs=["g"],
+                              code_root="/x", provider="copilot", model="gpt-5-mini",
+                              judge_cfg=JudgeConfig(max_calls_per_axis=2),
+                              seed_files={"client/src/view.ts"})
+        self.assertTrue(res["verdict"].located)         # kept (seed-grounded)
+        self.assertEqual(res["verdict"].file, "client/src/view.ts")
+        fu.assert_not_called()
+
+    def test_non_seed_absent_file_still_downgraded(self):
+        # The exception is narrow: a NON-seed invented file is still downgraded.
+        c1 = json.dumps({
+            "verdict": {"located": True, "file": "server/imaginary.py",
+                        "lines": "10-20", "reason": "guessed"},
+            "need": {"symbols": [], "greps": [], "file_globs": []}})
+        with mock.patch.object(J, "call_worker", return_value=_wr(c1)), \
+             mock.patch.object(J, "retrieve_followup"):
+            res = J.run_judge(plan_bundle=PLAN_BUNDLE, symptom="s", axis_globs=["g"],
+                              code_root="/x", provider="copilot", model="gpt-5-mini",
+                              judge_cfg=JudgeConfig(max_calls_per_axis=2),
+                              seed_files={"client/src/view.ts"})
+        self.assertFalse(res["verdict"].located)
+        self.assertIn("ungrounded", res["verdict"].reason)
+
     def test_ungrounded_located_forces_rejudge(self):
         # located but ungrounded WITH a need → re-judge fires (the gate does not
         # let an invented file short-circuit); a grounded call2 becomes final.

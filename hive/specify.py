@@ -99,6 +99,13 @@ _CITATION_RE = re.compile(
 _GROUND_MAX_ANCHORS = 12       # cap lifts so a citation-heavy honey can't balloon
 _GROUND_MAX_LINES = 40         # per-anchor line cap (a huge range is clamped)
 _GROUND_MIN_LINE_CHARS = 8     # lines shorter than this don't vote in the dedup guard
+# Seed-named targets get a GENEROUS forward window (Defect 2 / T892): the seed
+# cites an APPROXIMATE range ("Around lines 299-322"), but the exact assertion
+# block to rewrite often sits past it in a large test file. A 40-line slice
+# truncated before the real expectations, so specify had no byte-for-byte anchor
+# and deferred the file a third time. Lifting a wider block from the cited start
+# puts the full enclosing case set on the table for the tool-OFF author.
+_GROUND_WIDE_LINES = 120
 
 
 def _read_lines(path: str, lo: int, hi: int) -> str:
@@ -127,22 +134,36 @@ def _already_grounded(text: str, honey_text: str) -> bool:
     return bool(sig) and all(ln in honey_text for ln in sig)
 
 
+def _in_wide(rel: str, wide: set[str]) -> bool:
+    """True when ``rel`` is one of the seed-named wide-grounding files (path-aligned)."""
+    r = rel.lower()
+    return any(r == w or r.endswith("/" + w) or w.endswith("/" + r)
+               or os.path.basename(w) == os.path.basename(r) for w in wide)
+
+
 def ground_anchors(honey_text: str, codebase_root: str,
                    docs_root: str | None = None,
                    *, max_anchors: int = _GROUND_MAX_ANCHORS,
-                   max_lines: int = _GROUND_MAX_LINES) -> tuple[str, dict[str, Any]]:
+                   max_lines: int = _GROUND_MAX_LINES,
+                   wide_files: set[str] | None = None,
+                   wide_lines: int = _GROUND_WIDE_LINES) -> tuple[str, dict[str, Any]]:
     """Lift the CURRENT live text at each ``file:line`` the honey cites into the honey.
 
     Returns ``(enriched_honey, diag)`` where ``diag`` records lifted / skipped /
     unresolved citations for logging. Citations are resolved against the code tree
     first, then the docs tree. Already-quoted or unresolvable citations are skipped.
     Pure-local and free — no model call — and never raises.
+
+    ``wide_files`` (seed-named edit targets) get a GENEROUS forward window of
+    ``wide_lines`` from the cited start, so an approximate seed range still pulls
+    the full enclosing block — clamped to the file length (Defect 2 / T892).
     """
     seen: set[tuple[str, int, int]] = set()
     lifted: list[dict[str, Any]] = []
     skipped_present: list[str] = []
     unresolved: list[str] = []
     roots = [("code", codebase_root)] + ([("docs", docs_root)] if docs_root else [])
+    wide = {f.replace("\\", "/").lstrip("/").lower() for f in (wide_files or set())}
 
     for m in _CITATION_RE.finditer(honey_text):
         rel = m.group(1).replace("\\", "/").lstrip("/")
@@ -150,9 +171,14 @@ def ground_anchors(honey_text: str, codebase_root: str,
         hi = int(m.group(3)) if m.group(3) else lo
         if hi < lo:
             lo, hi = hi, lo
-        truncated = hi - lo + 1 > max_lines
+        # Seed-named targets: widen forward from the cited start so an approximate
+        # range still captures the real block; others keep the tight per-anchor cap.
+        cap = wide_lines if (wide and _in_wide(rel, wide)) else max_lines
+        if cap == wide_lines:
+            hi = max(hi, lo + cap - 1)
+        truncated = hi - lo + 1 > cap
         if truncated:
-            hi = lo + max_lines - 1
+            hi = lo + cap - 1
         key = (rel, lo, hi)
         if key in seen:
             continue
@@ -854,7 +880,11 @@ def run_specify(
     # into the honey so the author writes a real change and the effectiveness
     # reviewer can judge the behavioral delta (NR164/NR165/TR891 fix). Local/free.
     if ground:
-        honey_text, gdiag = ground_anchors(honey_text, codebase_root, docs_root)
+        # Seed-named edit targets get a generous grounding window so an approximate
+        # seed line range still pulls the full block the author must rewrite (T892).
+        wide_files = set(_seed_target_files(honey_text))
+        honey_text, gdiag = ground_anchors(honey_text, codebase_root, docs_root,
+                                           wide_files=wide_files)
         if gdiag["lifted"]:
             logger.info("specify: anchor-grounding lifted %d cited location(s): %s",
                         len(gdiag["lifted"]), gdiag["lifted"])

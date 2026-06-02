@@ -316,9 +316,21 @@ def build_proposal(spec: dict[str, Any], codebase_root: str) -> dict[str, Any]:
     edits = spec.get("edits") if isinstance(spec.get("edits"), list) else []
     deferred = spec.get("deferred") if isinstance(spec.get("deferred"), list) else []
     gate = spec.get("gate") if isinstance(spec.get("gate"), dict) else {}
+    eff = spec.get("effectiveness") if isinstance(spec.get("effectiveness"), dict) else {}
+    ineffective = {str(x) for x in (eff.get("ineffective_ids") or [])}
 
     edit_results = [evaluate_edit(e, codebase_root) for e in edits if isinstance(e, dict)]
     n_applicable = sum(1 for r in edit_results if r["applicable"])
+
+    # Per-edit writability (Defect 3): an edit is individually safe to write when
+    # its anchor is unique in live code (applicable) AND the effectiveness review
+    # did not flag IT as ineffective. This is decoupled from the GLOBAL termination
+    # so a verified, effective edit is not held hostage by a deferred sibling — a
+    # lone "anchor_not_grounded" defer on an unrelated item used to flip termination
+    # to needs_reinvestigation and block an already-ready root-cause fix (T892 E1).
+    for r in edit_results:
+        r["writable"] = bool(r["applicable"]) and str(r["id"]) not in ineffective
+    writable_ids = [r["id"] for r in edit_results if r["writable"]]
 
     reasons: list[str] = []
     if termination != "ready_to_apply":
@@ -339,9 +351,15 @@ def build_proposal(spec: dict[str, Any], codebase_root: str) -> dict[str, Any]:
         and bool(edit_results)
         and all(r["applicable"] for r in edit_results)
     )
+    # Partial-ready: not fully ready, but ≥1 edit is individually writable — the
+    # operator can apply just those with --partial without waiting on the deferred
+    # items. We never down-rank a writable edit for a sibling's unresolved state.
+    partial_ready = (not ready) and bool(writable_ids)
 
     return {
         "ready": ready,
+        "partial_ready": partial_ready,
+        "writable_ids": writable_ids,
         "not_ready_reasons": reasons,
         "codebase_root": os.path.abspath(codebase_root),
         "source_honey": spec.get("source_honey", ""),
@@ -359,14 +377,18 @@ def write_edits(
     codebase_root: str,
     backup_root: str,
     ttl_hours: int,
+    only_ids: set[str] | None = None,
 ) -> dict[str, Any]:
-    """Apply every edit of a READY spec to disk, with a scratch backup + rollback.
+    """Apply a READY spec's edits to disk, with a scratch backup + rollback.
 
-    Precondition: the caller has already confirmed ``build_proposal(...)['ready']``
-    is True, so every edit's anchor was unique in live code a moment ago. This
-    function still re-verifies uniqueness at the instant of each write (a file may
-    have changed in between, or one edit may collide with another that targets the
-    same file). The sequence is:
+    Precondition: the caller has already confirmed the edits to write are each
+    applicable (anchor unique in live code a moment ago). This function still
+    re-verifies uniqueness at the instant of each write (a file may have changed
+    in between, or one edit may collide with another that targets the same file).
+
+    When ``only_ids`` is given, only those edit ids are written (Defect 3 partial
+    apply: the individually-writable subset, when the spec is not globally ready);
+    the backup bundle snapshots only the touched files. The sequence is:
 
       1. purge expired backup bundles (time-boxed undo window upkeep),
       2. snapshot every target file's original bytes into a fresh bundle,
@@ -384,6 +406,8 @@ def write_edits(
     }
 
     edits = [e for e in (spec.get("edits") or []) if isinstance(e, dict)]
+    if only_ids is not None:
+        edits = [e for e in edits if str(e.get("id", "?")) in only_ids]
 
     # Modified paths (anchor edits) are snapshotted; created paths are recorded
     # in the manifest so a restore deletes them (they have no original bytes).
@@ -509,6 +533,13 @@ def render_proposal_markdown(proposal: dict[str, Any]) -> str:
         lines.append("Do not apply. Reasons:")
         for reason in proposal["not_ready_reasons"]:
             lines.append(f"- {reason}")
+        if proposal.get("partial_ready"):
+            lines.append("")
+            lines.append(f"> **Partial apply available:** {len(proposal['writable_ids'])} "
+                         f"edit(s) {proposal['writable_ids']} are individually "
+                         "applicable and passed the effectiveness review — they are NOT "
+                         "blocked by the unresolved items above. Re-run `apply --write "
+                         "--partial` to write just those.")
     lines.append("")
 
     if write and write.get("attempted"):
@@ -626,6 +657,7 @@ def run_apply(
     write: bool = False,
     backup_root: str | None = None,
     ttl_hours: int = 168,
+    partial: bool = False,
 ) -> dict[str, Any]:
     """Run the apply stage: edit-spec JSON + live code → proposal (and optional write).
 
@@ -684,12 +716,31 @@ def run_apply(
             raise ValueError("write=True requires a backup_root")
         if proposal["ready"]:
             proposal["write"] = write_edits(spec, root, backup_root, ttl_hours)
+        elif partial and proposal["writable_ids"]:
+            # Partial apply (Defect 3): the spec is not globally ready, but some
+            # edits are individually applicable + effective. Write JUST those so a
+            # verified root-cause fix ships instead of being blocked by a deferred
+            # sibling. The deferred/unresolved items are reported, not applied.
+            only = set(proposal["writable_ids"])
+            logger.warning("apply: proposal NOT fully ready, but --partial set — "
+                           "writing %d individually-ready edit(s) %s; %d item(s) "
+                           "remain unresolved", len(only), sorted(only),
+                           len(proposal["not_ready_reasons"]))
+            w = write_edits(spec, root, backup_root, ttl_hours, only_ids=only)
+            w["partial"] = True
+            w["applied_ids"] = sorted(only)
+            proposal["write"] = w
+            proposal["applied_partial"] = bool(w.get("ok"))
         else:
+            why = ("no individually-writable edit (every edit is non-applicable "
+                   "or flagged ineffective)" if not proposal["writable_ids"]
+                   else "proposal not ready — rerun with --partial to apply the "
+                        f"{len(proposal['writable_ids'])} individually-ready edit(s)")
             logger.warning("apply: --write requested but proposal is NOT READY — "
-                           "nothing written")
+                           "nothing written (%s)", why)
             proposal["write"] = {
                 "ok": False, "attempted": False, "written": [], "bundle": None,
-                "reason": "proposal not ready — refusing to write", "rolled_back": False,
+                "reason": why, "rolled_back": False,
             }
     else:
         proposal["write"] = None

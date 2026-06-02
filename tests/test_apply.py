@@ -372,5 +372,86 @@ class TestRunApplyWrite(unittest.TestCase):
         self.assertEqual(self._read_target(), "a = 10\nb = 20\n")
 
 
+class TestPartialApply(unittest.TestCase):
+    """Defect 3 (T892): a verified, effective edit must be writable even when an
+    unrelated sibling item defers and flips termination to needs_reinvestigation."""
+
+    def setUp(self):
+        self.root = tempfile.mkdtemp()
+        self.target = os.path.join(self.root, "a.py")
+        self._original = "before\nx = 1\nafter\n"
+        with open(self.target, "w", encoding="utf-8") as f:
+            f.write(self._original)
+        self.tmp = tempfile.mkdtemp()
+        self.spec_path = os.path.join(self.tmp, "spec.json")
+        self.backup_root = tempfile.mkdtemp()
+
+    def _write_spec(self, spec):
+        with open(self.spec_path, "w", encoding="utf-8") as f:
+            json.dump(spec, f)
+
+    def _read_target(self):
+        with open(self.target, encoding="utf-8") as f:
+            return f.read()
+
+    def _deferred_spec(self):
+        # E1 applicable + verified, but a sibling deferred → needs_reinvestigation.
+        return _spec(
+            [_edit("x = 1", "x = 2", eid="E1")],
+            termination="needs_reinvestigation",
+            deferred=[{"issue": "spec.ts guard", "reason": "anchor_not_grounded"}],
+            codebase_root=self.root)
+
+    def test_writable_subset_surfaced_when_sibling_defers(self):
+        p = apply.build_proposal(self._deferred_spec(), self.root)
+        self.assertFalse(p["ready"])
+        self.assertTrue(p["partial_ready"])
+        self.assertEqual(p["writable_ids"], ["E1"])
+
+    def test_partial_write_applies_only_writable_edit(self):
+        self._write_spec(self._deferred_spec())
+        proposal = apply.run_apply(
+            self.spec_path, write=True, partial=True,
+            backup_root=self.backup_root, ttl_hours=24)
+        # E1 shipped despite the non-ready termination
+        self.assertEqual(self._read_target(), "before\nx = 2\nafter\n")
+        self.assertTrue(proposal["applied_partial"])
+        self.assertTrue(proposal["write"]["ok"])
+        self.assertTrue(proposal["write"]["partial"])
+        self.assertEqual(proposal["write"]["applied_ids"], ["E1"])
+
+    def test_without_partial_flag_nothing_is_written(self):
+        self._write_spec(self._deferred_spec())
+        proposal = apply.run_apply(
+            self.spec_path, write=True, backup_root=self.backup_root)
+        self.assertEqual(self._read_target(), self._original)  # untouched
+        self.assertFalse(proposal["write"]["attempted"])
+        # but the operator is told a ready subset exists
+        self.assertTrue(proposal["partial_ready"])
+
+    def test_ineffective_edit_is_not_writable(self):
+        # An edit the effectiveness gate flagged ineffective must NOT be partial-applied.
+        spec = self._deferred_spec()
+        spec["effectiveness"] = {"inconclusive": False, "ineffective_ids": ["E1"]}
+        self._write_spec(spec)
+        proposal = apply.run_apply(
+            self.spec_path, write=True, partial=True, backup_root=self.backup_root)
+        self.assertEqual(self._read_target(), self._original)  # not applied
+        self.assertEqual(proposal["writable_ids"], [])
+        self.assertFalse(proposal["partial_ready"])
+
+    def test_partial_only_writes_writable_when_a_sibling_edit_drifts(self):
+        # Two edits: E1 applicable, E2 drifted. Partial writes only E1.
+        self._write_spec(_spec([
+            _edit("x = 1", "x = 2", eid="E1"),
+            _edit("gone = 0", "gone = 1", eid="E2"),  # not in file → not applicable
+        ], termination="needs_reinvestigation", codebase_root=self.root))
+        proposal = apply.run_apply(
+            self.spec_path, write=True, partial=True, backup_root=self.backup_root)
+        self.assertEqual(self._read_target(), "before\nx = 2\nafter\n")
+        self.assertEqual(proposal["write"]["applied_ids"], ["E1"])
+        self.assertTrue(proposal["applied_partial"])
+
+
 if __name__ == "__main__":
     unittest.main()
