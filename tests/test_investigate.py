@@ -340,5 +340,68 @@ class TestPrioritizeAxes(unittest.TestCase):
         self.assertEqual(out[:12][0]["id"], "SEED_ANCHOR")  # front of any cap window
 
 
+class TestSeedEditTargets(unittest.TestCase):
+    """Defect 2 (T892): the seed's own explicitly-named files must be groundable
+    edit targets even when no judge axis located them."""
+
+    def _write(self, td, rel, text):
+        path = os.path.join(td, *rel.split("/"))
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(text)
+
+    def test_resolves_seed_named_file_to_its_keyword_line(self):
+        with tempfile.TemporaryDirectory() as td:
+            self._write(td, "server/sql/queries/queries.json",
+                        '{\n  "get_in_progress_head_by_group": "SELECT 1",\n'
+                        '  "get_pending_head_by_group": "SELECT x WHERE result_doc_id '
+                        'IS NULL ORDER BY sort_order LIMIT 1"\n}\n')
+            seed = ("[Edit 1] server/sql/queries/queries.json get_pending_head_by_group "
+                    "WHERE result_doc_id IS NULL ORDER BY sort_order")
+            targets = INV.seed_edit_targets(seed, td)
+            self.assertEqual(len(targets), 1)
+            self.assertEqual(targets[0]["file"], "server/sql/queries/queries.json")
+            # the densest keyword line is the get_pending line (line 3)
+            self.assertEqual(targets[0]["lines"].split("-")[0], "3")
+
+    def test_honours_explicit_line_written_in_seed(self):
+        with tempfile.TemporaryDirectory() as td:
+            self._write(td, "client/src/view.ts", "a\nb\nc\nd\ne\n")
+            seed = "fix client/src/view.ts:2-3 current-step derivation"
+            targets = INV.seed_edit_targets(seed, td)
+            self.assertEqual(targets[0]["lines"], "2-3")
+
+    def test_honours_prose_lines_range_near_file_mention(self):
+        # The seed writes the range as prose ("Around lines 5-7"), not path:line.
+        with tempfile.TemporaryDirectory() as td:
+            self._write(td, "client/tests/spec.ts", "1\n2\n3\n4\n5\n6\n7\n8\n")
+            seed = ("[Edit] client/tests/spec.ts\nAround lines 5-7 there is the "
+                    "R-head fixture pinned to the buggy state.")
+            targets = INV.seed_edit_targets(seed, td)
+            self.assertEqual(targets[0]["lines"], "5-7")
+
+    def test_skips_file_not_on_disk(self):
+        with tempfile.TemporaryDirectory() as td:
+            self.assertEqual(INV.seed_edit_targets("edit server/x/nope.py do_it", td), [])
+
+    def test_no_code_root_returns_empty(self):
+        self.assertEqual(INV.seed_edit_targets("edit a/b.py thing", None), [])
+
+    def test_honey_emits_seed_target_section_with_citation(self):
+        with tempfile.TemporaryDirectory() as td:
+            self._write(td, "server/sql/queries/queries.json",
+                        '{\n  "get_pending_head_by_group": "SELECT x WHERE result_doc_id '
+                        'IS NULL ORDER BY sort_order"\n}\n')
+            seed = ("[Edit 1] server/sql/queries/queries.json get_pending_head_by_group "
+                    "result_doc_id IS NULL ORDER BY sort_order")
+            result = {"axes_total": 1, "axes_judged": 1, "verdicts": [
+                {"axis_id": "X", "title": "t",
+                 "verdict": {"located": False, "file": "", "lines": "", "reason": "n/a"}}]}
+            honey = render_local_honey(result, seed, td)
+            self.assertIn("Seed-specified edit targets", honey)
+            self.assertIn("AUTHOR them", honey)
+            self.assertIn("server/sql/queries/queries.json:", honey)
+
+
 if __name__ == "__main__":
     unittest.main()

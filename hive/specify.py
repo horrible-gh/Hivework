@@ -36,6 +36,7 @@ import os
 import re
 from typing import Any
 
+from hive.investigate import SEED_TARGET_SECTION
 from hive.parse import extract_first_json
 from hive.providers import call_worker
 
@@ -698,6 +699,91 @@ def _apply_decisiveness_gate(spec: dict[str, Any]) -> dict[str, Any]:
     return spec
 
 
+def _seed_target_files(honey_text: str) -> list[str]:
+    """Parse the honey's "Seed-specified edit targets" section into file paths.
+
+    The investigate stage lists the files the user explicitly named as edit targets
+    (``hive.investigate.SEED_TARGET_SECTION``) as ``- path:line`` bullets. We read
+    them back so the coverage gate can enforce that each becomes an actual edit.
+    Returns repo-relative paths (the ``:line`` suffix stripped), order-preserving.
+    """
+    files: list[str] = []
+    in_section = False
+    for line in honey_text.splitlines():
+        if line.startswith(SEED_TARGET_SECTION):
+            in_section = True
+            continue
+        if in_section:
+            if line.startswith("## "):
+                break
+            s = line.strip()
+            if s.startswith("- "):
+                tok = s[2:].strip().strip("`")
+                m = re.match(r"([A-Za-z0-9_][A-Za-z0-9_./\\-]*\.[A-Za-z0-9]+)", tok)
+                if m:
+                    files.append(m.group(1).replace("\\", "/").lstrip("/"))
+    seen: set[str] = set()
+    out: list[str] = []
+    for f in files:
+        if f not in seen:
+            seen.add(f)
+            out.append(f)
+    return out
+
+
+def _apply_seed_coverage_gate(spec: dict[str, Any], honey_text: str) -> dict[str, Any]:
+    """A seed-named edit target must become an edit, or the spec is NOT ready.
+
+    The honey marks the files the user explicitly named as AUTHOR targets and
+    grounds their live text (``investigate.seed_edit_targets``). If the author still
+    leaves one out of ``edits[]`` — silently or as an optional defer — that is a
+    user-provided instruction dropped, exactly the Defect 2 failure (T892 dropped
+    queries.json + the spec test as ``not_expressible_as_edit`` yet shipped green).
+    We refuse to present such a spec as ready_to_apply, and record which target was
+    missed and the author's stated reason (so the gap is reported, not hidden).
+
+    Diagnostics are recorded unconditionally; only a ``ready_to_apply`` claim is
+    downgraded (to needs_pm) — a spec already at needs_pm/needs_reinvestigation is
+    not vouching for completeness, so it is left as-is.
+    """
+    targets = _seed_target_files(honey_text)
+    if not targets:
+        return spec
+    edits = [e for e in (spec.get("edits") or []) if isinstance(e, dict)]
+    edited = [str(e.get("file", "")).replace("\\", "/").lstrip("/")
+              for e in edits if e.get("file")]
+
+    def _covered(t: str) -> bool:
+        tb = os.path.basename(t)
+        return any(e == t or e.endswith("/" + t) or t.endswith("/" + e)
+                   or os.path.basename(e) == tb for e in edited)
+
+    missing = [t for t in targets if not _covered(t)]
+    deferred = spec.get("deferred") if isinstance(spec.get("deferred"), list) else []
+    reasons: dict[str, str] = {}
+    for t in missing:
+        tb = os.path.basename(t)
+        why = "absent (not authored and not deferred)"
+        for d in deferred:
+            if isinstance(d, dict) and tb in str(d.get("issue", "")):
+                why = (str(d.get("reason", "deferred")) + ": "
+                       + str(d.get("issue", ""))[:160])
+                break
+        reasons[t] = why
+    spec["seed_coverage"] = {"targets": targets, "missing": missing, "reasons": reasons}
+
+    if missing and spec.get("termination") == "ready_to_apply":
+        logger.warning("specify: seed-named edit target(s) not authored %s — "
+                       "downgrading ready_to_apply to needs_pm (a user-specified edit "
+                       "must not be silently dropped)", missing)
+        spec["termination"] = "needs_pm"
+        note = ("seed-coverage gate: seed-specified target(s) not authored — "
+                + "; ".join(f"{t} [{reasons[t]}]" for t in missing))
+        prev = str(spec.get("notes", "")).strip()
+        spec["notes"] = f"{prev} {note}".strip() if prev else note
+    return spec
+
+
 def _review_and_gate(
     spec: dict[str, Any],
     honey_text: str,
@@ -806,6 +892,11 @@ def run_specify(
     # Decisiveness gate: a verified+effective edit must be applyable even when the
     # honey also surfaced optional/policy directions (which sit in deferred[]).
     spec = _apply_decisiveness_gate(spec)
+
+    # Seed-coverage gate (runs LAST so it has final say): a file the user named as
+    # an explicit edit target must become an edit, or a ready_to_apply spec is
+    # downgraded to needs_pm with the dropped target(s) reported (Defect 2 / T892).
+    spec = _apply_seed_coverage_gate(spec, honey_text)
 
     problems = _validate_spec(spec)
     if problems:

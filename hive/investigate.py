@@ -28,12 +28,18 @@ from typing import Any
 
 from hive.decompose import run_decompose
 from hive.judge import run_judge
-from hive.retriever import retrieve
+from hive.retriever import _ripgrep, retrieve
 from hive.searchplan import (
     extract_doc_topics, extract_globs, extract_keywords, task_to_searchplan,
 )
 
 logger = logging.getLogger("hive.investigate")
+
+# Header for the honey section that lists the seed's own explicitly-named edit
+# targets (Defect 2). specify parses this section to GROUND those files' live text
+# and to enforce that none is silently dropped — keep the literal in sync with
+# ``hive.specify.SEED_TARGET_SECTION`` (imported from here).
+SEED_TARGET_SECTION = "## Seed-specified edit targets"
 
 
 def _leaf_axes(tasks: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -125,6 +131,93 @@ def _prioritize_axes(leaves: list[dict[str, Any]], seed_text: str,
     return [seed_axis] + ranked
 
 
+# A repo-relative ``path.ext`` optionally followed by ``:line`` / ``:lo-hi`` as the
+# seed writes it — used to honour an explicit line the seed already pinned.
+_SEED_CITE_RE = re.compile(
+    r"([A-Za-z0-9_][A-Za-z0-9_./\\-]*\.[A-Za-z0-9]+)(?::(\d+)(?:-(\d+))?)?")
+
+
+def seed_edit_targets(seed_text: str, code_root: str | None,
+                      docs_root: str | None = None,
+                      *, max_targets: int = 8) -> list[dict[str, Any]]:
+    """Resolve the concrete files the seed NAMES into groundable ``file:line`` targets.
+
+    The seed routinely pins exact edit sites (``[Edit 1] server/sql/queries/queries.json
+    get_pending_head_by_group → …``). When investigate fails to independently re-locate
+    one (Defect 1), that user-provided target must NOT vanish: we lift it here so the
+    honey can present it as an AUTHOR target with live ground truth, regardless of the
+    judge's verdicts. The structural mirror of ``_prioritize_axes``'s SEED_ANCHOR
+    injection, lifted from the axis layer up to the honey/grounding layer.
+
+    For each named concrete file (extension, no wildcard):
+      * honour an explicit ``:line`` the seed already wrote; else
+      * grep the seed's keywords inside the file and pick the line with the most
+        distinct keyword hits (ties → lowest line) as the representative anchor.
+
+    A file that cannot be found on disk (code tree then docs tree) is skipped — we
+    only surface targets we can actually ground. Pure-local, free, never raises.
+    """
+    if not code_root:
+        return []
+    seed_files = [g for g in extract_globs(seed_text)
+                  if "*" not in g and _CONCRETE_FILE_RE.search(g)]
+    if not seed_files:
+        return []
+    explicit: dict[str, tuple[int, int]] = {}      # file the seed pinned a line on
+    for m in _SEED_CITE_RE.finditer(seed_text):
+        if not m.group(2):
+            continue
+        rel = m.group(1).replace("\\", "/").lstrip("/")
+        lo = int(m.group(2))
+        hi = int(m.group(3)) if m.group(3) else lo
+        explicit.setdefault(rel, (lo, hi))
+
+    seed_kw = extract_keywords(seed_text)
+    roots = [code_root] + ([docs_root] if docs_root else [])
+    targets: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for g in seed_files:
+        rel = g.replace("\\", "/").lstrip("/")
+        if rel in seen:
+            continue
+        seen.add(rel)
+        root = next((r for r in roots
+                     if r and os.path.isfile(os.path.join(r, rel))), None)
+        if root is None:
+            continue
+        ln_lo = ln_hi = None
+        for cited, (lo, hi) in explicit.items():
+            if (rel == cited or rel.endswith("/" + cited) or cited.endswith("/" + rel)
+                    or os.path.basename(cited) == os.path.basename(rel)):
+                ln_lo, ln_hi = lo, hi
+                break
+        # Prose "(around) lines N-M" near the file mention (the seed writes the
+        # range as prose, not path:line — e.g. "spec.ts\nAround lines 299-322").
+        if ln_lo is None:
+            idx = seed_text.find(os.path.basename(rel))
+            if idx >= 0:
+                pm = re.search(r"lines?\s+(\d+)(?:\s*-\s*(\d+))?",
+                               seed_text[idx: idx + 200], re.IGNORECASE)
+                if pm:
+                    ln_lo = int(pm.group(1))
+                    ln_hi = int(pm.group(2)) if pm.group(2) else ln_lo
+        if ln_lo is None and seed_kw:
+            kws_at: dict[int, set[str]] = {}
+            for kw in seed_kw:
+                for h in _ripgrep(kw, [rel], root):
+                    kws_at.setdefault(h["line"], set()).add(kw)
+            if kws_at:
+                best = sorted(kws_at.keys(),
+                              key=lambda l: (len(kws_at[l]), -l), reverse=True)[0]
+                ln_lo = ln_hi = best
+        if ln_lo is None:
+            continue   # nothing groundable to cite
+        targets.append({"file": rel, "lines": f"{ln_lo}-{ln_hi}"})
+        if len(targets) >= max_targets:
+            break
+    return targets
+
+
 def run_investigate(
     *,
     seed_text: str,
@@ -163,6 +256,17 @@ def run_investigate(
     )
     tasks = decompose_result.get("tasks", []) or []
     leaves = _leaf_axes(tasks)
+    # depends_on pruning is silent by default, yet in EDIT mode the queen routinely
+    # makes the very edit-target axes (BE_EDIT, FE_TEST_EDIT…) depend on the
+    # investigation axes, so the seed's own targets get no judge call at all
+    # (T892: 7 of 12 axes pruned here, BE_EDIT among them). Surface the dropped
+    # axes so the miss is visible; the SEED_ANCHOR injection + seed_edit_targets
+    # grounding are what actually recover the seed's targets downstream.
+    nonleaf = [t for t in tasks if (t.get("depends_on") or [])]
+    if nonleaf:
+        logger.info("decompose: %d non-leaf (dependent) axes not judged: %s",
+                    len(nonleaf),
+                    [t.get("id") or t.get("name") or "?" for t in nonleaf])
     # Deterministic, free guard against decompose non-determinism (T891): rank the
     # leaves by seed-relevance and inject the seed's own named target as a front
     # axis, BEFORE the position-based max_axes truncation — so a scattered queen
@@ -255,7 +359,9 @@ def run_investigate(
     return result
 
 
-def render_local_honey(result: dict[str, Any], seed_text: str) -> str:
+def render_local_honey(result: dict[str, Any], seed_text: str,
+                       code_root: str | None = None,
+                       docs_root: str | None = None) -> str:
     """Render investigate verdicts into a honey-shaped markdown — LOCAL, free.
 
     This is the seam that lets the cheap path feed ``specify``: the swarm pipeline
@@ -284,6 +390,10 @@ def render_local_honey(result: dict[str, Any], seed_text: str) -> str:
     verdicts = result.get("verdicts", []) or []
     located = [v for v in verdicts if v.get("verdict", {}).get("located")]
     unlocated = [v for v in verdicts if not v.get("verdict", {}).get("located")]
+    # The seed's OWN explicitly-named edit targets, grounded independently of the
+    # judge's verdicts (Defect 2): a user-provided file:line must become an AUTHOR
+    # target even when investigate failed to re-locate it on its own.
+    seed_targets = seed_edit_targets(seed_text, code_root, docs_root)
 
     out: list[str] = [
         "# Hivework honey (local — rendered from investigate verdicts)",
@@ -343,8 +453,32 @@ def render_local_honey(result: dict[str, Any], seed_text: str) -> str:
         out += ["_No axis produced a grounded localisation. specify should defer "
                 "rather than fabricate an edit._", ""]
 
+    # Seed-specified edit targets — the user named these exact files, so they are
+    # AUTHOR targets (not "context", not "do NOT edit"), grounded below regardless
+    # of whether any judge axis located them (Defect 2 / T892). specify lifts the
+    # live text at each cited file:line and enforces that none is silently dropped.
+    if seed_targets:
+        out += [
+            SEED_TARGET_SECTION + " (the user named these files explicitly — AUTHOR them)",
+            "",
+            "The Requested change names these exact files as edit targets. They are "
+            "NOT optional and NOT mere context: author the seed's specified change at "
+            "each, lifting `anchor_old` from the live text in the \"Anchor ground "
+            "truth\" block below. If you genuinely cannot express one as an edit, you "
+            "MUST defer it with a reason that NAMES the file and states exactly what "
+            "grounding was missing — never drop a seed-named target silently.",
+            "",
+        ]
+        out += [f"- {t['file']}:{t['lines']}" for t in seed_targets]
+        out.append("")
+
     if unlocated:
         out += ["## Axes without a confident localisation (do NOT fabricate edits here)", ""]
+        if seed_targets:
+            out.append("(Files under “Seed-specified edit targets” above remain AUTHOR "
+                       "targets — the prohibition here applies only to these speculative "
+                       "axis loci, not to a seed-named file.)")
+            out.append("")
         for v in unlocated:
             vd = v.get("verdict", {})
             reason = vd.get("reason") or "not located"

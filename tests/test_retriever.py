@@ -399,3 +399,64 @@ def test_retrieve_does_not_invent_values_for_unresolvable_refs(tmp_path):
     out = retrieve(plan, str(tmp_path), max_hops=0)
     assert out["stats"]["resolved_refs"] == 0
     assert all("resolved" not in s for s in out["code_snippets"])
+
+
+# ── Defect 1 (T892): dense one-record-per-line files (SQL/JSON query maps) ──────
+def _make_dense_sql_tree(tmp_path):
+    qdir = tmp_path / "server" / "sql" / "queries"
+    qdir.mkdir(parents=True)
+    # one SQL query per line, each a long single-line string — the queries.json
+    # shape where get_pending_head_by_group sat on a 586-char line (T892).
+    lines = [
+        "{",
+        '  "get_in_progress_head_by_group": "SELECT wsi.*, ws.id FROM workflow_sequence_items'
+        " wsi JOIN workflow_sequences ws ON wsi.sequence_id = ws.id WHERE d.group_id = ?"
+        ' AND wsi.result_doc_id IS NOT NULL ORDER BY wsi.sort_order ASC LIMIT 1",',
+        '  "get_pending_head_by_group": "SELECT wsi.*, ws.id FROM workflow_sequence_items'
+        " wsi JOIN workflow_sequences ws ON wsi.sequence_id = ws.id WHERE d.group_id = ?"
+        " AND d.project_id = ? AND wsi.result_doc_id IS NULL ORDER BY wsi.sort_order ASC"
+        ' LIMIT 1",',
+        '  "get_effective_head": "SELECT wsi.* FROM workflow_sequence_items wsi WHERE'
+        ' d.group_id = ? ORDER BY wsi.sort_order ASC LIMIT 1"',
+        "}",
+    ]
+    (qdir / "queries.json").write_text("\n".join(lines), encoding="utf-8")
+    return str(tmp_path)
+
+
+def test_retrieve_surfaces_exact_line_in_dense_single_line_file(tmp_path):
+    # The ±k window + cluster picking could not isolate the target key on a dense
+    # one-query-per-line file (every line carries SELECT/WHERE/JOIN, so dozens tie),
+    # so the judge ruled located=False on the SAME file another run located. The
+    # dense-line path must surface get_pending_head_by_group as its OWN snippet.
+    root = _make_dense_sql_tree(tmp_path)
+    plan = SearchPlan(
+        axis_id="H",
+        keywords=["get_pending_head_by_group", "result_doc_id", "ORDER BY", "IS NULL"],
+        file_globs=["server/sql/queries/queries.json"],
+    )
+    out = retrieve(plan, root, max_hops=0)
+    snips = out["code_snippets"]
+    target = [s for s in snips if "get_pending_head_by_group" in s["text"]]
+    assert target, f"target line not surfaced: {[(s['lines'], s['text'][:40]) for s in snips]}"
+    s = target[0]
+    lo, hi = s["lines"].split("-")
+    assert lo == hi, f"expected a single-record snippet, got {s['lines']}"
+    # the WHOLE SQL string is present (not truncated out of a ±k window)
+    assert "result_doc_id IS NULL" in s["text"]
+    assert "ORDER BY wsi.sort_order" in s["text"]
+
+
+def test_dense_file_does_not_collapse_distinct_query_lines(tmp_path):
+    # Each distinct query line is its own snippet (not merged into one whole-file
+    # window) so the judge can tell get_pending from get_in_progress.
+    root = _make_dense_sql_tree(tmp_path)
+    plan = SearchPlan(
+        axis_id="H",
+        keywords=["result_doc_id", "ORDER BY", "LIMIT"],
+        file_globs=["server/sql/queries/queries.json"],
+    )
+    out = retrieve(plan, root, max_hops=0)
+    # at least the two result_doc_id-bearing queries surface as separate records
+    rec_lines = {s["lines"] for s in out["code_snippets"]}
+    assert len(rec_lines) >= 2, rec_lines

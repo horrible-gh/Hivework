@@ -726,5 +726,70 @@ class TestConfigSpecifyRole(unittest.TestCase):
         self.assertEqual(cfg.role("specify").model, "claude-sonnet-4.6")
 
 
+_HONEY_WITH_TARGETS = (
+    "## Seed-specified edit targets (the user named these files explicitly — AUTHOR them)\n\n"
+    "Author the seed's specified change at each.\n\n"
+    "- server/sql/queries/queries.json:129-129\n"
+    "- client/tests/main/workflowViewState.spec.ts:300-320\n\n"
+    "## Axes without a confident localisation (do NOT fabricate edits here)\n\n"
+    "- SEED_ANCHOR: not located\n"
+)
+
+
+class TestSeedCoverageGate(unittest.TestCase):
+    """Defect 2 (T892): a seed-named edit target must become an edit, or a ready
+    spec is downgraded to needs_pm with the dropped target reported."""
+
+    def test_seed_target_files_parsed_from_section(self):
+        self.assertEqual(
+            specify._seed_target_files(_HONEY_WITH_TARGETS),
+            ["server/sql/queries/queries.json",
+             "client/tests/main/workflowViewState.spec.ts"])
+
+    def test_downgrades_ready_when_seed_target_missing(self):
+        spec = {
+            "edits": [{"id": "E1",
+                       "file": "client/src/main/workflow/workflowViewState.ts"}],
+            "deferred": [{"issue": "Update queries.json get_pending_head_by_group …",
+                          "reason": "not_expressible_as_edit"}],
+            "termination": "ready_to_apply", "notes": "",
+        }
+        out = specify._apply_seed_coverage_gate(spec, _HONEY_WITH_TARGETS)
+        self.assertEqual(out["termination"], "needs_pm")
+        # both seed targets are missing (only the FE view-state file was edited)
+        self.assertIn("server/sql/queries/queries.json", out["seed_coverage"]["missing"])
+        self.assertIn("client/tests/main/workflowViewState.spec.ts",
+                      out["seed_coverage"]["missing"])
+        # the author's stated defer reason is reported, not hidden
+        self.assertIn("not_expressible_as_edit",
+                      out["seed_coverage"]["reasons"]["server/sql/queries/queries.json"])
+        self.assertIn("seed-coverage gate", out["notes"])
+
+    def test_passes_when_all_seed_targets_edited(self):
+        spec = {
+            "edits": [
+                {"id": "E1", "file": "server/sql/queries/queries.json"},
+                {"id": "E2", "file": "client/tests/main/workflowViewState.spec.ts"}],
+            "deferred": [], "termination": "ready_to_apply", "notes": "",
+        }
+        out = specify._apply_seed_coverage_gate(spec, _HONEY_WITH_TARGETS)
+        self.assertEqual(out["termination"], "ready_to_apply")
+        self.assertEqual(out["seed_coverage"]["missing"], [])
+
+    def test_noop_when_no_seed_section(self):
+        spec = {"edits": [], "termination": "ready_to_apply"}
+        out = specify._apply_seed_coverage_gate(spec, "no seed section here")
+        self.assertEqual(out["termination"], "ready_to_apply")
+        self.assertNotIn("seed_coverage", out)
+
+    def test_records_diagnostics_but_does_not_upgrade_non_ready(self):
+        # A spec already at needs_reinvestigation is not vouching for completeness;
+        # the gate records coverage but never promotes it.
+        spec = {"edits": [], "deferred": [], "termination": "needs_reinvestigation"}
+        out = specify._apply_seed_coverage_gate(spec, _HONEY_WITH_TARGETS)
+        self.assertEqual(out["termination"], "needs_reinvestigation")
+        self.assertEqual(len(out["seed_coverage"]["missing"]), 2)
+
+
 if __name__ == "__main__":
     unittest.main()

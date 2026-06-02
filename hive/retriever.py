@@ -306,6 +306,52 @@ def _widen_globs(globs: list[str]) -> list[str]:
     return widened
 
 
+# A "structured key→value" file (a SQL/JSON query map, a one-locale-per-line i18n
+# file) packs a whole record onto ONE long line. Both the ±k line WINDOW and the
+# keyword-cooccurrence CLUSTERING break there: neighbouring lines are unrelated
+# records, and in an all-SQL file EVERY line carries SELECT/WHERE/JOIN so dozens
+# tie at max coverage and the greedy pick is decided by line ORDER, not by the
+# target. (T892: ``get_pending_head_by_group`` sat on a 586-char line; the same
+# file N168 located at queries.json:117-129 came back located=False because the
+# ±6-line window centred elsewhere and the 2000-char cap truncated the key out.)
+# When a file's matched lines are this long, snippet PER LINE instead — each
+# record is isolated and ranked by its own keyword coverage. Deterministic, free.
+_DENSE_LINE_CHARS = 200
+_DENSE_MAX_LINES = 6      # per dense file: surface up to this many record-lines
+_DENSE_LINE_CAP = 1500    # chars kept per surfaced record-line
+
+
+def _dense_line_snippets(code_root: str, relpath: str,
+                         hits: list[tuple[int, str]], max_lines: int,
+                         line_cap: int) -> list[dict[str, Any]]:
+    """Per-line snippets for a one-record-per-line file (SQL/JSON query map, i18n).
+
+    Ranks the matched lines by DISTINCT-keyword coverage (ties → lowest line) and
+    surfaces each WHOLE line as its own snippet, so a dense SQL/JSON record is
+    handed to the judge isolated instead of averaged into a ±k window of unrelated
+    neighbours (or truncated out of it). This is what makes anchor location on a
+    dense single-line file deterministic given the same hits (Defect 1 / T892).
+    """
+    abspath = os.path.join(code_root, relpath)
+    try:
+        with open(abspath, "r", encoding="utf-8", errors="replace") as fh:
+            all_lines = fh.readlines()
+    except OSError:
+        return []
+    kws_at: dict[int, set[str]] = defaultdict(set)
+    for ln, kw in hits:
+        kws_at[ln].add(kw)
+    ranked_lines = sorted(kws_at.keys(),
+                          key=lambda ln: (len(kws_at[ln]), -ln), reverse=True)
+    snips: list[dict[str, Any]] = []
+    for ln in ranked_lines[:max_lines]:
+        if 1 <= ln <= len(all_lines):
+            text = all_lines[ln - 1].rstrip("\n")[:line_cap]
+            snips.append({"file": relpath, "lines": f"{ln}-{ln}",
+                          "text": text, "hits": sorted(kws_at[ln])})
+    return snips
+
+
 def _scan_code(keywords: list[str], globs: list[str], code_root: str,
                k: int, top_files: int) -> dict[str, Any]:
     """ripgrep keywords → rank files → window densest clusters (retrieve steps 1-3).
@@ -316,12 +362,14 @@ def _scan_code(keywords: list[str], globs: list[str], code_root: str,
     call_sites: list[dict[str, Any]] = []
     file_hits: dict[str, set[str]] = defaultdict(set)       # file -> keywords
     file_lines: dict[str, list[tuple[int, str]]] = defaultdict(list)  # (line,kw)
+    file_maxlen: dict[str, int] = defaultdict(int)          # file -> longest hit line
     for kw in keywords:
         for h in _ripgrep(kw, globs, code_root):
             h["keyword"] = kw
             call_sites.append(h)
             file_hits[h["file"]].add(kw)
             file_lines[h["file"]].append((h["line"], kw))
+            file_maxlen[h["file"]] = max(file_maxlen[h["file"]], len(h.get("text", "")))
 
     hit_count: dict[str, int] = defaultdict(int)
     for h in call_sites:
@@ -333,8 +381,21 @@ def _scan_code(keywords: list[str], globs: list[str], code_root: str,
     )
 
     raw_snips: list[dict[str, Any]] = []
+    # Dense per-line snippets are kept OUT of _merge_windows: in a query map the
+    # records sit on consecutive lines, so merging would re-collapse them into the
+    # whole-file window the dense path exists to avoid (Defect 1/T892).
+    dense_snips: list[dict[str, Any]] = []
     densest_line: dict[str, int] = {}  # file -> centroid of its top cluster
     for f in ranked[:top_files]:
+        # Dense one-record-per-line file (SQL/JSON map): snippet per line so the
+        # target record is isolated, not averaged into a ±k window (Defect 1/T892).
+        if file_maxlen[f] >= _DENSE_LINE_CHARS:
+            dense = _dense_line_snippets(code_root, f, file_lines[f],
+                                         _DENSE_MAX_LINES, _DENSE_LINE_CAP)
+            if dense:
+                densest_line[f] = int(dense[0]["lines"].split("-")[0])
+                dense_snips.extend(dense)
+                continue
         clusters = _cluster_lines(file_lines[f], k, max_clusters=2)
         if clusters:
             densest_line[f] = (clusters[0]["lo"] + clusters[0]["hi"]) // 2
@@ -350,7 +411,7 @@ def _scan_code(keywords: list[str], globs: list[str], code_root: str,
         "file_lines": file_lines,
         "ranked": ranked,
         "densest_line": densest_line,
-        "code_snippets": _merge_windows(raw_snips),
+        "code_snippets": _merge_windows(raw_snips) + dense_snips,
     }
 
 
