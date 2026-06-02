@@ -375,6 +375,7 @@ def run_investigate(
             code_root=code_root, provider=judge_role.provider,
             model=judge_role.model, judge_cfg=cfg.judge, ledger=ledger,
             provider_kwargs=pk, k=k, seed_files=seed_files,
+            seed_axis=(sp.axis_id == "SEED_ANCHOR"),
         )
         v = jr["verdict"]
         logger.info("   verdict: located=%s %s:%s — %s",
@@ -421,8 +422,16 @@ def run_investigate(
             provider=conv_role.provider, model=conv_role.model, code_root=code_root,
             ledger=ledger, provider_kwargs=pk, k=k, max_hops=2)
         converge_dict = cres.as_dict()
+        cc = cres.causal_check or {}
         if cres.converged and cres.attributed_defect:
-            logger.info("   converged → defect at %s:%s",
+            logger.info("   converged → defect at %s:%s (causal: consistent)",
+                        cres.attributed_defect.get("file"),
+                        cres.attributed_defect.get("lines"))
+        elif cres.attributed_defect and cc.get("verdict") in (
+                "contradicted", "undecidable", "unverified"):
+            logger.info("   not converged → causal check %s for suspected %s:%s "
+                        "(reachable, not a verified cause — routed to "
+                        "reinvestigation/data-state)", cc.get("verdict"),
                         cres.attributed_defect.get("file"),
                         cres.attributed_defect.get("lines"))
         elif cres.missing_link:
@@ -490,6 +499,17 @@ def _render_converge_section(converge: dict[str, Any] | None,
             f"- why this is the defect: {ad.get('why', '')}",
             "",
         ]
+        # Causal check (N170): the attribution passed the cause→symptom check.
+        # Surface the data-state assumptions + trace so the author can confirm the
+        # fix matches the verified failing condition (not just a reachable node).
+        cc = converge.get("causal_check") or {}
+        if cc.get("data_state_assumptions") or cc.get("trace"):
+            out += ["#### Causal verification (cause→symptom — CONSISTENT)"]
+            for a in cc.get("data_state_assumptions") or []:
+                out.append(f"- assumes: {a}")
+            if cc.get("trace"):
+                out.append(f"- trace: {cc['trace']}")
+            out.append("")
         if seed_kind == "diagnostic":
             out += [
                 "> **This seed is DIAGNOSTIC (trace/map), not a change request.** The "
@@ -507,6 +527,58 @@ def _render_converge_section(converge: dict[str, Any] | None,
                 "the path that runs for this scenario is no longer ambiguous.",
                 "",
             ]
+        return out
+
+    # ── Causal failure (N170): the converger reached a node on the executed path
+    # but the cause→symptom check did NOT confirm it produces the symptom. This is
+    # NOT a primary edit target — emitting it as one is exactly the N170 defect
+    # (a reachable-but-innocent ORDER BY clause authored into a wrong edit). Route
+    # it to reinvestigation (contradicted) or data-state confirmation (undecidable).
+    cc = converge.get("causal_check") or {}
+    cv = cc.get("verdict")
+    ad = converge.get("attributed_defect")
+    if cv in ("contradicted", "undecidable", "unverified") and ad:
+        loc = f"{ad.get('file', '')}:{ad.get('lines', '')}".strip(":")
+        out += [
+            "## Convergence reached a node but the CAUSAL CHECK did not confirm it",
+            "",
+            f"The converge stage stitched the executed path and SUSPECTED "
+            f"`{loc}` ({ad.get('node', '?')}), but its cause→symptom check came back "
+            f"**{cv}** — reachability alone, not a verified cause. **Do NOT author an "
+            f"edit at this node on the strength of convergence.** It is a suspected "
+            f"locus to re-examine, not an attributed defect.",
+            "",
+        ]
+        for a in cc.get("data_state_assumptions") or []:
+            out.append(f"- assumed data state: {a}")
+        if cc.get("trace"):
+            out.append(f"- causal trace: {cc['trace']}")
+        out.append("")
+        if cv == "contradicted":
+            out += [
+                "> The suspected code is reachable but, under the only data state the "
+                "scenario allows, it CANNOT produce the reported symptom (the cause "
+                "contradicts the symptom). The real defect is elsewhere: return "
+                "needs_reinvestigation NAMING this contradiction (which node was "
+                "suspected and why it cannot be the cause), or — if the seed names "
+                "concrete edit targets (see the seed-specified targets section "
+                "below) — author only those, not this node.",
+                "",
+            ]
+        else:  # undecidable / unverified
+            needs = cc.get("need_data_state") or []
+            out += [
+                "> Whether this node is the defect depends on stored row/field state "
+                "that static evidence cannot determine. Do NOT guess an edit: surface "
+                "the data state / fixture needed and defer (needs_pm), or author only "
+                "seed-named targets (see the seed-specified targets section below) "
+                "if present.",
+                "",
+            ]
+            if needs:
+                out.append("Data state / fixture required to decide:")
+                out += [f"- {n}" for n in needs]
+                out.append("")
         return out
 
     ml = converge.get("missing_link")

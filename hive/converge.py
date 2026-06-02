@@ -63,12 +63,21 @@ class ConvergeResult:
     ``converged`` is the gate a downstream consumer trusts; ``path`` /
     ``attributed_defect`` / ``missing_link`` are the evidence. ``raw`` keeps the
     full parsed JSON so nothing the model said is dropped.
+
+    ``causal_check`` (N170) is the cause→symptom verification: reachability tells
+    us a node is ON the executed path, but NOT that its code actually produces the
+    reported symptom. ``converged`` is gated on a ``consistent`` causal check — a
+    ``contradicted`` (the attributed code cannot produce the symptom under the only
+    data state the scenario allows) or ``undecidable`` (the outcome depends on
+    stored row state static evidence can't determine) attribution is NOT converged,
+    so it is routed to reinvestigation / data-state confirmation, not to an edit.
     """
 
     converged: bool = False
     path: list[dict[str, Any]] = field(default_factory=list)
     attributed_defect: dict[str, Any] | None = None
     missing_link: dict[str, Any] | None = None
+    causal_check: dict[str, Any] | None = None
     summary: str = ""
     raw: dict[str, Any] = field(default_factory=dict)
 
@@ -78,6 +87,7 @@ class ConvergeResult:
             "path": self.path,
             "attributed_defect": self.attributed_defect,
             "missing_link": self.missing_link,
+            "causal_check": self.causal_check,
             "summary": self.summary,
         }
 
@@ -175,7 +185,9 @@ executes for the reported scenario, and attribute the defect to ONE node on it.
 and emit the JSON immediately. Judge EXECUTION REACHABILITY: which fragments are on \
 the path that actually runs for this scenario, and which are merely similar-looking \
 code that is NOT on it. A located fragment can be a RED HERRING (real code, but not \
-reached in this scenario) — say so by leaving it off the path.
+reached in this scenario) — say so by leaving it off the path. Reachability is \
+NECESSARY but NOT SUFFICIENT: a node can be on the executed path yet not be what \
+produces the reported symptom (step 3 below is where you check that).
 
 [Reported scenario / seed]
 {_trunc(seed_text, 2000)}
@@ -190,9 +202,30 @@ reached in this scenario) — say so by leaving it off the path.
 1. ORDER the on-path fragments into the single executed path for the scenario.
 2. ATTRIBUTE the defect to exactly ONE node (the place a fix must change), with a \
 one-line reason that explains the wrong behaviour at THAT node.
-3. If — and only if — two adjacent nodes cannot be connected because a needed \
+3. CAUSALLY VERIFY that attribution. Being on the executed path is not enough — you \
+must show the attributed code actually PRODUCES the reported symptom. State the \
+DATA-STATE assumptions the scenario forces (the concrete row/field values at each \
+record the attributed code reads), then TRACE what the code OUTPUTS under those \
+assumptions, and rule:
+   - It reproduces the symptom under the stated assumptions → causal_check.verdict = \
+"consistent".
+   - Under the ONLY data state the scenario allows it does NOT (e.g. the candidate \
+rows TIE on a column, so a later ORDER-BY/branch is never the discriminator and the \
+claimed mis-ordering cannot occur) → verdict = "contradicted". The cause contradicts \
+the symptom — do not pass it off as the defect.
+   - The outcome DEPENDS on stored row state you cannot read from the static evidence \
+(which row has result_doc_id set, what review status it carries, …) → verdict = \
+"undecidable"; put the exact row state / fixture you would need in need_data_state. \
+Do NOT guess an attribution to fill the gap.
+4. If — and only if — two adjacent nodes cannot be connected because a needed \
 callee/symbol is NOT shown in the evidence, set converged=false and NAME the missing \
 link instead of guessing.
+
+[Gate] Only a "consistent" causal check is actionable downstream. When your check is \
+"contradicted" or "undecidable", STILL fill attributed_defect with the node you \
+suspected and causal_check with your honest reasoning — the pipeline routes it to \
+reinvestigation / data-state confirmation, NOT to an edit. Do not suppress the \
+finding to force a convergence.
 
 [Output contract] Output ONLY this JSON object. No prose outside the JSON.
 {{
@@ -201,14 +234,16 @@ link instead of guessing.
     {{ "node": "endpoint|handler|db_fn|sql_key|fe|other", "file": "<repo-relative>", "lines": "<start-end>", "symbol": "<fn/route/key name>" }}
   ],
   "attributed_defect": {{ "node": "<which node above>", "file": "<repo-relative>", "lines": "<start-end>", "why": "<one line: the wrong behaviour here>" }},
+  "causal_check": {{ "verdict": "consistent|contradicted|undecidable", "data_state_assumptions": ["<the row/field values the scenario forces>"], "trace": "<what the attributed code outputs under those assumptions, and whether it reproduces the symptom>", "need_data_state": ["<when undecidable: the exact stored row state / fixture to confirm>"] }},
   "missing_link": null
 }}
 
-When you cannot converge, instead emit:
+When you cannot converge because a CODE link is missing, instead emit:
 {{
   "converged": false,
   "path": [ ...the partial path you DID establish... ],
   "attributed_defect": null,
+  "causal_check": null,
   "missing_link": {{ "between": ["<node A>", "<node B>"], "need": {{ "symbols": ["<callee/def to resolve>"], "greps": ["<literal/regex>"], "file_globs": ["<optional scope>"] }} }}
 }}
 """
@@ -222,6 +257,32 @@ def _coerce_node(d: Any) -> dict[str, Any] | None:
         "file": str(d.get("file", "") or ""),
         "lines": str(d.get("lines", "") or ""),
         "symbol": str(d.get("symbol", "") or ""),
+    }
+
+
+# The cause→symptom check verdicts we accept; anything else (typo, blank, a model
+# that emitted the block but skipped the verdict) normalises to ``unverified`` so
+# the gate fails CLOSED — only an explicit ``consistent`` is actionable.
+_CAUSAL_VERDICTS = ("consistent", "contradicted", "undecidable")
+
+
+def _coerce_causal(d: Any) -> dict[str, Any] | None:
+    """Parse the converger's ``causal_check`` block, or None when absent.
+
+    None means the converger did not perform the mandated step; the gate treats
+    that as ``unverified`` (fail closed). A present-but-unrecognised verdict is
+    also normalised to ``unverified`` rather than trusted.
+    """
+    if not isinstance(d, dict):
+        return None
+    verdict = str(d.get("verdict", "") or "").strip().lower()
+    if verdict not in _CAUSAL_VERDICTS:
+        verdict = "unverified"
+    return {
+        "verdict": verdict,
+        "data_state_assumptions": [str(x) for x in (d.get("data_state_assumptions") or [])],
+        "trace": str(d.get("trace", "") or ""),
+        "need_data_state": [str(x) for x in (d.get("need_data_state") or [])],
     }
 
 
@@ -267,14 +328,41 @@ def _result_from(parsed: dict[str, Any] | None,
             },
         }
 
+    causal = _coerce_causal(parsed.get("causal_check"))
+
     # A claimed convergence with no attributed node is not a convergence.
     if converged and attributed is None:
         converged = False
 
+    # ── Causal gate (N170): reachability is necessary, not sufficient. A converged
+    # attribution is ACTIONABLE only when the cause→symptom check says the attributed
+    # code actually produces the reported symptom. The converger attributed BEFORE it
+    # ran this check, so it routinely emits converged=true on a node that is merely
+    # reachable; we flip that to NOT-converged unless the check is ``consistent``.
+    # The attribution is kept (the honey surfaces the suspected-but-refuted node) but
+    # it no longer reads as a primary edit target — it routes to reinvestigation
+    # (contradicted) or data-state confirmation (undecidable / unverified).
+    if converged and attributed is not None:
+        if causal is None:
+            causal = {"verdict": "unverified", "data_state_assumptions": [],
+                      "trace": "converger did not perform the cause→symptom check",
+                      "need_data_state": []}
+            converged = False
+        elif causal["verdict"] != "consistent":
+            converged = False
+
     summary = ""
+    cv = (causal or {}).get("verdict")
     if converged and attributed:
         summary = (f"converged: defect at {attributed['file']}:{attributed['lines']} "
-                   f"({attributed.get('node', '?')}) over a {len(path)}-node path")
+                   f"({attributed.get('node', '?')}) over a {len(path)}-node path "
+                   f"[causal: consistent]")
+    elif attributed and cv == "contradicted":
+        summary = (f"not converged: causal contradiction — {attributed['file']}:"
+                   f"{attributed['lines']} is reachable but cannot produce the symptom")
+    elif attributed and cv in ("undecidable", "unverified"):
+        summary = (f"not converged: causal check {cv} — needs data state/fixture to "
+                   f"rule on {attributed['file']}:{attributed['lines']}")
     elif missing:
         summary = ("not converged: missing link between "
                    + " ↔ ".join(missing["between"]) if missing["between"]
@@ -284,7 +372,7 @@ def _result_from(parsed: dict[str, Any] | None,
 
     return ConvergeResult(converged=converged, path=path,
                           attributed_defect=attributed, missing_link=missing,
-                          summary=summary, raw=parsed)
+                          causal_check=causal, summary=summary, raw=parsed)
 
 
 def _dedup_windows(windows: list[dict[str, Any]]) -> list[dict[str, Any]]:

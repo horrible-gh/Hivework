@@ -175,14 +175,25 @@ def _verdict_contract(want_need: bool) -> str:
 
 
 def build_judge_prompt(axis_id: str, symptom: str, bundle_text: str,
-                       *, want_need: bool, code_root: str = "") -> str:
+                       *, want_need: bool, code_root: str = "",
+                       seed_axis: bool = False) -> str:
     """Build the JUDGE prompt for one axis. ``want_need`` enables follow-up asks.
 
     The judge rules on the SUPPLIED bundle — it has no tools and must not try to
     read files or run commands (the bundle is the substitute for agentic FIND;
     re-exploring defeats the redesign and blows latency). When it lacks a piece,
     it asks for it via ``need`` (a bounded re-search), it does not go fetch it.
+
+    ``seed_axis`` marks an axis the seed itself mandated (e.g. the injected
+    SEED_ANCHOR): the ruling mandate below is stated for every axis, but a
+    seed-mandated one gets an extra line because dismissing it is the costliest
+    miss (N170: axis E "does get_pending call the wrong SQL key?" was waved off as
+    a "simple lookup request" and never confirmed or refuted).
     """
+    seed_line = (
+        "\nThis axis is MANDATED BY THE SEED — the user specifically asked it to be "
+        "investigated. A dismissal here is a defect: you MUST return an explicit "
+        "confirm or refute.\n" if seed_axis else "")
     return f"""[Role] You are the JUDGE for Hivework axis "{axis_id}". You are given a \
 locally-retrieved evidence bundle (keyword windows, call-chain hops, git history) and \
 the reported symptom. Your job is to localise the bug: name the exact file and line range \
@@ -192,6 +203,17 @@ symptom's path — not merely that matching text exists.
 [Constraints] You have NO tools. Do NOT attempt to read files or run commands. Decide \
 ONLY from the evidence below and emit the JSON immediately. If a referenced callee/symbol \
 you need is not shown, ask for it in ``need`` rather than trying to fetch it.
+
+[Ruling mandate] The axis brief is a HYPOTHESIS about where/whether this symptom's \
+defect lives — RULE on it. Return exactly one of:
+  - CONFIRM: located=true, naming the exact buggy file/lines, OR
+  - REFUTE: located=false with a concrete, evidence-based reason this code path is \
+correct / not the cause (cite what in the evidence disproves the hypothesis).
+You may NOT decline to rule. A brief phrased as a question ("does X call the wrong \
+key?", "is the ORDER BY wrong?") still demands a confirm/refute answer about the \
+symptom — do NOT dismiss it as "merely an informational/lookup request", "not itself \
+a code defect", or "no source-line change needed" to sidestep judging. "located=false" \
+must mean "refuted, because <evidence>", never "this was not a real question."{seed_line}
 
 [Symptom / axis brief]
 {symptom}
@@ -334,6 +356,29 @@ def _merge_followup(bundle: dict[str, Any], fu: dict[str, Any]) -> dict[str, Any
     return merged
 
 
+# Dismissal phrases: a located=false verdict whose reason rejects the QUESTION
+# ("this isn't a real defect / just a lookup") rather than REFUTING the hypothesis
+# with evidence. We don't flip the bit (the model may be right that it's unlocated)
+# — we SURFACE it (free, deterministic) so a non-ruling is visible to the operator
+# and the honey, and never silently accepted (N170 axis E). Matched on a
+# dash-normalised, lowercased reason.
+_DISMISSAL_MARKERS = (
+    "informational request", "informational query", "not a code defect",
+    "not a defect", "no source-line change", "no source line change",
+    "no code change", "does not require a source", "not require a source-line",
+    "merely a lookup", "merely an informational", "simply a lookup",
+    "just a lookup", "just a query", "not itself a defect",
+)
+
+
+def _is_dismissal(reason: str) -> bool:
+    """True when an unlocated reason DISMISSES the question instead of refuting it."""
+    norm = (reason or "").lower()
+    for dash in ("‐", "‑", "‒", "–", "—"):
+        norm = norm.replace(dash, "-")
+    return any(m in norm for m in _DISMISSAL_MARKERS)
+
+
 def _cites_seed_file(cited: str, seed_files: set[str]) -> bool:
     """True when a verdict's cited file is one of the seed's named (on-disk) targets.
 
@@ -352,7 +397,8 @@ def run_judge(*, plan_bundle: dict[str, Any], symptom: str, axis_globs: list[str
               code_root: str, provider: str, model: str, judge_cfg,
               ledger=None, provider_kwargs: dict | None = None,
               k: int = 6, max_hops: int = 2, timeout: int = 180,
-              seed_files: set[str] | None = None) -> dict[str, Any]:
+              seed_files: set[str] | None = None,
+              seed_axis: bool = False) -> dict[str, Any]:
     """End-to-end JUDGE for one axis: verdict (+ optional one re-judge after follow-up).
 
     Returns a comb dict::
@@ -377,7 +423,8 @@ def run_judge(*, plan_bundle: dict[str, Any], symptom: str, axis_globs: list[str
     # ── Call 1: verdict + (optional) need, on the first-pass bundle.
     bundle_text = summarize_bundle(plan_bundle)
     prompt1 = build_judge_prompt(axis_id, symptom, bundle_text,
-                                 want_need=want_need, code_root=code_root)
+                                 want_need=want_need, code_root=code_root,
+                                 seed_axis=seed_axis)
     parsed1 = _call_and_parse(provider, model, prompt1, cwd=code_root,
                               axis_id=axis_id, stage="judge1", ledger=ledger,
                               provider_kwargs=pk, timeout=timeout)
@@ -399,7 +446,8 @@ def run_judge(*, plan_bundle: dict[str, Any], symptom: str, axis_globs: list[str
         followup_bundle = retrieve_followup(need, code_root, k=k, max_hops=max_hops)
         merged = _merge_followup(plan_bundle, followup_bundle)
         prompt2 = build_judge_prompt(axis_id, symptom, summarize_bundle(merged),
-                                     want_need=False, code_root=code_root)
+                                     want_need=False, code_root=code_root,
+                                     seed_axis=seed_axis)
         parsed2 = _call_and_parse(provider, model, prompt2, cwd=code_root,
                                   axis_id=axis_id, stage="judge2", ledger=ledger,
                                   provider_kwargs=pk, timeout=timeout)
@@ -431,6 +479,21 @@ def run_judge(*, plan_bundle: dict[str, Any], symptom: str, axis_globs: list[str
                 reason="ungrounded (cited file absent from evidence bundle): "
                        + (verdict.reason or ""),
                 raw=verdict.raw)
+
+    # ── Dismissal backstop (N170 axis E): an unlocated verdict whose reason rejects
+    # the QUESTION ("informational request, not a code defect") instead of REFUTING
+    # the hypothesis is not a ruling. Free + deterministic: we don't flip the bit
+    # (it may genuinely be unlocated) — we FLAG it so the non-ruling is visible in
+    # the report/honey and not silently accepted, escalated for a seed-mandated axis.
+    if not verdict.located and _is_dismissal(verdict.reason):
+        logger.warning("judge: [%s]%s unlocated verdict DISMISSED the question rather "
+                       "than refuting it (reason=%r) — flagged as an unruled dismissal",
+                       axis_id, " SEED-MANDATED" if seed_axis else "", verdict.reason)
+        verdict = JudgeVerdict(
+            axis_id=axis_id, located=False, file=verdict.file, lines=verdict.lines,
+            reason="[unruled-dismissal: question waved off, not refuted with evidence] "
+                   + (verdict.reason or ""),
+            raw=verdict.raw)
 
     return {
         "axis_id": axis_id,
