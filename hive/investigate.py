@@ -452,13 +452,19 @@ def run_investigate(
     converge_dict: dict[str, Any] | None = None
     if located_n >= 2:
         conv_role = cfg.role("converge")
+        # Read-only DB connection for this codebase (if configured) — lets converge
+        # resolve an UNDECIDABLE causal check by reading the deciding row from the live
+        # DB instead of guessing. None (the common case) → converge keeps its static
+        # path. db_for_codebase never raises.
+        db_conn = cfg.db_for_codebase(code_root)
         logger.info("[HIVE_STAGE] pipeline=investigate stage=4 name=converge")
-        logger.info("④ converge (%s/%s) — stitch %d located verdict(s) into one path",
-                    conv_role.provider, conv_role.model, located_n)
+        logger.info("④ converge (%s/%s) — stitch %d located verdict(s) into one path%s",
+                    conv_role.provider, conv_role.model, located_n,
+                    f" (DB data-state read available: {db_conn.kind})" if db_conn else "")
         cres = run_converge(
             seed_text=seed_text, verdicts=verdicts, bundles=bundles,
             provider=conv_role.provider, model=conv_role.model, code_root=code_root,
-            ledger=ledger, provider_kwargs=pk, k=k, max_hops=2)
+            ledger=ledger, provider_kwargs=pk, k=k, max_hops=2, db_conn=db_conn)
         converge_dict = cres.as_dict()
         cc = cres.causal_check or {}
         if cres.converged and cres.attributed_defect:

@@ -13,5 +13,16 @@
   "ledger":  { "enabled": true, "db_path": "hive_ledger.db" },
   "apply":   { "backup_dir": ".apply_backups", "backup_ttl_hours": 168 },
   "judge":   { "max_calls_per_axis": 2, "max_axes": 12, "max_parallel": 2 },
-  "safety":  { "allow_swarm": false }
+  "safety":  { "allow_swarm": false },
+  "db_connections": {
+    "flowgate": {
+      "kind": "sqlite",
+      "path": "C:/workspace/projects/FlowGate/server/flowgate.db"
+    },
+    "timeweaver": {
+      "kind": "mysql",
+      "host": "localhost", "port": 3306, "dbname": "timeweaver",
+      "user": "timeweaver", "password": "password"
+    }
+  }
 }

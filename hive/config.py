@@ -99,6 +99,45 @@ class ApplyConfig:
 
 
 @dataclass
+class DbConnection:
+    """One target codebase's read-only DB connection (for the converge data-state read).
+
+    NEUTRAL by design — no FlowGate (or any caller) semantics. ``kind`` dispatches
+    the driver; the rest are standard connection coordinates. The converge data-read
+    glue only ever issues SELECTs, so a connection is read-only BY CONSTRUCTION
+    regardless of the account's grants; a SELECT-only DB account is recommended
+    defence-in-depth, not a correctness requirement.
+
+    - sqlite: only ``path`` (the ``.db`` FILE, not its folder) is used; opened with
+      ``mode=ro`` so the file is never mutated. ``host``/``user``/``password`` ignored.
+    - mysql / mariadb (kind ``"mysql"`` or ``"mariadb"`` — same wire driver) and
+      postgres (kind ``"postgres"``): ``host``/``port``/``dbname``/``user`` plus a
+      secret. The secret is ``password`` (raw — fine for a dev SELECT-only account)
+      OR ``password_env`` (name of an env var holding it — keeps the secret out of a
+      committed/open config). ``password_env`` wins when both are set.
+
+    ``codebase`` optionally binds this entry to an explicit codebase path; when
+    absent the entry is matched to a run by its key vs the ``--codebase`` leaf name
+    (case-insensitive), so ``"flowgate"`` matches ``…/FlowGate``.
+    """
+    kind: str = "sqlite"
+    path: str = ""
+    host: str = ""
+    port: int | None = None
+    dbname: str = ""
+    user: str = ""
+    password: str = ""
+    password_env: str = ""
+    codebase: str = ""
+
+    def secret(self) -> str:
+        """Resolve the password: ``password_env`` (env lookup) wins, else raw ``password``."""
+        if self.password_env:
+            return os.environ.get(self.password_env, "")
+        return self.password
+
+
+@dataclass
 class SafetyConfig:
     """Cost guard-rails enforced by the CLI before any spend.
 
@@ -147,6 +186,33 @@ class Config:
     apply: ApplyConfig = field(default_factory=ApplyConfig)
     judge: JudgeConfig = field(default_factory=JudgeConfig)
     safety: SafetyConfig = field(default_factory=SafetyConfig)
+    # Per-codebase read-only DB connections, keyed by a short name (e.g. "flowgate").
+    # Empty by default — the converge data-state read is SKIPPED when a run's codebase
+    # has no entry (graceful: converge falls back to its static path / needs_data).
+    db_connections: dict[str, DbConnection] = field(default_factory=dict)
+
+    def db_for_codebase(self, codebase_root: str | None) -> DbConnection | None:
+        """Resolve the DB connection for a run's ``--codebase`` path, or None.
+
+        Match order: (1) an entry whose explicit ``codebase`` path-aligns with the
+        run's codebase, then (2) an entry whose KEY equals the codebase's leaf folder
+        name (case-insensitive) — so ``"flowgate"`` matches ``…/FlowGate``. Returns
+        None when nothing matches (the common no-DB case), never raises.
+        """
+        if not codebase_root or not self.db_connections:
+            return None
+        norm = codebase_root.replace("\\", "/").rstrip("/").lower()
+        leaf = norm.rsplit("/", 1)[-1]
+        # (1) explicit codebase binding wins (handles key≠folder-name)
+        for conn in self.db_connections.values():
+            cb = (conn.codebase or "").replace("\\", "/").rstrip("/").lower()
+            if cb and (cb == norm or norm.endswith("/" + cb) or cb.endswith("/" + norm)):
+                return conn
+        # (2) key vs codebase leaf name
+        for key, conn in self.db_connections.items():
+            if key.strip().lower() == leaf:
+                return conn
+        return None
 
     def role(self, name: str) -> RoleConfig:
         """Return the RoleConfig for a role ('queen', 'swarm', 'assemble', 'specify', 'review', 'commit', 'judge')."""
@@ -199,6 +265,25 @@ def load_config(path: str | None = None) -> Config:
     apply_raw = merged.get("apply", {})
     judge_raw = merged.get("judge", {})
     safety_raw = merged.get("safety", {})
+    db_raw = merged.get("db_connections", {})
+
+    def _db_conn(d: dict) -> DbConnection:
+        port = d.get("port")
+        return DbConnection(
+            kind=str(d.get("kind", "sqlite")).strip().lower(),
+            path=str(d.get("path", "")),
+            host=str(d.get("host", "")),
+            port=int(port) if port is not None else None,
+            dbname=str(d.get("dbname", "")),
+            user=str(d.get("user", "")),
+            password=str(d.get("password", "")),
+            password_env=str(d.get("password_env", "")),
+            codebase=str(d.get("codebase", "")),
+        )
+
+    db_connections = {
+        str(k): _db_conn(v) for k, v in db_raw.items() if isinstance(v, dict)
+    }
 
     def _role(name: str, default_model: str = "gpt-5-mini") -> RoleConfig:
         r = roles.get(name, {})
@@ -238,4 +323,5 @@ def load_config(path: str | None = None) -> Config:
         safety=SafetyConfig(
             allow_swarm=bool(safety_raw.get("allow_swarm", True)),
         ),
+        db_connections=db_connections,
     )
