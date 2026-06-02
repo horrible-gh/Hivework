@@ -100,6 +100,50 @@ CONTRADICTED_OUT = json.dumps({
     "missing_link": None,
 })
 
+# NR173 shape: same contradiction as above, but the converger does NOT dead-end — it
+# reasons that the symptom must still have a home elsewhere and points the next hunt
+# there (the front-end render path that overrides the already-correct query result).
+CONTRADICTED_WITH_LEAD_OUT = json.dumps({
+    "converged": True,
+    "path": [
+        {"node": "db_fn", "file": "db/workflow_sequences.py", "lines": "45-57",
+         "symbol": "get_effective_head"},
+    ],
+    "attributed_defect": {"node": "db_fn", "file": "db/workflow_sequences.py",
+                          "lines": "45-57",
+                          "why": "ORDER BY CASE suspected of shifting the head"},
+    "causal_check": {
+        "verdict": "contradicted",
+        "data_state_assumptions": ["all candidate rows result_doc_id NULL"],
+        "trace": "the query already returns the pending memo as head; this node cannot "
+                 "produce the observed skip — the symptom originates elsewhere.",
+        "need_data_state": []},
+    "missing_link": {"between": ["get_effective_head", "workflow bar render"],
+                     "need": {"symbols": ["renderWorkflowBar", "currentStep"],
+                              "greps": ["current.*step", "head"],
+                              "file_globs": ["web/**"]}},
+})
+
+# The redirect re-pass lands the defect on a DIFFERENT node — the render path — proving
+# the refutation became the next, better-aimed search rather than a rejection.
+REDIRECT_CONVERGED_OUT = json.dumps({
+    "converged": True,
+    "path": [
+        {"node": "fe", "file": "web/workflow_bar.tsx", "lines": "20-40",
+         "symbol": "renderWorkflowBar"},
+    ],
+    "attributed_defect": {"node": "fe", "file": "web/workflow_bar.tsx", "lines": "20-40",
+                          "why": "render keys 'current' off item_seq, skipping the "
+                                 "sort_order-0 memo"},
+    "causal_check": {
+        "verdict": "consistent",
+        "data_state_assumptions": ["memo item_seq highest though sort_order 0"],
+        "trace": "ordering by item_seq puts DS first, painting the memo done — "
+                 "reproduces the observed skip.",
+        "need_data_state": []},
+    "missing_link": None,
+})
+
 # Outcome depends on stored row state the static evidence cannot determine.
 UNDECIDABLE_OUT = json.dumps({
     "converged": True,
@@ -289,6 +333,35 @@ class TestConvergeDataRead(unittest.TestCase):
               "columns": ["doc_review_status"]}], db)
         self.assertIn("doc_review_status", block)
         self.assertIn("approved", block)
+
+    def test_wide_cell_is_truncated_in_rendered_block(self):
+        """Row COUNT is hard-capped by LIMIT; a single huge cell (SELECT * over a wide
+        TEXT column) must also be clipped so it can't bloat the prompt/token cost."""
+        d = tempfile.mkdtemp()
+        path = os.path.join(d, "wide.db")
+        c = sqlite3.connect(path)
+        c.execute("CREATE TABLE docs (doc_id TEXT, meta TEXT)")
+        c.execute("INSERT INTO docs VALUES ('D1', ?)", ("x" * 5000,))
+        c.commit(); c.close()
+        db = DbConnection(kind="sqlite", path=path)
+        block = C._fetch_data_state([{"table": "docs", "where": {"doc_id": "D1"}}], db)
+        self.assertIn("truncated", block)
+        self.assertLess(len(block), 1000)            # 5000-char cell did NOT land whole
+
+    def test_truncation_warning_when_set_hits_cap(self):
+        """Reading exactly the cap means the set may be clipped — flag it so an ordering
+        verdict isn't drawn on a partial set (silent truncation would mislead)."""
+        d = tempfile.mkdtemp()
+        path = os.path.join(d, "many.db")
+        c = sqlite3.connect(path)
+        c.execute("CREATE TABLE items (sequence_id INTEGER, sort_order INTEGER)")
+        for i in range(25):                          # more rows than the read cap
+            c.execute("INSERT INTO items VALUES (1, ?)", (i,))
+        c.commit(); c.close()
+        db = DbConnection(kind="sqlite", path=path)
+        block = C._fetch_data_state([{"table": "items", "where": {"sequence_id": 1},
+                                      "columns": ["sort_order"]}], db)
+        self.assertIn("TRUNCATED", block)
 
     def test_fetch_data_state_chains_reads(self):
         """Multi-hop: read a key from one table, carry it into the next read's WHERE.
@@ -490,6 +563,24 @@ class TestConvergeDataRead(unittest.TestCase):
         self.assertFalse(res.converged)
         self.assertIsNotNone(res.missing_link)
 
+    def test_contradiction_with_lead_redirects_and_reconverges(self):
+        """NR173: a refutation that NAMES where to look next re-hunts and can land the
+        real defect on a DIFFERENT node — not a dead-end rejection."""
+        outs = [_wr(CONTRADICTED_WITH_LEAD_OUT), _wr(REDIRECT_CONVERGED_OUT)]
+        fu = {"seeds": [{"file": "web/workflow_bar.tsx", "lines": "20-40",
+                         "text": "renderWorkflowBar: order by item_seq", "via": "need-grep"}],
+              "call_chain": [], "stats": {}}
+        with mock.patch.object(C, "call_worker", side_effect=outs) as cw, \
+             mock.patch.object(C, "retrieve_followup", return_value=fu) as rf:
+            res = C.run_converge(seed_text="s", verdicts=LOCATED_VERDICTS,
+                                 bundles=BUNDLES, provider="deepinfra", model="m",
+                                 code_root="/repo")
+        rf.assert_called_once()
+        self.assertEqual(cw.call_count, 2)                  # 1st + redirect re-converge
+        self.assertTrue(res.converged)                      # adopted the redirect
+        self.assertEqual(res.attributed_defect["node"], "fe")
+        self.assertIn("workflow_bar", res.attributed_defect["file"])
+
     def test_converged_claim_without_node_is_demoted(self):
         out = json.dumps({"converged": True, "path": [],
                           "attributed_defect": None, "missing_link": None})
@@ -609,12 +700,63 @@ class TestConvergeN173DbMandate(unittest.TestCase):
             res = C.run_converge(seed_text="s", verdicts=LOCATED_VERDICTS,
                                  bundles=BUNDLES, provider="deepinfra", model="m",
                                  code_root="/repo", db_conn=db)
-        # no fact re-pass (no rows came back) — only the first call
-        self.assertTrue(all("Confirmed data state" not in p for p in calls))
+        # The iterative loop re-asks with the HONEST empty result ("no rows matched"),
+        # never a fabricated value; and since the model re-asks for the SAME read with no
+        # new angle, the loop stops after one re-pass (no infinite spin).
+        repass = [p for p in calls if "Confirmed data state" in p]
+        self.assertEqual(len(repass), 1)
+        self.assertIn("no rows matched", repass[0])
+        self.assertNotIn("doc123", repass[0])           # no invented value injected
         self.assertTrue(res.data_state_attempted)
         self.assertFalse(res.data_state_backed)
         self.assertIn("no rows matched", res.data_state_block)
         self.assertFalse(res.converged)
+
+    def test_iterative_read_narrows_then_rules(self):
+        """The 'read more' lever: a first read that can't decide → the model NARROWS the
+        query and reads AGAIN, and only the second (deciding) row lets it rule. Proves
+        the loop iterates instead of giving up after one shot."""
+        d = tempfile.mkdtemp()
+        path = os.path.join(d, "iter.db")
+        c = sqlite3.connect(path)
+        c.execute("CREATE TABLE items (seq INTEGER, kind TEXT, val TEXT)")
+        c.execute("INSERT INTO items VALUES (1, 'A', 'x')")
+        c.execute("INSERT INTO items VALUES (1, 'B', 'decider')")
+        c.commit(); c.close()
+        db = DbConnection(kind="sqlite", path=path)
+
+        broad = json.dumps({
+            "converged": False,
+            "path": [{"node": "db_fn", "file": "db/x.py", "lines": "1-2"}],
+            "attributed_defect": {"node": "db_fn", "file": "db/x.py", "lines": "1-2",
+                                  "why": "depends on the B row"},
+            "causal_check": {"verdict": "undecidable", "data_state_assumptions": [],
+                             "trace": "rows tie; need the B row", "need_data_state": [],
+                             "data_reads": [{"table": "items", "where": {"seq": 1},
+                                             "columns": ["kind"]}]},
+            "missing_link": None})
+        narrowed = json.loads(broad)
+        narrowed["causal_check"]["data_reads"] = [
+            {"table": "items", "where": {"seq": 1, "kind": "B"}, "columns": ["val"]}]
+        narrowed = json.dumps(narrowed)
+
+        calls = []
+
+        def fake(provider, model, prompt, cwd=None, timeout=300, **kw):
+            calls.append(prompt)
+            if "Confirmed data state" not in prompt:
+                return _wr(broad)                       # first pass: broad read
+            if "'decider'" not in prompt and "decider" not in prompt:
+                return _wr(narrowed)                    # saw broad rows → narrow & re-read
+            return _wr(CONVERGED_OUT)                   # saw the deciding row → rule
+
+        with mock.patch.object(C, "call_worker", side_effect=fake):
+            res = C.run_converge(seed_text="s", verdicts=LOCATED_VERDICTS, bundles=BUNDLES,
+                                 provider="deepinfra", model="m",
+                                 code_root="/repo", db_conn=db)
+        self.assertEqual(len(calls), 3)                 # first + 2 read rounds
+        self.assertTrue(res.converged)                  # the narrowed read settled it
+        self.assertIn("decider", res.data_state_block)  # the deciding row was fetched
 
 
 class TestHoneyPastesRealRows(unittest.TestCase):

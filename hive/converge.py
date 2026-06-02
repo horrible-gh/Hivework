@@ -43,6 +43,29 @@ logger = logging.getLogger("hive.converge")
 
 # Prompt-budget guards — mirror judge: the evidence is rendered COMPACT, not raw.
 _MAX_EVIDENCE = 24          # distinct (file,lines) windows shown to the converger
+_DATA_READ_LIMIT = 5        # max rows per data-read SELECT. NOT a fetch quota — it's a
+                            # CEILING (a point lookup that matches 1 row returns 1). Small
+                            # ON PURPOSE: the answer is a PRECISE row, not a table dump. The
+                            # model is told to aim the WHERE at the row(s) that actually
+                            # decide (e.g. for an ORDER BY, filter by the ranking predicate
+                            # — the rows that would sort FIRST — not the whole sibling set),
+                            # and if a read still misses, the iterative loop below lets it
+                            # NARROW and read again rather than dumping rows. A small window
+                            # forces a sharp condition and keeps prompt/token cost down.
+_MAX_DATA_ROUNDS = 3        # iterative data-read chances: one initial read + up to two
+                            # MORE — each round the converger may narrow / re-aim the query
+                            # in reaction to what it saw (like reading more source when the
+                            # first window misses). Bounded so a stuck model can't spin. If
+                            # all three chances still can't surface the deciding row, the
+                            # read CONDITION itself was likely mis-derived → the converger
+                            # is told to re-derive it / redirect (missing_link) to
+                            # reinvestigation rather than rule on data it never read.
+_MAX_CELL = 200             # per-cell char cap when rendering live-DB rows into the honey/
+                            # re-pass prompt. Row COUNT is already hard-capped (dbread
+                            # LIMIT 20, glue-set), but a single wide TEXT/BLOB column under
+                            # SELECT * could still bloat the prompt + token cost — so each
+                            # value's rendered repr is truncated. The deciding columns the
+                            # converger names are short; this only clips runaway blobs.
 _EVIDENCE_CHARS = 500       # per-window char cap
 _REASON_CHARS = 300         # per-verdict reason cap
 
@@ -213,7 +236,25 @@ def build_converge_prompt(seed_text: str, located: list[dict[str, Any]],
             "\n[Confirmed data state — ACTUAL rows read from the live DB; these are "
             "FACT, not assumptions. Re-run your cause→symptom check against THESE "
             "values and rule consistent or contradicted accordingly. Do NOT return "
-            "undecidable for a field shown here.]\n" + data_state_block.strip() + "\n")
+            "undecidable for a field shown here.\n"
+            "BUT if these rows are INSUFFICIENT — a line says the set was TRUNCATED, or "
+            "the row that actually decides the verdict is NOT among them — do NOT give up "
+            "and do NOT rule on what's missing. Instead emit a NEW, NARROWER "
+            "causal_check.data_reads: add a condition / change the selector to home in on "
+            "the deciding row (e.g. filter by the specific type/key, or read the parent "
+            "first and chain to it). The pipeline will run it and ask you AGAIN with the "
+            "new rows — keep narrowing until the deciding fact is in hand. The window is "
+            "small by design, so make each read SHARP (aim the WHERE straight at the "
+            "deciding row), not broad. Only rule once the value you need is actually "
+            "present in the rows above.\n"
+            "If you have already re-read a few times and STILL cannot surface the deciding "
+            "row, stop narrowing the SAME way — that means the read CONDITION you derived "
+            "was likely wrong (wrong table / selector / assumption about where the value "
+            "lives). RE-DERIVE it from the evidence (a different table or key), or, if the "
+            "value plainly is not reachable by reading here, emit a ``missing_link`` to "
+            "send the investigation back to find the right place — never rule on data you "
+            "could not read.]\n"
+            + data_state_block.strip() + "\n")
 
     # When a read-only DB IS configured (db_available) AND we have not yet read it
     # (no confirmed_block on this pass), tell the converger the read exists and forbid
@@ -290,7 +331,19 @@ read's ``where``, reference an earlier result with ``{{"from": "<that id>", "col
 "<column to carry over>"}}`` instead of a literal — the pipeline runs the reads in order \
 and feeds each result into the next (it issues plain single-table SELECTs, so express a \
 join as such a chain, e.g. read the rows, then read the joined table by the id column \
-they carried).
+they carried). When the attributed defect is an ORDER BY / LIMIT / "which row is \
+selected first" decision, the read window is SMALL (a few rows) — so do NOT dump the \
+whole sibling set hoping the winner is in it. Instead aim the WHERE at the rows that \
+would RANK FIRST: filter by the ordering's LEADING predicate (the column the ORDER BY \
+prioritises, e.g. ``result_doc_id IS NOT NULL`` / the not-yet-approved rows). If that \
+targeted read comes back EMPTY, no row beats the tie-breaker, so the order falls through \
+to the next key (e.g. sort_order) and the query already returns the EXPECTED row → the \
+ordering hypothesis is CONTRADICTED. If it returns row(s), those are the actual head \
+candidates — check whether they reproduce the symptom. (If you do read raw siblings and \
+a TRUNCATED flag appears, re-read with the ranking predicate as the filter — that is the \
+right, sharp condition.) When the query already yields the expected row, that query is \
+NOT the defect even if a fork in the seed pointed at it: on a data question the live rows \
+outrank the seed's framing, and the real cause lies on a DIFFERENT resolver / render path.
 4. If — and only if — two adjacent nodes cannot be connected because a needed \
 callee/symbol is NOT shown in the evidence, set converged=false and NAME the missing \
 link instead of guessing.
@@ -300,6 +353,20 @@ link instead of guessing.
 suspected and causal_check with your honest reasoning — the pipeline routes it to \
 reinvestigation / data-state confirmation, NOT to an edit. Do not suppress the \
 finding to force a convergence.
+
+[Keep hunting — a refutation is a LEAD, not a dead end] The reporter can only hand you \
+the SYMPTOM they see on screen (e.g. "the head renders as DS"); they CANNOT tell you \
+where the bug lives — DERIVING that is YOUR job, so never demand a pre-localised answer. \
+When your causal check comes back "contradicted" — the suspected node is reachable but \
+PROVABLY cannot produce the symptom (often the live data shows it already yields the \
+EXPECTED output) — the symptom STILL has a home somewhere else. Do NOT stop at "not \
+here". REASON about what MUST be true for the symptom to occur and where that path lives \
+(e.g. "get_effective_head already returns the memo, yet the bar shows DS as current → \
+some OTHER head/current-step resolver or the front-end render path is overriding it"), \
+then ALSO emit ``missing_link`` pointing the next hunt there: name the symbols / greps / \
+file_globs to search for the path that DOES produce the symptom, EXCLUDING the refuted \
+node. The pipeline will fetch that neighbourhood and re-converge — turning your \
+refutation into the next, better-aimed search instead of a rejection.
 
 [Output contract] Output ONLY this JSON object. No prose outside the JSON.
 {{
@@ -611,7 +678,7 @@ def _run_data_reads(data_reads: list[dict[str, Any]], db_conn) -> tuple[str, boo
             continue
         try:
             rr = read_rows(db_conn, table, columns=spec.get("columns") or None,
-                           where=resolved or None, limit=20)
+                           where=resolved or None, limit=_DATA_READ_LIMIT)
         except DbReadError as e:
             logger.warning("converge: data read on %r failed — skipping: %s", table, e)
             lines.append(f"- read {rid} on {table}: FAILED ({e})")
@@ -624,7 +691,15 @@ def _run_data_reads(data_reads: list[dict[str, Any]], db_conn) -> tuple[str, boo
         else:
             any_rows = True
         for row in rr.rows:
-            lines.append("  -> " + ", ".join(f"{k}={v!r}" for k, v in row.items()))
+            lines.append("  -> " + ", ".join(
+                f"{k}={_trunc(repr(v), _MAX_CELL)}" for k, v in row.items()))
+        # Hit the ceiling → the result set may be CLIPPED. Flag it so an ordering /
+        # "which row wins" verdict is not drawn on a partial set (a silent truncation
+        # would make that inference wrong, not just incomplete).
+        if len(rr.rows) >= _DATA_READ_LIMIT:
+            lines.append(f"  -> (NOTE: returned {_DATA_READ_LIMIT} rows = the read cap; "
+                         f"the set may be TRUNCATED — do not draw an ordering/'which row "
+                         f"wins' conclusion from a possibly-incomplete set)")
     return "\n".join(lines), any_rows
 
 
@@ -694,40 +769,57 @@ def run_converge(*, seed_text: str, verdicts: list[dict[str, Any]],
     # assumption-backed verdict into a data-backed one. Read-only by construction; any
     # read failure degrades to the static path (the verdict stays as-is, reported honestly).
     data_ruled = False
-    data_block = ""
     data_backed = False
     data_attempted = False
-    cc = res.causal_check or {}
-    if db_conn is not None and cc.get("data_reads"):
+    block_parts: list[str] = []
+    seen_sigs: set[str] = set()
+    pending = (res.causal_check or {}).get("data_reads") or []
+    rounds = 0
+    while db_conn is not None and pending and rounds < _MAX_DATA_ROUNDS:
+        sig = repr(pending)
+        if sig in seen_sigs:
+            # The model re-asked for the SAME read — no new angle, stop rather than spin.
+            logger.info("converge: data read repeated unchanged — ending read loop")
+            break
+        seen_sigs.add(sig)
         data_attempted = True
-        data_block, data_backed = _run_data_reads(cc.get("data_reads") or [], db_conn)
-        if data_backed:
-            logger.info("converge: read live DB for %d row-set(s) → re-converging on fact",
-                        len(cc.get("data_reads") or []))
-            res2 = _converge_once(seed_text, located, unlocated, windows, known,
-                                  provider, model, pk, ledger, timeout,
-                                  data_state_block=data_block, db_available=db_available)
-            logger.info("converge: data re-pass → %s", res2.summary)
-            v2 = (res2.causal_check or {}).get("verdict")
-            # Adopt the fact-grounded re-pass on any real RULING (consistent OR
-            # contradicted) — fact wins over an assumed verdict either way. A
-            # still-undecidable re-pass (the read didn't cover the deciding field)
-            # keeps the original and lets the missing-link path try.
-            if v2 in ("consistent", "contradicted"):
-                res = res2
-                data_ruled = True
-        else:
-            # A configured read was tried but returned nothing / failed. Do NOT re-rule on
-            # a fiction: leave the verdict as-is. The honey reports the attempt honestly so
-            # it never looks like the read simply never happened (the N173 run-1 confusion).
-            logger.info("converge: data read attempted but no rows returned — "
-                        "verdict left data-unbacked (honest)")
+        rounds += 1
+        block, backed = _run_data_reads(pending, db_conn)
+        block_parts.append(block)
+        data_backed = data_backed or backed
+        logger.info("converge: data read round %d → %d row-set(s), rows=%s",
+                    rounds, len(pending), backed)
+        combined = "\n\n".join(p for p in block_parts if p)
+        res2 = _converge_once(seed_text, located, unlocated, windows, known,
+                              provider, model, pk, ledger, timeout,
+                              data_state_block=combined, db_available=db_available)
+        logger.info("converge: data re-pass %d → %s", rounds, res2.summary)
+        v2 = (res2.causal_check or {}).get("verdict")
+        if v2 in ("consistent", "contradicted"):
+            # Fact-grounded RULING (either way) wins over an assumed verdict — done.
+            res = res2
+            data_ruled = True
+            break
+        # Still can't rule on what came back. Adopt the re-pass and LOOP if it NAMES a
+        # different/narrower read — the agentic "add a condition and read again" step
+        # (e.g. the first set was TRUNCATED, or the deciding row wasn't in the window).
+        # When it stops naming reads, the loop ends and the verdict degrades honestly —
+        # never a fabricated value (the honey shows exactly what was read).
+        res = res2
+        pending = (res2.causal_check or {}).get("data_reads") or []
+    data_block = "\n\n".join(p for p in block_parts if p)
 
-    # ── Conditional second pass: the principled "more" — fetch the link the model
-    # said it lacked, then re-converge ONCE. Not a blind retry and not a bigger
-    # model: a converger that already stitched the path is trusted as-is; one that
-    # NAMED a missing hop is exactly what a free local follow-up can unblock.
-    if (not res.converged and not data_ruled and res.missing_link
+    # ── Conditional second pass: the principled "more" — fetch the lead the model
+    # named, then re-converge ONCE. Not a blind retry and not a bigger model: a
+    # converger that already stitched the path is trusted as-is; one that NAMED where
+    # to look next is exactly what a free local follow-up can unblock. Two cases emit a
+    # ``missing_link`` lead: (1) a missing CODE hop it couldn't resolve, and (2) a
+    # data-backed CONTRADICTION — the suspected node provably can't produce the symptom,
+    # so the symptom's real home is elsewhere and the model points the hunt there
+    # (NR173: don't dead-end at "not here" and demand the reporter pre-localise the fix;
+    # the refutation IS the next, better-aimed search). So we re-hunt on a named lead
+    # REGARDLESS of data_ruled — a data-ruled contradiction is precisely when we redirect.
+    if (not res.converged and res.missing_link
             and code_root and max_calls > 1):
         need_d = res.missing_link.get("need") or {}
         symbols = [str(s) for s in (need_d.get("symbols") or [])]
@@ -750,6 +842,7 @@ def run_converge(*, seed_text: str, verdicts: list[dict[str, Any]],
                 known2 = known | {_norm(w.get("file", "")) for w in extra if w.get("file")}
                 res2 = _converge_once(seed_text, located, unlocated, merged, known2,
                                       provider, model, pk, ledger, timeout,
+                                      data_state_block=data_block,
                                       db_available=db_available)
                 logger.info("converge: re-pass → %s", res2.summary)
                 # Adopt the re-pass only if it actually converged; otherwise keep the
