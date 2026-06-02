@@ -47,6 +47,11 @@ _DEFAULT_CONTRACT_PATH = os.path.join(
     os.path.dirname(__file__), "..", "recipes", "edit_spec_contract_v1.md"
 )
 
+# The single specify author can be a SLOW agentic CLI (codex), unlike the tool-OFF
+# API reviewer. This is its per-attempt wall-clock cap; it is overridable per-role
+# via hive.config.json (``specify.timeout_sec``) so the operator can right-size it.
+_AUTHOR_TIMEOUT_DEFAULT = 600
+
 # Providers whose author worker has live file-system tools. An author on any other
 # provider (e.g. deepinfra) is a tool-OFF single-shot call and must lift anchors
 # from the grounding pre-flight's "Anchor ground truth" block, not by reading files.
@@ -106,6 +111,37 @@ _GROUND_MIN_LINE_CHARS = 8     # lines shorter than this don't vote in the dedup
 # and deferred the file a third time. Lifting a wider block from the cited start
 # puts the full enclosing case set on the table for the tool-OFF author.
 _GROUND_WIDE_LINES = 120
+# Total line budget across ALL lifts — a hard ceiling so even a citation-storm of
+# distinct regions can't balloon the author prompt past a workable size (T892
+# timeout: 8 overlapping wide windows blew the codex author past its 600s cap).
+# Sized to hold ~5 distinct wide windows; merge removes the redundancy first so the
+# budget only bites a genuinely pathological number of DISTINCT regions.
+_GROUND_MAX_TOTAL_LINES = 600
+# Ceiling on a single MERGED window — the union of two overlapping wide windows can
+# exceed one window's cap; this bounds it so a merge can't itself balloon.
+_GROUND_MERGED_MAX_LINES = 200
+
+
+def _merge_intervals(ivs: list[tuple[int, int]]) -> list[tuple[int, int]]:
+    """Merge overlapping or directly-adjacent ``[lo, hi]`` line ranges (1-based).
+
+    The grounding loop previously deduped on the EXACT ``(file, lo, hi)`` key, so
+    three near-duplicate windows of one region (queries.json 124-243 / 127-246 /
+    129-248 — all the same ~19-line tail of a 142-line file) each lifted in full and
+    tripled the author prompt (T892). Collapsing overlapping ranges into one window
+    per region kills that redundancy. Ranges touching at the boundary (``hi+1 ==
+    next.lo``) are merged too, since a one-line gap is not worth a second fenced block.
+    """
+    if not ivs:
+        return []
+    ordered = sorted(ivs)
+    merged = [list(ordered[0])]
+    for lo, hi in ordered[1:]:
+        if lo <= merged[-1][1] + 1:          # overlap or directly adjacent
+            merged[-1][1] = max(merged[-1][1], hi)
+        else:
+            merged.append([lo, hi])
+    return [(lo, hi) for lo, hi in merged]
 
 
 def _read_lines(path: str, lo: int, hi: int) -> str:
@@ -158,32 +194,58 @@ def ground_anchors(honey_text: str, codebase_root: str,
     ``wide_lines`` from the cited start, so an approximate seed range still pulls
     the full enclosing block — clamped to the file length (Defect 2 / T892).
     """
-    seen: set[tuple[str, int, int]] = set()
     lifted: list[dict[str, Any]] = []
     skipped_present: list[str] = []
     unresolved: list[str] = []
     roots = [("code", codebase_root)] + ([("docs", docs_root)] if docs_root else [])
     wide = {f.replace("\\", "/").lstrip("/").lower() for f in (wide_files or set())}
 
-    for m in _CITATION_RE.finditer(honey_text):
+    # Pass 1 — collect the RAW honey-cited ranges per file, preserving the order in
+    # which each file first appears (so lifts read in citation order downstream).
+    raw: dict[str, list[tuple[int, int]]] = {}
+    order: dict[str, int] = {}
+    for idx, m in enumerate(_CITATION_RE.finditer(honey_text)):
         rel = m.group(1).replace("\\", "/").lstrip("/")
         lo = int(m.group(2))
         hi = int(m.group(3)) if m.group(3) else lo
         if hi < lo:
             lo, hi = hi, lo
-        # Seed-named targets: widen forward from the cited start so an approximate
-        # range still captures the real block; others keep the tight per-anchor cap.
-        cap = wide_lines if (wide and _in_wide(rel, wide)) else max_lines
-        if cap == wide_lines:
-            hi = max(hi, lo + cap - 1)
-        truncated = hi - lo + 1 > cap
-        if truncated:
-            hi = lo + cap - 1
-        key = (rel, lo, hi)
-        if key in seen:
-            continue
-        seen.add(key)
+        order.setdefault(rel, idx)
+        raw.setdefault(rel, []).append((lo, hi))
 
+    # Pass 2 — expand each citation to its window (forward-widening seed targets),
+    # THEN merge overlapping windows per file. Expanding BEFORE merging is what
+    # collapses near-duplicate windows of one region: three 120-line windows that
+    # only overlap once widened (queries.json 124-243 / 127-246 / 129-248 of a
+    # 142-line file) merge to a single lift instead of three (the T892 balloon).
+    windows: list[tuple[int, str, int, int, bool]] = []  # (order, rel, lo, hi, truncated)
+    for rel, ivs in raw.items():
+        is_wide = bool(wide) and _in_wide(rel, wide)
+        cap = wide_lines if is_wide else max_lines
+        expanded: list[tuple[int, int]] = []
+        trunc_hi: dict[int, int] = {}   # lo -> requested hi before the per-window cap
+        for lo, hi in ivs:
+            if is_wide:                          # seed target: forward window from start
+                hi = max(hi, lo + cap - 1)
+            if hi - lo + 1 > cap:                # clamp a single window to its cap
+                trunc_hi[lo] = hi
+                hi = lo + cap - 1
+            expanded.append((lo, hi))
+        for lo, hi in _merge_intervals(expanded):
+            # A merged span may exceed a single window's cap (two overlapping wide
+            # windows union wider); clamp only at the merged ceiling so the union of
+            # two near-duplicate regions is kept whole rather than re-split.
+            requested_hi = max([hi] + [v for k, v in trunc_hi.items() if lo <= k <= hi])
+            if requested_hi - lo + 1 > _GROUND_MERGED_MAX_LINES:
+                hi = lo + _GROUND_MERGED_MAX_LINES - 1
+            else:
+                hi = min(hi, requested_hi)
+            truncated = hi < requested_hi
+            windows.append((order[rel], rel, lo, hi, truncated))
+    windows.sort(key=lambda w: (w[0], w[2]))
+
+    total_lines = 0
+    for _ord, rel, lo, hi, truncated in windows:
         text, tree = "", ""
         for label, root in roots:
             if root and os.path.isfile(os.path.join(root, rel)):
@@ -196,6 +258,13 @@ def ground_anchors(honey_text: str, codebase_root: str,
         if _already_grounded(text, honey_text):
             skipped_present.append(f"{rel}:{lo}-{hi}")
             continue
+        n_lines = text.count("\n") + 1
+        # Total-line budget: stop lifting once the cumulative block size would
+        # exceed the ceiling, so a citation-storm can't balloon the prompt even
+        # when every window is a distinct region (count cap alone is not enough).
+        if lifted and total_lines + n_lines > _GROUND_MAX_TOTAL_LINES:
+            break
+        total_lines += n_lines
         lifted.append({"cite": f"{rel}:{lo}-{hi}", "tree": tree,
                        "text": text, "truncated": truncated})
         if len(lifted) >= max_anchors:
@@ -842,6 +911,8 @@ def run_specify(
     ground: bool = True,
     review_model: str | None = None,
     review_provider: str | None = None,
+    author_timeout: int = _AUTHOR_TIMEOUT_DEFAULT,
+    author_retries: int = 0,
 ) -> dict[str, Any]:
     """Run the specify stage: honey + live code → edit-spec JSON.
 
@@ -899,14 +970,37 @@ def run_specify(
     logger.info("Running specify author (single, not fan-out)...")
     logger.debug("Prompt length: %d chars", len(prompt))
 
-    wr = call_worker(provider, model, prompt, cwd=codebase_root, timeout=600,
-                     **(provider_kwargs or {}))
-    if ledger is not None:
-        ledger.record_call("specify", "specify", provider, model,
-                           prompt=prompt, output=wr.stdout, latency_s=wr.latency_s,
-                           ok=wr.exit_code == 0,
-                           err=wr.stderr[:200] if wr.exit_code != 0 else "",
-                           real_tokens=wr.real_tokens)
+    # The author is a single blocking call with a hard wall-clock cap. A slow agentic
+    # CLI (codex) can hit it; ``author_retries`` extra attempts cover a transient
+    # timeout / provider hiccup so one slow call does not discard a completed
+    # investigate stage (T892). Each attempt is recorded to the ledger (real spend).
+    wr = None
+    last_exc: Exception | None = None
+    for attempt in range(author_retries + 1):
+        try:
+            wr = call_worker(provider, model, prompt, cwd=codebase_root,
+                             timeout=author_timeout, **(provider_kwargs or {}))
+        except Exception as e:  # subprocess timeout, provider error, etc.
+            last_exc = e
+            if attempt < author_retries:
+                logger.warning("specify: author call failed (%s) — retrying "
+                               "(attempt %d/%d)", e, attempt + 2, author_retries + 1)
+                continue
+            raise
+        if ledger is not None:
+            ledger.record_call("specify", "specify", provider, model,
+                               prompt=prompt, output=wr.stdout, latency_s=wr.latency_s,
+                               ok=wr.exit_code == 0,
+                               err=wr.stderr[:200] if wr.exit_code != 0 else "",
+                               real_tokens=wr.real_tokens)
+        # A non-zero exit or an empty comb is a soft failure: retry if budget remains
+        # rather than crashing in extract_first_json on an empty string.
+        if (wr.exit_code != 0 or not wr.stdout.strip()) and attempt < author_retries:
+            logger.warning("specify: author returned exit=%d / %d-char output — "
+                           "retrying (attempt %d/%d)", wr.exit_code, len(wr.stdout),
+                           attempt + 2, author_retries + 1)
+            continue
+        break
 
     spec = extract_first_json(wr.stdout)  # raises ValueError if no JSON found
     spec = _normalize_spec(spec)

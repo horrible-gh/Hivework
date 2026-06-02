@@ -13,6 +13,7 @@ The provider is mocked so these run without the copilot CLI. Coverage:
 
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -599,6 +600,47 @@ class TestGroundAnchors(unittest.TestCase):
         self.assertIn("assert_60", wide)
         self.assertIn("client/src/view.spec.ts", diag["lifted"][0])
 
+    def test_overlapping_windows_merged_to_one(self):
+        # T892 balloon: three near-duplicate windows of ONE region (queries.json
+        # 124-130 / 127-127 / 129-135, each widened to ~120 lines of a short file)
+        # were each lifted in full, tripling the author prompt. Merging overlapping
+        # ranges collapses them to a single lift.
+        f = os.path.join(self.code, "q.json")
+        with open(f, "w", encoding="utf-8") as fh:
+            fh.write("\n".join(f"row{i}" for i in range(1, 40)) + "\n")
+        honey = ("- a: q.json:5-8\n- b: q.json:7-7\n- c: q.json:9-12\n")
+        out, diag = specify.ground_anchors(
+            honey, self.code, wide_files={"q.json"}, wide_lines=120)
+        # One merged window, not three separate lifts of the same region.
+        self.assertEqual(len(diag["lifted"]), 1)
+        # The merged window starts at the earliest cited line and covers the region.
+        self.assertTrue(diag["lifted"][0].startswith("q.json:5-"))
+        self.assertIn("row9", out)
+
+    def test_disjoint_regions_stay_separate(self):
+        # Non-overlapping regions of the same file are NOT merged (they are genuinely
+        # different blocks the author needs — workflowViewState.ts 51-170 vs 200-319).
+        f = os.path.join(self.code, "big.txt")
+        with open(f, "w", encoding="utf-8") as fh:
+            fh.write("\n".join(f"row{i}" for i in range(1, 400)) + "\n")
+        honey = "- a: big.txt:10-12\n- b: big.txt:300-302\n"
+        out, diag = specify.ground_anchors(honey, self.code, max_lines=20)
+        self.assertEqual(len(diag["lifted"]), 2)
+
+    def test_total_line_budget_caps_runaway(self):
+        # A citation-storm of DISTINCT regions can't balloon the prompt past the
+        # total-line ceiling even when each window is individually within the cap.
+        f = os.path.join(self.code, "huge.txt")
+        with open(f, "w", encoding="utf-8") as fh:
+            fh.write("\n".join(f"row{i}" for i in range(1, 2000)) + "\n")
+        # 20 disjoint 100-line windows = 2000 lines requested, well over the budget.
+        cites = "".join(f"- x: huge.txt:{1 + i*120}-{100 + i*120}\n" for i in range(20))
+        out, diag = specify.ground_anchors(
+            cites, self.code, max_lines=100, max_anchors=99)
+        total = sum(block.count("\n") for block in out.split("```")[1::2])
+        self.assertLessEqual(total, specify._GROUND_MAX_TOTAL_LINES + 100)
+        self.assertLess(len(diag["lifted"]), 20)
+
 
 class TestRunSpecifyGrounding(unittest.TestCase):
     """run_specify feeds the grounded honey to the author prompt."""
@@ -669,6 +711,51 @@ class TestRunSpecifyGrounding(unittest.TestCase):
                 provider="deepinfra", model="openai/gpt-oss-120b")
         author_prompt = cw.call_args_list[0].args[2]
         self.assertIn("color: #999999;", author_prompt)   # forced on despite ground=False
+
+    def test_author_timeout_passes_through(self):
+        # The per-call author timeout is forwarded to call_worker so the operator
+        # can right-size the slow agentic CLI (codex) cap via config (T892).
+        bare = {"edits": [], "deferred": [], "gate": {"apply": False},
+                "termination": "needs_reinvestigation"}
+        with mock.patch.object(specify, "call_worker",
+                               return_value=_wr(json.dumps(bare))) as cw:
+            specify.run_specify(
+                honey_path=self.honey, codebase_root=self.tmp,
+                output_path=self.out, contract_path=self.contract,
+                review=False, author_timeout=900)
+        self.assertEqual(cw.call_args_list[0].kwargs["timeout"], 900)
+
+    def test_author_retries_on_timeout(self):
+        # A transient timeout is retried up to author_retries before giving up, so
+        # one slow call does not discard the completed investigate stage (T892).
+        bare = {"edits": [], "deferred": [], "gate": {"apply": False},
+                "termination": "needs_reinvestigation"}
+        calls = []
+
+        def fake(provider, model, prompt, cwd=None, timeout=300, **kw):
+            calls.append(1)
+            if len(calls) == 1:
+                raise subprocess.TimeoutExpired(cmd="codex", timeout=timeout)
+            return _wr(json.dumps(bare))
+
+        with mock.patch.object(specify, "call_worker", side_effect=fake):
+            spec = specify.run_specify(
+                honey_path=self.honey, codebase_root=self.tmp,
+                output_path=self.out, contract_path=self.contract,
+                review=False, author_retries=1)
+        self.assertEqual(len(calls), 2)            # first timed out, second succeeded
+        self.assertEqual(spec["termination"], "needs_reinvestigation")
+
+    def test_author_reraises_after_retries_exhausted(self):
+        def fake(provider, model, prompt, cwd=None, timeout=300, **kw):
+            raise subprocess.TimeoutExpired(cmd="codex", timeout=timeout)
+
+        with mock.patch.object(specify, "call_worker", side_effect=fake):
+            with self.assertRaises(subprocess.TimeoutExpired):
+                specify.run_specify(
+                    honey_path=self.honey, codebase_root=self.tmp,
+                    output_path=self.out, contract_path=self.contract,
+                    review=False, author_retries=1)
 
 
 class TestReviewerProvider(unittest.TestCase):
