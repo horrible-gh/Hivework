@@ -1,0 +1,15 @@
+# Hivework runtime dependencies.
+#   pip install -r requirements.txt      (setup.bat / setup.sh run this for you)
+
+# Model providers: the deepinfra roles (judge / converge / review) are called through
+# the OpenAI-compatible SDK. queen=codex and specify=copilot are external CLIs, not
+# pip packages, so they are not listed here.
+openai>=1.40
+
+# Pretty terminal UI for the interactive setup (hive_setup.py).
+rich>=13.0
+
+# Optional DB drivers for the converge live data-read — install ONLY the one your
+# target uses. sqlite needs nothing (it is in the stdlib). Uncomment as needed:
+# pymysql>=1.1            # mysql / mariadb targets
+# psycopg[binary]>=3.1    # postgres targets
