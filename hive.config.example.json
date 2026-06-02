@@ -1,0 +1,28 @@
+{
+  "roles": {
+    "queen":    { "provider": "provider", "model": "model" },
+    "specify":  { "provider": "provider", "model": "model", "timeout_sec": 900, "retries": 1 },
+    "review":   { "provider": "provider", "model": "model" },
+    "judge":    { "provider": "provider", "model": "model" },
+    "converge": { "provider": "provider", "model": "model" },
+    "commit":   { "provider": "provider", "model": "model" },
+    "swarm":    { "provider": "provider", "model": "model" },
+    "assemble": { "provider": "provider", "model": "model" }
+  },
+  "copilot": { "exe": null, "allow": "--allow-all", "timeout_sec": 300 },
+  "ledger":  { "enabled": true, "db_path": "hive_ledger.db" },
+  "apply":   { "backup_dir": ".apply_backups", "backup_ttl_hours": 168 },
+  "judge":   { "max_calls_per_axis": 2, "max_axes": 12, "max_parallel": 4 },
+  "safety":  { "allow_swarm": false },
+  "db_connections": {
+    "project1": {
+      "kind": "sqlite",
+      "path": "sqlite.db"
+    },
+    "project2": {
+      "kind": "mysql",
+      "host": "localhost", "port": 3306, "dbname": "dbname",
+      "user": "user", "password_env": "DB_PASSWORD"
+    }
+  }
+}
