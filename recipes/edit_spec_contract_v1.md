@@ -42,7 +42,7 @@ Test each fix direction in the honey against one question: "can this be expresse
   "deferred": [
     {
       "issue": "<the fix direction that could not be lowered to an edit>",
-      "reason": "not_expressible_as_edit|needs_runtime|policy_direction|multi_file_design",
+      "reason": "not_expressible_as_edit|needs_runtime|policy_direction|multi_file_design|anchor_not_grounded",
       "stays_as": "investigation|surface",
       "evidence": ["<file:line if any>"]
     }
@@ -51,7 +51,7 @@ Test each fix direction in the honey against one question: "can this be expresse
     "commands": ["<compile/lint/target-test command>", "..."],
     "apply": false
   },
-  "termination": "ready_to_apply | needs_reinvestigation | needs_pm",
+  "termination": "ready_to_apply | needs_reinvestigation | needs_pm | needs_runtime",
   "notes": "<one line. if anything is stale/not_found or self-excluded, say what the loop should look at next>"
 }
 
@@ -59,6 +59,8 @@ Test each fix direction in the honey against one question: "can this be expresse
 - The JSON edit-spec is the SSOT. The human-facing unified diff is a DERIVED view rendered by hive/apply.py from anchor_old/replacement_new — you do not author the diff.
 - If every actionable fix landed in `deferred[]` (nothing was expressible as an edit), set termination = "needs_reinvestigation" and say so in notes; do not invent edits to fill the array.
 - An edit whose anchor_status is "stale" or "not_found" must NOT be presented as ready: set termination = "needs_reinvestigation".
+- CONTRADICTION RULE: an `anchor_not_grounded` or `needs_runtime` deferred item for a file is a hard BLOCK — do NOT also emit an edit for that same file. A direction belongs in ONE place: edits[] (grounded) OR deferred[] (ungrounded). Emitting both is contradictory and the edit will be removed by the post-authoring gate.
+- TERMINATION `needs_runtime`: use when the direction cannot be resolved from static evidence alone — the investigation needs a runtime fact (which loader key executes, which row is the active head, what review status a record carries). Pair with a deferred[] entry (reason: "needs_runtime") naming the exact fact needed. This is distinct from `needs_reinvestigation` (more code evidence would help) and `needs_pm` (human judgment required): `needs_runtime` names a concrete datum that, once supplied, would unblock the investigation.
 - EFFECTIVENESS: every edit must actually change the behavior the honey identified. An edit that is anchored correctly but functionally inert — a no-op assignment, a guard whose condition can never be true, a value set to what it already is, a whitespace-only change — is NOT a fix. Do not emit it as an edit, and never set termination = "ready_to_apply" for it. specify enforces this after you author: a deterministic no-op check plus an independent effectiveness review downgrade a ready spec whose edits do not change the reported behavior (to needs_reinvestigation), and defer a ready claim that cannot be verified to a human (needs_pm).
 - TERMINATION SCOPE: `termination` reflects whether the edits in `edits[]` are safe to APPLY, not whether the whole investigation is closed. If at least one edit is anchor-verified and effective, set `termination = "ready_to_apply"` even when optional or policy directions are deferred — those surface separately in `deferred[]` for the PM. Do NOT downgrade to `needs_pm` merely because optional/policy options exist; reserve `needs_pm` for a ready claim that genuinely cannot be verified. (specify additionally promotes a conservatively-authored needs_pm to ready_to_apply when every edit is verified+effective+confident and all deferred items are optional — but author it correctly so that promotion is rarely needed.)
 
