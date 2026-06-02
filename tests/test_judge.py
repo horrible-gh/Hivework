@@ -338,6 +338,58 @@ class TestGroundingGate(unittest.TestCase):
         self.assertEqual(res["verdict"].file, "server/store.py")
 
 
+class TestDismissalBackstop(unittest.TestCase):
+    """N170 axis E: an unlocated verdict that WAVES OFF the question is flagged."""
+
+    def _run(self, reason, **kw):
+        out = json.dumps({"verdict": {"located": False, "file": "", "lines": "",
+                                      "reason": reason},
+                          "need": {"symbols": [], "greps": [], "file_globs": []}})
+        with mock.patch.object(J, "call_worker", return_value=_wr(out)), \
+             mock.patch.object(J, "retrieve_followup"):
+            return J.run_judge(plan_bundle=PLAN_BUNDLE, symptom="does get_pending "
+                               "call the wrong SQL key?", axis_globs=["g"],
+                               code_root="/x", provider="deepinfra", model="m",
+                               judge_cfg=JudgeConfig(max_calls_per_axis=1), **kw)
+
+    def test_dismissal_reason_is_flagged(self):
+        # The exact axis-E phrasing from the N170 log (with the unicode hyphen).
+        res = self._run("The symptom is an informational request to list callers of "
+                        "get_pending_head_by_group, not a code defect requiring a "
+                        "source‑line change.")
+        self.assertFalse(res["verdict"].located)
+        self.assertIn("unruled-dismissal", res["verdict"].reason)
+
+    def test_evidence_based_refutation_not_flagged(self):
+        # A genuine refutation (cites why the code is correct) is a valid ruling.
+        res = self._run("This function correctly uses the in_progress key; the SQL it "
+                        "calls filters on result_doc_id IS NULL, which is correct here.")
+        self.assertFalse(res["verdict"].located)
+        self.assertNotIn("unruled-dismissal", res["verdict"].reason)
+
+    def test_located_verdict_never_flagged(self):
+        out = json.dumps({"verdict": {"located": True, "file": "server/store.py",
+                                      "lines": "1444-1453", "reason": "informational only"},
+                          "need": {"symbols": [], "greps": [], "file_globs": []}})
+        with mock.patch.object(J, "call_worker", return_value=_wr(out)), \
+             mock.patch.object(J, "retrieve_followup"):
+            res = J.run_judge(plan_bundle=PLAN_BUNDLE, symptom="s", axis_globs=["g"],
+                              code_root="/x", provider="deepinfra", model="m",
+                              judge_cfg=JudgeConfig(max_calls_per_axis=1))
+        self.assertTrue(res["verdict"].located)          # located: not a dismissal
+        self.assertNotIn("unruled-dismissal", res["verdict"].reason)
+
+    def test_seed_axis_prompt_carries_mandate(self):
+        with mock.patch.object(J, "call_worker", return_value=_wr(VERDICT_NO_NEED)) as cw, \
+             mock.patch.object(J, "retrieve_followup"):
+            J.run_judge(plan_bundle=PLAN_BUNDLE, symptom="s", axis_globs=["g"],
+                        code_root="/x", provider="deepinfra", model="m",
+                        judge_cfg=JudgeConfig(max_calls_per_axis=1), seed_axis=True)
+        prompt = cw.call_args_list[0].args[2]
+        self.assertIn("MANDATED BY THE SEED", prompt)
+        self.assertIn("Ruling mandate", prompt)
+
+
 class TestLedgerRecording(unittest.TestCase):
     """Each model call is recorded to the ledger under stage 'judge'."""
 

@@ -57,6 +57,12 @@ CONVERGED_OUT = json.dumps({
     ],
     "attributed_defect": {"node": "db_fn", "file": "db/workflow_sequences.py",
                           "lines": "45-57", "why": "ORDER BY prefers in-progress over pending"},
+    "causal_check": {
+        "verdict": "consistent",
+        "data_state_assumptions": ["R approved; M in-progress with result_doc_id set"],
+        "trace": "with M.result_doc_id set the CASE puts M first, displacing the "
+                 "pending slot — reproduces the off-by-one",
+        "need_data_state": []},
     "missing_link": None,
 })
 MISSING_OUT = json.dumps({
@@ -66,6 +72,60 @@ MISSING_OUT = json.dumps({
     "missing_link": {"between": ["handler", "db_fn"],
                      "need": {"symbols": ["get_effective_head"], "greps": ["ORDER BY"],
                               "file_globs": []}},
+})
+
+# The N170 shape: the converger reaches a node (get_effective_head's ORDER BY CASE)
+# and would attribute the defect there, but the cause→symptom check shows that under
+# the only data state the scenario allows the clause cannot produce the symptom.
+CONTRADICTED_OUT = json.dumps({
+    "converged": True,
+    "path": [
+        {"node": "endpoint", "file": "api/workflow_head_routes.py", "lines": "93-102"},
+        {"node": "db_fn", "file": "db/workflow_sequences.py", "lines": "45-57",
+         "symbol": "get_effective_head"},
+    ],
+    "attributed_defect": {"node": "db_fn", "file": "db/workflow_sequences.py",
+                          "lines": "45-57",
+                          "why": "ORDER BY CASE WHEN result_doc_id IS NOT NULL prefers a "
+                                 "linked slot, shifting the head one step"},
+    "causal_check": {
+        "verdict": "contradicted",
+        "data_state_assumptions": [
+            "R approved → excluded by WHERE; M, DS, D not started → result_doc_id NULL"],
+        "trace": "all candidate rows have result_doc_id NULL, so the CASE expression "
+                 "ties at 1 for every row; the tie breaks on sort_order which already "
+                 "orders M first — the ORDER BY CASE cannot skip M. The reported skip "
+                 "cannot be produced here.",
+        "need_data_state": []},
+    "missing_link": None,
+})
+
+# Outcome depends on stored row state the static evidence cannot determine.
+UNDECIDABLE_OUT = json.dumps({
+    "converged": True,
+    "path": [
+        {"node": "db_fn", "file": "db/workflow_sequences.py", "lines": "45-57",
+         "symbol": "get_effective_head"},
+    ],
+    "attributed_defect": {"node": "db_fn", "file": "db/workflow_sequences.py",
+                          "lines": "45-57", "why": "ORDER BY may mis-rank the head"},
+    "causal_check": {
+        "verdict": "undecidable",
+        "data_state_assumptions": ["depends on whether M carries a non-null result_doc_id"],
+        "trace": "if M.result_doc_id is set the CASE displaces it; if NULL it does not — "
+                 "the static evidence does not show the row state.",
+        "need_data_state": ["the workflow_sequence_items rows for the failing doc: "
+                            "result_doc_id and doc_review_status per slot"]},
+    "missing_link": None,
+})
+
+# converged + attributed but the converger SKIPPED the mandated causal_check.
+NO_CAUSAL_OUT = json.dumps({
+    "converged": True,
+    "path": [{"node": "db_fn", "file": "db/workflow_sequences.py", "lines": "45-57"}],
+    "attributed_defect": {"node": "db_fn", "file": "db/workflow_sequences.py",
+                          "lines": "45-57", "why": "ORDER BY wrong"},
+    "missing_link": None,
 })
 
 
@@ -136,12 +196,62 @@ class TestRunConverge(unittest.TestCase):
             "converged": True, "path": [],
             "attributed_defect": {"node": "db_fn", "file": "totally/unseen.py",
                                   "lines": "1-2", "why": "x"},
+            "causal_check": {"verdict": "consistent", "data_state_assumptions": [],
+                             "trace": "reproduces", "need_data_state": []},
             "missing_link": None})
         with mock.patch.object(C, "call_worker", return_value=_wr(out)):
             res = C.run_converge(seed_text="s", verdicts=LOCATED_VERDICTS,
                                  bundles=BUNDLES, provider="deepinfra", model="m")
         self.assertTrue(res.converged)
         self.assertTrue(res.attributed_defect.get("ungrounded"))
+
+    def test_contradicted_causal_rejects_attribution(self):
+        """Reachable node whose code can't produce the symptom ⇒ NOT converged (N170)."""
+        with mock.patch.object(C, "call_worker", return_value=_wr(CONTRADICTED_OUT)):
+            res = C.run_converge(seed_text="R-head bar skips M, shows DS",
+                                 verdicts=LOCATED_VERDICTS, bundles=BUNDLES,
+                                 provider="deepinfra", model="m")
+        self.assertFalse(res.converged)                       # rejected, not a target
+        self.assertEqual(res.causal_check["verdict"], "contradicted")
+        self.assertIsNotNone(res.attributed_defect)           # suspected node kept
+        self.assertIn("contradiction", res.summary)
+
+    def test_contradicted_does_not_trigger_followup(self):
+        """A causal contradiction is not a missing CODE link — no second pass/retrieve."""
+        with mock.patch.object(C, "call_worker", return_value=_wr(CONTRADICTED_OUT)) as cw, \
+             mock.patch.object(C, "retrieve_followup") as rf:
+            res = C.run_converge(seed_text="s", verdicts=LOCATED_VERDICTS,
+                                 bundles=BUNDLES, provider="deepinfra", model="m",
+                                 code_root="/repo")
+        rf.assert_not_called()
+        self.assertEqual(cw.call_count, 1)
+        self.assertFalse(res.converged)
+
+    def test_undecidable_surfaces_need_data_state(self):
+        """Outcome depends on stored row state ⇒ NOT converged, need_data_state carried."""
+        with mock.patch.object(C, "call_worker", return_value=_wr(UNDECIDABLE_OUT)):
+            res = C.run_converge(seed_text="s", verdicts=LOCATED_VERDICTS,
+                                 bundles=BUNDLES, provider="deepinfra", model="m")
+        self.assertFalse(res.converged)
+        self.assertEqual(res.causal_check["verdict"], "undecidable")
+        self.assertTrue(res.causal_check["need_data_state"])
+        self.assertIn("data state", res.summary)
+
+    def test_missing_causal_check_fails_closed(self):
+        """converged+attributed but no causal_check ⇒ unverified ⇒ NOT converged."""
+        with mock.patch.object(C, "call_worker", return_value=_wr(NO_CAUSAL_OUT)):
+            res = C.run_converge(seed_text="s", verdicts=LOCATED_VERDICTS,
+                                 bundles=BUNDLES, provider="deepinfra", model="m")
+        self.assertFalse(res.converged)
+        self.assertEqual(res.causal_check["verdict"], "unverified")
+
+    def test_as_dict_carries_causal_check(self):
+        with mock.patch.object(C, "call_worker", return_value=_wr(CONVERGED_OUT)):
+            res = C.run_converge(seed_text="s", verdicts=LOCATED_VERDICTS,
+                                 bundles=BUNDLES, provider="deepinfra", model="m")
+        d = res.as_dict()
+        self.assertIn("causal_check", d)
+        self.assertEqual(d["causal_check"]["verdict"], "consistent")
 
     def test_converged_first_pass_makes_no_second_call(self):
         """A first pass that converges is trusted — no follow-up, single call."""
@@ -252,6 +362,40 @@ class TestHoneyConvergeSection(unittest.TestCase):
                                    "trace the path")
         self.assertIn("DIAGNOSTIC", honey)
         self.assertIn("deliverable", honey)
+
+    def test_contradicted_causal_section_warns_not_primary(self):
+        converge = {
+            "converged": False,
+            "path": [{"node": "db_fn", "file": "db/workflow_sequences.py",
+                      "lines": "45-57", "symbol": "get_effective_head"}],
+            "attributed_defect": {"node": "db_fn", "file": "db/workflow_sequences.py",
+                                  "lines": "45-57", "why": "ORDER BY CASE"},
+            "causal_check": {"verdict": "contradicted",
+                             "data_state_assumptions": ["M, DS, D all result_doc_id NULL"],
+                             "trace": "rows tie on CASE; sort_order orders M first",
+                             "need_data_state": []},
+            "missing_link": None}
+        honey = render_local_honey(self._result(converge, "fix"), "fix the head")
+        self.assertIn("CAUSAL CHECK did not confirm", honey)
+        self.assertNotIn("Primary edit target", honey)
+        self.assertIn("Do NOT author an edit", honey)
+        self.assertIn("needs_reinvestigation", honey)
+
+    def test_undecidable_causal_section_lists_need_data_state(self):
+        converge = {
+            "converged": False,
+            "path": [],
+            "attributed_defect": {"node": "db_fn", "file": "db/workflow_sequences.py",
+                                  "lines": "45-57", "why": "maybe"},
+            "causal_check": {"verdict": "undecidable", "data_state_assumptions": [],
+                             "trace": "depends on M.result_doc_id",
+                             "need_data_state": ["rows for the failing doc: result_doc_id per slot"]},
+            "missing_link": None}
+        honey = render_local_honey(self._result(converge, "fix"), "fix it")
+        self.assertIn("CAUSAL CHECK did not confirm", honey)
+        self.assertIn("Data state / fixture required", honey)
+        self.assertIn("result_doc_id per slot", honey)
+        self.assertNotIn("Primary edit target", honey)
 
     def test_missing_link_section_named(self):
         converge = {"converged": False, "path": [], "attributed_defect": None,
