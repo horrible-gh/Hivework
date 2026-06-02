@@ -24,6 +24,7 @@ import json
 import logging
 import os
 import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any
 
 from hive.converge import run_converge
@@ -363,31 +364,41 @@ def run_investigate(
             cfg.judge.max_axes, len(leaves), len(dropped), dropped)
 
     # ── ②..③ per axis: bridge → local retrieve (free) → JUDGE (budgeted).
-    verdicts: list[dict[str, Any]] = []
-    # Each axis's retrieve bundle is kept (was discarded after judge) so the ④
-    # converge stage can pool the cross-axis call-chain hops it needs to stitch the
-    # fragments into one path. Parallel to ``verdicts``.
-    bundles: list[dict[str, Any]] = []
-    warned_no_docs = False
+    # The axes are INDEPENDENT: each judges only its own retrieve bundle against the
+    # shared, read-only ``seed_files`` — nothing here reads another axis's verdict
+    # (cross-axis synthesis happens once, later, in ④ converge). So the per-axis
+    # retrieve+judge work is run CONCURRENTLY over a bounded pool
+    # (``cfg.judge.max_parallel``), overlapping the judge's network round-trips
+    # instead of serialising N×~20s of them. Results are reassembled in the original
+    # ``judged`` order, so ``verdicts``/``bundles`` (and thus converge's input) are
+    # identical to the sequential path — only wall-clock changes.
+    #
     # Seed-named, on-disk edit targets — passed to every axis's judge so a verdict
     # citing one is grounded even when that axis's own retrieve didn't window it
     # (Defect 4a: seed files aren't guaranteed in every per-axis bundle).
     seed_files = {t["file"] for t in seed_edit_targets(seed_text, code_root, docs_root)}
-    for task in judged:
-        sp = task_to_searchplan(task, default_globs=default_globs)
+    # Pre-resolve each judged axis's search plan (pure, cheap) so the docs=(none)
+    # confound (N165) is surfaced ONCE here, before the fan-out — not racily (and
+    # possibly multiple times) from inside concurrent workers.
+    plans = [task_to_searchplan(task, default_globs=default_globs) for task in judged]
+    if docs_root is None:
+        # docs=(none) confound (N165): the queen produced doc_topics for an axis but
+        # no docs tree was supplied, so the entire design-doc channel is silently
+        # skipped and any doc-targeting glob degrades into a code-tree search. Surface
+        # it once at WARNING — a missing --docs is an invocation bug, not a result.
+        for sp in plans:
+            if sp.doc_topics:
+                logger.warning(
+                    "docs_root not supplied (--docs) but axes carry doc_topics "
+                    "(first: [%s] topics=%s): the design-doc channel is DISABLED and "
+                    "doc-targeted globs fall back to the code tree. Pass --docs <dir> "
+                    "to enable design retrieval.", sp.axis_id, sp.doc_topics)
+                break
+
+    def _investigate_axis(idx, task, sp):
+        """Retrieve (free, local) then JUDGE one axis. Independent of other axes;
+        returns ``(idx, verdict_entry, bundle_to_keep)`` for order-preserving merge."""
         symptom = str(task.get("brief") or task.get("title") or sp.axis_id)
-        # docs=(none) confound (N165): the queen produced doc_topics for an axis
-        # but no docs tree was supplied, so the entire design-doc channel is
-        # silently skipped and any doc-targeting glob degrades into a code-tree
-        # search. Surface it once at WARNING — a missing --docs is an invocation
-        # bug, not a localisation result.
-        if docs_root is None and sp.doc_topics and not warned_no_docs:
-            logger.warning(
-                "docs_root not supplied (--docs) but axes carry doc_topics "
-                "(first: [%s] topics=%s): the design-doc channel is DISABLED and "
-                "doc-targeted globs fall back to the code tree. Pass --docs <dir> "
-                "to enable design retrieval.", sp.axis_id, sp.doc_topics)
-            warned_no_docs = True
         logger.info("[HIVE_STAGE] pipeline=investigate stage=2 name=retrieve axis=%s",
                     sp.axis_id)
         logger.info("② retrieve [%s] keywords=%d globs=%d (local, free)",
@@ -422,17 +433,16 @@ def run_investigate(
         # same call-chain the judge did, not just the first-pass windows.
         fu = jr.get("followup_bundle")
         if fu:
-            merged_bundle = {
+            keep_bundle = {
                 **bundle,
                 "code_snippets": (list(bundle.get("code_snippets") or [])
                                   + list(fu.get("seeds") or [])),
                 "call_chain": (list(bundle.get("call_chain") or [])
                                + list(fu.get("call_chain") or [])),
             }
-            bundles.append(merged_bundle)
         else:
-            bundles.append(bundle)
-        verdicts.append({
+            keep_bundle = bundle
+        verdict_entry = {
             "axis_id": sp.axis_id,
             "title": task.get("title", ""),
             "search_plan": {"keywords": sp.keywords, "file_globs": sp.file_globs,
@@ -440,7 +450,28 @@ def run_investigate(
             "calls_made": jr["calls_made"],
             "verdict": {"located": v.located, "file": v.file, "lines": v.lines,
                         "reason": v.reason},
-        })
+        }
+        return idx, verdict_entry, keep_bundle
+
+    # Bounded concurrency: overlap the judge round-trips without unbounded fan-out
+    # (and stay within the judge provider's rate budget). max_parallel=1 degrades to
+    # a single-worker pool — i.e. today's sequential behaviour — with no code branch.
+    max_workers = max(1, min(int(getattr(cfg.judge, "max_parallel", 2)), len(judged)))
+    # ``bundles`` is kept parallel to ``verdicts`` (was discarded after judge) so the
+    # ④ converge stage can pool the cross-axis call-chain hops it needs.
+    slots: list[Any] = [None] * len(judged)
+    if judged:
+        logger.info("②..③ judging %d axes (max_parallel=%d)", len(judged), max_workers)
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            futures = [pool.submit(_investigate_axis, i, task, plans[i])
+                       for i, task in enumerate(judged)]
+            for fut in as_completed(futures):
+                idx, verdict_entry, keep_bundle = fut.result()
+                slots[idx] = (verdict_entry, keep_bundle)
+    # Reassemble in the original judged order so the verdicts/bundles pairing (and
+    # therefore converge's input) is identical to the sequential path.
+    verdicts: list[dict[str, Any]] = [s[0] for s in slots if s is not None]
+    bundles: list[dict[str, Any]] = [s[1] for s in slots if s is not None]
 
     # ── ④ converge (the reconcile step the cheap path was missing): stitch the
     # scattered per-axis verdicts into ONE executed call path and attribute the

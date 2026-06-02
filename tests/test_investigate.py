@@ -203,6 +203,70 @@ class TestInvestigateWiring(unittest.TestCase):
         self.assertIn("design-doc channel is DISABLED", joined)
 
 
+class TestParallelJudging(unittest.TestCase):
+    """The per-axis retrieve+judge fan-out runs concurrently (bounded by
+    judge.max_parallel) yet returns verdicts in the original judged order — same
+    result as the sequential path, only faster."""
+
+    def test_verdicts_preserve_judged_order(self):
+        # 5 leaves, generic seed (no concrete file → stable order a1..css_rules).
+        # Even with parallel workers completing out of order, the reassembled
+        # verdicts must follow the judged order, so converge's input is unchanged.
+        cfg = load_config()
+        cfg.judge.max_calls_per_axis = 1
+        cfg.judge.max_parallel = 4
+        with tempfile.TemporaryDirectory() as td:
+            out = os.path.join(td, "v.json")
+            with mock.patch("hive.decompose.call_worker",
+                            return_value=_wr(TestInvestigateWiring._FIVE_LEAVES)), \
+                 mock.patch("hive.judge.call_worker", return_value=_wr(VERDICT_OUT)), \
+                 mock.patch("hive.converge.call_worker", return_value=_wr(CONVERGE_OUT)), \
+                 mock.patch("hive.investigate.retrieve", side_effect=_fake_retrieve):
+                result = INV.run_investigate(
+                    seed_text="x", recipe_path=None, code_root=td,
+                    docs_root=None, output_path=out, cfg=cfg, ledger=None)
+        order = [v["axis_id"] for v in result["verdicts"]]
+        self.assertEqual(order, ["a1", "a2", "a3", "a4", "css_rules"])
+
+    def test_axes_actually_run_concurrently(self):
+        # A judge that blocks on a barrier proves overlap: with max_parallel>=3 and
+        # 3 axes, all three enter judge at once. A sequential loop would deadlock the
+        # barrier (only one thread ever inside), so a clean pass IS the concurrency proof.
+        import threading
+        cfg = load_config()
+        cfg.judge.max_calls_per_axis = 1
+        cfg.judge.max_parallel = 3
+        barrier = threading.Barrier(3, timeout=10)
+        peak = {"n": 0}
+        live = {"n": 0}
+        lock = threading.Lock()
+
+        def _blocking_judge(*a, **kw):
+            with lock:
+                live["n"] += 1
+                peak["n"] = max(peak["n"], live["n"])
+            barrier.wait()            # all 3 must be here simultaneously
+            with lock:
+                live["n"] -= 1
+            return _wr(VERDICT_OUT)
+
+        three = json.dumps({
+            "fanout_decision": "fanout", "reason": "x", "steps": [["a", "b", "c"]],
+            "tasks": [{"id": i, "title": i, "depends_on": [], "brief": i}
+                      for i in ("a", "b", "c")]})
+        with tempfile.TemporaryDirectory() as td:
+            out = os.path.join(td, "v.json")
+            with mock.patch("hive.decompose.call_worker", return_value=_wr(three)), \
+                 mock.patch("hive.judge.call_worker", side_effect=_blocking_judge), \
+                 mock.patch("hive.converge.call_worker", return_value=_wr(CONVERGE_OUT)), \
+                 mock.patch("hive.investigate.retrieve", side_effect=_fake_retrieve):
+                result = INV.run_investigate(
+                    seed_text="x", recipe_path=None, code_root=td,
+                    docs_root=None, output_path=out, cfg=cfg, ledger=None)
+        self.assertEqual(result["axes_judged"], 3)
+        self.assertEqual(peak["n"], 3)   # all three judged at the same instant
+
+
 class TestRenderLocalHoney(unittest.TestCase):
     """The free verdict→honey seam that lets the cheap path feed specify."""
 
