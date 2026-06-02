@@ -531,6 +531,47 @@ def run_investigate(
     return result
 
 
+def _render_data_state_lines(converge: dict[str, Any]) -> list[str]:
+    """Render the live-DB rows converge actually read into honey lines (or []).
+
+    N173: when a read-only DB connection is configured and the converger's causal
+    check depended on stored row state, the pipeline executes the read and the rows
+    come back on ``converge["data_state_block"]``. We PASTE that block verbatim so the
+    report is grounded on REAL data — the explicit antidote to converge fabricating a
+    value (``result_doc_id = 'doc123'``) to reach a verdict. When a read was attempted
+    but returned nothing/failed (``data_state_attempted`` set, not ``data_state_backed``)
+    we say so HONESTLY rather than letting it look like a read never happened.
+    """
+    if not converge.get("data_state_attempted"):
+        return []
+    block = (converge.get("data_state_block") or "").strip()
+    backed = converge.get("data_state_backed")
+    if backed and block:
+        return [
+            "#### Live DB data confirmed (rows READ from the configured database — FACT, "
+            "not assumed; the verdict above is data-backed)",
+            "",
+            "```",
+            block,
+            "```",
+            "",
+        ]
+    # Attempted but no usable rows — be explicit so no assumed value fills the gap.
+    return [
+        "#### Live DB read attempted — NO usable rows returned",
+        "",
+        "A read-only DB connection is configured and the converger named the rows to "
+        "read, but the read returned nothing / failed (see below). The verdict is NOT "
+        "data-backed — do NOT substitute an assumed value; treat the data state as "
+        "unconfirmed (needs a real fixture / runtime check).",
+        "",
+        "```",
+        block or "(no query was executed)",
+        "```",
+        "",
+    ]
+
+
 def _render_converge_section(converge: dict[str, Any] | None,
                              seed_kind: str) -> list[str]:
     """Render the ④ converge result into honey lines (the START-HERE section).
@@ -585,6 +626,8 @@ def _render_converge_section(converge: dict[str, Any] | None,
             if cc.get("trace"):
                 out.append(f"- trace: {cc['trace']}")
             out.append("")
+        # PASTE the real rows the read returned (N173) — the grounding for the verdict.
+        out += _render_data_state_lines(converge)
         if seed_kind == "diagnostic":
             out += [
                 "> **This seed is DIAGNOSTIC (trace/map), not a change request.** The "
@@ -629,6 +672,9 @@ def _render_converge_section(converge: dict[str, Any] | None,
         if cc.get("trace"):
             out.append(f"- causal trace: {cc['trace']}")
         out.append("")
+        # If a live read ran, PASTE its rows (or honestly note it returned nothing) so a
+        # contradiction/undecidable is grounded on real data, never on an assumed value.
+        out += _render_data_state_lines(converge)
         if cv == "contradicted":
             out += [
                 "> The suspected code is reachable but, under the only data state the "

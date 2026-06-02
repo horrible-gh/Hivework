@@ -12,7 +12,7 @@
   "copilot": { "exe": null, "allow": "--allow-all", "timeout_sec": 300 },
   "ledger":  { "enabled": true, "db_path": "hive_ledger.db" },
   "apply":   { "backup_dir": ".apply_backups", "backup_ttl_hours": 168 },
-  "judge":   { "max_calls_per_axis": 2, "max_axes": 12, "max_parallel": 2 },
+  "judge":   { "max_calls_per_axis": 2, "max_axes": 12, "max_parallel": 4 },
   "safety":  { "allow_swarm": false },
   "db_connections": {
     "flowgate": {
