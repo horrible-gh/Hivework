@@ -78,24 +78,40 @@ def _check_ident(name: str, what: str) -> str:
     return name
 
 
+def _quote_ident(name: str, what: str, quote_char: str) -> str:
+    """Validate then DELIMIT an identifier so SQL reserved words work as names.
+
+    A column/table legitimately named ``from``/``order``/``select`` passes ``_IDENT``
+    (it is all letters) but breaks an un-delimited SELECT — that is the NR174 planner
+    bug. Delimiting it (``"from"`` for sqlite/pg, `` `from` `` for mysql) makes it a
+    plain name again. Because ``_check_ident`` has already proven the name contains no
+    quote/escape character, wrapping it cannot reopen the injection hole the bare
+    validation closed — the delimiter is decoration over an already-safe token.
+    """
+    safe = _check_ident(name, what)
+    return f"{quote_char}{safe}{quote_char}"
+
+
 def _build_select(table: str, columns: list[str] | None,
                   where: dict[str, Any] | None, limit: int,
-                  placeholder: str) -> tuple[str, list[Any]]:
+                  placeholder: str, quote_char: str) -> tuple[str, list[Any]]:
     """Build a parameterised single-table SELECT from validated identifiers.
 
     ``placeholder`` is the driver's bound-param marker ("?" for sqlite, "%s" for
-    pymysql/psycopg). Values go through it; identifiers are validated, never interpolated.
+    pymysql/psycopg); ``quote_char`` is its identifier delimiter (``"`` for sqlite/pg,
+    `` ` `` for mysql). Values go through the placeholder; identifiers are validated
+    AND delimited, never bare-interpolated.
     """
-    tbl = _check_ident(table, "table")
+    tbl = _quote_ident(table, "table", quote_char)
     cols = "*"
     if columns:
-        cols = ", ".join(_check_ident(c, "column") for c in columns)
+        cols = ", ".join(_quote_ident(c, "column", quote_char) for c in columns)
     sql = f"SELECT {cols} FROM {tbl}"
     params: list[Any] = []
     if where:
         clauses = []
         for col, val in where.items():
-            cc = _check_ident(col, "where-column")
+            cc = _quote_ident(col, "where-column", quote_char)
             if val is None:
                 clauses.append(f"{cc} IS NULL")
             elif isinstance(val, (list, tuple, set)):
@@ -204,7 +220,10 @@ def read_rows(conn: DbConnection, table: str, *, columns: list[str] | None = Non
     """
     kind = (conn.kind or "sqlite").strip().lower()
     placeholder = "?" if kind == "sqlite" else "%s"
-    sql, params = _build_select(table, columns, where, limit, placeholder)
+    # mysql/mariadb delimit identifiers with backticks; sqlite and postgres use the
+    # SQL-standard double quote. This lets a reserved-word column (e.g. ``from``) work.
+    quote_char = "`" if kind in _MYSQL_KINDS else '"'
+    sql, params = _build_select(table, columns, where, limit, placeholder, quote_char)
     rendered = _render(sql, params, placeholder)
     logger.info("dbread: %s on %s", rendered, kind)
 
@@ -218,6 +237,60 @@ def read_rows(conn: DbConnection, table: str, *, columns: list[str] | None = Non
         raise DbReadError(f"unknown db kind: {conn.kind!r} (use sqlite|mysql|mariadb|postgres)")
 
     return ReadResult(rows=rows, sql=rendered, params=params)
+
+
+def _schema_sqlite(conn: DbConnection) -> dict[str, list[str]]:
+    tables = _read_sqlite(
+        conn,
+        "SELECT name FROM sqlite_master WHERE type='table' "
+        "AND name NOT LIKE 'sqlite_%' ORDER BY name", [])
+    out: dict[str, list[str]] = {}
+    for t in tables:
+        name = t.get("name") or ""
+        if not _IDENT.match(name):
+            continue  # skip exotically-named tables rather than risk un-quotable SQL
+        # PRAGMA can't be parameterised; the name comes from sqlite_master (the DB's own
+        # catalog, not model input) and is _IDENT-checked + quoted, so it is safe here.
+        cols = _read_sqlite(conn, f'PRAGMA table_info("{name}")', [])
+        out[name] = [c.get("name") for c in cols if c.get("name")]
+    return out
+
+
+def _schema_info_schema(conn: DbConnection, reader, dbname: str | None) -> dict[str, list[str]]:
+    # information_schema is standard for mysql/mariadb/postgres. mysql needs the db name
+    # to scope it; postgres defaults to the user-facing 'public' schema (skip catalogs).
+    if dbname:
+        sql = ("SELECT table_name, column_name FROM information_schema.columns "
+               "WHERE table_schema = %s ORDER BY table_name, ordinal_position")
+        rows = reader(conn, sql, [dbname])
+    else:
+        sql = ("SELECT table_name, column_name FROM information_schema.columns "
+               "WHERE table_schema = 'public' ORDER BY table_name, ordinal_position")
+        rows = reader(conn, sql, [])
+    out: dict[str, list[str]] = {}
+    for r in rows:
+        out.setdefault(r["table_name"], []).append(r["column_name"])
+    return out
+
+
+def list_schema(conn: DbConnection) -> dict[str, list[str]]:
+    """Introspect the connected DB read-only: return ``{table: [columns…]}``.
+
+    This is how the converge glue hands the model an AUTHORITATIVE name list so it names
+    REAL tables/columns in its ``data_reads`` instead of guessing from whatever code
+    happened to be retrieved (NR174: it shortened ``workflow_sequence_items`` to ``items``
+    and the read came back empty). NEUTRAL by construction: it reads whatever schema the
+    connection exposes — exactly like the retriever reads any codebase — with zero
+    caller-specific knowledge. Raises ``DbReadError`` on failure (caller injects nothing).
+    """
+    kind = (conn.kind or "sqlite").strip().lower()
+    if kind == "sqlite":
+        return _schema_sqlite(conn)
+    elif kind in _MYSQL_KINDS:
+        return _schema_info_schema(conn, _read_mysql, conn.dbname)
+    elif kind in _PG_KINDS:
+        return _schema_info_schema(conn, _read_postgres, None)
+    raise DbReadError(f"unknown db kind: {conn.kind!r} (use sqlite|mysql|mariadb|postgres)")
 
 
 def probe(conn: DbConnection) -> bool:
