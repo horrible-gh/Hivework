@@ -238,7 +238,14 @@ the symptom — do not pass it off as the defect.
 ``data_reads``: the precise table(s), the row selector (the column=value that picks the \
 row, taken from the scenario, e.g. the document id), and the column(s) whose value \
 decides the verdict. Use the EXACT table/column names visible in the evidence (the SQL \
-in queries.json names them). Do NOT guess an attribution to fill the gap.
+in queries.json names them). Do NOT guess an attribution to fill the gap. When the \
+deciding row cannot be reached in one lookup (you must read a key from one table to \
+find the row in the next), CHAIN the reads: give each read an ``id`` and, in a later \
+read's ``where``, reference an earlier result with ``{{"from": "<that id>", "column": \
+"<column to carry over>"}}`` instead of a literal — the pipeline runs the reads in order \
+and feeds each result into the next (it issues plain single-table SELECTs, so express a \
+join as such a chain, e.g. read the rows, then read the joined table by the id column \
+they carried).
 4. If — and only if — two adjacent nodes cannot be connected because a needed \
 callee/symbol is NOT shown in the evidence, set converged=false and NAME the missing \
 link instead of guessing.
@@ -256,7 +263,7 @@ finding to force a convergence.
     {{ "node": "endpoint|handler|db_fn|sql_key|fe|other", "file": "<repo-relative>", "lines": "<start-end>", "symbol": "<fn/route/key name>" }}
   ],
   "attributed_defect": {{ "node": "<which node above>", "file": "<repo-relative>", "lines": "<start-end>", "why": "<one line: the wrong behaviour here>" }},
-  "causal_check": {{ "verdict": "consistent|contradicted|undecidable", "data_state_assumptions": ["<the row/field values the scenario forces>"], "trace": "<what the attributed code outputs under those assumptions, and whether it reproduces the symptom>", "need_data_state": ["<when undecidable: the exact stored row state / fixture to confirm>"], "data_reads": [ {{ "table": "<table name from the evidence>", "where": {{ "<key column>": "<row selector value from the scenario>" }}, "columns": ["<column(s) whose value decides the verdict>"] }} ] }},
+  "causal_check": {{ "verdict": "consistent|contradicted|undecidable", "data_state_assumptions": ["<the row/field values the scenario forces>"], "trace": "<what the attributed code outputs under those assumptions, and whether it reproduces the symptom>", "need_data_state": ["<when undecidable: the exact stored row state / fixture to confirm>"], "data_reads": [ {{ "id": "<short name for chaining, optional>", "table": "<table name from the evidence>", "where": {{ "<key column>": "<literal row selector OR {{\\"from\\": \\"<prior read id>\\", \\"column\\": \\"<column to carry over>\\"}}>" }}, "columns": ["<column(s) whose value decides the verdict>"] }} ] }},
   "missing_link": null
 }}
 
@@ -312,8 +319,12 @@ def _coerce_causal(d: Any) -> dict[str, Any] | None:
 def _coerce_data_reads(raw: Any) -> list[dict[str, Any]]:
     """Parse the converger's machine-readable ``data_reads`` into clean read specs.
 
-    Each spec is ``{table, where: {col: val}, columns: [..]}`` — the structured form
-    the dbread glue turns into one mechanical SELECT. Lenient: drops anything without a
+    Each spec is ``{id?, table, where: {col: val | {from, column}}, columns: [..]}`` —
+    the structured form the dbread glue turns into mechanical SELECT(s). A ``where``
+    VALUE may be a reference object ``{"from": "<prior read id>", "column": "<col>"}``
+    instead of a literal, so reads CHAIN: a later read filters on the value(s) a prior
+    read returned (resolve-a-key-then-look-it-up, the common multi-hop need). The ref is
+    kept verbatim here and resolved at execution time. Lenient: drops anything without a
     table; identifier SAFETY is enforced later by hive.dbread (the anti-injection gate),
     so here we only normalise shape, never trust it.
     """
@@ -327,6 +338,7 @@ def _coerce_data_reads(raw: Any) -> list[dict[str, Any]]:
         where = r.get("where") if isinstance(r.get("where"), dict) else {}
         columns = [str(c) for c in (r.get("columns") or []) if str(c).strip()]
         out.append({
+            "id": str(r.get("id", "") or "").strip(),
             "table": table,
             "where": {str(k): v for k, v in where.items()},
             "columns": columns,
@@ -480,14 +492,51 @@ def _converge_once(seed_text: str, located: list[dict[str, Any]],
     return _result_from(parsed, known)
 
 
+def _resolve_where(where: dict[str, Any],
+                   prior: dict[str, list[dict[str, Any]]]) -> tuple[dict[str, Any], str]:
+    """Resolve a spec's ``where`` against the rows produced by prior reads.
+
+    A literal value passes through unchanged. A reference ``{"from": id, "column": c}``
+    is replaced by the DISTINCT non-null values of column ``c`` across read ``id``'s
+    rows: one value → scalar (``= ?``), several → a list (``IN (…)``), zero → the read
+    cannot proceed (no upstream key to look up). Returns ``(resolved_where, skip_note)``;
+    ``skip_note`` is non-empty only when a reference had no upstream values, in which
+    case the caller skips the read. This is the GENERIC chaining primitive — it knows no
+    table or column names, only "feed the prior result's values into the next filter".
+    """
+    resolved: dict[str, Any] = {}
+    for col, val in where.items():
+        if isinstance(val, dict) and "from" in val:
+            src = prior.get(str(val.get("from")), [])
+            colname = str(val.get("column", ""))
+            vals: list[Any] = []
+            seen: set[Any] = set()
+            for row in src:
+                v = row.get(colname)
+                if v is not None and v not in seen:
+                    seen.add(v)
+                    vals.append(v)
+            if not vals:
+                return resolved, (f"no upstream values from "
+                                  f"{val.get('from')!r}.{colname}")
+            resolved[col] = vals if len(vals) > 1 else vals[0]
+        else:
+            resolved[col] = val
+    return resolved, ""
+
+
 def _fetch_data_state(data_reads: list[dict[str, Any]], db_conn) -> str:
     """Run the converger's ``data_reads`` against the live DB; render rows as fact lines.
 
-    Deterministic glue — NOT a model call. Each spec becomes ONE read-only SELECT via
-    hive.dbread (read-only by construction, identifier-validated). Any failure (no
-    driver, bad identifier, connect error) is logged and skipped, never raised: a
-    failed read just means that fact stays unconfirmed and the converge degrades to its
-    static result. Returns "" when nothing could be read.
+    Deterministic glue — NOT a model call. Reads run IN ORDER so later ones can CHAIN on
+    earlier results (a ``where`` value of ``{"from": <prior id>, "column": c}`` is
+    resolved to that read's returned values — see ``_resolve_where``). This turns the
+    common multi-hop need ("look up a key in table A, then use it to read table B, then
+    C") into a sequence of safe single-table SELECTs via hive.dbread, with NO join logic
+    and NO schema knowledge in this module. Any failure (no driver, bad identifier,
+    connect error, an empty upstream) is logged and skipped, never raised: that fact just
+    stays unconfirmed and the converge degrades to its static result. Returns "" when
+    nothing could be read.
     """
     try:
         from hive.dbread import read_rows, DbReadError
@@ -495,14 +544,24 @@ def _fetch_data_state(data_reads: list[dict[str, Any]], db_conn) -> str:
         logger.warning("converge: dbread unavailable (%s) — skipping data read", e)
         return ""
     lines: list[str] = []
-    for spec in data_reads:
+    by_id: dict[str, list[dict[str, Any]]] = {}
+    for idx, spec in enumerate(data_reads):
         table = spec.get("table", "")
+        rid = spec.get("id") or f"read{idx}"
+        resolved, skip = _resolve_where(spec.get("where") or {}, by_id)
+        if skip:
+            logger.info("converge: chained read %r skipped — %s", rid, skip)
+            lines.append(f"- read {rid} on {table}: skipped ({skip})")
+            by_id[rid] = []
+            continue
         try:
             rr = read_rows(db_conn, table, columns=spec.get("columns") or None,
-                           where=spec.get("where") or None, limit=20)
+                           where=resolved or None, limit=20)
         except DbReadError as e:
             logger.warning("converge: data read on %r failed — skipping: %s", table, e)
+            by_id[rid] = []
             continue
+        by_id[rid] = rr.rows
         lines.append(f"- query: {rr.sql}")
         if not rr.rows:
             lines.append("  -> (no rows matched)")

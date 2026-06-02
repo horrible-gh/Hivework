@@ -290,6 +290,64 @@ class TestConvergeDataRead(unittest.TestCase):
         self.assertIn("doc_review_status", block)
         self.assertIn("approved", block)
 
+    def test_fetch_data_state_chains_reads(self):
+        """Multi-hop: read a key from one table, carry it into the next read's WHERE.
+
+        Mirrors the real need (resolve a row in table A, then read table B by the id A
+        carried) WITHOUT any join logic or schema knowledge in the glue.
+        """
+        d = tempfile.mkdtemp()
+        path = os.path.join(d, "chain.db")
+        c = sqlite3.connect(path)
+        c.execute("CREATE TABLE seqs (head TEXT, seq_id INTEGER)")
+        c.execute("CREATE TABLE items (seq_id INTEGER, label TEXT, result_doc_id TEXT)")
+        c.execute("INSERT INTO seqs VALUES ('HEAD1', 7)")
+        c.execute("INSERT INTO items VALUES (7, 'DS', NULL)")
+        c.execute("INSERT INTO items VALUES (7, 'D', NULL)")
+        c.commit(); c.close()
+        db = DbConnection(kind="sqlite", path=path)
+
+        reads = [
+            {"id": "s", "table": "seqs", "where": {"head": "HEAD1"}, "columns": ["seq_id"]},
+            {"id": "i", "table": "items",
+             "where": {"seq_id": {"from": "s", "column": "seq_id"}},
+             "columns": ["label", "result_doc_id"]},
+        ]
+        block = C._fetch_data_state(reads, db)
+        # the second read was filtered by the value the first returned (seq_id=7)
+        self.assertIn("seq_id = 7", block)
+        self.assertIn("label='DS'", block)
+        # both item rows came back, and their NULL result_doc_id is visible as fact
+        self.assertIn("result_doc_id=None", block)
+
+    def test_fetch_data_state_chain_empty_upstream_skips(self):
+        """When the upstream read returns nothing, the dependent read is skipped, not run
+        with a bogus literal — and it degrades gracefully (no crash)."""
+        d = tempfile.mkdtemp()
+        path = os.path.join(d, "empty.db")
+        c = sqlite3.connect(path)
+        c.execute("CREATE TABLE seqs (head TEXT, seq_id INTEGER)")
+        c.execute("CREATE TABLE items (seq_id INTEGER, label TEXT)")
+        c.commit(); c.close()
+        db = DbConnection(kind="sqlite", path=path)
+        reads = [
+            {"id": "s", "table": "seqs", "where": {"head": "MISSING"}, "columns": ["seq_id"]},
+            {"id": "i", "table": "items",
+             "where": {"seq_id": {"from": "s", "column": "seq_id"}}, "columns": ["label"]},
+        ]
+        block = C._fetch_data_state(reads, db)
+        self.assertIn("no upstream values", block)
+
+    def test_resolve_where_multi_value_becomes_list(self):
+        """Several distinct upstream values resolve to a list (→ IN), one to a scalar."""
+        prior = {"src": [{"k": "A"}, {"k": "B"}, {"k": "A"}, {"k": None}]}
+        resolved, skip = C._resolve_where({"col": {"from": "src", "column": "k"}}, prior)
+        self.assertEqual(skip, "")
+        self.assertEqual(resolved["col"], ["A", "B"])  # distinct, NULL dropped, order kept
+        one, _ = C._resolve_where({"col": {"from": "src2", "column": "k"}},
+                                  {"src2": [{"k": "only"}]})
+        self.assertEqual(one["col"], "only")  # single value stays scalar
+
     def test_data_reads_parsed_into_causal_check(self):
         res = C._result_from(json.loads(UNDECIDABLE_WITH_READS_OUT), set())
         self.assertEqual(res.causal_check["data_reads"][0]["table"], "documents")
