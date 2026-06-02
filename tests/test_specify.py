@@ -840,6 +840,84 @@ _HONEY_WITH_TARGETS = (
 )
 
 
+class TestAnchorNotGroundedGate(unittest.TestCase):
+    """_apply_anchor_not_grounded_gate: an edit for the same file as an
+    anchor_not_grounded deferred item is a contradiction and must be removed."""
+
+    def test_removes_contradictory_edit_and_downgrades_ready(self):
+        # The author put queries.json in deferred(anchor_not_grounded) AND in edits[].
+        spec = {
+            "edits": [{"id": "E1", "file": "server/sql/queries/queries.json",
+                       "anchor_old": "x", "replacement_new": "y",
+                       "anchor_status": "verified"}],
+            "deferred": [{"issue": "get_pending_head_by_group queries.json not in evidence",
+                          "reason": "anchor_not_grounded", "stays_as": "investigation"}],
+            "termination": "ready_to_apply", "notes": "",
+        }
+        out = specify._apply_anchor_not_grounded_gate(spec)
+        self.assertEqual(out["edits"], [])
+        self.assertEqual(out["termination"], "needs_pm")
+        self.assertIn("anchor-not-grounded gate", out["notes"])
+
+    def test_no_anchor_not_grounded_deferred_leaves_spec_unchanged(self):
+        spec = {
+            "edits": [{"id": "E1", "file": "a.py", "anchor_status": "verified"}],
+            "deferred": [{"issue": "optional UX", "reason": "policy_direction"}],
+            "termination": "ready_to_apply", "notes": "",
+        }
+        out = specify._apply_anchor_not_grounded_gate(spec)
+        self.assertEqual(len(out["edits"]), 1)
+        self.assertEqual(out["termination"], "ready_to_apply")
+
+    def test_different_file_edit_is_kept(self):
+        # deferred names queries.json, edit targets routers/main.py → no contradiction
+        spec = {
+            "edits": [{"id": "E1", "file": "server/routers/main.py",
+                       "anchor_status": "verified"}],
+            "deferred": [{"issue": "queries.json path not grounded",
+                          "reason": "anchor_not_grounded"}],
+            "termination": "ready_to_apply", "notes": "",
+        }
+        out = specify._apply_anchor_not_grounded_gate(spec)
+        self.assertEqual(len(out["edits"]), 1)
+        self.assertEqual(out["termination"], "ready_to_apply")
+
+    def test_does_not_change_non_ready_termination(self):
+        # The edit is still removed; only ready_to_apply is downgraded
+        spec = {
+            "edits": [{"id": "E1", "file": "queries.json", "anchor_status": "verified"}],
+            "deferred": [{"issue": "queries.json not grounded",
+                          "reason": "anchor_not_grounded"}],
+            "termination": "needs_reinvestigation", "notes": "",
+        }
+        out = specify._apply_anchor_not_grounded_gate(spec)
+        self.assertEqual(out["edits"], [])
+        self.assertEqual(out["termination"], "needs_reinvestigation")
+
+    def test_match_via_evidence_field(self):
+        # The file reference is in the evidence list, not the issue text
+        spec = {
+            "edits": [{"id": "E1", "file": "server/sql/queries.json",
+                       "anchor_status": "verified"}],
+            "deferred": [{"issue": "path unknown",
+                          "reason": "anchor_not_grounded",
+                          "evidence": ["server/sql/queries.json:45"]}],
+            "termination": "ready_to_apply", "notes": "",
+        }
+        out = specify._apply_anchor_not_grounded_gate(spec)
+        self.assertEqual(out["edits"], [])
+        self.assertEqual(out["termination"], "needs_pm")
+
+    def test_needs_runtime_termination_is_valid(self):
+        problems = specify._validate_spec({
+            "edits": [],
+            "deferred": [{"issue": "needs row state", "reason": "needs_runtime"}],
+            "gate": {},
+            "termination": "needs_runtime",
+        })
+        self.assertEqual(problems, [])
+
+
 class TestSeedCoverageGate(unittest.TestCase):
     """Defect 2 (T892): a seed-named edit target must become an edit, or a ready
     spec is downgraded to needs_pm with the dropped target reported."""

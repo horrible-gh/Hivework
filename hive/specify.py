@@ -59,7 +59,7 @@ _TOOL_PROVIDERS = frozenset({"copilot"})
 
 # Structural expectations for the emitted edit-spec JSON.
 _REQUIRED_KEYS = ("edits", "deferred", "gate", "termination")
-_VALID_TERMINATION = {"ready_to_apply", "needs_reinvestigation", "needs_pm"}
+_VALID_TERMINATION = {"ready_to_apply", "needs_reinvestigation", "needs_pm", "needs_runtime"}
 _STALE_STATUSES = {"stale", "not_found"}
 
 # Effectiveness-gate outcomes. An ineffective edit means the fix does not change
@@ -375,7 +375,11 @@ def build_specify_prompt(honey_text: str, contract_text: str, codebase_root: str
             "anchor_status=verified only for an anchor copied from that section). If a "
             "value you must anchor is NOT present in the ground truth, put that direction "
             "in `deferred[]` (reason: \"anchor_not_grounded\") rather than guessing — never "
-            "fabricate an anchor from the honey's prose.")
+            "fabricate an anchor from the honey's prose. "
+            "IMPORTANT: an anchor_not_grounded deferred item and an edit for the SAME FILE "
+            "are a CONTRADICTION — a file cannot be both ungroundable and successfully anchored. "
+            "A direction belongs in one place only: edits[] (grounded) OR deferred[] "
+            "(ungrounded). Never emit both for the same file.")
     else:
         lift_block = (
             "[Input honey — lower each fix direction into the edit-spec contracted above]\n"
@@ -735,6 +739,56 @@ def _apply_effectiveness_gate(
     return spec
 
 
+def _apply_anchor_not_grounded_gate(spec: dict[str, Any]) -> dict[str, Any]:
+    """Remove edits that contradict an anchor_not_grounded deferred item for the same file.
+
+    When the author puts a direction in deferred[] with reason=anchor_not_grounded it means
+    the grounding evidence is missing for that target. Emitting an edit for the same file is a
+    logical contradiction — a file cannot be both ungroundable and successfully anchored.
+    Remove the contradictory edit from edits[], keep only the deferred record, log the
+    contradiction, and downgrade a ready_to_apply claim to needs_pm.
+    """
+    deferred = [d for d in (spec.get("deferred") or []) if isinstance(d, dict)]
+
+    ungrounded_files: set[str] = set()
+    for d in deferred:
+        if str(d.get("reason", "")).lower() != "anchor_not_grounded":
+            continue
+        for field in [str(d.get("issue", "") or ""),
+                      *[str(e) for e in (d.get("evidence") or [])]]:
+            for tok in re.findall(r"[A-Za-z0-9_./\\-]+\.[A-Za-z0-9]+", field):
+                ungrounded_files.add(os.path.basename(tok).lower())
+
+    if not ungrounded_files:
+        return spec
+
+    edits = [e for e in (spec.get("edits") or []) if isinstance(e, dict)]
+    contradictory: list[str] = []
+    kept: list[dict] = []
+    for e in edits:
+        ef = str(e.get("file", "") or "").replace("\\", "/")
+        if os.path.basename(ef).lower() in ungrounded_files:
+            contradictory.append(str(e.get("id", "?")))
+        else:
+            kept.append(e)
+
+    if not contradictory:
+        return spec
+
+    logger.warning(
+        "specify: edits %s target file(s) also deferred as anchor_not_grounded — "
+        "removing contradictory edits (cannot both ground and defer-as-ungrounded "
+        "the same anchor)", contradictory)
+    spec["edits"] = kept
+    if spec.get("termination") == "ready_to_apply":
+        spec["termination"] = "needs_pm"
+        note = ("anchor-not-grounded gate: edits %s removed — file also in deferred "
+                "as anchor_not_grounded (contradictory emit)" % contradictory)
+        prev = str(spec.get("notes", "")).strip()
+        spec["notes"] = f"{prev} {note}".strip() if prev else note
+    return spec
+
+
 def _apply_decisiveness_gate(spec: dict[str, Any]) -> dict[str, Any]:
     """Promote a conservatively-authored needs_pm spec to ready_to_apply.
 
@@ -1004,6 +1058,7 @@ def run_specify(
 
     spec = extract_first_json(wr.stdout)  # raises ValueError if no JSON found
     spec = _normalize_spec(spec)
+    spec = _apply_anchor_not_grounded_gate(spec)
 
     # Effectiveness gate: a second, independent pass that refuses to present edits
     # which are anchored but do not change the reported behavior as ready. The

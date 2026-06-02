@@ -569,10 +569,12 @@ def _render_converge_section(converge: dict[str, Any] | None,
             needs = cc.get("need_data_state") or []
             out += [
                 "> Whether this node is the defect depends on stored row/field state "
-                "that static evidence cannot determine. Do NOT guess an edit: surface "
-                "the data state / fixture needed and defer (needs_pm), or author only "
-                "seed-named targets (see the seed-specified targets section below) "
-                "if present.",
+                "that static evidence cannot determine. Do NOT guess an edit: put the "
+                "direction in deferred[] with reason=\"needs_runtime\", naming the "
+                "exact row/field state required (e.g. \"which result_doc_id the target "
+                "row carries, what review status it holds\"), and set "
+                "termination=needs_runtime. Author only seed-named targets "
+                "(see the seed-specified targets section below) if present.",
                 "",
             ]
             if needs:
@@ -596,9 +598,19 @@ def _render_converge_section(converge: dict[str, Any] | None,
             f"- need symbols: {', '.join(need.get('symbols') or []) or '(none)'}",
             f"- need greps: {', '.join(need.get('greps') or []) or '(none)'}",
             "",
-            "> If you cannot author a confident edit, a needs_reinvestigation is "
-            "justified — but it MUST name this missing link (the symbol/hop above), "
-            "not request a blank re-investigation.",
+            "> The missing link above means the call path cannot be traced from static "
+            "evidence alone. Do NOT author an edit for either unconnected node — "
+            "such an edit is ungrounded speculation on a path that has not been verified.",
+            "> - If the link is a RUNTIME question (which code path actually executes "
+            "for this request, which loader key is passed, which row is the active "
+            "head): emit termination=needs_runtime with a deferred[] entry "
+            "(reason: \"needs_runtime\") naming the exact runtime fact that would "
+            "resolve this (e.g. \"which key get_pending passes to the handler\").",
+            "> - If the missing symbol is likely statically resolvable from code: "
+            "emit needs_reinvestigation naming this specific missing hop — not a "
+            "blank re-investigation.",
+            "> NEVER emit both a deferred[anchor_not_grounded] AND an edit for the "
+            "same file.",
             "",
         ]
     return out
