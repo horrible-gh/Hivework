@@ -28,7 +28,7 @@ from hive.assemble import run_assemble
 from hive.specify import run_specify
 from hive.apply import run_apply
 from hive.commit import run_propose, run_commit
-from hive.investigate import render_local_honey, run_investigate
+from hive.investigate import render_local_honey, run_investigate, seed_edit_targets
 from hive import backup as backup_store
 
 
@@ -417,13 +417,18 @@ def run_investigate_command(args: argparse.Namespace) -> None:
     #    then the single specify author lowers it against live code. This is what
     #    lets a create/edit task get its edit-spec WITHOUT swarm fan-out.
     if getattr(args, "specify", False):
-        if located == 0:
-            logger.warning("Skipping chained specify: no located verdict to author "
-                           "an edit from (specify would have nothing to lower).")
+        # The seed may name explicit edit targets even when no axis located one
+        # (Defect 2): those are still authorable from their grounded live text, so
+        # specify must run if EITHER a verdict located something OR the seed pinned
+        # a concrete file target.
+        seed_targets = seed_edit_targets(seed_text, args.codebase, args.docs)
+        if located == 0 and not seed_targets:
+            logger.warning("Skipping chained specify: no located verdict and no "
+                           "seed-named target to author an edit from.")
             return
         honey_path = os.path.splitext(args.out)[0] + ".honey.md"
         with open(honey_path, "w", encoding="utf-8") as f:
-            f.write(render_local_honey(result, seed_text))
+            f.write(render_local_honey(result, seed_text, args.codebase, args.docs))
         logger.info("Local honey rendered (no assemble call): %s", honey_path)
 
         specify_role = cfg.role("specify")
