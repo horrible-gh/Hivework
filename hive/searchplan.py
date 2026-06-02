@@ -178,6 +178,62 @@ def extract_doc_topics(text: str) -> list[str]:
     return _dedupe(codes + phrases)
 
 
+# ── Visibility-class symptom probe (N176) ──────────────────────────────────────
+# A "X is not visible / is disabled / does not render" symptom is produced by the
+# component TEMPLATE's conditional-render branch (a v-if/v-show that evaluates false,
+# an unpopulated v-for option list, a :disabled bind) — NOT by the data/endpoint
+# layer. But such a symptom is usually WORDED about data ("the module isn't accepted"),
+# so the blind keyword extractor hunts only the data path and the template branch never
+# enters the bundle: N176 had two runs conclude "the endpoint already accepts it / the
+# module is bound" with 0 edits, while the real cause was the selector never rendering.
+# The deterministic fix (NOT a queen-prompt plea): when the SEED carries a visibility
+# symptom, add the template conditional-render directives as keywords so that wherever a
+# front-end template file IS in a plan's scope, the branch governing the element's
+# visibility is retrieved and judged. Where no template file is in scope these tokens
+# match nothing — an honest no-op, never a fabricated front-end finding.
+_VISIBILITY_SYMPTOM_RE = re.compile(
+    r"not\s+(?:visible|render(?:ed|ing)?|showing|shown|display(?:ed|ing)?|"
+    r"appear(?:ing|s)?)"
+    r"|(?:isn'?t|aren'?t|doesn'?t|don'?t|won'?t|can'?t|no longer)\s+"
+    r"(?:see|show|shown|render|rendered|appear|appears|display|displayed|visible)"
+    r"|(?:greyed|grayed)\s*out|\bnot\s+enabled\b|\bgreyed\b|\bdisabled\b|\bhidden\b"
+    r"|\binvisible\b"
+    r"|안\s*보|보이지\s*않|표시되지\s*않|렌더(?:링)?\s*(?:안|되지\s*않)"
+    r"|나타나지\s*않|노출되지\s*않|비활성",
+    re.IGNORECASE,
+)
+
+# Low-noise template directives: these rarely false-match outside a front-end template,
+# so adding them to a backend-scoped plan is a harmless no-op. v-for is included because
+# an empty option list ("the selector shows nothing to pick") is the same symptom class.
+_VISIBILITY_KEYWORDS = ("v-if", "v-show", "v-else-if", "v-else", "v-for", ":disabled")
+
+
+def is_visibility_symptom(seed_text: str) -> bool:
+    """True when the seed describes a 'not visible / disabled / not rendered' symptom.
+
+    Deterministic. A false positive only ever causes the low-noise directive keywords
+    below to be added (a no-op where no template is in scope), so the detector is allowed
+    to be generous rather than risk missing the symptom class N176 flagged.
+    """
+    return bool(_VISIBILITY_SYMPTOM_RE.search(seed_text or ""))
+
+
+def with_visibility_probe(plan: SearchPlan) -> SearchPlan:
+    """Return a copy of ``plan`` with the template conditional-render directives added.
+
+    Idempotent and order-preserving: the probe keywords are appended AFTER the plan's own
+    keywords (the queen's precise terms still rank first) and de-duped case-insensitively.
+    Free and deterministic; the caller gates this on :func:`is_visibility_symptom`.
+    """
+    have = {k.lower() for k in plan.keywords}
+    extra = [kw for kw in _VISIBILITY_KEYWORDS if kw.lower() not in have]
+    if not extra:
+        return plan
+    return SearchPlan(axis_id=plan.axis_id, keywords=plan.keywords + extra,
+                      file_globs=plan.file_globs, doc_topics=plan.doc_topics)
+
+
 def task_to_searchplan(task: dict[str, Any], *,
                        default_globs: list[str] | None = None,
                        max_keywords: int = 14) -> SearchPlan:

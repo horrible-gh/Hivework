@@ -33,6 +33,7 @@ from hive.judge import run_judge
 from hive.retriever import _ripgrep, retrieve
 from hive.searchplan import (
     extract_doc_topics, extract_globs, extract_keywords, task_to_searchplan,
+    is_visibility_symptom, with_visibility_probe,
 )
 
 logger = logging.getLogger("hive.investigate")
@@ -381,6 +382,16 @@ def run_investigate(
     # confound (N165) is surfaced ONCE here, before the fan-out — not racily (and
     # possibly multiple times) from inside concurrent workers.
     plans = [task_to_searchplan(task, default_globs=default_globs) for task in judged]
+    # Visibility-class symptom (N176): a "not visible / disabled / not rendered" report
+    # is produced by the component template's conditional-render branch, not the data
+    # layer the brief is usually worded around. Deterministically add the template
+    # directives (v-if/v-show/…) to every plan so the branch is retrieved wherever a
+    # front-end file is in scope — a no-op where none is (never a fabricated finding).
+    if is_visibility_symptom(seed_text):
+        plans = [with_visibility_probe(sp) for sp in plans]
+        logger.info("visibility-class symptom detected — added template conditional-"
+                    "render probe (v-if/v-show/v-for/:disabled) to %d axis plan(s)",
+                    len(plans))
     if docs_root is None:
         # docs=(none) confound (N165): the queen produced doc_topics for an axis but
         # no docs tree was supplied, so the entire design-doc channel is silently

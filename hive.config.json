@@ -1,7 +1,7 @@
 {
   "roles": {
-    "queen":    { "provider": "copilot", "model": "gpt-5.4-mini", "model_old": "gpt-5-mini" },
-    "specify":  { "provider": "codex", "model": "gpt-5.4-mini", "timeout_sec": 900, "retries": 1 },
+    "queen":    { "provider": "codex", "model": "gpt-5.4-mini", "model_old": "gpt-5-mini" },
+    "specify":  { "provider": "copilot", "model": "gpt-5-mini", "timeout_sec": 900, "retries": 1 },
     "review":   { "provider": "deepinfra", "model": "openai/gpt-oss-120b" },
     "judge":    { "provider": "deepinfra", "model": "openai/gpt-oss-120b" },
     "converge": { "provider": "deepinfra", "model": "openai/gpt-oss-120b" },

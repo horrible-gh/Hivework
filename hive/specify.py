@@ -59,7 +59,13 @@ _TOOL_PROVIDERS = frozenset({"copilot"})
 
 # Structural expectations for the emitted edit-spec JSON.
 _REQUIRED_KEYS = ("edits", "deferred", "gate", "termination")
-_VALID_TERMINATION = {"ready_to_apply", "needs_reinvestigation", "needs_pm", "needs_runtime"}
+# CANONICAL termination vocabulary — the single source of truth shared with apply
+# (imported there as VALID_TERMINATION) so the two can never drift. ``needs_runtime`` is
+# first-class: investigate.py instructs the author to emit it when a fix's correctness
+# depends on a runtime fact that cannot be confirmed statically (N174 — apply used to
+# reject it as "invalid" because its copy of this set was stale).
+VALID_TERMINATION = {"ready_to_apply", "needs_reinvestigation", "needs_pm", "needs_runtime"}
+_VALID_TERMINATION = VALID_TERMINATION  # backward-compatible local alias
 _STALE_STATUSES = {"stale", "not_found"}
 
 # Effectiveness-gate outcomes. An ineffective edit means the fix does not change
@@ -400,6 +406,64 @@ forcing an anchor edit against an existing file.
 """
 
 
+def _verify_anchors_live(spec: dict[str, Any], codebase_root: str,
+                         docs_root: str | None = None) -> dict[str, Any]:
+    """Re-read each anchor from LIVE disk and downgrade a false ``verified`` status.
+
+    N175 E7: specify stamped ``anchor_status=verified`` on an edit whose ``anchor_old``
+    was NOT actually present in the live file, and apply only discovered the DRIFT at
+    apply time. The authoring contract already PLEADS "re-confirm byte-for-byte before
+    anchoring" — but a prose plea to a single-shot author is exactly the soft layer that
+    keeps failing. This is the deterministic backstop: for every anchor edit we open the
+    live file and count ``anchor_old``; ``verified`` survives ONLY when the anchor occurs
+    EXACTLY ONCE (the same bar apply applies). 0 occurrences → ``not_found`` (drift);
+    >1 → ``stale`` (ambiguous, cannot target one edit). Both land in ``_STALE_STATUSES``,
+    so ``_normalize_spec`` then downgrades a ready_to_apply spec to needs_reinvestigation.
+
+    Only ever DOWNGRADES — a live read cannot vouch that a non-verified anchor is correct,
+    so a status the author left as stale/not_found/anchor-less is untouched, as is any file
+    we cannot read (apply re-verifies once more against live code regardless). Free, local,
+    deterministic, never raises. ``create_file`` edits have no anchor and are skipped.
+    """
+    roots = [r for r in (codebase_root, docs_root) if r]
+    drifted: list[str] = []
+    for e in spec.get("edits") or []:
+        if not isinstance(e, dict) or e.get("kind", "edit") == "create_file":
+            continue
+        if str(e.get("anchor_status", "")).lower() != "verified":
+            continue  # only a 'verified' claim needs the live cross-check
+        anchor = e.get("anchor_old") or ""
+        rel = e.get("file") or ""
+        if not anchor or not rel:
+            continue
+        text: str | None = None
+        for root in roots:
+            p = os.path.join(root, rel)
+            if os.path.isfile(p):
+                try:
+                    with open(p, "r", encoding="utf-8", errors="replace") as fh:
+                        text = fh.read()
+                except OSError:
+                    text = None
+                break
+        if text is None:
+            continue  # cannot read the live file → leave it; apply re-checks at write
+        count = text.count(anchor)
+        if count == 1:
+            continue  # genuinely verified — anchor is uniquely present in live code
+        new_status = "not_found" if count == 0 else "stale"
+        e["anchor_status"] = new_status
+        e["anchor_drift"] = (
+            f"specify marked verified but anchor_old occurs {count}x in live {rel} "
+            f"(expected exactly 1) — downgraded to {new_status}")
+        drifted.append(str(e.get("id", "?")))
+    if drifted:
+        logger.warning("specify: anchor drift — edits %s claimed 'verified' but their "
+                       "anchor is absent/non-unique in live code; downgraded so the "
+                       "spec is not presented as ready", drifted)
+    return spec
+
+
 def _normalize_spec(spec: dict[str, Any]) -> dict[str, Any]:
     """Enforce Stage-1 invariants and reconcile internal inconsistencies.
 
@@ -482,6 +546,134 @@ def _deterministic_noop_ids(spec: dict[str, Any]) -> list[str]:
         elif _normalize_ws(e.get("anchor_old", "")) == _normalize_ws(e.get("replacement_new", "")):
             noop.append(str(e.get("id", "?")))
     return noop
+
+
+# An import statement (JS/TS/Vue ES or Python) — used to detect a binding that an edit
+# ADDS so we can verify it is actually USED in the post-edit file (N175: an edit added
+# `import { useToast }` but never wrote the `const { showToast } = useToast()` binding,
+# so the imported name was dead and the call site stayed unwired, yet it was applied).
+_RE_ES_NAMED = re.compile(r"""\bimport\b[^'"]*\{([^}]*)\}\s*from\s*['"]""")
+_RE_ES_DEFAULT = re.compile(r"""\bimport\s+([A-Za-z_$][\w$]*)\s*(?:,\s*\{[^}]*\})?\s*from\s*['"]""")
+_RE_ES_NS = re.compile(r"""\bimport\s+\*\s+as\s+([A-Za-z_$][\w$]*)\s+from\s*['"]""")
+_RE_PY_FROM = re.compile(r"^\s*from\s+[\w.]+\s+import\s+(.+)$")
+_RE_PY_IMPORT = re.compile(r"^\s*import\s+([\w.]+)(?:\s+as\s+([\w$]+))?\s*$")
+
+
+def _imported_names(line: str) -> list[str]:
+    """Return the binding name(s) an import LINE introduces, or [] if it is not an import.
+
+    Conservative: only the well-formed import shapes are parsed; anything ambiguous yields
+    [] so the completeness check never fires on a line it did not fully understand.
+    """
+    names: list[str] = []
+    def _split_clause(clause: str) -> list[str]:
+        out = []
+        for part in clause.split(","):
+            p = part.strip()
+            if not p:
+                continue
+            # "a as b" / "a AS b" → the local binding is b
+            m = re.match(r"^([\w$]+)\s+as\s+([\w$]+)$", p)
+            out.append(m.group(2) if m else p.split()[0] if p.split() else p)
+        return [n for n in out if re.fullmatch(r"[A-Za-z_$][\w$]*", n)]
+    m = _RE_ES_NAMED.search(line)
+    if m:
+        names += _split_clause(m.group(1))
+    m = _RE_ES_DEFAULT.search(line)
+    if m:
+        names.append(m.group(1))
+    m = _RE_ES_NS.search(line)
+    if m:
+        names.append(m.group(1))
+    m = _RE_PY_FROM.match(line)
+    if m:
+        clause = m.group(1).split("#", 1)[0].strip().strip("()")
+        names += _split_clause(clause)
+    else:
+        m = _RE_PY_IMPORT.match(line.split("#", 1)[0])
+        if m:
+            names.append(m.group(2) or m.group(1).split(".")[0])
+    # de-dup, drop empties
+    seen, out = set(), []
+    for n in names:
+        if n and n not in seen:
+            seen.add(n); out.append(n)
+    return out
+
+
+def _post_edit_files(spec: dict[str, Any], codebase_root: str) -> dict[str, str]:
+    """Best-effort reconstruction of each touched file's POST-edit text.
+
+    create_file → its content; anchor edits → the live file with each anchor_old replaced
+    by replacement_new (applied in spec order). A file we cannot read, or an anchor not
+    found in it, is skipped for that edit — the completeness check then simply does not run
+    for it (never a false positive on a file we could not assemble).
+    """
+    by_file: dict[str, str] = {}
+    for e in spec.get("edits") or []:
+        if not isinstance(e, dict):
+            continue
+        f = e.get("file") or ""
+        if not f:
+            continue
+        if e.get("kind", "edit") == "create_file":
+            by_file[f] = e.get("content") or ""
+            continue
+        if f not in by_file:
+            path = os.path.join(codebase_root, f)
+            try:
+                with open(path, "r", encoding="utf-8") as fh:
+                    by_file[f] = fh.read()
+            except OSError:
+                by_file[f] = None  # unreadable → mark, skip below
+        if by_file.get(f) is None:
+            continue
+        old, new = e.get("anchor_old") or "", e.get("replacement_new") or ""
+        if old and old in by_file[f]:
+            by_file[f] = by_file[f].replace(old, new, 1)
+    return {f: t for f, t in by_file.items() if t is not None}
+
+
+def _incomplete_wiring_ids(spec: dict[str, Any], codebase_root: str) -> dict[str, str]:
+    """Edit ids whose ADDED import binding is never used in the post-edit file → id→reason.
+
+    The deterministic completeness half of the gate (N175): adding an import is only half a
+    wiring; if the imported name is dead in the assembled file, the call it was meant to
+    enable is unbound and the edit does not work. We flag per file using the FULL post-edit
+    text, so an import added in one edit but used by a sibling edit's code is NOT flagged.
+    Anything we cannot assemble or parse is left alone — completeness only fires on a
+    provably-unused added import.
+    """
+    if not codebase_root:
+        return {}
+    files = _post_edit_files(spec, codebase_root)
+    incomplete: dict[str, str] = {}
+    for e in spec.get("edits") or []:
+        if not isinstance(e, dict):
+            continue
+        f = e.get("file") or ""
+        if f not in files:
+            continue
+        added_text = (e.get("content") if e.get("kind", "edit") == "create_file"
+                      else e.get("replacement_new")) or ""
+        old_text = e.get("anchor_old") or ""
+        # names this edit introduces via a NEW import line (absent from its anchor_old)
+        added_names: list[str] = []
+        for line in added_text.splitlines():
+            if line in old_text:
+                continue
+            added_names += _imported_names(line)
+        if not added_names:
+            continue
+        # strip every import line from the post-edit file, then look for real usage
+        body = "\n".join(ln for ln in files[f].splitlines() if not _imported_names(ln))
+        for name in added_names:
+            if not re.search(rf"\b{re.escape(name)}\b", body):
+                incomplete[str(e.get("id", "?"))] = (
+                    f"incomplete wiring — imported {name!r} is never used "
+                    f"(binding/call site missing)")
+                break
+    return incomplete
 
 
 # How many lines of a create_file's content to surface to the effectiveness
@@ -571,7 +763,15 @@ For every edit decide three booleans, applying the criterion that matches the ed
 behavior the honey identified as wrong? An edit that is functionally inert — a no-op \
 assignment, a guard whose condition can never be true, a value set to what it already is, \
 a change with no runtime effect — is effective=false EVEN THOUGH its anchor is valid. \
-Re-open the live files to judge reachability and effect; do not assume.
+Re-open the live files to judge reachability and effect; do not assume. \
+CRUCIAL — judge each edit AS PART OF THE WHOLE EDIT SET, not in isolation. A correct fix \
+is often WIRED ACROSS FILES (e.g. a back-end guard in one file PLUS the front-end toast \
+that surfaces it in another, or an import in one edit and the binding/call it enables in \
+a sibling edit). An edit that is a NECESSARY part of such a multi-edit wiring is \
+effective=true when the SET together produces the corrected behavior — do NOT mark it \
+effective=false merely because that one edit ALONE does not fully reproduce the symptom \
+fix. Reserve effective=false for an edit that contributes NOTHING to the behavior even \
+when taken together with the others (truly inert / unreachable / redundant).
   - create_file edit (kind "create_file"): effective=true when a non-empty file is created \
 in direct response to the honey's directions; effective=false if the content is empty or \
 whitespace-only, or the honey did not ask for a new file at this path.
@@ -671,6 +871,7 @@ def _apply_effectiveness_gate(
     noop_ids: list[str],
     judgments: dict[str, dict],
     inconclusive: bool,
+    incomplete_wiring: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """Downgrade a ready spec that contains ineffective edits or could not be verified.
 
@@ -684,7 +885,10 @@ def _apply_effectiveness_gate(
     """
     edits = [e for e in (spec.get("edits") or []) if isinstance(e, dict)]
     noop_set = {str(x) for x in noop_ids}
+    incomplete = {str(k): v for k, v in (incomplete_wiring or {}).items()}
     ineffective: dict[str, str] = {}
+    certain_ids: set[str] = set()      # deterministic findings (no-op / incomplete wiring)
+    review_flagged: set[str] = set()   # findings from the LLM review only
     for e in edits:
         eid = str(e.get("id", "?"))
         if eid in noop_set:
@@ -692,13 +896,22 @@ def _apply_effectiveness_gate(
                 ineffective[eid] = "no-op (create_file content is empty or whitespace-only)"
             else:
                 ineffective[eid] = "no-op (whitespace-normalized anchor == replacement)"
+            certain_ids.add(eid)
+            continue
+        # Deterministic completeness (N175): an added import nobody uses means the
+        # wiring is half-done — flag it the same way as a no-op (the fix won't work).
+        if eid in incomplete:
+            ineffective[eid] = incomplete[eid]
+            certain_ids.add(eid)
             continue
         j = judgments.get(eid)
         if isinstance(j, dict):
             if j.get("effective") is False:
                 ineffective[eid] = "review: ineffective — " + str(j.get("reason", "")).strip()
+                review_flagged.add(eid)
             elif j.get("coherent") is False:
                 ineffective[eid] = "review: incoherent — " + str(j.get("reason", "")).strip()
+                review_flagged.add(eid)
             elif j.get("in_scope") is False:
                 # Effective+coherent but over-applies (edits a shared rule / broad
                 # selector beyond the seed's named target) — a regression, so loop
@@ -719,12 +932,37 @@ def _apply_effectiveness_gate(
         return spec  # never upgrade — only a ready claim needs guarding
 
     if ineffective:
-        logger.warning("specify: edits %s do not change the reported behavior but "
-                       "termination=ready_to_apply — overriding to %s",
-                       sorted(ineffective), _INEFFECTIVE_TERMINATION)
-        spec["termination"] = _INEFFECTIVE_TERMINATION
-        note = "effectiveness gate: " + "; ".join(
-            f"{k} {v}" for k, v in sorted(ineffective.items()))
+        # Routing (N174 #3): deterministic findings (no-op / incomplete wiring) and
+        # over-scope regressions are CERTAIN → loop back (needs_reinvestigation). But a
+        # review-ONLY "ineffective"/"incoherent" verdict on edits that are all VERIFIED and
+        # part of a CROSS-FILE wiring is unreliable — the reviewer may have judged an edit
+        # in isolation and missed that a back-end guard pairs with a front-end toast in
+        # another file. Do NOT declare a verified fix wrong and loop on that basis; defer
+        # to a human (needs_pm) instead. Only applies when there is NO certain finding and
+        # every flagged id came from the review.
+        distinct_files = {e.get("file") for e in edits if e.get("file")}
+        only_review = bool(review_flagged) and not certain_ids and \
+            set(ineffective) == review_flagged
+        flagged_all_verified = all(
+            str(e.get("anchor_status", "")).lower() == "verified"
+            for e in edits if str(e.get("id", "?")) in review_flagged)
+        if only_review and len(distinct_files) > 1 and flagged_all_verified:
+            logger.warning("specify: review flagged %s as ineffective, but these are "
+                           "VERIFIED edits in a cross-file wiring — deferring to %s "
+                           "(not declaring the fix wrong)",
+                           sorted(review_flagged), _INCONCLUSIVE_TERMINATION)
+            spec["termination"] = _INCONCLUSIVE_TERMINATION
+            note = ("effectiveness gate: review judged " + ", ".join(sorted(review_flagged))
+                    + " ineffective in isolation, but they are verified edits in a "
+                    "cross-file wiring — a human must confirm before applying rather than "
+                    "looping back")
+        else:
+            logger.warning("specify: edits %s do not change the reported behavior but "
+                           "termination=ready_to_apply — overriding to %s",
+                           sorted(ineffective), _INEFFECTIVE_TERMINATION)
+            spec["termination"] = _INEFFECTIVE_TERMINATION
+            note = "effectiveness gate: " + "; ".join(
+                f"{k} {v}" for k, v in sorted(ineffective.items()))
     elif inconclusive:
         logger.warning("specify: effectiveness review inconclusive — downgrading "
                        "ready_to_apply to %s (human must confirm)", _INCONCLUSIVE_TERMINATION)
@@ -945,10 +1183,12 @@ def _review_and_gate(
 ) -> dict[str, Any]:
     """Run both halves of the effectiveness gate and adjust the spec's termination."""
     noop_ids = _deterministic_noop_ids(spec)
+    incomplete_wiring = _incomplete_wiring_ids(spec, codebase_root)
     judgments, inconclusive = review_effectiveness(
         honey_text, spec, codebase_root, model, provider, ledger, provider_kwargs,
         docs_root=docs_root)
-    return _apply_effectiveness_gate(spec, noop_ids, judgments, inconclusive)
+    return _apply_effectiveness_gate(spec, noop_ids, judgments, inconclusive,
+                                     incomplete_wiring)
 
 
 def run_specify(
@@ -1057,6 +1297,10 @@ def run_specify(
         break
 
     spec = extract_first_json(wr.stdout)  # raises ValueError if no JSON found
+    # Deterministic anchor drift check FIRST: re-read each 'verified' anchor from live
+    # disk and downgrade any that is absent/non-unique, so _normalize_spec's stale-anchor
+    # rule then refuses to present it as ready (N175 E7 — verified-without-live-recheck).
+    spec = _verify_anchors_live(spec, codebase_root, docs_root)
     spec = _normalize_spec(spec)
     spec = _apply_anchor_not_grounded_gate(spec)
 

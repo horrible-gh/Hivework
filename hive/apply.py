@@ -42,10 +42,11 @@ import tempfile
 from typing import Any
 
 from hive import backup as backup_store
+# Share the ONE canonical termination vocabulary with specify so apply never rejects a
+# value specify legitimately emits (N174: 'needs_runtime' was missing from apply's copy).
+from hive.specify import VALID_TERMINATION as _VALID_TERMINATION
 
 logger = logging.getLogger("hive.apply")
-
-_VALID_TERMINATION = {"ready_to_apply", "needs_reinvestigation", "needs_pm"}
 
 # Per-edit applicability statuses (only "applicable" can contribute to a ready verdict).
 APPLICABLE = "applicable"

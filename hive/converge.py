@@ -293,7 +293,12 @@ def build_converge_prompt(seed_text: str, located: list[dict[str, Any]],
             "causal_check.data_reads use ONLY names that appear here; never invent or "
             "ABBREVIATE a name (e.g. do NOT shorten \"workflow_sequence_items\" to "
             "\"items\"). If a name you need is NOT in this list, the deciding data is not "
-            "in this DB — emit a missing_link instead of guessing a name.]\n"
+            "in this DB — emit a missing_link instead of guessing a name.\n"
+            "CROSS-CHECK schema-shape claims against THIS list before attributing a defect "
+            "to one (N176): if the suspected cause is that a column/table is MISSING, "
+            "RENAMED, or MISMATCHED, but the object IS present here, that hypothesis is "
+            "CONTRADICTED — set causal_check.verdict=\"contradicted\" and look elsewhere; "
+            "do NOT make a refuted schema claim the attributed defect.]\n"
             + db_schema.strip() + "\n")
 
     return f"""[Role] You are the CONVERGER for a Hivework investigation. Independent \
@@ -350,7 +355,12 @@ read's ``where``, reference an earlier result with ``{{"from": "<that id>", "col
 "<column to carry over>"}}`` instead of a literal — the pipeline runs the reads in order \
 and feeds each result into the next (it issues plain single-table SELECTs, so express a \
 join as such a chain, e.g. read the rows, then read the joined table by the id column \
-they carried). When the attributed defect is an ORDER BY / LIMIT / "which row is \
+they carried). Use ONLY a row selector value that actually appears in the scenario (a \
+business key like the document id). Do NOT hardcode an INTERNAL key you cannot see there \
+(e.g. ``sequence_id = 1``) — that is a guess that silently reads the wrong row; instead \
+derive it by CHAINING from the scenario's key (read the parent table by the doc_id to get \
+its internal id, then read the child by that id). When the attributed defect is an ORDER \
+BY / LIMIT / "which row is \
 selected first" decision, the read window is SMALL (a few rows) — so do NOT dump the \
 whole sibling set hoping the winner is in it. Instead aim the WHERE at the rows that \
 would RANK FIRST: filter by the ordering's LEADING predicate (the column the ORDER BY \
@@ -660,25 +670,31 @@ def _resolve_where(where: dict[str, Any],
     return resolved, ""
 
 
-def _schema_block(db_conn) -> str:
-    """Render the live DB's ``table(col, col, …)`` schema for the prompt; '' on any failure.
+def _introspect_schema(db_conn) -> dict[str, list[str]]:
+    """Read the live DB's ``{table: [columns…]}`` once; ``{}`` on any failure.
 
-    Read once per converge and handed to every pass so the converger names REAL objects
-    in its data_reads (NR174). Introspection failure degrades silently to no block — the
-    converger then falls back to names from the code evidence, exactly as before.
+    The single source of truth for BOTH the injected prompt block (so the converger names
+    REAL objects, NR174) and the pre-execution read guard (so a hallucinated table/column
+    is rejected before it becomes broken SQL). Failure degrades silently to ``{}`` — the
+    converger then falls back to names from the code evidence and the guard is a no-op,
+    exactly as before introspection existed.
     """
     if db_conn is None:
-        return ""
+        return {}
     try:
         from hive.dbread import list_schema
     except Exception as e:  # pragma: no cover - import guard
-        logger.warning("converge: dbread unavailable (%s) — no schema injected", e)
-        return ""
+        logger.warning("converge: dbread unavailable (%s) — no schema", e)
+        return {}
     try:
-        schema = list_schema(db_conn)
+        return list_schema(db_conn)
     except Exception as e:
-        logger.warning("converge: schema introspection failed (%s) — none injected", e)
-        return ""
+        logger.warning("converge: schema introspection failed (%s) — no schema", e)
+        return {}
+
+
+def _render_schema_block(schema: dict[str, list[str]]) -> str:
+    """Render ``{table: [cols]}`` as the prompt's ``- table(col, col, …)`` lines."""
     lines = []
     for t in sorted(schema):
         cols = ", ".join(schema[t])
@@ -686,7 +702,32 @@ def _schema_block(db_conn) -> str:
     return "\n".join(lines)
 
 
-def _run_data_reads(data_reads: list[dict[str, Any]], db_conn) -> tuple[str, bool]:
+def _validate_read(spec: dict[str, Any], schema: dict[str, list[str]]) -> str:
+    """Pre-execution guard: check a read's table/columns exist in the live schema.
+
+    Returns "" when the read is safe to run (or when ``schema`` is empty — no schema means
+    no basis to reject, so we degrade to running it). Otherwise returns a human note naming
+    the first unknown identifier. This catches the NR174 hallucinations — a wrong table
+    (``items`` for ``workflow_sequence_items``) and an invented column (``WHERE column =
+    'result_doc_id'``) — BEFORE they become a SELECT, so the read is skipped honestly
+    instead of failing with a SQL error or silently matching nothing.
+    """
+    if not schema:
+        return ""
+    table = (spec.get("table") or "").strip()
+    if table not in schema:
+        return f"unknown table {table!r} (not in live schema)"
+    cols_ok = set(schema[table])
+    # every named output column and every where-key must be a real column of this table
+    named = list(spec.get("columns") or []) + list((spec.get("where") or {}).keys())
+    for c in named:
+        if c not in cols_ok:
+            return f"unknown column {c!r} on table {table!r} (not in live schema)"
+    return ""
+
+
+def _run_data_reads(data_reads: list[dict[str, Any]], db_conn,
+                    schema: dict[str, list[str]] | None = None) -> tuple[str, bool]:
     """Run the converger's ``data_reads`` against the live DB; return (block, any_rows).
 
     Deterministic glue — NOT a model call. Reads run IN ORDER so later ones can CHAIN on
@@ -715,6 +756,14 @@ def _run_data_reads(data_reads: list[dict[str, Any]], db_conn) -> tuple[str, boo
     for idx, spec in enumerate(data_reads):
         table = spec.get("table", "")
         rid = spec.get("id") or f"read{idx}"
+        # Guard FIRST: reject a hallucinated table/column against the live schema before
+        # it becomes broken SQL (NR174). A skipped read is recorded honestly, never run.
+        bad = _validate_read(spec, schema or {})
+        if bad:
+            logger.info("converge: data read %r rejected by schema guard — %s", rid, bad)
+            lines.append(f"- read {rid} on {table}: skipped ({bad})")
+            by_id[rid] = []
+            continue
         resolved, skip = _resolve_where(spec.get("where") or {}, by_id)
         if skip:
             logger.info("converge: chained read %r skipped — %s", rid, skip)
@@ -792,8 +841,10 @@ def run_converge(*, seed_text: str, verdicts: list[dict[str, Any]],
     pk.setdefault("available_tools", [])
 
     db_available = db_conn is not None
-    # Introspect the live schema ONCE so every pass names real tables/columns (NR174).
-    db_schema = _schema_block(db_conn)
+    # Introspect the live schema ONCE: feeds BOTH the prompt block (name real objects,
+    # NR174) and the pre-execution read guard (reject hallucinated table/columns).
+    schema_map = _introspect_schema(db_conn)
+    db_schema = _render_schema_block(schema_map)
     res = _converge_once(seed_text, located, unlocated, windows, known,
                          provider, model, pk, ledger, timeout,
                          db_available=db_available, db_schema=db_schema)
@@ -831,7 +882,7 @@ def run_converge(*, seed_text: str, verdicts: list[dict[str, Any]],
         seen_sigs.add(sig)
         data_attempted = True
         rounds += 1
-        block, backed = _run_data_reads(pending, db_conn)
+        block, backed = _run_data_reads(pending, db_conn, schema_map)
         block_parts.append(block)
         data_backed = data_backed or backed
         logger.info("converge: data read round %d → %d row-set(s), rows=%s",
@@ -843,17 +894,28 @@ def run_converge(*, seed_text: str, verdicts: list[dict[str, Any]],
                               db_schema=db_schema)
         logger.info("converge: data re-pass %d → %s", rounds, res2.summary)
         v2 = (res2.causal_check or {}).get("verdict")
-        if v2 in ("consistent", "contradicted"):
-            # Fact-grounded RULING (either way) wins over an assumed verdict — done.
+        if v2 in ("consistent", "contradicted") and backed:
+            # Fact-grounded RULING (rows were ACTUALLY read) wins over an assumed
+            # verdict — done. Gated on ``backed``: a verdict claimed over an EMPTY
+            # read is not fact-grounded (N173 fabrication risk), so it does not count
+            # as a ruling — it falls through to the "failed to strengthen" branch.
             res = res2
             data_ruled = True
             break
-        # Still can't rule on what came back. Adopt the re-pass and LOOP if it NAMES a
-        # different/narrower read — the agentic "add a condition and read again" step
-        # (e.g. the first set was TRUNCATED, or the deciding row wasn't in the window).
-        # When it stops naming reads, the loop ends and the verdict degrades honestly —
-        # never a fabricated value (the honey shows exactly what was read).
-        res = res2
+        # The re-pass could NOT rule on fact: the read came back empty/failed, or the
+        # model still cannot decide. Per N174 #2 this is a FAILED CONFIRMATION, not a
+        # convergence CANCELLATION — "data unavailable" must never DOWNGRADE the prior
+        # static result. So we do NOT overwrite a converged ``res`` with this weaker
+        # re-pass, and we never let an UNBACKED re-pass PROMOTE to converged (a
+        # "consistent" claimed on rows we could not read is the N173 fiction). We adopt
+        # the re-pass ONLY to carry its latest reasoning forward when NEITHER side is a
+        # trustworthy convergence — and LOOP if it NAMED a different/narrower read (the
+        # agentic "add a condition and read again" step: the first set was TRUNCATED, or
+        # the deciding row wasn't in the window). The honey still shows exactly what was
+        # read, so a kept-static verdict is reported as "data confirmation attempted but
+        # unavailable", never as a fabricated value.
+        if not res.converged and not res2.converged:
+            res = res2
         pending = (res2.causal_check or {}).get("data_reads") or []
     data_block = "\n\n".join(p for p in block_parts if p)
 
