@@ -5,6 +5,9 @@ investigate = fanout (swarm)  →  merge = parse/conflict-scan/reconcile/assembl
 →  SPECIFY = honey + live code → edit-spec   ← this contract (hive/specify.py)
 →  apply  = render diff, run gate, propose    ← hive/apply.py (Stage 1: propose only)
 
+[Caller-supplied context — the requester's own words, if present]
+The honey may carry a "## Caller-supplied context (requester's direct input)" section: the requester's direct message/hints. Treat its stated INTENT and VALUES as authoritative requirements (what the change must achieve, e.g. a target color/position/copy) — these resolve direction the honey left ambiguous, so prefer them over guessing and do NOT defer to needs_pm merely because the honey's prose was vague when this section answers it. BUT any claim it makes about WHERE code lives is only a HINT: the cardinal rule still holds — re-open the live file and verify, never anchor on the requester's prose alone.
+
 [Cardinal rule — anchors come from LIVE code, never from the honey]
 For every edit you MUST re-open the real file in the codebase and lift `anchor_old` from the CURRENT text, byte-for-byte. Do NOT copy code quoted inside the honey: the honey may be stale.
 - If the live text matches what the honey assumed → anchor_status = "verified".
