@@ -57,6 +57,14 @@ _REPO_ROOT = os.path.dirname(os.path.abspath(_DEFAULT_CONFIG_PATH))
 class RoleConfig:
     provider: str = "copilot"
     model: str = "gpt-5-mini"
+    # Optional per-role worker overrides. ``timeout_sec=None`` means the caller's
+    # built-in default applies (e.g. run_specify's 600s author cap). ``retries`` is
+    # how many EXTRA attempts a transient worker failure (timeout / non-zero exit /
+    # empty output) gets before the stage gives up — 0 preserves single-shot
+    # behavior. Surfaced per-role because a slow agentic CLI (codex specify author)
+    # needs a different cap than a fast tool-OFF API call (T892 timeout).
+    timeout_sec: int | None = None
+    retries: int = 0
 
 
 @dataclass
@@ -185,8 +193,11 @@ def load_config(path: str | None = None) -> Config:
 
     def _role(name: str, default_model: str = "gpt-5-mini") -> RoleConfig:
         r = roles.get(name, {})
+        timeout = r.get("timeout_sec")
         return RoleConfig(provider=r.get("provider", "copilot"),
-                          model=r.get("model", default_model))
+                          model=r.get("model", default_model),
+                          timeout_sec=int(timeout) if timeout is not None else None,
+                          retries=int(r.get("retries", 0)))
 
     return Config(
         queen=_role("queen"),

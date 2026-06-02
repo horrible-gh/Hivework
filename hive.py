@@ -301,6 +301,10 @@ def run_pipeline(args: argparse.Namespace) -> None:
             logger.info("STAGE ⑦ specify (chained — honey → edit-spec, propose only)")
             logger.info("─" * 60)
             spec_out = args.spec_out or (os.path.splitext(args.out)[0] + ".edit_spec.json")
+            review_role = cfg.role("review")
+            specify_kwargs = dict(author_retries=specify_role.retries)
+            if specify_role.timeout_sec is not None:
+                specify_kwargs["author_timeout"] = specify_role.timeout_sec
             try:
                 spec = run_specify(
                     honey_path=honey_path,
@@ -309,17 +313,24 @@ def run_pipeline(args: argparse.Namespace) -> None:
                     contract_path=args.contract,
                     model=specify_role.model,
                     provider=specify_role.provider,
+                    review_model=review_role.model,
+                    review_provider=review_role.provider,
                     ledger=ldg,
                     provider_kwargs=provider_kwargs,
+                    **specify_kwargs,
                 )
                 logger.info("Edit-spec: %s (%d edits, %d deferred, termination=%s)",
                             spec_out, len(spec.get("edits") or []),
                             len(spec.get("deferred") or []), spec.get("termination", "?"))
             except Exception as e:
                 # The honey is the valuable artifact and is already on disk; a
-                # specify hiccup must not lose it. Surface, but don't fail the run.
+                # specify hiccup must not lose it. Persist a resume marker (partial-
+                # save) so specify can re-run from it without re-investigating.
+                resume_path = _write_specify_resume(
+                    honey_path, spec_out, specify_role, review_role, args, str(e))
                 logger.error("Chained specify failed (honey is intact at %s): %s",
                              honey_path, e)
+                logger.error("Resume specify WITHOUT re-investigating: %s", resume_path)
 
         ldg.finish_run(
             honey_path=honey_path,
@@ -348,6 +359,45 @@ def run_pipeline(args: argparse.Namespace) -> None:
     logger.info("  Remaining conflicts: %d", len(remaining_conflicts))
     logger.info("  Parse errors: %d", len(parse_errors))
     logger.info("=" * 60)
+
+
+def _write_specify_resume(honey_path, spec_out, specify_role, review_role, args,
+                          error: str) -> str:
+    """Persist a resume marker so a failed chained specify can be re-run from the
+    SAVED honey, skipping decompose→retrieve→judge entirely.
+
+    The honey IS the investigate stage's full output and is already on disk; this
+    marker just records the exact standalone-``specify`` invocation that reproduces
+    the chained author/review against it. Best-effort: a write failure must not mask
+    the original specify error, so any OSError is swallowed.
+    """
+    resume_path = os.path.splitext(spec_out)[0] + ".specify_resume.json"
+    marker = {
+        "stage": "specify",
+        "reason": "chained specify failed — investigate output (honey) is intact",
+        "error": error,
+        "honey_path": os.path.abspath(honey_path),
+        "spec_out": os.path.abspath(spec_out),
+        "codebase": os.path.abspath(args.codebase),
+        "docs": os.path.abspath(args.docs) if getattr(args, "docs", None) else None,
+        "specify": {"provider": specify_role.provider, "model": specify_role.model,
+                    "timeout_sec": specify_role.timeout_sec, "retries": specify_role.retries},
+        "review": {"provider": review_role.provider, "model": review_role.model},
+        "resume_cmd": (
+            f"{sys.executable} {os.path.abspath(__file__)} specify "
+            f"--honey {os.path.abspath(honey_path)} "
+            f"--codebase {os.path.abspath(args.codebase)} "
+            f"--out {os.path.abspath(spec_out)}"
+            + (f" --docs {os.path.abspath(args.docs)}" if getattr(args, "docs", None) else "")
+        ),
+    }
+    try:
+        os.makedirs(os.path.dirname(os.path.abspath(resume_path)), exist_ok=True)
+        with open(resume_path, "w", encoding="utf-8") as f:
+            json.dump(marker, f, indent=2, ensure_ascii=False)
+    except OSError:
+        pass
+    return resume_path
 
 
 def run_investigate_command(args: argparse.Namespace) -> None:
@@ -440,20 +490,31 @@ def run_investigate_command(args: argparse.Namespace) -> None:
         ldg2 = open_ledger(cfg.ledger.enabled, cfg.ledger.db_path)
         try:
             review_role = cfg.role("review")
+            specify_kwargs = dict(author_retries=specify_role.retries)
+            if specify_role.timeout_sec is not None:
+                specify_kwargs["author_timeout"] = specify_role.timeout_sec
             spec = run_specify(
                 honey_path=honey_path, codebase_root=args.codebase,
                 docs_root=args.docs,
                 output_path=spec_out, contract_path=args.contract,
                 model=specify_role.model, provider=specify_role.provider,
                 review_model=review_role.model, review_provider=review_role.provider,
-                ledger=ldg2, provider_kwargs=provider_kwargs,
+                ledger=ldg2, provider_kwargs=provider_kwargs, **specify_kwargs,
             )
             logger.info("Edit-spec: %s (%d edits, %d deferred, termination=%s)",
                         spec_out, len(spec.get("edits") or []),
                         len(spec.get("deferred") or []), spec.get("termination", "?"))
         except Exception as e:
+            # Partial-save: the honey (the whole investigate stage's output) is
+            # already on disk, so specify can be RESUMED from it without re-running
+            # decompose→retrieve→judge. Drop a resume marker next to the honey that
+            # records exactly how, so a single slow/failed author call does not force
+            # a full re-investigate (T892).
+            resume_path = _write_specify_resume(
+                honey_path, spec_out, specify_role, review_role, args, str(e))
             logger.error("Chained specify failed (verdicts + honey intact at %s): %s",
                          honey_path, e)
+            logger.error("Resume specify WITHOUT re-investigating: %s", resume_path)
         finally:
             ldg2.close()
 
@@ -492,6 +553,9 @@ def run_specify_command(args: argparse.Namespace) -> None:
     ldg = open_ledger(cfg.ledger.enabled, cfg.ledger.db_path)
     ldg.start_run(seed=args.honey, codebase=args.codebase,
                   model_queen=role.model, model_swarm=role.model)
+    specify_kwargs = dict(author_retries=role.retries)
+    if role.timeout_sec is not None:
+        specify_kwargs["author_timeout"] = role.timeout_sec
     spec: dict = {}
     try:
         spec = run_specify(
@@ -506,6 +570,7 @@ def run_specify_command(args: argparse.Namespace) -> None:
             review_provider=review_role.provider,
             ledger=ldg,
             provider_kwargs=provider_kwargs,
+            **specify_kwargs,
         )
         ldg.finish_run(honey_path=args.out, axes_n=len(spec.get("edits") or []),
                        status="done")
