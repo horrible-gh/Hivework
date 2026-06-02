@@ -14,7 +14,7 @@ Token accounting tiers:
                            and code metrics but no prompt/completion token fields).
                           Column is kept nullable for future providers.
 """
-import logging, os, sqlite3, time
+import logging, os, sqlite3, threading, time
 from datetime import datetime, timezone
 from typing import Any
 
@@ -59,6 +59,12 @@ class Ledger:
         self._run_id: int | None = None
         self._calls: list[dict[str, Any]] = []
         self._start_ts = time.time()
+        # The connection is opened ``check_same_thread=False`` so the parallel
+        # per-axis judge fan-out (hive.investigate) can record from worker threads.
+        # SQLite serialises its own writes, but two threads sharing ONE connection
+        # can still interleave statements; this lock serialises every connection
+        # access so concurrent ``record_call``s are safe and lossless.
+        self._lock = threading.Lock()
         self._connect()
 
     def _connect(self) -> None:
@@ -77,12 +83,13 @@ class Ledger:
             return
         ts = ts or datetime.now(timezone.utc).isoformat()
         try:
-            cur = self._conn.execute(
-                "INSERT INTO runs (ts, seed, work_type, codebase, model_queen, model_swarm, status)"
-                " VALUES (?,?,?,?,?,?,?)",
-                (ts, seed, "investigate", codebase, model_queen, model_swarm, "running"))
-            self._conn.commit()
-            self._run_id = cur.lastrowid
+            with self._lock:
+                cur = self._conn.execute(
+                    "INSERT INTO runs (ts, seed, work_type, codebase, model_queen, model_swarm, status)"
+                    " VALUES (?,?,?,?,?,?,?)",
+                    (ts, seed, "investigate", codebase, model_queen, model_swarm, "running"))
+                self._conn.commit()
+                self._run_id = cur.lastrowid
         except Exception as e:
             logger.warning("Ledger: start_run failed: %s", e)
 
@@ -102,18 +109,19 @@ class Ledger:
         out_chars = len(output)
         est_tokens = estimate_tokens(prompt) + estimate_tokens(output)
         try:
-            self._conn.execute(
-                "INSERT INTO worker_calls"
-                " (run_id, stage, axis_id, provider, model,"
-                "  in_chars, out_chars, est_tokens, real_tokens,"
-                "  latency_s, comb_path, ok, err)"
-                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                (self._run_id, stage, axis_id, provider, model,
-                 in_chars, out_chars, est_tokens, real_tokens,
-                 latency_s, comb_path, int(ok), err))
-            self._conn.commit()
-            self._calls.append({"in_chars": in_chars, "out_chars": out_chars,
-                                "est": est_tokens, "real": real_tokens})
+            with self._lock:
+                self._conn.execute(
+                    "INSERT INTO worker_calls"
+                    " (run_id, stage, axis_id, provider, model,"
+                    "  in_chars, out_chars, est_tokens, real_tokens,"
+                    "  latency_s, comb_path, ok, err)"
+                    " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (self._run_id, stage, axis_id, provider, model,
+                     in_chars, out_chars, est_tokens, real_tokens,
+                     latency_s, comb_path, int(ok), err))
+                self._conn.commit()
+                self._calls.append({"in_chars": in_chars, "out_chars": out_chars,
+                                    "est": est_tokens, "real": real_tokens})
         except Exception as e:
             logger.warning("Ledger: record_call failed: %s", e)
 
@@ -132,14 +140,15 @@ class Ledger:
         reals = [c["real"] for c in self._calls if c.get("real") is not None]
         total_real = sum(reals) if reals else None
         try:
-            self._conn.execute(
-                "UPDATE runs SET axes_n=?, rounds=?, conflicts_n=?, remaining_n=?, parse_errs=?,"
-                " total_in_chars=?, total_out_chars=?, total_est_tokens=?, total_real_tokens=?,"
-                " elapsed_s=?, honey_path=?, status=? WHERE id=?",
-                (axes_n, rounds, conflicts_n, remaining_n, parse_errs,
-                 total_in, total_out, total_est, total_real,
-                 elapsed_s, honey_path, status, self._run_id))
-            self._conn.commit()
+            with self._lock:
+                self._conn.execute(
+                    "UPDATE runs SET axes_n=?, rounds=?, conflicts_n=?, remaining_n=?, parse_errs=?,"
+                    " total_in_chars=?, total_out_chars=?, total_est_tokens=?, total_real_tokens=?,"
+                    " elapsed_s=?, honey_path=?, status=? WHERE id=?",
+                    (axes_n, rounds, conflicts_n, remaining_n, parse_errs,
+                     total_in, total_out, total_est, total_real,
+                     elapsed_s, honey_path, status, self._run_id))
+                self._conn.commit()
         except Exception as e:
             logger.warning("Ledger: finish_run failed: %s", e)
 
