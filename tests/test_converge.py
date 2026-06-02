@@ -499,6 +499,168 @@ class TestConvergeDataRead(unittest.TestCase):
         self.assertFalse(res.converged)
 
 
+# ── N173: a configured DB must be READ, not fabricated around ───────────────────
+
+# The N173 failure shape: the converger claims "consistent" while ASSUMING a stored
+# value it never read (result_doc_id='doc123'). It DID name the rows in data_reads,
+# so the pipeline can fetch them and re-rule on fact instead of trusting the fiction.
+CONSISTENT_ON_ASSUMPTION_OUT = json.dumps({
+    "converged": True,
+    "path": [{"node": "db_fn", "file": "db/workflow_sequences.py", "lines": "45-57",
+              "symbol": "get_effective_head"}],
+    "attributed_defect": {"node": "db_fn", "file": "db/workflow_sequences.py",
+                          "lines": "45-57", "why": "ORDER BY mis-ranks the head"},
+    "causal_check": {
+        "verdict": "consistent",
+        "data_state_assumptions": ["assumes result_doc_id = 'doc123' (non-NULL)"],
+        "trace": "with result_doc_id set the CASE displaces the pending slot",
+        "need_data_state": [],
+        "data_reads": [{"table": "documents", "where": {"doc_id": "D1"},
+                        "columns": ["doc_review_status"]}]},
+    "missing_link": None,
+})
+
+
+class TestConvergeN173DbMandate(unittest.TestCase):
+    """N173: when a DB is configured the converger is told so and must not fabricate
+    stored values; any named read is executed and the verdict re-ruled on fact."""
+
+    def test_db_available_signalled_in_first_prompt(self):
+        prompts = []
+
+        def fake(provider, model, prompt, cwd=None, timeout=300, **kw):
+            prompts.append(prompt)
+            return _wr(CONVERGED_OUT)
+
+        db = _tmp_db_with_doc("approved")
+        with mock.patch.object(C, "call_worker", side_effect=fake):
+            C.run_converge(seed_text="s", verdicts=LOCATED_VERDICTS, bundles=BUNDLES,
+                           provider="deepinfra", model="m", code_root="/repo", db_conn=db)
+        self.assertIn("LIVE DATABASE AVAILABLE", prompts[0])
+        self.assertIn("doc123", prompts[0])  # the forbidden-fabrication example
+
+    def test_no_db_no_mandate_in_prompt(self):
+        prompts = []
+
+        def fake(provider, model, prompt, cwd=None, timeout=300, **kw):
+            prompts.append(prompt)
+            return _wr(CONVERGED_OUT)
+
+        with mock.patch.object(C, "call_worker", side_effect=fake):
+            C.run_converge(seed_text="s", verdicts=LOCATED_VERDICTS, bundles=BUNDLES,
+                           provider="deepinfra", model="m", db_conn=None)
+        self.assertNotIn("LIVE DATABASE AVAILABLE", prompts[0])
+
+    def test_consistent_on_assumption_is_overruled_by_real_rows(self):
+        """The core N173 fix: a 'consistent' verdict built on an ASSUMED stored value
+        still triggers the read (data_reads were named) and is re-ruled on the real
+        row — here the fact CONTRADICTS the fabrication, so it is NOT converged."""
+        prompts = []
+
+        def fake(provider, model, prompt, cwd=None, timeout=300, **kw):
+            prompts.append(prompt)
+            return _wr(CONTRADICTED_OUT if "Confirmed data state" in prompt
+                       else CONSISTENT_ON_ASSUMPTION_OUT)
+
+        db = _tmp_db_with_doc("wf_in_progress")
+        with mock.patch.object(C, "call_worker", side_effect=fake):
+            res = C.run_converge(seed_text="head off-by-one for D1",
+                                 verdicts=LOCATED_VERDICTS, bundles=BUNDLES,
+                                 provider="deepinfra", model="m",
+                                 code_root="/repo", db_conn=db)
+        self.assertEqual(len(prompts), 2)                 # 1st (assumed) + fact re-pass
+        self.assertIn("wf_in_progress", prompts[1])        # the REAL value, not doc123
+        self.assertFalse(res.converged)                    # fact overruled the fiction
+        self.assertEqual(res.causal_check["verdict"], "contradicted")
+
+    def test_real_rows_carried_onto_result(self):
+        def fake(provider, model, prompt, cwd=None, timeout=300, **kw):
+            return _wr(CONVERGED_OUT if "Confirmed data state" in prompt
+                       else CONSISTENT_ON_ASSUMPTION_OUT)
+
+        db = _tmp_db_with_doc("approved")
+        with mock.patch.object(C, "call_worker", side_effect=fake):
+            res = C.run_converge(seed_text="s", verdicts=LOCATED_VERDICTS,
+                                 bundles=BUNDLES, provider="deepinfra", model="m",
+                                 code_root="/repo", db_conn=db)
+        self.assertTrue(res.data_state_attempted)
+        self.assertTrue(res.data_state_backed)
+        self.assertIn("approved", res.data_state_block)
+        d = res.as_dict()
+        self.assertIn("approved", d["data_state_block"])
+        self.assertTrue(d["data_state_backed"])
+
+    def test_read_attempted_but_empty_is_honest_not_fabricated(self):
+        """A named read that matches no row leaves the verdict unchanged and records
+        the honest 'attempted, no rows' fact — no re-rule on a fiction."""
+        out = json.loads(CONSISTENT_ON_ASSUMPTION_OUT)
+        out["causal_check"]["verdict"] = "undecidable"
+        out["causal_check"]["data_reads"] = [
+            {"table": "documents", "where": {"doc_id": "NOPE"}, "columns": ["doc_review_status"]}]
+        out["converged"] = False
+        calls = []
+
+        def fake(provider, model, prompt, cwd=None, timeout=300, **kw):
+            calls.append(prompt)
+            return _wr(json.dumps(out))
+
+        db = _tmp_db_with_doc("approved")
+        with mock.patch.object(C, "call_worker", side_effect=fake):
+            res = C.run_converge(seed_text="s", verdicts=LOCATED_VERDICTS,
+                                 bundles=BUNDLES, provider="deepinfra", model="m",
+                                 code_root="/repo", db_conn=db)
+        # no fact re-pass (no rows came back) — only the first call
+        self.assertTrue(all("Confirmed data state" not in p for p in calls))
+        self.assertTrue(res.data_state_attempted)
+        self.assertFalse(res.data_state_backed)
+        self.assertIn("no rows matched", res.data_state_block)
+        self.assertFalse(res.converged)
+
+
+class TestHoneyPastesRealRows(unittest.TestCase):
+    """The honey must PASTE the rows converge read, or honestly say the read was empty."""
+
+    def _result(self, converge):
+        return {"axes_judged": 2, "axes_total": 2, "seed_kind": "fix",
+                "converge": converge, "verdicts": LOCATED_VERDICTS}
+
+    def test_confirmed_rows_pasted_under_consistent(self):
+        converge = {
+            "converged": True,
+            "path": [{"node": "db_fn", "file": "db/workflow_sequences.py",
+                      "lines": "45-57", "symbol": "get_effective_head"}],
+            "attributed_defect": {"node": "db_fn", "file": "db/workflow_sequences.py",
+                                  "lines": "45-57", "why": "ORDER BY wrong"},
+            "causal_check": {"verdict": "consistent",
+                             "data_state_assumptions": ["head row result_doc_id NULL"],
+                             "trace": "reproduces", "need_data_state": []},
+            "missing_link": None,
+            "data_state_attempted": True, "data_state_backed": True,
+            "data_state_block": "- query: SELECT result_doc_id FROM "
+                                "workflow_sequence_items WHERE group_id = 'g1'\n"
+                                "  -> result_doc_id=None, label='DS'"}
+        honey = render_local_honey(self._result(converge), "fix the head")
+        self.assertIn("Live DB data confirmed", honey)
+        self.assertIn("workflow_sequence_items", honey)
+        self.assertIn("result_doc_id=None", honey)
+        self.assertNotIn("doc123", honey)
+
+    def test_empty_read_reported_honestly(self):
+        converge = {
+            "converged": False, "path": [],
+            "attributed_defect": {"node": "db_fn", "file": "x.py", "lines": "1-2",
+                                  "why": "maybe"},
+            "causal_check": {"verdict": "undecidable", "data_state_assumptions": [],
+                             "trace": "depends on stored row", "need_data_state": ["rows"]},
+            "missing_link": None,
+            "data_state_attempted": True, "data_state_backed": False,
+            "data_state_block": "- query: SELECT x FROM t WHERE id = 'NOPE'\n"
+                                "  -> (no rows matched)"}
+        honey = render_local_honey(self._result(converge), "fix it")
+        self.assertIn("NO usable rows", honey)
+        self.assertIn("(no rows matched)", honey)
+
+
 class TestClassifySeedKind(unittest.TestCase):
     def test_trace_seed_is_diagnostic(self):
         self.assertEqual(
