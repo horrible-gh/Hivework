@@ -239,6 +239,37 @@ UNDECIDABLE_WITH_READS_OUT = json.dumps({
 })
 
 
+# N174 #2 shape: the first pass already CONVERGED (consistent) but — belt-and-suspenders
+# under db_available — ALSO listed data_reads. If those reads come back EMPTY the re-pass
+# can only say "undecidable"; that must NOT cancel the static convergence.
+CONVERGED_WITH_READS_OUT = json.dumps({
+    "converged": True,
+    "path": [{"node": "db_fn", "file": "db/workflow_sequences.py", "lines": "45-57",
+              "symbol": "get_effective_head"}],
+    "attributed_defect": {"node": "db_fn", "file": "db/workflow_sequences.py",
+                          "lines": "45-57", "why": "ORDER BY prefers in-progress"},
+    "causal_check": {
+        "verdict": "consistent",
+        "data_state_assumptions": ["R approved"],
+        "trace": "reproduces the off-by-one",
+        "need_data_state": [],
+        "data_reads": [{"table": "documents", "where": {"doc_id": "NOPE"},
+                        "columns": ["doc_review_status"]}]},
+    "missing_link": None,
+})
+# A re-pass that cannot decide and names NO further reads (so the read loop ends).
+UNDECIDABLE_NO_READS_OUT = json.dumps({
+    "converged": True,
+    "path": [{"node": "db_fn", "file": "db/workflow_sequences.py", "lines": "45-57"}],
+    "attributed_defect": {"node": "db_fn", "file": "db/workflow_sequences.py",
+                          "lines": "45-57", "why": "ORDER BY may mis-rank"},
+    "causal_check": {"verdict": "undecidable",
+                     "data_state_assumptions": [], "trace": "rows empty — cannot tell",
+                     "need_data_state": ["the deciding row"], "data_reads": []},
+    "missing_link": None,
+})
+
+
 def _tmp_db_with_doc(review_status):
     d = tempfile.mkdtemp()
     path = os.path.join(d, "t.db")
@@ -294,6 +325,43 @@ class TestConvergeDataRead(unittest.TestCase):
                                  code_root="/repo", db_conn=db)
         self.assertTrue(res.converged)
         self.assertEqual(res.causal_check["verdict"], "consistent")
+
+    def test_empty_read_does_not_cancel_a_converged_verdict(self):
+        """N174 #2: a data re-pass that comes back EMPTY is a FAILED CONFIRMATION,
+        not a convergence cancellation — the static consistent verdict must STAND."""
+        def fake(provider, model, prompt, cwd=None, timeout=300, **kw):
+            # pass 1 converges (consistent) + lists reads; the empty re-pass is undecidable
+            return _wr(UNDECIDABLE_NO_READS_OUT if "Confirmed data state" in prompt
+                       else CONVERGED_WITH_READS_OUT)
+
+        db = _tmp_db_with_doc("approved")  # holds only D1; the read targets 'NOPE' → empty
+        with mock.patch.object(C, "call_worker", side_effect=fake):
+            res = C.run_converge(seed_text="head off-by-one", verdicts=LOCATED_VERDICTS,
+                                 bundles=BUNDLES, provider="deepinfra", model="m",
+                                 code_root="/repo", db_conn=db)
+        # the converged consistent verdict survives the empty data re-pass
+        self.assertTrue(res.converged)
+        self.assertEqual(res.causal_check["verdict"], "consistent")
+        # but the report is honest: a read was attempted and returned nothing
+        self.assertTrue(res.data_state_attempted)
+        self.assertFalse(res.data_state_backed)
+
+    def test_fact_backed_contradiction_still_overturns_convergence(self):
+        """The N173 guard is preserved: when reads ACTUALLY return rows and the re-pass
+        rules contradicted on them, that fact DOES overturn even a converged first pass."""
+        def fake(provider, model, prompt, cwd=None, timeout=300, **kw):
+            return _wr(CONTRADICTED_OUT if "Confirmed data state" in prompt
+                       else CONVERGED_WITH_READS_OUT.replace('"doc_id": "NOPE"',
+                                                              '"doc_id": "D1"'))
+
+        db = _tmp_db_with_doc("approved")  # D1 exists → the read returns a row (backed)
+        with mock.patch.object(C, "call_worker", side_effect=fake):
+            res = C.run_converge(seed_text="head off-by-one", verdicts=LOCATED_VERDICTS,
+                                 bundles=BUNDLES, provider="deepinfra", model="m",
+                                 code_root="/repo", db_conn=db)
+        self.assertFalse(res.converged)
+        self.assertEqual(res.causal_check["verdict"], "contradicted")
+        self.assertTrue(res.data_state_backed)
 
     def test_no_db_conn_leaves_undecidable_unresolved(self):
         """Without a DB connection the data read is skipped — the static path stands."""
@@ -714,6 +782,45 @@ class TestConvergeN173DbMandate(unittest.TestCase):
         self.assertFalse(res.converged)
 
 
+class TestConvergeSchemaGuard(unittest.TestCase):
+    """NR174: a read naming a table/column that does not exist in the live schema must be
+    SKIPPED before it becomes broken SQL (the 'WHERE column = ...' / wrong-table cases),
+    recorded honestly — never run, never silently matching nothing."""
+
+    def setUp(self):
+        self.db = _tmp_db_with_doc("approved")  # documents(doc_id, doc_review_status)
+        self.schema = C._introspect_schema(self.db)
+
+    def test_unknown_table_rejected(self):
+        reads = [{"id": "r", "table": "items", "where": {"doc_id": "D1"},
+                  "columns": ["doc_review_status"]}]
+        block, any_rows = C._run_data_reads(reads, self.db, self.schema)
+        self.assertIn("unknown table 'items'", block)
+        self.assertFalse(any_rows)
+
+    def test_unknown_column_rejected(self):
+        # the NR174 hallucination: WHERE column = 'result_doc_id'
+        reads = [{"id": "r", "table": "documents", "where": {"column": "result_doc_id"},
+                  "columns": ["doc_review_status"]}]
+        block, any_rows = C._run_data_reads(reads, self.db, self.schema)
+        self.assertIn("unknown column 'column'", block)
+        self.assertFalse(any_rows)
+
+    def test_valid_read_passes_guard(self):
+        reads = [{"id": "r", "table": "documents", "where": {"doc_id": "D1"},
+                  "columns": ["doc_review_status"]}]
+        block, any_rows = C._run_data_reads(reads, self.db, self.schema)
+        self.assertTrue(any_rows)
+        self.assertIn("approved", block)
+
+    def test_empty_schema_is_noop_guard(self):
+        # no schema (introspection failed) → guard cannot reject, read still runs
+        reads = [{"id": "r", "table": "documents", "where": {"doc_id": "D1"},
+                  "columns": ["doc_review_status"]}]
+        block, any_rows = C._run_data_reads(reads, self.db, {})
+        self.assertTrue(any_rows)
+
+
 class TestConvergeSchemaInjection(unittest.TestCase):
     """NR174: the converger mis-named the table (asked for 'items', real table is
     'workflow_sequence_items') so the read came back empty. The live schema is now
@@ -740,6 +847,8 @@ class TestConvergeSchemaInjection(unittest.TestCase):
         # the FULL real name is shown — the abbreviation it guessed before is impossible
         self.assertIn("workflow_sequence_items(", prompts[0])
         self.assertIn("result_doc_id", prompts[0])
+        # N176: the schema-shape cross-check directive is present
+        self.assertIn("CROSS-CHECK schema-shape claims", prompts[0])
 
     def test_no_schema_block_without_db(self):
         prompts = []

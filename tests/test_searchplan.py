@@ -11,6 +11,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from hive.searchplan import (
     extract_doc_topics, extract_globs, extract_keywords, task_to_searchplan,
+    is_visibility_symptom, with_visibility_probe,
 )
 from hive.retriever import SearchPlan
 
@@ -143,6 +144,51 @@ class TestHybridMerge(unittest.TestCase):
     def test_malformed_search_plan_ignored(self):
         sp = task_to_searchplan({"id": "M", "brief": "server/x.py", "search_plan": "oops"})
         self.assertIn("server/x.py", sp.file_globs)
+
+
+class TestVisibilityProbe(unittest.TestCase):
+    """N176: a 'not visible / disabled / not rendered' symptom must pull the template
+    conditional-render directives into the search, deterministically (not via the queen)."""
+
+    def test_detects_english_visibility_symptoms(self):
+        for s in ("the module selector is not visible",
+                  "the control doesn't render on screen",
+                  "the dropdown is disabled and greyed out",
+                  "options no longer appear in the picker"):
+            self.assertTrue(is_visibility_symptom(s), s)
+
+    def test_detects_korean_visibility_symptoms(self):
+        for s in ("모듈 셀렉터가 화면에 안 보임",
+                  "컨트롤이 렌더링되지 않음",
+                  "옵션이 노출되지 않습니다",
+                  "버튼이 비활성 상태"):
+            self.assertTrue(is_visibility_symptom(s), s)
+
+    def test_ignores_unrelated_symptoms(self):
+        for s in ("the head doc sorts in the wrong order",
+                  "the API returns a 500 on submit",
+                  "the total is off by one"):
+            self.assertFalse(is_visibility_symptom(s), s)
+
+    def test_probe_appends_directives_after_existing_keywords(self):
+        sp = SearchPlan(axis_id="FE", keywords=["moduleSelector", "type_code"],
+                        file_globs=["client/**/*.vue"], doc_topics=[])
+        out = with_visibility_probe(sp)
+        # original terms stay first (queen's precise terms still rank highest)
+        self.assertEqual(out.keywords[:2], ["moduleSelector", "type_code"])
+        self.assertIn("v-if", out.keywords)
+        self.assertIn("v-show", out.keywords)
+        self.assertIn("v-for", out.keywords)
+        # globs/doc_topics untouched
+        self.assertEqual(out.file_globs, ["client/**/*.vue"])
+
+    def test_probe_is_idempotent(self):
+        sp = SearchPlan(axis_id="FE", keywords=["v-if"], file_globs=[], doc_topics=[])
+        once = with_visibility_probe(sp)
+        twice = with_visibility_probe(once)
+        # case-insensitive de-dupe: v-if not duplicated
+        self.assertEqual(twice.keywords.count("v-if"), 1)
+        self.assertEqual(once.keywords, twice.keywords)
 
 
 if __name__ == "__main__":

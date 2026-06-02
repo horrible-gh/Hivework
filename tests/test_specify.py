@@ -281,6 +281,70 @@ class TestDeterministicNoop(unittest.TestCase):
         self.assertEqual(specify._deterministic_noop_ids(spec), [])
 
 
+class TestIncompleteWiring(unittest.TestCase):
+    """N175: an edit that adds an import nobody uses (the binding/call site was never
+    wired) is incomplete and must be flagged, not marked applicable."""
+
+    def setUp(self):
+        self.root = tempfile.mkdtemp()
+
+    def _write(self, name, text):
+        p = os.path.join(self.root, name)
+        with open(p, "w", encoding="utf-8") as f:
+            f.write(text)
+        return p
+
+    def test_unused_added_import_is_flagged(self):
+        # the reported shape: useToast imported, but the call site uses showToast and the
+        # `const { showToast } = useToast()` binding is missing → useToast is dead.
+        self._write("Modal.vue",
+                    "<script setup>\nconst x = 1\nshowToast('hi')\n</script>\n")
+        spec = {"edits": [{
+            "id": "E1", "file": "Modal.vue",
+            "anchor_old": "<script setup>",
+            "replacement_new": "<script setup>\nimport { useToast } from '@/composables/useToast'",
+        }]}
+        flagged = specify._incomplete_wiring_ids(spec, self.root)
+        self.assertIn("E1", flagged)
+        self.assertIn("useToast", flagged["E1"])
+
+    def test_used_added_import_is_not_flagged(self):
+        # same import, but this time the binding IS added in the same edit → used → ok
+        self._write("Modal.vue",
+                    "<script setup>\nconst x = 1\nshowToast('hi')\n</script>\n")
+        spec = {"edits": [{
+            "id": "E1", "file": "Modal.vue",
+            "anchor_old": "<script setup>\nconst x = 1",
+            "replacement_new": ("<script setup>\nimport { useToast } from '@/x'\n"
+                                "const { showToast } = useToast()\nconst x = 1"),
+        }]}
+        self.assertEqual(specify._incomplete_wiring_ids(spec, self.root), {})
+
+    def test_import_used_by_sibling_edit_not_flagged(self):
+        # import added in E1, used by code added in E2 to the SAME file → not flagged
+        self._write("m.js", "// head\nlineA\nlineB\n")
+        spec = {"edits": [
+            {"id": "E1", "file": "m.js", "anchor_old": "// head",
+             "replacement_new": "// head\nimport { fmt } from './fmt'"},
+            {"id": "E2", "file": "m.js", "anchor_old": "lineB",
+             "replacement_new": "fmt(lineB)"},
+        ]}
+        self.assertEqual(specify._incomplete_wiring_ids(spec, self.root), {})
+
+    def test_unreadable_file_is_skipped(self):
+        spec = {"edits": [{
+            "id": "E1", "file": "nope.js", "anchor_old": "a",
+            "replacement_new": "import X from 'x'\na"}]}
+        self.assertEqual(specify._incomplete_wiring_ids(spec, self.root), {})
+
+    def test_gate_downgrades_on_incomplete_wiring(self):
+        spec = _fresh_ready()
+        out = specify._apply_effectiveness_gate(
+            spec, [], {}, False, incomplete_wiring={"E1": "incomplete wiring — imported 'useToast' is never used"})
+        self.assertEqual(out["termination"], "needs_reinvestigation")
+        self.assertIn("E1", out["effectiveness"]["ineffective_ids"])
+
+
 class TestEffectivenessGateUnit(unittest.TestCase):
     def test_ineffective_review_downgrades(self):
         out = specify._apply_effectiveness_gate(
@@ -335,6 +399,45 @@ class TestEffectivenessGateUnit(unittest.TestCase):
         out = specify._apply_effectiveness_gate(
             spec, ["E1"], {"E1": {"effective": False}}, True)
         self.assertEqual(out["termination"], "needs_pm")
+
+    # N174 #3: a review-only "ineffective" verdict on VERIFIED edits in a CROSS-FILE
+    # wiring must not declare the fix wrong and loop back — defer to a human (needs_pm).
+    def _cross_file_ready(self):
+        return {
+            "source_honey": "h.md", "codebase_root": "/code", "gate": {"apply": False},
+            "deferred": [], "termination": "ready_to_apply",
+            "edits": [
+                {"id": "E1", "file": "server/guard.py", "anchor_old": "a",
+                 "replacement_new": "b", "anchor_status": "verified"},
+                {"id": "E2", "file": "ui/Toast.vue", "anchor_old": "c",
+                 "replacement_new": "d", "anchor_status": "verified"},
+            ]}
+
+    def test_cross_file_verified_review_ineffective_defers_to_needs_pm(self):
+        out = specify._apply_effectiveness_gate(
+            self._cross_file_ready(), [],
+            {"E1": {"effective": False, "reason": "alone doesn't change behavior"}}, False)
+        self.assertEqual(out["termination"], "needs_pm")
+        self.assertIn("E1", out["effectiveness"]["ineffective_ids"])
+
+    def test_cross_file_but_unverified_still_reinvestigates(self):
+        spec = self._cross_file_ready()
+        spec["edits"][0]["anchor_status"] = "stale"  # the flagged edit is not verified
+        out = specify._apply_effectiveness_gate(
+            spec, [], {"E1": {"effective": False, "reason": "x"}}, False)
+        self.assertEqual(out["termination"], "needs_reinvestigation")
+
+    def test_cross_file_with_deterministic_noop_still_reinvestigates(self):
+        # a CERTAIN finding (no-op) is present → loop back regardless of cross-file
+        out = specify._apply_effectiveness_gate(
+            self._cross_file_ready(), ["E1"], {}, False)
+        self.assertEqual(out["termination"], "needs_reinvestigation")
+
+    def test_single_file_review_ineffective_still_reinvestigates(self):
+        # _fresh_ready has one edit/one file → softening does not apply
+        out = specify._apply_effectiveness_gate(
+            _fresh_ready(), [], {"E1": {"effective": False, "reason": "x"}}, False)
+        self.assertEqual(out["termination"], "needs_reinvestigation")
 
 
 class TestRunSpecifyWithReview(unittest.TestCase):
@@ -971,6 +1074,58 @@ class TestSeedCoverageGate(unittest.TestCase):
         out = specify._apply_seed_coverage_gate(spec, _HONEY_WITH_TARGETS)
         self.assertEqual(out["termination"], "needs_reinvestigation")
         self.assertEqual(len(out["seed_coverage"]["missing"]), 2)
+
+
+class TestVerifyAnchorsLive(unittest.TestCase):
+    """N175 E7: a 'verified' anchor must be re-confirmed against LIVE disk, not trusted
+    from the author's claim. _verify_anchors_live downgrades a verified-but-absent or
+    non-unique anchor so the spec is not presented as ready."""
+
+    def _spec(self, anchor_old, status="verified", file="f.py"):
+        return {"edits": [{"id": "E1", "file": file, "anchor_old": anchor_old,
+                           "replacement_new": "y = 2", "anchor_status": status}],
+                "deferred": [], "gate": {"apply": False},
+                "termination": "ready_to_apply"}
+
+    def test_verified_but_absent_downgraded_to_not_found(self):
+        with tempfile.TemporaryDirectory() as root:
+            with open(os.path.join(root, "f.py"), "w", encoding="utf-8") as fh:
+                fh.write("a = 1\nb = 2\n")  # does NOT contain the claimed anchor
+            spec = self._spec("y = 1")      # author claimed verified, but it's not there
+            out = specify._verify_anchors_live(spec, root)
+        self.assertEqual(out["edits"][0]["anchor_status"], "not_found")
+        self.assertIn("anchor_drift", out["edits"][0])
+        # and the normalize step then refuses to present it as ready
+        out = specify._normalize_spec(out)
+        self.assertEqual(out["termination"], "needs_reinvestigation")
+
+    def test_verified_and_present_once_survives(self):
+        with tempfile.TemporaryDirectory() as root:
+            with open(os.path.join(root, "f.py"), "w", encoding="utf-8") as fh:
+                fh.write("x = 1\nb = 2\n")
+            out = specify._verify_anchors_live(self._spec("x = 1"), root)
+        self.assertEqual(out["edits"][0]["anchor_status"], "verified")
+        self.assertNotIn("anchor_drift", out["edits"][0])
+
+    def test_verified_but_ambiguous_downgraded_to_stale(self):
+        with tempfile.TemporaryDirectory() as root:
+            with open(os.path.join(root, "f.py"), "w", encoding="utf-8") as fh:
+                fh.write("x = 1\nx = 1\n")  # anchor occurs twice → not uniquely targetable
+            out = specify._verify_anchors_live(self._spec("x = 1"), root)
+        self.assertEqual(out["edits"][0]["anchor_status"], "stale")
+
+    def test_non_verified_status_is_left_untouched(self):
+        with tempfile.TemporaryDirectory() as root:
+            with open(os.path.join(root, "f.py"), "w", encoding="utf-8") as fh:
+                fh.write("a = 1\n")
+            out = specify._verify_anchors_live(self._spec("y = 1", status="stale"), root)
+        self.assertEqual(out["edits"][0]["anchor_status"], "stale")  # not upgraded/changed
+
+    def test_unreadable_file_left_for_apply_to_recheck(self):
+        # File missing under root → cannot read → status untouched (apply re-verifies).
+        with tempfile.TemporaryDirectory() as root:
+            out = specify._verify_anchors_live(self._spec("y = 1"), root)
+        self.assertEqual(out["edits"][0]["anchor_status"], "verified")
 
 
 if __name__ == "__main__":

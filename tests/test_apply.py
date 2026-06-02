@@ -179,6 +179,15 @@ class TestBuildProposal(unittest.TestCase):
         p = apply.build_proposal(spec, self.root)
         self.assertFalse(p["ready"])
 
+    def test_needs_runtime_is_valid_and_not_ready(self):
+        # N174: needs_runtime is first-class (investigate.py emits it). apply must accept
+        # it as a known termination — no "invalid" warning — and treat it as non-ready.
+        self.assertIn("needs_runtime", apply._VALID_TERMINATION)
+        spec = _spec([_edit("x = 1", "x = 2")], termination="needs_runtime")
+        p = apply.build_proposal(spec, self.root)
+        self.assertFalse(p["ready"])
+        self.assertTrue(any("needs_runtime" in r for r in p["not_ready_reasons"]))
+
     def test_not_ready_when_no_edits(self):
         spec = _spec([], deferred=[{"issue": "X", "reason": "policy_direction"}])
         p = apply.build_proposal(spec, self.root)
