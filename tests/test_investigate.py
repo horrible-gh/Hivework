@@ -43,6 +43,16 @@ VERDICT_OUT = json.dumps({
     "verdict": {"located": True, "file": "server/x.py", "lines": "10-12",
                 "reason": "the bug"},
 })
+# Converge stub: the ④ stage stitches the located fragments into one path. Patched
+# so the wiring tests stay hermetic (no deepinfra network call when ≥2 axes locate).
+CONVERGE_OUT = json.dumps({
+    "converged": True,
+    "path": [{"node": "db_fn", "file": "server/x.py", "lines": "10-12",
+              "symbol": "f"}],
+    "attributed_defect": {"node": "db_fn", "file": "server/x.py", "lines": "10-12",
+                          "why": "the bug runs here"},
+    "missing_link": None,
+})
 
 
 def _fake_retrieve(plan, code_root, docs_root=None, **kwargs):
@@ -68,6 +78,7 @@ class TestInvestigateWiring(unittest.TestCase):
             out = os.path.join(td, "verdicts.json")
             with mock.patch("hive.decompose.call_worker", return_value=_wr(DECOMPOSE_OUT)), \
                  mock.patch("hive.judge.call_worker", return_value=_wr(VERDICT_OUT)) as judge_cw, \
+                 mock.patch("hive.converge.call_worker", return_value=_wr(CONVERGE_OUT)), \
                  mock.patch("hive.investigate.retrieve", side_effect=_fake_retrieve):
                 result = INV.run_investigate(
                     seed_text="find the bug", recipe_path=None,
@@ -136,6 +147,7 @@ class TestInvestigateWiring(unittest.TestCase):
             out = os.path.join(td, "v.json")
             with mock.patch("hive.decompose.call_worker", return_value=_wr(self._FIVE_LEAVES)), \
                  mock.patch("hive.judge.call_worker", return_value=_wr(VERDICT_OUT)), \
+                 mock.patch("hive.converge.call_worker", return_value=_wr(CONVERGE_OUT)), \
                  mock.patch("hive.investigate.retrieve", side_effect=_fake_retrieve):
                 return INV.run_investigate(
                     seed_text="x", recipe_path=None, code_root=td,

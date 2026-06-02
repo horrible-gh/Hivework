@@ -26,6 +26,7 @@ import os
 import re
 from typing import Any
 
+from hive.converge import run_converge
 from hive.decompose import run_decompose
 from hive.judge import run_judge
 from hive.retriever import _ripgrep, retrieve
@@ -40,6 +41,40 @@ logger = logging.getLogger("hive.investigate")
 # and to enforce that none is silently dropped — keep the literal in sync with
 # ``hive.specify.SEED_TARGET_SECTION`` (imported from here).
 SEED_TARGET_SECTION = "## Seed-specified edit targets"
+
+# Diagnostic seeds ask the pipeline to TRACE/MAP/EXPLAIN a path or behaviour — the
+# deliverable is the answer (the converged call path), NOT an edit. Forcing such a
+# seed toward an edit is exactly what drove N169 into the needs_reinvestigation
+# loop (the author rightly could not author an edit for "trace the call path").
+# Fix seeds ask to CHANGE code. The classifier is deterministic, free, and only a
+# HINT to the honey/author — it never blocks authoring (a diagnostic seed that also
+# names concrete fix targets still gets them authored).
+_DIAGNOSTIC_VERBS = (
+    "trace", "map ", "locate", "find where", "where is", "where does", "why ",
+    "investigate", "diagnose", "audit", "understand", "explain", "identify",
+    "figure out", "root cause", "root-cause", "call path", "call-path", "usage map",
+)
+_FIX_VERBS = (
+    "fix", "change", "add ", "remove", "delete", "update", "implement", "replace",
+    "refactor", "rename", "correct", "patch", "make it", "should be", "must be",
+    "set ", "wire", "introduce", "ensure",
+)
+
+
+def classify_seed_kind(seed_text: str) -> str:
+    """Classify a seed as ``"diagnostic"`` or ``"fix"`` (deterministic, free).
+
+    Heuristic on the seed's leading lines (where the task verb lives): a strong
+    diagnostic verb with NO strong fix verb ⇒ diagnostic; otherwise fix (the
+    conservative default that preserves today's edit-oriented behaviour). Only a
+    HINT — it never gates authoring.
+    """
+    head = "\n".join((seed_text or "").splitlines()[:8]).lower()
+    has_fix = any(v in head for v in _FIX_VERBS)
+    has_diag = any(v in head for v in _DIAGNOSTIC_VERBS)
+    if has_diag and not has_fix:
+        return "diagnostic"
+    return "fix"
 
 
 def _leaf_axes(tasks: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -291,6 +326,10 @@ def run_investigate(
 
     # ── ②..③ per axis: bridge → local retrieve (free) → JUDGE (budgeted).
     verdicts: list[dict[str, Any]] = []
+    # Each axis's retrieve bundle is kept (was discarded after judge) so the ④
+    # converge stage can pool the cross-axis call-chain hops it needs to stitch the
+    # fragments into one path. Parallel to ``verdicts``.
+    bundles: list[dict[str, Any]] = []
     warned_no_docs = False
     # Seed-named, on-disk edit targets — passed to every axis's judge so a verdict
     # citing one is grounded even when that axis's own retrieve didn't window it
@@ -340,6 +379,20 @@ def run_investigate(
         v = jr["verdict"]
         logger.info("   verdict: located=%s %s:%s — %s",
                     v.located, v.file, v.lines, v.reason)
+        # Keep the merged bundle (first-pass + any follow-up) so converge sees the
+        # same call-chain the judge did, not just the first-pass windows.
+        fu = jr.get("followup_bundle")
+        if fu:
+            merged_bundle = {
+                **bundle,
+                "code_snippets": (list(bundle.get("code_snippets") or [])
+                                  + list(fu.get("seeds") or [])),
+                "call_chain": (list(bundle.get("call_chain") or [])
+                               + list(fu.get("call_chain") or [])),
+            }
+            bundles.append(merged_bundle)
+        else:
+            bundles.append(bundle)
         verdicts.append({
             "axis_id": sp.axis_id,
             "title": task.get("title", ""),
@@ -350,17 +403,133 @@ def run_investigate(
                         "reason": v.reason},
         })
 
+    # ── ④ converge (the reconcile step the cheap path was missing): stitch the
+    # scattered per-axis verdicts into ONE executed call path and attribute the
+    # defect to one node. ONE tool-OFF call, and only when ≥2 axes located (nothing
+    # to stitch otherwise → free skip). This is what turns N169's "5 fragments on 5
+    # files, 0 edits" into a single attributable target for specify.
+    located_n = sum(1 for v in verdicts if v["verdict"]["located"])
+    seed_kind = classify_seed_kind(seed_text)
+    converge_dict: dict[str, Any] | None = None
+    if located_n >= 2:
+        conv_role = cfg.role("converge")
+        logger.info("[HIVE_STAGE] pipeline=investigate stage=4 name=converge")
+        logger.info("④ converge (%s/%s) — stitch %d located verdict(s) into one path",
+                    conv_role.provider, conv_role.model, located_n)
+        cres = run_converge(
+            seed_text=seed_text, verdicts=verdicts, bundles=bundles,
+            provider=conv_role.provider, model=conv_role.model, code_root=code_root,
+            ledger=ledger, provider_kwargs=pk, k=k, max_hops=2)
+        converge_dict = cres.as_dict()
+        if cres.converged and cres.attributed_defect:
+            logger.info("   converged → defect at %s:%s",
+                        cres.attributed_defect.get("file"),
+                        cres.attributed_defect.get("lines"))
+        elif cres.missing_link:
+            logger.info("   not converged → missing link: %s",
+                        cres.missing_link.get("between"))
+    else:
+        logger.info("converge: skipped (%d located verdict(s) < 2 — nothing to stitch)",
+                    located_n)
+
     result = {
         "seed_chars": len(seed_text),
         "axes_total": len(tasks),
         "axes_judged": len(verdicts),
         "max_axes": cfg.judge.max_axes,
         "max_calls_per_axis": cfg.judge.max_calls_per_axis,
+        "seed_kind": seed_kind,
+        "converge": converge_dict,
         "verdicts": verdicts,
     }
     _write_report(result, output_path)
     result["report_path"] = output_path
     return result
+
+
+def _render_converge_section(converge: dict[str, Any] | None,
+                             seed_kind: str) -> list[str]:
+    """Render the ④ converge result into honey lines (the START-HERE section).
+
+    A successful convergence gives specify ONE stitched path + ONE attributed
+    defect — replacing the "N scattered loci, you figure it out" framing that
+    drove N169 to 0 edits. A failed convergence names the missing link so a
+    needs_reinvestigation cites the specific hop rather than re-asking blind.
+    Returns [] when converge was skipped (<2 located) so the honey is unchanged.
+    """
+    if not converge:
+        return []
+    out: list[str] = []
+    if converge.get("converged") and converge.get("attributed_defect"):
+        ad = converge["attributed_defect"]
+        out += [
+            "## Converged call path (the single executed path — START HERE)",
+            "",
+            "The independent axes below each located ONE fragment of what is really "
+            "a SINGLE call path. The converge stage stitched them into the one path "
+            "that actually executes for this scenario and attributed the defect to "
+            "ONE node. **Convergence SUCCEEDED** — treat the node below as the "
+            "primary target; the per-axis localisations further down are corroborating "
+            "context for it, not separate edit sites.",
+            "",
+        ]
+        path = converge.get("path") or []
+        if path:
+            out.append("Executed path:")
+            for i, n in enumerate(path, 1):
+                sym = f" — {n['symbol']}" if n.get("symbol") else ""
+                loc = f"{n.get('file', '')}:{n.get('lines', '')}".strip(":")
+                out.append(f"{i}. [{n.get('node', '?')}] {loc}{sym}")
+            out.append("")
+        flag = " (⚠ attributed file not in evidence — re-confirm it exists)" \
+            if ad.get("ungrounded") else ""
+        out += [
+            "### Primary edit target — attributed defect",
+            f"- location: {ad.get('file', '')}:{ad.get('lines', '')}{flag}",
+            f"- node: {ad.get('node', '?')}",
+            f"- why this is the defect: {ad.get('why', '')}",
+            "",
+        ]
+        if seed_kind == "diagnostic":
+            out += [
+                "> **This seed is DIAGNOSTIC (trace/map), not a change request.** The "
+                "converged call path above IS the deliverable. Report it as the "
+                "completed investigation. Author an edit ONLY if the seed also names a "
+                "concrete fix; otherwise returning 0 edits with this path as the "
+                "finding is CORRECT — do NOT return needs_reinvestigation.",
+                "",
+            ]
+        else:
+            out += [
+                "> Convergence succeeded and the executed path is established: author "
+                "the MINIMAL edit at the attributed defect above (re-anchoring from "
+                "live code per the contract). Do NOT return needs_reinvestigation — "
+                "the path that runs for this scenario is no longer ambiguous.",
+                "",
+            ]
+        return out
+
+    ml = converge.get("missing_link")
+    if ml:
+        between = " ↔ ".join(ml.get("between") or []) or "two adjacent nodes"
+        need = ml.get("need") or {}
+        out += [
+            "## Convergence incomplete — missing link",
+            "",
+            f"The converge stage could not connect **{between}** because the needed "
+            "callee/symbol is not present in the retrieved evidence. The located "
+            "fragments below are real but do not yet form one executed path.",
+            "",
+            f"- missing between: {between}",
+            f"- need symbols: {', '.join(need.get('symbols') or []) or '(none)'}",
+            f"- need greps: {', '.join(need.get('greps') or []) or '(none)'}",
+            "",
+            "> If you cannot author a confident edit, a needs_reinvestigation is "
+            "justified — but it MUST name this missing link (the symbol/hop above), "
+            "not request a blank re-investigation.",
+            "",
+        ]
+    return out
 
 
 def render_local_honey(result: dict[str, Any], seed_text: str,
@@ -399,17 +568,24 @@ def render_local_honey(result: dict[str, Any], seed_text: str,
     # target even when investigate failed to re-locate it on its own.
     seed_targets = seed_edit_targets(seed_text, code_root, docs_root)
 
+    seed_kind = result.get("seed_kind", "fix")
+    converge = result.get("converge")
     out: list[str] = [
         "# Hivework honey (local — rendered from investigate verdicts)",
         "",
-        "- source: cheap path (decompose → retrieve(local) → judge), no assemble call",
+        "- source: cheap path (decompose → retrieve(local) → judge → converge), no assemble call",
         f"- axes judged: {result.get('axes_judged', 0)}/{result.get('axes_total', 0)}; "
-        f"located: {len(located)}",
+        f"located: {len(located)}; seed-kind: {seed_kind}",
         "",
         "## Requested change / reported symptom",
         "",
         seed_text.strip(),
         "",
+    ]
+    # ④ converge section (START HERE): the stitched single path + attributed defect,
+    # or the named missing link. Empty when converge was skipped (<2 located).
+    out += _render_converge_section(converge, seed_kind)
+    out += [
         "## Grounded localisations (investigation evidence — NOT a list of edit sites)",
         "",
         "Independent investigation axes located the code below relevant to the "
