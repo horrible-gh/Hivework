@@ -387,8 +387,9 @@ class TestConvergeDataRead(unittest.TestCase):
              "columns": ["label", "result_doc_id"]},
         ]
         block = C._fetch_data_state(reads, db)
-        # the second read was filtered by the value the first returned (seq_id=7)
-        self.assertIn("seq_id = 7", block)
+        # the second read was filtered by the value the first returned (seq_id=7);
+        # identifiers render delimited now (reserved-word safe)
+        self.assertIn('"seq_id" = 7', block)
         self.assertIn("label='DS'", block)
         # both item rows came back, and their NULL result_doc_id is visible as fact
         self.assertIn("result_doc_id=None", block)
@@ -711,6 +712,62 @@ class TestConvergeN173DbMandate(unittest.TestCase):
         self.assertFalse(res.data_state_backed)
         self.assertIn("no rows matched", res.data_state_block)
         self.assertFalse(res.converged)
+
+
+class TestConvergeSchemaInjection(unittest.TestCase):
+    """NR174: the converger mis-named the table (asked for 'items', real table is
+    'workflow_sequence_items') so the read came back empty. The live schema is now
+    introspected and injected so it names real objects."""
+
+    def test_schema_block_injected_when_db_available(self):
+        prompts = []
+
+        def fake(provider, model, prompt, cwd=None, timeout=300, **kw):
+            prompts.append(prompt)
+            return _wr(CONVERGED_OUT)
+
+        d = tempfile.mkdtemp()
+        path = os.path.join(d, "t.db")
+        c = sqlite3.connect(path)
+        c.execute("CREATE TABLE workflow_sequence_items "
+                  "(id INTEGER, sequence_id INTEGER, result_doc_id TEXT)")
+        c.commit(); c.close()
+        db = DbConnection(kind="sqlite", path=path)
+        with mock.patch.object(C, "call_worker", side_effect=fake):
+            C.run_converge(seed_text="s", verdicts=LOCATED_VERDICTS, bundles=BUNDLES,
+                           provider="deepinfra", model="m", code_root="/repo", db_conn=db)
+        self.assertIn("DB SCHEMA — the live database", prompts[0])  # the injected block
+        # the FULL real name is shown — the abbreviation it guessed before is impossible
+        self.assertIn("workflow_sequence_items(", prompts[0])
+        self.assertIn("result_doc_id", prompts[0])
+
+    def test_no_schema_block_without_db(self):
+        prompts = []
+
+        def fake(provider, model, prompt, cwd=None, timeout=300, **kw):
+            prompts.append(prompt)
+            return _wr(CONVERGED_OUT)
+
+        with mock.patch.object(C, "call_worker", side_effect=fake):
+            C.run_converge(seed_text="s", verdicts=LOCATED_VERDICTS, bundles=BUNDLES,
+                           provider="deepinfra", model="m", db_conn=None)
+        self.assertNotIn("DB SCHEMA — the live database", prompts[0])
+
+    def test_schema_introspection_failure_degrades_silently(self):
+        prompts = []
+
+        def fake(provider, model, prompt, cwd=None, timeout=300, **kw):
+            prompts.append(prompt)
+            return _wr(CONVERGED_OUT)
+
+        # a connection pointing at a nonexistent file: list_schema raises, block is ''
+        db = DbConnection(kind="sqlite", path="/no/such/file.db")
+        with mock.patch.object(C, "call_worker", side_effect=fake):
+            C.run_converge(seed_text="s", verdicts=LOCATED_VERDICTS, bundles=BUNDLES,
+                           provider="deepinfra", model="m", code_root="/repo", db_conn=db)
+        # still signals the DB is available; just no authoritative schema list
+        self.assertNotIn("DB SCHEMA — the live database", prompts[0])
+        self.assertIn("LIVE DATABASE AVAILABLE", prompts[0])
 
     def test_iterative_read_narrows_then_rules(self):
         """The 'read more' lever: a first read that can't decide → the model NARROWS the

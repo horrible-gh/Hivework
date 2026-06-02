@@ -68,6 +68,8 @@ _MAX_CELL = 200             # per-cell char cap when rendering live-DB rows into
                             # converger names are short; this only clips runaway blobs.
 _EVIDENCE_CHARS = 500       # per-window char cap
 _REASON_CHARS = 300         # per-verdict reason cap
+_SCHEMA_LINE_CHARS = 400    # per-table char cap in the injected [DB SCHEMA] block — a
+                            # very wide table's column list is clipped, not the table count
 
 # One terse JSON-only retry (mirrors judge's lever): a reasoning model on deepinfra
 # occasionally wraps the object in prose; the reparse recovers it. Recorded to the
@@ -187,7 +189,8 @@ def build_converge_prompt(seed_text: str, located: list[dict[str, Any]],
                           unlocated: list[dict[str, Any]],
                           windows: list[dict[str, Any]],
                           data_state_block: str = "",
-                          db_available: bool = False) -> str:
+                          db_available: bool = False,
+                          db_schema: str = "") -> str:
     """Build the single converge prompt: fragments + evidence → one path + one node.
 
     ``data_state_block`` is the optional ``[Confirmed data state]`` section: on the
@@ -279,6 +282,20 @@ def build_converge_prompt(seed_text: str, located: list[dict[str, Any]],
             "- Assumptions taken straight from the scenario text (e.g. \"the seed states R is "
             "approved\") are fine; assumptions about UNSEEN stored values are not — read them.\n")
 
+    # The live DB's ACTUAL table/column names. Without this the converger guessed names
+    # from whatever code was retrieved and mis-named the table (NR174: it asked for
+    # ``items`` when the real table is ``workflow_sequence_items``, so the read came back
+    # empty). Handing it the authoritative list makes the data_reads name real objects.
+    schema_block = ""
+    if db_available and db_schema.strip():
+        schema_block = (
+            "\n[DB SCHEMA — the live database's ACTUAL tables and columns. In "
+            "causal_check.data_reads use ONLY names that appear here; never invent or "
+            "ABBREVIATE a name (e.g. do NOT shorten \"workflow_sequence_items\" to "
+            "\"items\"). If a name you need is NOT in this list, the deciding data is not "
+            "in this DB — emit a missing_link instead of guessing a name.]\n"
+            + db_schema.strip() + "\n")
+
     return f"""[Role] You are the CONVERGER for a Hivework investigation. Independent \
 per-axis judges each localised ONE fragment of what is really a SINGLE call path \
 (typically endpoint → request handler → db function → SQL key / query → frontend \
@@ -295,7 +312,7 @@ produces the reported symptom (step 3 below is where you check that).
 
 [Reported scenario / seed]
 {_trunc(seed_text, 2000)}
-{confirmed_block}{db_avail_block}
+{confirmed_block}{db_avail_block}{schema_block}
 [Located fragments — each is ONE node candidate, from a different axis]
 {frags}
 {unloc_block}
@@ -323,8 +340,10 @@ the symptom — do not pass it off as the defect.
 — so the pipeline can FETCH it for you and re-rule on fact — emit machine-readable \
 ``data_reads``: the precise table(s), the row selector (the column=value that picks the \
 row, taken from the scenario, e.g. the document id), and the column(s) whose value \
-decides the verdict. Use the EXACT table/column names visible in the evidence (the SQL \
-in queries.json names them). Do NOT guess an attribution to fill the gap. When the \
+decides the verdict. Name tables/columns using the EXACT names from the [DB SCHEMA] \
+block above (the authoritative live-DB list); if no schema block is shown, fall back to \
+the names visible in the evidence (the SQL in queries.json). Never abbreviate or invent \
+a name. Do NOT guess an attribution to fill the gap. When the \
 deciding row cannot be reached in one lookup (you must read a key from one table to \
 find the row in the next), CHAIN the reads: give each read an ``id`` and, in a later \
 read's ``where``, reference an earlier result with ``{{"from": "<that id>", "column": \
@@ -566,7 +585,7 @@ def _converge_once(seed_text: str, located: list[dict[str, Any]],
                    unlocated: list[dict[str, Any]], windows: list[dict[str, Any]],
                    known: set[str], provider: str, model: str, pk: dict[str, Any],
                    ledger, timeout: int, data_state_block: str = "",
-                   db_available: bool = False) -> ConvergeResult:
+                   db_available: bool = False, db_schema: str = "") -> ConvergeResult:
     """One logical converge call (with a transport-level JSON-only reparse). Never raises.
 
     The reparse retry handles a model that wrapped the JSON in prose — it is a
@@ -577,7 +596,7 @@ def _converge_once(seed_text: str, located: list[dict[str, Any]],
     instead of inventing stored values (N173).
     """
     prompt = build_converge_prompt(seed_text, located, unlocated, windows,
-                                   data_state_block, db_available)
+                                   data_state_block, db_available, db_schema)
     attempt_prompt = prompt
     parsed: dict[str, Any] | None = None
     for attempt in range(2):
@@ -639,6 +658,32 @@ def _resolve_where(where: dict[str, Any],
         else:
             resolved[col] = val
     return resolved, ""
+
+
+def _schema_block(db_conn) -> str:
+    """Render the live DB's ``table(col, col, …)`` schema for the prompt; '' on any failure.
+
+    Read once per converge and handed to every pass so the converger names REAL objects
+    in its data_reads (NR174). Introspection failure degrades silently to no block — the
+    converger then falls back to names from the code evidence, exactly as before.
+    """
+    if db_conn is None:
+        return ""
+    try:
+        from hive.dbread import list_schema
+    except Exception as e:  # pragma: no cover - import guard
+        logger.warning("converge: dbread unavailable (%s) — no schema injected", e)
+        return ""
+    try:
+        schema = list_schema(db_conn)
+    except Exception as e:
+        logger.warning("converge: schema introspection failed (%s) — none injected", e)
+        return ""
+    lines = []
+    for t in sorted(schema):
+        cols = ", ".join(schema[t])
+        lines.append(_trunc(f"- {t}({cols})", _SCHEMA_LINE_CHARS))
+    return "\n".join(lines)
 
 
 def _run_data_reads(data_reads: list[dict[str, Any]], db_conn) -> tuple[str, bool]:
@@ -747,9 +792,11 @@ def run_converge(*, seed_text: str, verdicts: list[dict[str, Any]],
     pk.setdefault("available_tools", [])
 
     db_available = db_conn is not None
+    # Introspect the live schema ONCE so every pass names real tables/columns (NR174).
+    db_schema = _schema_block(db_conn)
     res = _converge_once(seed_text, located, unlocated, windows, known,
                          provider, model, pk, ledger, timeout,
-                         db_available=db_available)
+                         db_available=db_available, db_schema=db_schema)
     logger.info("converge: %s", res.summary)
 
     # ── Data-state read (N172/N173): the verdict hinges on a STORED row value static
@@ -792,7 +839,8 @@ def run_converge(*, seed_text: str, verdicts: list[dict[str, Any]],
         combined = "\n\n".join(p for p in block_parts if p)
         res2 = _converge_once(seed_text, located, unlocated, windows, known,
                               provider, model, pk, ledger, timeout,
-                              data_state_block=combined, db_available=db_available)
+                              data_state_block=combined, db_available=db_available,
+                              db_schema=db_schema)
         logger.info("converge: data re-pass %d → %s", rounds, res2.summary)
         v2 = (res2.causal_check or {}).get("verdict")
         if v2 in ("consistent", "contradicted"):
@@ -843,7 +891,7 @@ def run_converge(*, seed_text: str, verdicts: list[dict[str, Any]],
                 res2 = _converge_once(seed_text, located, unlocated, merged, known2,
                                       provider, model, pk, ledger, timeout,
                                       data_state_block=data_block,
-                                      db_available=db_available)
+                                      db_available=db_available, db_schema=db_schema)
                 logger.info("converge: re-pass → %s", res2.summary)
                 # Adopt the re-pass only if it actually converged; otherwise keep the
                 # first result, which at least named the missing link for the author.
