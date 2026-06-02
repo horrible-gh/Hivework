@@ -914,11 +914,13 @@ class TestReviewerProvider(unittest.TestCase):
 
 class TestConfigSpecifyRole(unittest.TestCase):
     def test_specify_role_exists(self):
-        # hive.config.json routes the specify author onto codex (gpt-5.4-mini).
+        # hive.config.json routes the specify author onto copilot (gpt-5-mini): specify
+        # is a tool-ON author (it re-opens live files to lift anchors), so it stays on the
+        # file-tool provider, not a tool-OFF single-shot one (see hivework-model-placement).
         cfg = load_config()
         role = cfg.role("specify")
-        self.assertEqual(role.provider, "codex")
-        self.assertEqual(role.model, "gpt-5.4-mini")
+        self.assertEqual(role.provider, "copilot")
+        self.assertEqual(role.model, "gpt-5-mini")
 
     def test_review_role_routes_to_deepinfra(self):
         # hive.config.json opts the reviewer onto deepinfra (cost lever).
