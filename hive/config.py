@@ -31,6 +31,11 @@ _DEFAULTS: dict[str, Any] = {
         # The JUDGE re-search reviewer (M004 §4). Copilot's ceiling is sonnet
         # (opus unavailable), so the quality-critical judge sits at sonnet.
         "judge":    {"provider": "copilot", "model": "claude-sonnet-4.5"},
+        # The CONVERGER (hive.converge): a single tool-OFF call that stitches the
+        # per-axis verdicts into one executed call path and attributes the defect
+        # to one node. Same cost class / shape as judge, so it defaults to the same
+        # provider/model; hive.config.json routes it to deepinfra like judge.
+        "converge": {"provider": "copilot", "model": "claude-sonnet-4.5"},
     },
     "copilot": {"exe": None, "allow": "--allow-all", "timeout_sec": 300},
     "ledger":  {"enabled": True, "db_path": "hive_ledger.db"},
@@ -135,6 +140,8 @@ class Config:
         default_factory=lambda: RoleConfig(model="claude-haiku-4.5"))
     judge_role: RoleConfig = field(
         default_factory=lambda: RoleConfig(model="claude-sonnet-4.5"))
+    converge_role: RoleConfig = field(
+        default_factory=lambda: RoleConfig(model="claude-sonnet-4.5"))
     copilot: CopilotConfig = field(default_factory=CopilotConfig)
     ledger: LedgerConfig = field(default_factory=LedgerConfig)
     apply: ApplyConfig = field(default_factory=ApplyConfig)
@@ -147,6 +154,8 @@ class Config:
             return self.assemble_role
         if name == "judge":
             return self.judge_role
+        if name == "converge":
+            return self.converge_role
         return getattr(self, name, RoleConfig())
 
     def apply_cli_model(self, model: str | None) -> None:
@@ -154,7 +163,7 @@ class Config:
         if model is None:
             return
         for role in (self.queen, self.swarm, self.assemble_role, self.specify,
-                     self.review, self.commit, self.judge_role):
+                     self.review, self.commit, self.judge_role, self.converge_role):
             role.model = model
 
 
@@ -207,6 +216,7 @@ def load_config(path: str | None = None) -> Config:
         review=_role("review"),
         commit=_role("commit", default_model="claude-haiku-4.5"),
         judge_role=_role("judge", default_model="claude-sonnet-4.5"),
+        converge_role=_role("converge", default_model="claude-sonnet-4.5"),
         copilot=CopilotConfig(
             exe=copilot_raw.get("exe"),
             allow=copilot_raw.get("allow", "--allow-all"),
