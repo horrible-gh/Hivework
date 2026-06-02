@@ -98,6 +98,18 @@ def _build_select(table: str, columns: list[str] | None,
             cc = _check_ident(col, "where-column")
             if val is None:
                 clauses.append(f"{cc} IS NULL")
+            elif isinstance(val, (list, tuple, set)):
+                # A multi-value selector → ``col IN (?, ?, …)``. Still single-table and
+                # fully parameterised. An empty set means "no upstream values matched"
+                # (a chained read whose source returned nothing) → match nothing
+                # deterministically rather than erroring.
+                vals = list(val)
+                if not vals:
+                    clauses.append("1=0")
+                else:
+                    marks = ", ".join(placeholder for _ in vals)
+                    clauses.append(f"{cc} IN ({marks})")
+                    params.extend(vals)
             else:
                 clauses.append(f"{cc} = {placeholder}")
                 params.append(val)

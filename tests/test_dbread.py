@@ -59,6 +59,21 @@ class TestSqliteRead(unittest.TestCase):
     def test_probe_ok(self):
         self.assertTrue(probe(self.conn))
 
+    def test_where_list_renders_in_clause(self):
+        # a multi-value selector → col IN (?, ?) — used by chained reads that resolve
+        # several upstream keys at once
+        res = read_rows(self.conn, "documents", columns=["doc_id"],
+                        where={"doc_id": ["R1", "A1"]})
+        self.assertIn("IN (", res.sql)
+        got = sorted(r["doc_id"] for r in res.rows)
+        self.assertEqual(got, ["A1", "R1"])
+
+    def test_where_empty_list_matches_nothing(self):
+        # an empty upstream (chained read whose source returned no rows) must match
+        # nothing deterministically, not raise
+        res = read_rows(self.conn, "documents", where={"doc_id": []})
+        self.assertEqual(res.rows, [])
+
 
 class TestReadOnly(unittest.TestCase):
     """mode=ro must reject any attempt to mutate, and read_rows only ever builds SELECT."""
