@@ -42,6 +42,44 @@ logger = logging.getLogger("hive.investigate")
 # ``hive.specify.SEED_TARGET_SECTION`` (imported from here).
 SEED_TARGET_SECTION = "## Seed-specified edit targets"
 
+# Optional channel for the requester's own words — the direct message/hints the
+# caller (a chat operator, or a FlowGate rejection note) supplies alongside the
+# seed. It is OPT-IN (the ``--comment`` flag); when absent nothing changes. We fold
+# it into the seed text so every downstream stage that already reads the seed
+# (decompose/judge/assemble) and the local honey (which embeds the seed verbatim →
+# specify) sees it — no signature changes. The header sentence carries the only
+# guardrail needed: the requester's stated INTENT and VALUES are authoritative
+# requirements, but any claim about WHERE code lives is still verified against live
+# files (the edit-spec contract already mandates byte-for-byte re-anchoring), so a
+# comment can resolve ambiguous direction without ever standing in for code grounding.
+CALLER_CONTEXT_SECTION = "## Caller-supplied context (requester's direct input)"
+
+
+def format_caller_context(comments: list[str] | None) -> str:
+    """Render opt-in requester comments into a labelled seed section (or "").
+
+    Returns a leading-newline block ready to append to the seed text, or an empty
+    string when no comments were supplied (so callers can append unconditionally).
+    Each comment is listed verbatim and order-preserving; blank/whitespace-only
+    entries are dropped.
+    """
+    items = [c.strip() for c in (comments or []) if c and c.strip()]
+    if not items:
+        return ""
+    lines = [
+        "",
+        CALLER_CONTEXT_SECTION,
+        "",
+        "Direct input from the requester. Treat the stated INTENT and VALUES as "
+        "authoritative requirements (what the change must achieve). Any claim about "
+        "WHERE code lives is a HINT — verify it against the live files, never anchor "
+        "on the requester's prose alone.",
+        "",
+    ]
+    lines += [f"- {c}" for c in items]
+    lines.append("")
+    return "\n".join(lines)
+
 # Diagnostic seeds ask the pipeline to TRACE/MAP/EXPLAIN a path or behaviour — the
 # deliverable is the answer (the converged call path), NOT an edit. Forcing such a
 # seed toward an edit is exactly what drove N169 into the needs_reinvestigation

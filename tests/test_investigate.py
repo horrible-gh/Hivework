@@ -282,6 +282,45 @@ class TestRenderLocalHoney(unittest.TestCase):
         self.assertIn("defer", honey.lower())
 
 
+class TestFormatCallerContext(unittest.TestCase):
+    """Opt-in requester comments fold into the seed (and thus the local honey)."""
+
+    def test_none_or_empty_yields_empty_string(self):
+        self.assertEqual(INV.format_caller_context(None), "")
+        self.assertEqual(INV.format_caller_context([]), "")
+        self.assertEqual(INV.format_caller_context(["", "   "]), "")
+
+    def test_comments_rendered_verbatim_in_order(self):
+        out = INV.format_caller_context(["color is #FFF", "place it top-right"])
+        self.assertIn(INV.CALLER_CONTEXT_SECTION, out)
+        self.assertIn("- color is #FFF", out)
+        self.assertIn("- place it top-right", out)
+        # order preserved
+        self.assertLess(out.index("#FFF"), out.index("top-right"))
+
+    def test_guardrail_sentence_present(self):
+        # intent authoritative, locations only a hint to verify — the non-hallucination line
+        out = INV.format_caller_context(["the logic lives in theme.ts"])
+        self.assertIn("authoritative", out.lower())
+        self.assertIn("verify", out.lower())
+
+    def test_blank_entries_dropped_but_real_kept(self):
+        out = INV.format_caller_context(["", "real hint", "  "])
+        self.assertIn("- real hint", out)
+        self.assertEqual(out.count("\n- "), 1)
+
+    def test_folds_into_local_honey_so_specify_sees_it(self):
+        # The seam: appending to seed_text means render_local_honey carries it through.
+        seed = "Make the badge blue." + INV.format_caller_context(["exact color is #1E90FF"])
+        result = {"axes_total": 1, "axes_judged": 1, "verdicts": [
+            {"axis_id": "X", "title": "t",
+             "verdict": {"located": True, "file": "ui/badge.ts",
+                         "lines": "10-12", "reason": "render call"}}]}
+        honey = render_local_honey(result, seed)
+        self.assertIn("#1E90FF", honey)
+        self.assertIn(INV.CALLER_CONTEXT_SECTION, honey)
+
+
 class TestPrioritizeAxes(unittest.TestCase):
     """Deterministic seed-relevance ranking + seed-anchor injection (T891)."""
 

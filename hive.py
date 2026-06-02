@@ -28,7 +28,12 @@ from hive.assemble import run_assemble
 from hive.specify import run_specify
 from hive.apply import run_apply
 from hive.commit import run_propose, run_commit
-from hive.investigate import render_local_honey, run_investigate, seed_edit_targets
+from hive.investigate import (
+    format_caller_context,
+    render_local_honey,
+    run_investigate,
+    seed_edit_targets,
+)
 from hive import backup as backup_store
 
 
@@ -121,9 +126,14 @@ def run_pipeline(args: argparse.Namespace) -> None:
     parse_errors: list[str] = []
 
     try:
-        # Load seed text
+        # Load seed text (+ opt-in requester comments folded in as a labelled section)
         with open(args.seed, 'r', encoding='utf-8') as f:
             seed_text = f.read()
+        caller_context = format_caller_context(getattr(args, "comment", None))
+        if caller_context:
+            seed_text += caller_context
+            logger.info("Caller-supplied context: %d comment(s) folded into seed",
+                        len(args.comment))
         logger.info("Seed loaded: %d chars", len(seed_text))
 
         # ────────────────────────────────────────────────────────────
@@ -436,6 +446,11 @@ def run_investigate_command(args: argparse.Namespace) -> None:
 
     with open(args.seed, "r", encoding="utf-8") as f:
         seed_text = f.read()
+    caller_context = format_caller_context(getattr(args, "comment", None))
+    if caller_context:
+        seed_text += caller_context
+        logger.info("Caller-supplied context: %d comment(s) folded into seed",
+                    len(args.comment))
 
     ldg = open_ledger(cfg.ledger.enabled, cfg.ledger.db_path)
     ldg.start_run(seed=args.seed, codebase=args.codebase,
@@ -830,6 +845,11 @@ def main() -> None:
         help="Model for copilot workers (default: per-role config, gpt-5-mini)",
     )
     run_parser.add_argument(
+        "--comment", action="append", metavar="TEXT", default=None,
+        help="Requester's direct input/hint, folded into the seed as authoritative "
+             "intent (locations still verified). Repeatable; optional.",
+    )
+    run_parser.add_argument(
         "--specify", action="store_true",
         help="Chain the specify stage after assemble: honey → edit-spec (propose only)",
     )
@@ -880,6 +900,11 @@ def main() -> None:
     inv_parser.add_argument(
         "--model", default=None,
         help="Model override for all roles (default: per-role config)",
+    )
+    inv_parser.add_argument(
+        "--comment", action="append", metavar="TEXT", default=None,
+        help="Requester's direct input/hint, folded into the seed as authoritative "
+             "intent (locations still verified). Repeatable; optional.",
     )
     inv_parser.add_argument(
         "--specify", action="store_true",
