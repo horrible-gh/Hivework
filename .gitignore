@@ -1,3 +1,6 @@
+# Hivework config
+hive.config.json
+
 # Claude / local
 /.claude/
 
@@ -18,6 +21,13 @@ dist/
 .venv/
 venv/
 env/
+
+# Secrets — Hivework's real secrets live OUTSIDE the repo (~/.hivework/.env or
+# $HIVE_ENV_FILE; run setup.bat / setup.sh to create it). These patterns are
+# defence-in-depth so a stray local .env can never be committed.
+.env
+.env.*
+*.secrets.json
 
 # Hive runtime artifacts
 hive_ledger.db*
