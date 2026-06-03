@@ -1006,7 +1006,10 @@ class TestHoneyConvergeSection(unittest.TestCase):
         self.assertIn("Converged call path", honey)
         self.assertIn("Primary edit target", honey)
         self.assertIn("db/workflow_sequences.py:45-57", honey)
-        self.assertIn("do not return needs_reinvestigation", honey.lower())
+        # discourages a needless re-locate loop, while requiring the author to confirm
+        # the claimed mechanism against live source (N177 phantom-attribution guard)
+        self.assertIn("do not loop back merely to re-locate", honey.lower())
+        self.assertIn("confirm the claimed mechanism against the live source", honey.lower())
 
     def test_diagnostic_seed_says_path_is_deliverable(self):
         converge = {
@@ -1066,6 +1069,69 @@ class TestHoneyConvergeSection(unittest.TestCase):
         honey = render_local_honey(self._result(None, "fix"), "fix it")
         self.assertNotIn("Converged call path", honey)
         self.assertNotIn("Convergence incomplete", honey)
+
+
+class TestConvergeLiveCodeGrounding(unittest.TestCase):
+    """N177: converge rules on a tool-OFF view, so it once fabricated a code mechanism
+    (a phantom argument mismatch) that the live source did not exhibit. The fix lifts the
+    CURRENT source at the located loci and injects it as authoritative ground truth."""
+
+    def _write(self, td, rel, text):
+        import tempfile  # noqa: F401 (td provided by caller)
+        path = os.path.join(td, *rel.split("/"))
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(text)
+
+    def test_lift_live_code_reads_cited_loci(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            self._write(td, "client/src/view.ts",
+                        "l1\nl2\nfunction buildStepStates(a, b, c, allDone = false) {}\nl4\n")
+            located = [_verdict("D", True, "client/src/view.ts", "3-3", "fe mapping")]
+            block = C._lift_live_code(located, td)
+            self.assertIn("client/src/view.ts", block)
+            self.assertIn("allDone = false", block)   # the live signature is in the block
+            self.assertIn("(live)", block)
+
+    def test_lift_live_code_skips_missing_file_and_no_root(self):
+        self.assertEqual(C._lift_live_code(
+            [_verdict("X", True, "nope.ts", "1-1", "r")], "/does/not/exist"), "")
+        self.assertEqual(C._lift_live_code(
+            [_verdict("X", True, "a.ts", "1-1", "r")], None), "")
+
+    def test_run_converge_injects_live_code_block(self):
+        import tempfile
+        prompts = []
+
+        def fake(provider, model, prompt, cwd=None, timeout=300, **kw):
+            prompts.append(prompt)
+            return _wr(CONVERGED_OUT)
+
+        with tempfile.TemporaryDirectory() as td:
+            self._write(td, "api/workflow_head_routes.py",
+                        "\n" * 92 + "def get_workflow_head(): return effective\n")
+            self._write(td, "db/workflow_sequences.py",
+                        "\n" * 44 + "def get_effective_head(): ORDER BY sort_order\n")
+            with mock.patch.object(C, "call_worker", side_effect=fake):
+                C.run_converge(seed_text="trace", verdicts=LOCATED_VERDICTS,
+                               bundles=BUNDLES, provider="deepinfra", model="m",
+                               code_root=td)
+        self.assertIn("Confirmed code", prompts[0])
+        self.assertIn("get_effective_head", prompts[0])
+        self.assertIn("THIS block wins", prompts[0])
+
+    def test_no_live_code_block_without_code_root(self):
+        prompts = []
+
+        def fake(provider, model, prompt, cwd=None, timeout=300, **kw):
+            prompts.append(prompt)
+            return _wr(CONVERGED_OUT)
+
+        with mock.patch.object(C, "call_worker", side_effect=fake):
+            C.run_converge(seed_text="trace", verdicts=LOCATED_VERDICTS,
+                           bundles=BUNDLES, provider="deepinfra", model="m")
+        self.assertNotIn("Confirmed code", prompts[0])
 
 
 if __name__ == "__main__":
