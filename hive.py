@@ -27,7 +27,7 @@ from hive.reconcile import run_reconcile_loop
 from hive.assemble import run_assemble
 from hive.specify import run_specify
 from hive.apply import run_apply
-from hive.commit import run_propose, run_commit
+from hive.commit import run_propose, run_commit, render_commit_summary_lines
 from hive.investigate import (
     format_caller_context,
     render_local_honey,
@@ -765,6 +765,7 @@ def run_commit_plan_command(args: argparse.Namespace) -> None:
             provider_kwargs=provider_kwargs,
             prev_plan_path=args.prev_plan,
             feedback=args.feedback,
+            filename_only_threshold=cfg.commit_stage.filename_only_threshold,
         )
         ldg.finish_run(honey_path=args.out,
                        axes_n=len(plan.get("commits") or []), status="done")
@@ -811,6 +812,8 @@ def run_commit_command(args: argparse.Namespace) -> None:
     logger.info("Commit complete: %s — %d/%d commits committable",
                 "READY" if proposal["ready"] else "NOT READY",
                 proposal["n_committable"], proposal["n_commits"])
+    for line in render_commit_summary_lines(proposal):
+        logger.info("  %s", line)
     if args.out:
         logger.info("  Proposal: %s", args.out)
     logger.info("=" * 60)

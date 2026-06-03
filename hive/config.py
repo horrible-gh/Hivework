@@ -120,6 +120,20 @@ class ApplyConfig:
 
 
 @dataclass
+class CommitConfig:
+    """Settings for the commit-plan author stage.
+
+    ``filename_only_threshold`` caps credit spend on huge change sets (commonly
+    documentation dumps of hundreds/thousands of files). When the number of changed
+    paths EXCEEDS this value, the author is told to group by file PATH/NAME only and
+    NOT to open file contents — grouping a thousand docs by reading each is the
+    expensive case. At or below the threshold the author may open files to judge
+    grouping. Set to 0 to disable filename-only mode entirely (always allow opening).
+    """
+    filename_only_threshold: int = 50
+
+
+@dataclass
 class DbConnection:
     """One target codebase's read-only DB connection (for the converge data-state read).
 
@@ -208,6 +222,7 @@ class Config:
     apply: ApplyConfig = field(default_factory=ApplyConfig)
     judge: JudgeConfig = field(default_factory=JudgeConfig)
     safety: SafetyConfig = field(default_factory=SafetyConfig)
+    commit_stage: CommitConfig = field(default_factory=CommitConfig)
     # Per-codebase read-only DB connections, keyed by a short name (e.g. "flowgate").
     # Empty by default — the converge data-state read is SKIPPED when a run's codebase
     # has no entry (graceful: converge falls back to its static path / needs_data).
@@ -288,6 +303,7 @@ def load_config(path: str | None = None) -> Config:
     apply_raw = merged.get("apply", {})
     judge_raw = merged.get("judge", {})
     safety_raw = merged.get("safety", {})
+    commit_raw = merged.get("commit_stage", {})
     db_raw = merged.get("db_connections", {})
 
     def _db_conn(d: dict) -> DbConnection:
@@ -350,6 +366,10 @@ def load_config(path: str | None = None) -> Config:
         ),
         safety=SafetyConfig(
             allow_swarm=bool(safety_raw.get("allow_swarm", True)),
+        ),
+        commit_stage=CommitConfig(
+            filename_only_threshold=int(
+                commit_raw.get("filename_only_threshold", 50)),
         ),
         db_connections=db_connections,
     )

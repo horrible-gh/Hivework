@@ -174,18 +174,38 @@ def _git_context(repo_root: str) -> str:
     return "\n".join(parts)
 
 
+# Injected into the author prompt when the change set is too large to read each file
+# economically — group by path/name alone, never open files (caps credit spend).
+_FILENAME_ONLY_DIRECTIVE = """
+[BUDGET MODE — filename-only grouping (large change set: {n_changed} files > {threshold})]
+This change set is too large to read each file economically. Group the changes using
+ONLY the file PATHS and NAMES shown in the git state above (directory, extension, and
+naming conventions). Do NOT open, read, or diff any file — no file-content tools.
+Infer each commit's purpose and conventional-commit type from the paths alone (e.g.
+``docs/**`` or ``*.md`` → ``docs``; ``tests/**`` or ``test_*`` → ``test``; config/build
+files → ``chore``). Consolidate aggressively by directory/topic rather than over-split.
+Every changed path must still be assigned to exactly one commit. Emit the same
+commit-plan JSON schema; ``ready_to_commit`` as usual.
+"""
+
+
 def build_propose_prompt(
     contract_text: str,
     repo_root: str,
     git_context: str,
     prev_plan_json: str | None = None,
     feedback: str | None = None,
+    filename_only: bool = False,
+    n_changed: int = 0,
+    threshold: int = 0,
 ) -> str:
     """Build the full prompt for the single commit author.
 
     The contract is the role/system prompt; the live git state is the input to
     group. If the PM rejected a previous plan, the previous plan plus the PM's
-    feedback are appended so the author revises rather than starting blind.
+    feedback are appended so the author revises rather than starting blind. When
+    ``filename_only`` is set the change set is too large to read economically, so a
+    budget directive is injected telling the author to group from paths alone.
     """
     prompt = f"""{contract_text}
 
@@ -195,6 +215,9 @@ def build_propose_prompt(
 [Live git state — group exactly these changed files, nothing else]
 {git_context}
 """
+    if filename_only:
+        prompt += _FILENAME_ONLY_DIRECTIVE.format(
+            n_changed=n_changed, threshold=threshold)
     if prev_plan_json:
         prompt += f"""
 [Previous plan you proposed — the PM rejected it, revise it]
@@ -248,12 +271,17 @@ def run_propose(
     provider_kwargs: dict | None = None,
     prev_plan_path: str | None = None,
     feedback: str | None = None,
+    filename_only_threshold: int = 0,
 ) -> dict[str, Any]:
     """Run the propose stage: live git working tree → commit-plan JSON (SSOT).
 
     Calls a single author worker, extracts the first complete JSON object from its
     stdout, forces ``gate.commit`` false, writes the plan to ``output_path``, and
     returns the parsed dict. Propose-only — nothing is committed.
+
+    When ``filename_only_threshold`` > 0 and the number of changed paths exceeds it,
+    a budget directive is injected so the author groups from file paths alone without
+    opening files (caps credit spend on huge, commonly documentation, change sets).
 
     Raises:
         ValueError: if the author produced no parseable JSON object.
@@ -266,13 +294,23 @@ def run_propose(
     contract_text = load_contract(contract_path)
     git_context = _git_context(repo_root)
 
+    n_changed = len(changed_paths(repo_root))
+    filename_only = filename_only_threshold > 0 and n_changed > filename_only_threshold
+    if filename_only:
+        logger.info("Large change set (%d files > threshold %d): filename-only "
+                    "grouping — the author will NOT open files (budget mode)",
+                    n_changed, filename_only_threshold)
+
     prev_plan_json = None
     if prev_plan_path and os.path.isfile(prev_plan_path):
         with open(prev_plan_path, "r", encoding="utf-8") as f:
             prev_plan_json = f.read()
 
     prompt = build_propose_prompt(contract_text, repo_root, git_context,
-                                  prev_plan_json, feedback)
+                                  prev_plan_json, feedback,
+                                  filename_only=filename_only,
+                                  n_changed=n_changed,
+                                  threshold=filename_only_threshold)
 
     logger.info("Running commit author (single, not fan-out)...")
     logger.debug("Prompt length: %d chars", len(prompt))
@@ -581,6 +619,46 @@ def execute_commits(plan: dict[str, Any], repo_root: str) -> dict[str, Any]:
     result["ok"] = True
     result["committed"] = committed
     return result
+
+
+def render_commit_summary_lines(
+    proposal: dict[str, Any], max_files: int = 8
+) -> list[str]:
+    """Render a compact, log-friendly summary of what each commit contains.
+
+    Unlike the full markdown proposal (written only with ``--out``), this is meant for
+    stdout/log: per commit it shows the verdict flag, message, file count, and up to
+    ``max_files`` paths (the rest collapsed to ``… +N more``) so a thousand-file
+    change set stays readable. Leftover/staged-leftover counts are summarized too.
+    """
+    lines: list[str] = []
+    commits = proposal.get("commits") or []
+    lines.append(f"Proposed commits ({len(commits)}):")
+    if not commits:
+        lines.append("  (none)")
+    for i, r in enumerate(commits, 1):
+        flag = "OK " if r.get("committable") else "BAD"
+        files = r.get("files") or []
+        shown = ", ".join(files[:max_files])
+        if len(files) > max_files:
+            shown += f", … +{len(files) - max_files} more"
+        lines.append(f"  [{flag}] {i}. {r.get('message', '')}  "
+                     f"({len(files)} file{'s' if len(files) != 1 else ''})")
+        if shown:
+            lines.append(f"        {shown}")
+        for msg in r.get("messages") or []:
+            lines.append(f"        ! {msg}")
+    staged_left = proposal.get("staged_leftover") or []
+    if staged_left:
+        lines.append(f"Staged but unassigned (auto-committed on --write): "
+                     f"{len(staged_left)}")
+    leftover = proposal.get("leftover") or []
+    if leftover:
+        shown = ", ".join(leftover[:max_files])
+        if len(leftover) > max_files:
+            shown += f", … +{len(leftover) - max_files} more"
+        lines.append(f"Uncommitted leftover ({len(leftover)}): {shown}")
+    return lines
 
 
 def render_commit_proposal_markdown(proposal: dict[str, Any]) -> str:

@@ -103,15 +103,28 @@ docs(readme): document the commit pipeline
 chore(deps): bump pytest to 8.x
 ```
 
-## 5. Leftover
+## 5. Leftover — the rare exception, not the default
 
-If some changed files should **not** be committed now (scratch files, unrelated
-in-progress work, generated artifacts), list them under `leftover` with a short
-reason instead of forcing them into a commit.
+**Default posture: commit everything in the change set.** The repo's `.gitignore`
+is the filter for what does not belong in version control; anything that still shows
+up as a change has already passed that filter and is presumed intended for the repo.
+This includes **new untracked files** — a brand-new file with no history is normal
+work to be committed, NOT a reason to defer. Do not park a path in `leftover` merely
+because it is untracked or has no prior history. Assign it to a commit like any other
+change.
 
-**Eligibility:** only *unstaged* or *untracked* changes may go to `leftover`. A
-**staged** path is committed intent (see §0) and must be assigned to a commit — it is
-never leftover-eligible, regardless of file type.
+`leftover` is for the **genuine exception only**: a file you can positively identify
+as scratch / unrelated in-progress work / a generated artifact that slipped past
+`.gitignore`. When you do use it, list the specific file with a short reason. Prefer
+committing and noting an assumption over deferring — if you are merely unsure, commit
+it. Leave a file in `leftover` only when you have a concrete reason it must not be
+committed now.
+
+**Eligibility:** only *unstaged* or *untracked* changes are even eligible for
+`leftover`. A **staged** path is committed intent (see §0) and must be assigned to a
+commit — it is never leftover-eligible, regardless of file type. (Eligibility is a
+ceiling, not an invitation: most unstaged/untracked changes should still be committed
+per the default posture above.)
 
 ---
 

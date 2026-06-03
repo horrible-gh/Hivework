@@ -19,6 +19,7 @@
   "apply":   { "backup_dir": ".apply_backups", "backup_ttl_hours": 168 },
   "judge":   { "max_calls_per_axis": 2, "max_axes": 12, "max_parallel": 4 },
   "safety":  { "allow_swarm": false },
+  "commit_stage": { "filename_only_threshold": 50 },
   "db_connections": {
     "project1": {
       "kind": "sqlite",

@@ -18,9 +18,11 @@ import pytest
 
 from hive.commit import (
     build_commit_proposal,
+    build_propose_prompt,
     changed_paths,
     execute_commits,
     render_commit_proposal_markdown,
+    render_commit_summary_lines,
     run_commit,
     staged_paths,
     _normalize_plan,
@@ -353,3 +355,42 @@ def test_write_untracks_ignored_present_file(tmp_path):
     assert result["ok"] is True, result.get("reason")
     assert _git(repo, "ls-files", "cache/x.pyc").stdout.strip() == ""   # untracked now
     assert os.path.exists(os.path.join(repo, "cache/x.pyc"))            # kept on disk
+
+
+# ── filename-only budget mode (large change sets) ────────────────────────────
+
+def test_propose_prompt_injects_filename_only_directive():
+    prompt = build_propose_prompt("CONTRACT", "/repo", "GIT STATE",
+                                  filename_only=True, n_changed=1200, threshold=50)
+    assert "BUDGET MODE" in prompt
+    assert "1200" in prompt and "50" in prompt
+    assert "Do NOT open" in prompt
+
+
+def test_propose_prompt_omits_directive_below_threshold():
+    prompt = build_propose_prompt("CONTRACT", "/repo", "GIT STATE",
+                                  filename_only=False)
+    assert "BUDGET MODE" not in prompt
+
+
+# ── compact stdout summary ───────────────────────────────────────────────────
+
+def test_summary_lists_messages_and_caps_files(tmp_path):
+    repo = _repo(tmp_path)
+    files = [_write(repo, f"docs/d{i}.md", f"# {i}\n") for i in range(20)]
+    plan = _plan([{"id": "c1", "message": "docs(area): bulk docs", "files": files}])
+    proposal = build_commit_proposal(plan, repo)
+    lines = render_commit_summary_lines(proposal, max_files=8)
+    text = "\n".join(lines)
+    assert "docs(area): bulk docs" in text
+    assert "(20 files)" in text
+    assert "+12 more" in text          # 20 files, 8 shown → 12 collapsed
+
+
+def test_summary_reports_leftover(tmp_path):
+    repo = _repo(tmp_path)
+    _write(repo, "a.py", "x = 1\n")
+    _write(repo, "scratch.txt", "tmp\n")   # changed but in no commit
+    plan = _plan([{"id": "c1", "message": "feat(core): add a", "files": ["a.py"]}])
+    lines = render_commit_summary_lines(build_commit_proposal(plan, repo))
+    assert any("leftover" in ln.lower() and "scratch.txt" in ln for ln in lines)
