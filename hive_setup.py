@@ -398,10 +398,10 @@ _MODEL_TIERS: dict[str, dict[str, str]] = {
     # copilot (verified): gpt-5-mini (cheapest that works; nano is rejected) ->
     # gpt-5.4-mini (mid) -> claude-sonnet-4.6 (strong coding card).
     "copilot": {"min": "gpt-5-mini", "mix": "gpt-5.4-mini", "max": "claude-sonnet-4.6"},
-    # codex (verified on a ChatGPT account): only the general gpt-5.x line works -
-    # gpt-5.4-mini -> gpt-5.4 -> gpt-5.5. NB: gpt-5.5 is the flagship (cost-caution);
-    # it sits at 'max' (the deliberately-expensive preset), not in cheaper tiers.
-    "codex":   {"min": "gpt-5.4-mini", "mix": "gpt-5.4", "max": "gpt-5.5"},
+    # codex (verified on a ChatGPT account): only the general gpt-5.x line works.
+    # Per actual usage + cost-caution: floor is gpt-5.4-mini (min AND mix), and 'max'
+    # reaches only gpt-5.4 - the gpt-5.5 flagship is deliberately NOT in any tier.
+    "codex":   {"min": "gpt-5.4-mini", "mix": "gpt-5.4-mini", "max": "gpt-5.4"},
     # deepinfra/openai: oss-20b (cheap) -> oss-120b (main worker, JSON+FC) ->
     # Qwen3-235B-Instruct (strong, JSON+FC). oss-120b is proven live; 20b/Qwen are
     # listed on DeepInfra's pricing but not yet round-tripped here.
