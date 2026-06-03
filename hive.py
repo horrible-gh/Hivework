@@ -101,6 +101,28 @@ def setup_logging(verbose: bool = False) -> None:
     logging.basicConfig(level=level, format=fmt, stream=sys.stdout)
 
 
+def build_provider_kwargs(cfg) -> dict:
+    """One shared kwargs dict handed to every ``call_worker`` in a command.
+
+    Carries BOTH providers' connection settings: the copilot CLI (``exe`` /
+    ``allow_flag``) and the OpenAI-compatible HTTP endpoint (``base_url`` /
+    ``api_key_env``, from the config ``openai`` block — what makes that provider
+    vendor-neutral). Each handler ignores the keys meant for the other (copilot via
+    ``**_ignored``, the HTTP handler likewise), so one dict safely serves a run that
+    mixes providers across roles.
+    """
+    kwargs: dict[str, str] = {}
+    if cfg.copilot.exe:
+        kwargs["exe"] = cfg.copilot.exe
+    if cfg.copilot.allow:
+        kwargs["allow_flag"] = cfg.copilot.allow
+    if cfg.openai.base_url:
+        kwargs["base_url"] = cfg.openai.base_url
+    if cfg.openai.api_key_env:
+        kwargs["api_key_env"] = cfg.openai.api_key_env
+    return kwargs
+
+
 def run_pipeline(args: argparse.Namespace) -> None:
     """Execute the full 6-stage pipeline."""
     start_time = time.time()
@@ -123,11 +145,7 @@ def run_pipeline(args: argparse.Namespace) -> None:
         logger.error("=" * 60)
         raise SystemExit(2)
 
-    provider_kwargs: dict[str, str] = {}
-    if cfg.copilot.exe:
-        provider_kwargs["exe"] = cfg.copilot.exe
-    if cfg.copilot.allow:
-        provider_kwargs["allow_flag"] = cfg.copilot.allow
+    provider_kwargs = build_provider_kwargs(cfg)
 
     queen_role = cfg.queen
     swarm_role = cfg.swarm
@@ -463,11 +481,7 @@ def run_investigate_command(args: argparse.Namespace) -> None:
     cfg = load_config()
     cfg.apply_cli_model(args.model)
 
-    provider_kwargs: dict[str, str] = {}
-    if cfg.copilot.exe:
-        provider_kwargs["exe"] = cfg.copilot.exe
-    if cfg.copilot.allow:
-        provider_kwargs["allow_flag"] = cfg.copilot.allow
+    provider_kwargs = build_provider_kwargs(cfg)
 
     queen = cfg.queen
     judge_role = cfg.role("judge")
@@ -586,11 +600,7 @@ def run_specify_command(args: argparse.Namespace) -> None:
     cfg = load_config()
     cfg.apply_cli_model(args.model)
 
-    provider_kwargs: dict[str, str] = {}
-    if cfg.copilot.exe:
-        provider_kwargs["exe"] = cfg.copilot.exe
-    if cfg.copilot.allow:
-        provider_kwargs["allow_flag"] = cfg.copilot.allow
+    provider_kwargs = build_provider_kwargs(cfg)
 
     role = cfg.role("specify")
     review_role = cfg.role("review")
@@ -725,11 +735,7 @@ def run_commit_plan_command(args: argparse.Namespace) -> None:
     cfg = load_config()
     cfg.apply_cli_model(args.model)
 
-    provider_kwargs: dict[str, str] = {}
-    if cfg.copilot.exe:
-        provider_kwargs["exe"] = cfg.copilot.exe
-    if cfg.copilot.allow:
-        provider_kwargs["allow_flag"] = cfg.copilot.allow
+    provider_kwargs = build_provider_kwargs(cfg)
 
     role = cfg.role("commit")
 

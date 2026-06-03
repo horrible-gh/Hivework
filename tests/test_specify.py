@@ -913,24 +913,36 @@ class TestReviewerProvider(unittest.TestCase):
 
 
 class TestConfigSpecifyRole(unittest.TestCase):
+    """Specify/review role routing.
+
+    Loads an EXPLICIT fixture config (not the live repo-root hive.config.json — that
+    file is now gitignored and absent in a fresh clone / CI, so reading it here was
+    fragile). The fixture encodes the canonical deployment choice: specify is a
+    tool-ON author (re-opens live files to lift anchors) so it stays on the file-tool
+    provider copilot; the reviewer is a tool-OFF single-shot, opted onto the
+    OpenAI-compatible HTTP provider as a cost lever (see hivework-model-placement)."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        self.config_path = os.path.join(self.tmpdir, "hive.config.json")
+        with open(self.config_path, "w", encoding="utf-8") as f:
+            json.dump({"roles": {
+                "specify": {"provider": "copilot", "model": "gpt-5-mini"},
+                "review":  {"provider": "deepinfra", "model": "openai/gpt-oss-120b"},
+            }}, f)
+
     def test_specify_role_exists(self):
-        # hive.config.json routes the specify author onto copilot (gpt-5-mini): specify
-        # is a tool-ON author (it re-opens live files to lift anchors), so it stays on the
-        # file-tool provider, not a tool-OFF single-shot one (see hivework-model-placement).
-        cfg = load_config()
-        role = cfg.role("specify")
+        role = load_config(path=self.config_path).role("specify")
         self.assertEqual(role.provider, "copilot")
         self.assertEqual(role.model, "gpt-5-mini")
 
     def test_review_role_routes_to_deepinfra(self):
-        # hive.config.json opts the reviewer onto deepinfra (cost lever).
-        cfg = load_config()
-        role = cfg.role("review")
+        role = load_config(path=self.config_path).role("review")
         self.assertEqual(role.provider, "deepinfra")
         self.assertEqual(role.model, "openai/gpt-oss-120b")
 
     def test_cli_model_override_reaches_specify(self):
-        cfg = load_config()
+        cfg = load_config(path=self.config_path)
         cfg.apply_cli_model("claude-sonnet-4.6")
         self.assertEqual(cfg.role("specify").model, "claude-sonnet-4.6")
 
