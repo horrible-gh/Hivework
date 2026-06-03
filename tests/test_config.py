@@ -40,6 +40,12 @@ class TestConfigDefaults(unittest.TestCase):
     def test_copilot_exe_none(self):
         self.assertIsNone(self.cfg.copilot.exe)
 
+    def test_openai_endpoint_defaults_to_deepinfra_preset(self):
+        # Back-compat: a config that only names provider 'deepinfra' keeps working.
+        self.assertEqual(self.cfg.openai.base_url,
+                         "https://api.deepinfra.com/v1/openai")
+        self.assertEqual(self.cfg.openai.api_key_env, "DEEPINFRA_TOKEN")
+
     def test_judge_role_model_sonnet(self):
         self.assertEqual(self.cfg.role("judge").model, "claude-sonnet-4.5")
 
@@ -103,6 +109,25 @@ class TestConfigPartialFile(unittest.TestCase):
 
     def test_ledger_still_enabled(self):
         self.assertTrue(self.cfg.ledger.enabled)
+
+
+class TestConfigOpenAiEndpoint(unittest.TestCase):
+    """A custom openai block (e.g. OpenAI proper, or a self-hosted vLLM) is honored."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        self.config_path = os.path.join(self.tmpdir, "hive.config.json")
+        cfg = {"openai": {"base_url": "https://api.openai.com/v1",
+                          "api_key_env": "OPENAI_API_KEY"}}
+        with open(self.config_path, "w") as f:
+            json.dump(cfg, f)
+        self.cfg = load_config(path=self.config_path)
+
+    def test_base_url_overridden(self):
+        self.assertEqual(self.cfg.openai.base_url, "https://api.openai.com/v1")
+
+    def test_api_key_env_overridden(self):
+        self.assertEqual(self.cfg.openai.api_key_env, "OPENAI_API_KEY")
 
 
 class TestConfigJudgePartial(unittest.TestCase):

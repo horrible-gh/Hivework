@@ -38,6 +38,12 @@ _DEFAULTS: dict[str, Any] = {
         "converge": {"provider": "copilot", "model": "claude-sonnet-4.5"},
     },
     "copilot": {"exe": None, "allow": "--allow-all", "timeout_sec": 300},
+    # OpenAI-compatible HTTP endpoint for the 'openai'/'deepinfra' provider. These
+    # are the SAME backend; the defaults below are the DeepInfra preset (kept for
+    # back-compat). Point at any other vendor (OpenAI proper, a self-hosted vLLM, …)
+    # by overriding base_url + api_key_env in hive.config.json — no code change.
+    "openai":  {"base_url": "https://api.deepinfra.com/v1/openai",
+                "api_key_env": "DEEPINFRA_TOKEN"},
     "ledger":  {"enabled": True, "db_path": "hive_ledger.db"},
     "apply":   {"backup_dir": ".apply_backups", "backup_ttl_hours": 168},
     # Cost caps for the JUDGE-directed follow-up loop. The retriever is built
@@ -77,6 +83,21 @@ class CopilotConfig:
     exe: str | None = None
     allow: str = "--allow-all"
     timeout_sec: int = 300
+
+
+@dataclass
+class OpenAiConfig:
+    """OpenAI-compatible HTTP endpoint for the ``openai`` / ``deepinfra`` provider.
+
+    Both provider names share one backend (hive/providers.py); this block is what
+    makes it vendor-neutral. ``base_url`` is the chat-completions root and
+    ``api_key_env`` is the NAME of the env var holding the key (the key itself lives
+    in the out-of-repo secrets file, never here). Defaults are the DeepInfra preset
+    so existing configs that only say ``"provider": "deepinfra"`` keep working; the
+    setup wizard writes a chosen preset (DeepInfra, OpenAI, …) or a custom endpoint.
+    """
+    base_url: str = "https://api.deepinfra.com/v1/openai"
+    api_key_env: str = "DEEPINFRA_TOKEN"
 
 
 @dataclass
@@ -182,6 +203,7 @@ class Config:
     converge_role: RoleConfig = field(
         default_factory=lambda: RoleConfig(model="claude-sonnet-4.5"))
     copilot: CopilotConfig = field(default_factory=CopilotConfig)
+    openai: OpenAiConfig = field(default_factory=OpenAiConfig)
     ledger: LedgerConfig = field(default_factory=LedgerConfig)
     apply: ApplyConfig = field(default_factory=ApplyConfig)
     judge: JudgeConfig = field(default_factory=JudgeConfig)
@@ -261,6 +283,7 @@ def load_config(path: str | None = None) -> Config:
     merged = _deep_merge(_DEFAULTS, raw)
     roles = merged.get("roles", {})
     copilot_raw = merged.get("copilot", {})
+    openai_raw = merged.get("openai", {})
     ledger_raw = merged.get("ledger", {})
     apply_raw = merged.get("apply", {})
     judge_raw = merged.get("judge", {})
@@ -306,6 +329,11 @@ def load_config(path: str | None = None) -> Config:
             exe=copilot_raw.get("exe"),
             allow=copilot_raw.get("allow", "--allow-all"),
             timeout_sec=int(copilot_raw.get("timeout_sec", 300)),
+        ),
+        openai=OpenAiConfig(
+            base_url=str(openai_raw.get("base_url",
+                                        "https://api.deepinfra.com/v1/openai")),
+            api_key_env=str(openai_raw.get("api_key_env", "DEEPINFRA_TOKEN")),
         ),
         ledger=LedgerConfig(
             enabled=bool(ledger_raw.get("enabled", True)),

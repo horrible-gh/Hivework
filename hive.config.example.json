@@ -10,6 +10,11 @@
     "assemble": { "provider": "provider", "model": "model" }
   },
   "copilot": { "exe": null, "allow": "--allow-all", "timeout_sec": 300 },
+  "_openai_presets": {
+    "deepinfra": { "base_url": "https://api.deepinfra.com/v1/openai", "api_key_env": "DEEPINFRA_TOKEN" },
+    "openai":    { "base_url": "https://api.openai.com/v1",          "api_key_env": "OPENAI_API_KEY" }
+  },
+  "openai":  { "base_url": "https://api.deepinfra.com/v1/openai", "api_key_env": "DEEPINFRA_TOKEN" },
   "ledger":  { "enabled": true, "db_path": "hive_ledger.db" },
   "apply":   { "backup_dir": ".apply_backups", "backup_ttl_hours": 168 },
   "judge":   { "max_calls_per_axis": 2, "max_axes": 12, "max_parallel": 4 },
