@@ -13,8 +13,13 @@ _normalize_plan.
 import json
 import os
 import subprocess
+from unittest import mock
 
 import pytest
+
+import hive.commit as C
+from hive.commit import run_propose
+from hive.providers import WorkerResult
 
 from hive.commit import (
     build_commit_proposal,
@@ -85,6 +90,18 @@ def test_changed_paths_sees_modified_and_untracked(tmp_path):
 
 
 # ── build_commit_proposal ────────────────────────────────────────────────────
+
+def test_changed_paths_expands_untracked_new_dir(tmp_path):
+    """Untracked files in a NEW directory must be listed individually, not collapsed
+    to a single 'dir/' entry (which would undercount the budget threshold and make
+    each file look 'not changed' in the membership check)."""
+    repo = _repo(tmp_path)
+    _write(repo, "docs/a.md", "a\n")
+    _write(repo, "docs/b.md", "b\n")
+    changed = changed_paths(repo)
+    assert "docs/a.md" in changed and "docs/b.md" in changed
+    assert "docs/" not in changed
+
 
 def test_ready_when_all_committable(tmp_path):
     repo = _repo(tmp_path)
@@ -373,6 +390,35 @@ def test_propose_prompt_omits_directive_below_threshold():
     assert "BUDGET MODE" not in prompt
 
 
+def _ok_plan_json():
+    return WorkerResult(
+        stdout='{"commits": [], "gate": {"commit": false}, '
+               '"termination": "ready_to_commit"}',
+        stderr="", exit_code=0, latency_s=0.01)
+
+
+def test_filename_only_disables_worker_tools(tmp_path):
+    """Above the threshold the worker must be called with available_tools=[] so it
+    physically cannot open files — prose alone is not enough to enforce the budget."""
+    repo = _repo(tmp_path)
+    for i in range(5):
+        _write(repo, f"docs/d{i}.md", f"# {i}\n")
+    out = os.path.join(str(tmp_path), "plan.json")
+    with mock.patch.object(C, "call_worker", return_value=_ok_plan_json()) as cw:
+        run_propose(repo, out, provider="copilot", filename_only_threshold=3)
+    assert cw.call_args.kwargs.get("available_tools") == []
+
+
+def test_normal_mode_leaves_worker_tools_enabled(tmp_path):
+    """At or below the threshold the author may open files — no tool restriction."""
+    repo = _repo(tmp_path)
+    _write(repo, "a.py", "x = 1\n")
+    out = os.path.join(str(tmp_path), "plan.json")
+    with mock.patch.object(C, "call_worker", return_value=_ok_plan_json()) as cw:
+        run_propose(repo, out, provider="copilot", filename_only_threshold=50)
+    assert "available_tools" not in cw.call_args.kwargs
+
+
 # ── compact stdout summary ───────────────────────────────────────────────────
 
 def test_summary_lists_messages_and_caps_files(tmp_path):
@@ -393,4 +439,6 @@ def test_summary_reports_leftover(tmp_path):
     _write(repo, "scratch.txt", "tmp\n")   # changed but in no commit
     plan = _plan([{"id": "c1", "message": "feat(core): add a", "files": ["a.py"]}])
     lines = render_commit_summary_lines(build_commit_proposal(plan, repo))
-    assert any("leftover" in ln.lower() and "scratch.txt" in ln for ln in lines)
+    text = "\n".join(lines)
+    assert "leftover" in text.lower()
+    assert any(ln.strip() == "- scratch.txt" for ln in lines)
