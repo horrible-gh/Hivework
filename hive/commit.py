@@ -93,8 +93,15 @@ def changed_paths(repo_root: str) -> set[str]:
     Covers staged, unstaged, and untracked files via ``git status --porcelain``.
     Renames (``R  old -> new``) contribute the new path. Quoted paths (paths with
     spaces/unicode under core.quotepath) are unquoted.
+
+    ``--untracked-files=all`` is required: the default collapses untracked files in a
+    NEW directory into a single ``dir/`` entry, which would (a) undercount the change
+    set for the filename-only budget threshold and (b) make each real file look
+    "not changed" in the per-commit membership check (a false NOT-READY). Listing all
+    untracked files individually also keeps this aligned with the author's git context.
     """
-    res = _git(repo_root, ["status", "--porcelain"], check=True)
+    res = _git(repo_root, ["status", "--porcelain", "--untracked-files=all"],
+               check=True)
     paths: set[str] = set()
     for raw in res.stdout.splitlines():
         if not raw.strip():
@@ -315,8 +322,18 @@ def run_propose(
     logger.info("Running commit author (single, not fan-out)...")
     logger.debug("Prompt length: %d chars", len(prompt))
 
+    call_kwargs = dict(provider_kwargs or {})
+    if filename_only:
+        # Enforce the no-file-read budget at the HARNESS level, not by prose alone.
+        # The directive in the prompt is a request an agentic worker can ignore; an
+        # EMPTY available_tools list disables ALL local tools (copilot --available-tools=)
+        # so the author physically cannot open/read/diff files — it must emit the plan
+        # from the path list in a single shot. This is what actually caps the cost (and
+        # the latency) on a thousand-file change set. (Ignored by tool-less providers.)
+        call_kwargs["available_tools"] = []
+
     wr = call_worker(provider, model, prompt, cwd=repo_root, timeout=600,
-                     **(provider_kwargs or {}))
+                     **call_kwargs)
     if ledger is not None:
         ledger.record_call("commit", "commit-plan", provider, model,
                            prompt=prompt, output=wr.stdout, latency_s=wr.latency_s,
@@ -628,8 +645,9 @@ def render_commit_summary_lines(
 
     Unlike the full markdown proposal (written only with ``--out``), this is meant for
     stdout/log: per commit it shows the verdict flag, message, file count, and up to
-    ``max_files`` paths (the rest collapsed to ``… +N more``) so a thousand-file
-    change set stays readable. Leftover/staged-leftover counts are summarized too.
+    ``max_files`` paths listed ONE PER LINE (the rest collapsed to a ``… +N more``
+    line) so a thousand-file change set stays readable. Leftover/staged-leftover are
+    summarized the same way.
     """
     lines: list[str] = []
     commits = proposal.get("commits") or []
@@ -639,13 +657,12 @@ def render_commit_summary_lines(
     for i, r in enumerate(commits, 1):
         flag = "OK " if r.get("committable") else "BAD"
         files = r.get("files") or []
-        shown = ", ".join(files[:max_files])
-        if len(files) > max_files:
-            shown += f", … +{len(files) - max_files} more"
         lines.append(f"  [{flag}] {i}. {r.get('message', '')}  "
                      f"({len(files)} file{'s' if len(files) != 1 else ''})")
-        if shown:
-            lines.append(f"        {shown}")
+        for rel in files[:max_files]:
+            lines.append(f"        - {rel}")
+        if len(files) > max_files:
+            lines.append(f"        … +{len(files) - max_files} more")
         for msg in r.get("messages") or []:
             lines.append(f"        ! {msg}")
     staged_left = proposal.get("staged_leftover") or []
@@ -654,10 +671,11 @@ def render_commit_summary_lines(
                      f"{len(staged_left)}")
     leftover = proposal.get("leftover") or []
     if leftover:
-        shown = ", ".join(leftover[:max_files])
+        lines.append(f"Uncommitted leftover ({len(leftover)}):")
+        for rel in leftover[:max_files]:
+            lines.append(f"  - {rel}")
         if len(leftover) > max_files:
-            shown += f", … +{len(leftover) - max_files} more"
-        lines.append(f"Uncommitted leftover ({len(leftover)}): {shown}")
+            lines.append(f"  … +{len(leftover) - max_files} more")
     return lines
 
 
