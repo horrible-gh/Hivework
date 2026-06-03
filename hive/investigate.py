@@ -211,6 +211,51 @@ def _prioritize_axes(leaves: list[dict[str, Any]], seed_text: str,
 _SEED_CITE_RE = re.compile(
     r"([A-Za-z0-9_][A-Za-z0-9_./\\-]*\.[A-Za-z0-9]+)(?::(\d+)(?:-(\d+))?)?")
 
+# An edit target must be DESIGNATED, not merely mentioned. A seed routinely lists
+# files in an orientation/context map ("Backend lives in X.py (verify)") or in
+# investigative prose ("Trace the endpoint in Y.py") that the author must NOT treat
+# as an edit site — doing so makes the seed-coverage gate force edits onto files the
+# investigation (converge) ruled out, contradicting the honey's own conclusion. N177:
+# the seed's ``[System context]`` file map ("SQL queries live in queries.json … head
+# API: workflow_head_routes.py (verify) … FE view-state: workflowViewState.ts") became
+# FIVE mandatory BE edit targets — including the queries.json the SAME seed says "Do
+# NOT author an edit there" — so apply could never go ready and the author thrashed on
+# bogus targets instead of converge's single FE attribution. A file qualifies as an
+# edit target only when its mention carries an EDIT-INTENT cue (or the seed pinned an
+# explicit ``:line`` on it) AND no DO-NOT-EDIT cue rules it out.
+_EDIT_INTENT_RE = re.compile(
+    r"\[\s*edit|\bedits?\b|\bedited\b|\bediting\b|\bfix(?:es|ed|ing)?\b|\breplace\b|"
+    r"\brewrite\b|\bmodif(?:y|ies|ied)\b|\bchange\b|\bauthor\b|\bupdate\b|"
+    r"수정|편집|고쳐|교정|바꿔",
+    re.IGNORECASE)
+_DO_NOT_EDIT_RE = re.compile(
+    r"do\s+not\s+(?:author|edit|modif|produce|touch|change|rewrite)|"
+    r"don'?t\s+(?:edit|touch|modify|change)|no-?op|ruled\s+out|stop\s+re-?examin|"
+    r"leave\s+(?:it\s+)?unchanged|건드리지\s*마|수정하지\s*마|편집하지\s*마|"
+    r"손대지\s*마|만지지\s*마",
+    re.IGNORECASE)
+
+
+def _seed_target_designation(seed_text: str, rel: str) -> tuple[bool, bool]:
+    """``(designated_for_edit, ruled_out)`` for a seed-named file via line-scoped cues.
+
+    Scans each seed line that MENTIONS the file (by path or basename): a line with an
+    edit-intent cue designates it for editing; a line with a do-not-edit cue rules it
+    out. A file mentioned only in orientation / investigation prose ("(verify)",
+    "Trace …") is neither — so the seed-coverage gate does not force it into edits[].
+    Pure-local, free, never raises.
+    """
+    base = os.path.basename(rel)
+    designated = ruled_out = False
+    for line in seed_text.splitlines():
+        if rel not in line and base not in line:
+            continue
+        if _DO_NOT_EDIT_RE.search(line):
+            ruled_out = True
+        if _EDIT_INTENT_RE.search(line):
+            designated = True
+    return designated, ruled_out
+
 
 def seed_edit_targets(seed_text: str, code_root: str | None,
                       docs_root: str | None = None,
@@ -260,12 +305,20 @@ def seed_edit_targets(seed_text: str, code_root: str | None,
                      if r and os.path.isfile(os.path.join(r, rel))), None)
         if root is None:
             continue
+        # An explicit user-written ``:line`` is itself an edit designation.
         ln_lo = ln_hi = None
         for cited, (lo, hi) in explicit.items():
             if (rel == cited or rel.endswith("/" + cited) or cited.endswith("/" + rel)
                     or os.path.basename(cited) == os.path.basename(rel)):
                 ln_lo, ln_hi = lo, hi
                 break
+        # Qualify the file: only a file the seed DESIGNATES for editing (an edit-intent
+        # cue near its mention, or an explicit pinned line) becomes a binding target —
+        # never one that is merely mapped in orientation prose or explicitly ruled out
+        # (N177's [System context] map / "do NOT author an edit there" queries.json).
+        designated, ruled_out = _seed_target_designation(seed_text, rel)
+        if ruled_out or not (designated or ln_lo is not None):
+            continue
         # Prose "(around) lines N-M" near the file mention (the seed writes the
         # range as prose, not path:line — e.g. "spec.ts\nAround lines 299-322").
         if ln_lo is None:

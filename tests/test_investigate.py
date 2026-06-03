@@ -524,6 +524,43 @@ class TestSeedEditTargets(unittest.TestCase):
             self.assertIn("AUTHOR them", honey)
             self.assertIn("server/sql/queries/queries.json:", honey)
 
+    def test_orientation_context_map_is_not_an_edit_target(self):
+        # N177: a [System context] file map names files purely to ORIENT ("verify
+        # yourself … do NOT anchor on this prose"). None carry an edit-intent cue, so
+        # none may become a binding edit target (else the seed-coverage gate forces
+        # edits onto files converge ruled out).
+        with tempfile.TemporaryDirectory() as td:
+            self._write(td, "server/modules/api/workflow_head_routes.py", "x = 1\n")
+            self._write(td, "client/src/workflowViewState.ts", "let a = 1\n")
+            seed = (
+                "[System context]\n"
+                "Workflow head API: `server/modules/api/workflow_head_routes.py` (verify). "
+                "FE view-state: `client/src/workflowViewState.ts` (verify). "
+                "Verify every path/symbol yourself via grep/read — do NOT anchor on this prose.\n"
+                "[Instruction]\n"
+                "Trace the endpoint end-to-end and PIN the single off-by-one node with code.")
+            self.assertEqual(INV.seed_edit_targets(seed, td), [])
+
+    def test_ruled_out_file_is_not_an_edit_target(self):
+        # The seed names a file only to FORBID editing it ("Do NOT author an edit
+        # there"); even with a stray edit-ish word it must never be a target.
+        with tempfile.TemporaryDirectory() as td:
+            self._write(td, "server/sql/queries/queries.json",
+                        '{\n  "get_effective_head": "SELECT 1 ORDER BY sort_order"\n}\n')
+            seed = ("The ORDER BY change to server/sql/queries/queries.json is a CONFIRMED "
+                    "no-op. Do NOT author an edit there.")
+            self.assertEqual(INV.seed_edit_targets(seed, td), [])
+
+    def test_designated_edit_target_still_resolved(self):
+        # The complement: a genuinely DESIGNATED target (edit-intent cue on the line)
+        # is still lifted — the tightening must not drop real targets.
+        with tempfile.TemporaryDirectory() as td:
+            self._write(td, "client/src/view.ts", "a\nb\nfunction buildStepStates() {}\n")
+            seed = "Edit client/src/view.ts to fix the buildStepStates off-by-one."
+            targets = INV.seed_edit_targets(seed, td)
+            self.assertEqual(len(targets), 1)
+            self.assertEqual(targets[0]["file"], "client/src/view.ts")
+
 
 class TestApplyCallBudget(unittest.TestCase):
     """max_total_calls: one-number cap → reduce votes first, then trim axes."""
