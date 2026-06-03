@@ -9,6 +9,11 @@ openai>=1.40
 # Pretty terminal UI for the interactive setup (hive_setup.py).
 rich>=13.0
 
+# Arrow-key / space-toggle selection menus for the interactive setup, so the wizard
+# is point-and-pick instead of type-a-letter. Optional at runtime: if absent (or stdin
+# is not a TTY, e.g. piped/automation), hive_setup falls back to plain text prompts.
+questionary>=2.0
+
 # Optional DB drivers for the converge live data-read — install ONLY the one your
 # target uses. sqlite needs nothing (it is in the stdlib). Uncomment as needed:
 # pymysql>=1.1            # mysql / mariadb targets
