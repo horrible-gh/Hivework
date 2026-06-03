@@ -99,7 +99,7 @@ def _run_capture(cmd, *, input=None, cwd=None, timeout=None) -> subprocess.Compl
 
 
 def _call_copilot(model, prompt, cwd, timeout, exe=None, allow_flag="--allow-all",
-                  available_tools=None) -> WorkerResult:
+                  available_tools=None, **_ignored) -> WorkerResult:
     """Call the copilot CLI. Prompt sent via stdin (never -p) to avoid cp932 truncation.
 
     ``available_tools``: when not None, restrict the model to exactly this tool
@@ -107,6 +107,10 @@ def _call_copilot(model, prompt, cwd, timeout, exe=None, allow_flag="--allow-all
     forcing a single-shot completion (no file/shell access). The JUDGE uses this
     to rule on the supplied bundle instead of turning into an agentic explorer —
     which both defeats the retrieval redesign and blows the timeout.
+
+    ``**_ignored`` absorbs the OpenAI-compatible endpoint kwargs (``base_url`` /
+    ``api_key_env``) that callers put in the single shared ``provider_kwargs`` dict
+    for the HTTP provider — they are meaningless to the copilot CLI and dropped.
     """
     if exe is None:
         exe = shutil.which("copilot.cmd") or shutil.which("copilot") or "copilot"
@@ -135,41 +139,53 @@ def _call_copilot(model, prompt, cwd, timeout, exe=None, allow_flag="--allow-all
 _DEEPINFRA_MAX_TOKENS = 4096
 
 
-def _call_deepinfra(model, prompt, cwd=None, timeout=120, *, system=None,
-                    temperature=0.2, max_tokens=_DEEPINFRA_MAX_TOKENS,
-                    reasoning_effort=None,
-                    api_key_env="DEEPINFRA_TOKEN",
-                    base_url="https://api.deepinfra.com/v1/openai",
-                    available_tools=None, **_ignored) -> WorkerResult:
-    """Call a DeepInfra OpenAI-compatible chat model (e.g. ``openai/gpt-oss-120b``).
+def _call_openai_compatible(model, prompt, cwd=None, timeout=120, *, system=None,
+                            temperature=0.2, max_tokens=_DEEPINFRA_MAX_TOKENS,
+                            reasoning_effort=None,
+                            api_key_env="DEEPINFRA_TOKEN",
+                            base_url="https://api.deepinfra.com/v1/openai",
+                            available_tools=None, **_ignored) -> WorkerResult:
+    """Call any OpenAI-compatible chat endpoint (DeepInfra, OpenAI, vLLM, …).
+
+    This is the generic HTTP handler behind both the ``openai`` and ``deepinfra``
+    provider names — they are the SAME backend; "deepinfra" is simply the preset
+    whose ``base_url`` / ``api_key_env`` defaults below point at DeepInfra. Any
+    other OpenAI-compatible vendor is reached by passing a different ``base_url``
+    and ``api_key_env`` (wired from the config ``openai`` block), so the engine is
+    not bound to one provider.
 
     HTTP via the openai SDK, not subprocess. Unlike copilot this returns EXACT
     token counts (``response.usage.total_tokens``), surfaced on
     ``WorkerResult.real_tokens`` for the ledger's real_tokens column.
 
-    Tool-OFF single-shot path: the model has no access to the local filesystem,
-    so ``cwd`` and ``available_tools`` are accepted only for ``call_worker``
-    signature parity and ignored (a non-empty ``available_tools`` is meaningless
-    here and logged at debug). Intended for the judge / review roles, where a
-    ~20s round-trip is acceptable.
+    Tool-OFF single-shot path: this is a SINGLE chat completion with no tools and
+    no agent loop, so the model can't read local files — NOT because the OpenAI API
+    lacks function-calling (it has it), but because executing a tool that reads the
+    user's disk is inherently client-side work we haven't wired here yet. (copilot/
+    codex ship exactly that loop + local tools, which is why the agentic tool-ON
+    roles route to them today; giving this handler a tool loop would unlock tool-ON
+    over HTTP too, at the cost of per-token billing on long traces.) So ``cwd`` and
+    ``available_tools`` are accepted only for ``call_worker`` signature parity and
+    ignored (a non-empty ``available_tools`` is logged at debug). Intended for the
+    judge / converge / review roles, where a ~20s single round-trip is acceptable.
 
     Config errors (missing key, openai not installed) and API failures return a
     WorkerResult with exit_code=1 and the message on stderr — matching the
     copilot handler's contract so callers' existing error handling applies.
     """
     if available_tools:
-        logger.debug("deepinfra: ignoring available_tools=%s (no local tool access)",
+        logger.debug("openai: ignoring available_tools=%s (no local tool access)",
                      available_tools)
     api_key = os.environ.get(api_key_env)
     if not api_key:
         msg = f"{api_key_env} not set in environment"
-        logger.warning("deepinfra: %s", msg)
+        logger.warning("openai: %s", msg)
         return WorkerResult(stdout="", stderr=msg, exit_code=1, latency_s=0.0)
     try:
         from openai import OpenAI
     except ImportError:
         msg = "openai package not installed (pip install openai)"
-        logger.warning("deepinfra: %s", msg)
+        logger.warning("openai: %s", msg)
         return WorkerResult(stdout="", stderr=msg, exit_code=1, latency_s=0.0)
 
     messages = []
@@ -180,7 +196,8 @@ def _call_deepinfra(model, prompt, cwd=None, timeout=120, *, system=None,
     if reasoning_effort:
         extra["reasoning_effort"] = reasoning_effort
 
-    logger.debug("call_worker deepinfra: model=%s timeout=%d", model, timeout)
+    logger.debug("call_worker openai: model=%s base_url=%s timeout=%d",
+                 model, base_url, timeout)
     client = OpenAI(api_key=api_key, base_url=base_url, timeout=timeout)
     t0 = time.monotonic()
     try:
@@ -189,7 +206,7 @@ def _call_deepinfra(model, prompt, cwd=None, timeout=120, *, system=None,
             max_tokens=max_tokens, **extra)
     except Exception as e:
         latency_s = time.monotonic() - t0
-        logger.warning("deepinfra call failed (%.1fs): %s", latency_s, e)
+        logger.warning("openai call failed (%.1fs): %s", latency_s, e)
         return WorkerResult(stdout="", stderr=str(e), exit_code=1, latency_s=latency_s)
     latency_s = time.monotonic() - t0
 
@@ -271,9 +288,15 @@ def _call_codex(model, prompt, cwd=None, timeout=300, *, sandbox="read-only",
 
 # Extension point: add new providers here.
 # Handler signature: (model, prompt, cwd, timeout, **kwargs) -> WorkerResult
+#
+# ``openai`` and ``deepinfra`` map to the SAME OpenAI-compatible handler — the
+# generic provider name plus a DeepInfra-preset alias kept for back-compat with
+# existing configs/tests. Point either at another vendor via the config ``openai``
+# block (base_url / api_key_env).
 _REGISTRY: dict = {
     "copilot": _call_copilot,
-    "deepinfra": _call_deepinfra,
+    "openai": _call_openai_compatible,
+    "deepinfra": _call_openai_compatible,
     "codex": _call_codex,
 }
 

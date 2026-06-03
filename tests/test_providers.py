@@ -94,22 +94,55 @@ class _FakeOpenAI:
         return _FakeResp()
 
 
-def _run_deepinfra(env_key="set", **call_kwargs):
-    """Call the deepinfra handler with openai.OpenAI patched. env_key='set'|'unset'."""
+def _run_deepinfra(env_key="set", provider="deepinfra", env=None, **call_kwargs):
+    """Call the OpenAI-compatible handler with openai.OpenAI patched.
+
+    ``provider`` selects the registry alias ('deepinfra' or 'openai' — same backend).
+    ``env`` overrides the patched environment; by default DEEPINFRA_TOKEN=tok is set
+    (env_key='unset' clears it)."""
     _FakeOpenAI.raise_on_create = None
     import types
     fake_openai = types.ModuleType("openai")
     fake_openai.OpenAI = _FakeOpenAI
-    env = {"DEEPINFRA_TOKEN": "tok"} if env_key == "set" else {}
+    if env is None:
+        env = {"DEEPINFRA_TOKEN": "tok"} if env_key == "set" else {}
     with mock.patch.dict("sys.modules", {"openai": fake_openai}), \
          mock.patch.dict(os.environ, env, clear=True):
-        return providers.call_worker("deepinfra", "openai/gpt-oss-120b",
+        return providers.call_worker(provider, "openai/gpt-oss-120b",
                                      "explain X", cwd="/x", timeout=30, **call_kwargs)
 
 
 class TestDeepInfraHandler(unittest.TestCase):
     def test_registered(self):
         self.assertIn("deepinfra", providers._REGISTRY)
+
+    def test_openai_alias_is_same_backend(self):
+        """'openai' and 'deepinfra' map to the one OpenAI-compatible handler."""
+        self.assertIn("openai", providers._REGISTRY)
+        self.assertIs(providers._REGISTRY["openai"],
+                      providers._REGISTRY["deepinfra"])
+
+    def test_openai_provider_name_works(self):
+        wr = _run_deepinfra(provider="openai")
+        self.assertEqual(wr.exit_code, 0)
+        self.assertEqual(wr.stdout, "hi there")
+
+    def test_custom_base_url_and_api_key_env_override(self):
+        """A non-DeepInfra endpoint: base_url + api_key_env flow through to the client."""
+        wr = _run_deepinfra(provider="openai",
+                            env={"OPENAI_API_KEY": "sk-xyz"},
+                            base_url="https://api.openai.com/v1",
+                            api_key_env="OPENAI_API_KEY")
+        self.assertEqual(wr.exit_code, 0)
+        self.assertEqual(_FakeOpenAI.last_init_kwargs["base_url"],
+                         "https://api.openai.com/v1")
+        self.assertEqual(_FakeOpenAI.last_init_kwargs["api_key"], "sk-xyz")
+
+    def test_custom_api_key_env_missing_reports_that_name(self):
+        wr = _run_deepinfra(provider="openai", env={},
+                            api_key_env="OPENAI_API_KEY")
+        self.assertEqual(wr.exit_code, 1)
+        self.assertIn("OPENAI_API_KEY", wr.stderr)
 
     def test_success_returns_content_and_real_tokens(self):
         wr = _run_deepinfra()
