@@ -114,6 +114,27 @@ def test_literal_preview_empty_when_no_root():
     assert build_literal_preview("order_doc_id is wrong", "") == ""
 
 
+def test_literal_preview_drops_flood_keeps_specific(tmp_path):
+    # A common token (appears in many files) is too generic to anchor and must be
+    # dropped; a specific identifier (one file) must survive. Without this the
+    # per-file ripgrep cap let a common token flood the block (450-line bug).
+    repo = _git_repo(tmp_path)
+    for i in range(30):                       # `widget` floods 30 files
+        _add(repo, f"src/mod_{i}.py", "widget = 1\n")
+    _add(repo, "src/special.py",
+         'launch_sequence_handler("x")  # unique_marker_xyz lives here\n')
+    subprocess.run(["git", "-C", repo, "commit", "-q", "-m", "x"], check=True)
+
+    preview = build_literal_preview(
+        'the "unique_marker_xyz" path and widget handling are wrong',
+        repo, max_files_per_literal=8)
+    assert "unique_marker_xyz" in preview          # specific literal kept
+    assert "src/special.py" in preview
+    # widget grounded to 30 > 8 files → dropped, so the block stays tight.
+    assert "mod_0.py" not in preview
+    assert preview.count("\n") < 8                  # no flood
+
+
 def test_prompt_embeds_literal_preview_with_bait_framing():
     prompt = build_decompose_prompt(
         "fix it", literal_preview="order_doc_id:\n  server/db/orders.py:2  ...")

@@ -123,33 +123,51 @@ def build_repo_tree(code_root: str | None, max_lines: int = 400) -> str:
 def build_literal_preview(seed_text: str, code_root: str | None,
                           *, max_literals: int = 12,
                           max_hits_per_literal: int = 3,
-                          max_lines: int = 60) -> str:
-    """Render a bounded map of where the seed's LITERAL tokens already appear.
+                          max_lines: int = 60,
+                          max_files_per_literal: int = 50) -> str:
+    """Render a bounded map of where the seed's SPECIFIC literal tokens appear.
 
     Free, local, deterministic, never raises. Returns "" when there is no code
-    root, no literal in the seed, or none of the literals hit the tree — in which
-    case the caller omits the block entirely (no anchoring on an empty bait).
+    root, no literal in the seed, or none of the literals ground — the caller then
+    omits the block (no anchoring on an empty bait).
+
+    The bait must point at SPECIFIC sites (an error string, an identifier), so
+    noise is dropped on two axes: (1) tiny / path-fragment tokens (``server/``,
+    3-char tokens) carry no locating signal; (2) a literal that grounds to MANY
+    files (> ``max_files_per_literal`` — ``module`` hit 160, ``NULL`` 143) is too
+    common to anchor anything. Survivors are RANKED by file-spread ascending so the
+    most specific literals (a quoted UI label in 1 file, a unique identifier in a
+    few) lead and are never the ones the line cap trims. Hits are capped per
+    literal AND globally: ``_ripgrep``'s ``--max-count`` is PER FILE, so without a
+    total cap a common token floods (450 lines of ``server/`` matches once buried
+    the one useful ``ko.ts`` hit before the line cap could fire).
     """
     if not code_root:
         return ""
-    literals = extract_keywords(seed_text)[:max_literals]
-    if not literals:
-        return ""
-    sections: list[str] = []
-    total = 0
-    for lit in literals:
+    scored: list[tuple[int, str, list]] = []
+    for lit in extract_keywords(seed_text)[:max_literals]:
+        if len(lit) < 4 or lit.endswith("/"):
+            continue
         try:
             hits = _ripgrep(lit, [], code_root, max_hits=max_hits_per_literal)
         except (OSError, subprocess.SubprocessError):
             hits = []
-        if not hits:
+        n_files = len({h["file"] for h in hits})
+        if not hits or n_files > max_files_per_literal:
             continue
+        scored.append((n_files, lit, hits))
+    scored.sort(key=lambda t: t[0])                       # most specific first
+    sections: list[str] = []
+    total = 0
+    for _n, lit, hits in scored:
+        room = max_lines - total
+        if room <= 0:
+            break
+        shown = hits[:min(max_hits_per_literal, room)]
         lines = [f"  {h['file'].removeprefix('./')}:{h['line']}  "
-                 f"{h['text'][:120]}" for h in hits]
+                 f"{h['text'][:120]}" for h in shown]
         sections.append(f"{lit}:\n" + "\n".join(lines))
         total += len(lines)
-        if total >= max_lines:
-            break
     return "\n".join(sections)
 
 
