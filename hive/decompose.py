@@ -22,6 +22,8 @@ from typing import Any
 
 from hive.parse import extract_first_json
 from hive.providers import call_worker
+from hive.retriever import _ripgrep
+from hive.searchplan import extract_keywords
 
 logger = logging.getLogger("hive.decompose")
 
@@ -104,6 +106,53 @@ def build_repo_tree(code_root: str | None, max_lines: int = 400) -> str:
     return ("# very large repo — top-level areas with file counts:\n" +
             "\n".join(f"{d}/  ({n} files)" for d, n in sorted(top.items())))
 
+# ── Literal pre-grep given to the queen as BAIT, not a menu (M012) ─────────────
+# The seed sometimes carries hard literals — error-stack identifiers, quoted
+# strings, snake_case/CamelCase symbols, paths. Those are the one class of token
+# we can resolve to real code for FREE, before any model runs (extract_keywords
+# invents nothing; it only lifts tokens the seed already wrote). We grep them and
+# show the queen where each already lands.
+#
+# CRUX (M012 §4 — anchoring): this is a HEAD-START, never a constraint. The real
+# fix keyword is usually NOT in the request ("정렬이 안 돼요" → the fix lives at
+# `ORDER BY ... IS NULL`, a token the seed never wrote), and the queen's value is
+# exactly that symptom→code translation (decompose rule 6). So the prompt framing
+# below says "treat this as one extra clue, then STILL invent your own keywords",
+# never "pick from this list". On a pure-symptom seed extract_keywords returns
+# near-nothing → the block is empty → an honest no-op (M012's predicted outcome).
+def build_literal_preview(seed_text: str, code_root: str | None,
+                          *, max_literals: int = 12,
+                          max_hits_per_literal: int = 3,
+                          max_lines: int = 60) -> str:
+    """Render a bounded map of where the seed's LITERAL tokens already appear.
+
+    Free, local, deterministic, never raises. Returns "" when there is no code
+    root, no literal in the seed, or none of the literals hit the tree — in which
+    case the caller omits the block entirely (no anchoring on an empty bait).
+    """
+    if not code_root:
+        return ""
+    literals = extract_keywords(seed_text)[:max_literals]
+    if not literals:
+        return ""
+    sections: list[str] = []
+    total = 0
+    for lit in literals:
+        try:
+            hits = _ripgrep(lit, [], code_root, max_hits=max_hits_per_literal)
+        except (OSError, subprocess.SubprocessError):
+            hits = []
+        if not hits:
+            continue
+        lines = [f"  {h['file'].removeprefix('./')}:{h['line']}  "
+                 f"{h['text'][:120]}" for h in hits]
+        sections.append(f"{lit}:\n" + "\n".join(lines))
+        total += len(lines)
+        if total >= max_lines:
+            break
+    return "\n".join(sections)
+
+
 # Fixed axes that recipe_code_bug.md §1 requires always present
 RECIPE_FIXED_AXES = """
 ## Fixed axes that MUST be included (recipe §1):
@@ -174,7 +223,7 @@ value, prefer single quotes so no escaping is needed.
 
 
 def build_decompose_prompt(seed_text: str, recipe_section1: str = "",
-                           repo_tree: str = "") -> str:
+                           repo_tree: str = "", literal_preview: str = "") -> str:
     """Build the full prompt for the decompose worker.
 
     Args:
@@ -182,6 +231,8 @@ def build_decompose_prompt(seed_text: str, recipe_section1: str = "",
         recipe_section1: Recipe §1 fixed-axis rules (if available).
         repo_tree: A bounded file map of the target repo (build_repo_tree), so the
             queen anchors file_globs on real paths instead of guessing.
+        literal_preview: A free pre-grep of the seed's literal tokens
+            (build_literal_preview), attached as a HEAD-START — never a menu.
 
     Returns:
         Full prompt string for copilot.
@@ -197,12 +248,24 @@ ensure your axes cover BOTH.
 {repo_tree}
 ══════════════════════════════════════════════════════════════════════
 """
+    literal_part = ""
+    if literal_preview:
+        literal_part = f"""
+═══════════ LITERAL PRE-GREP (free head-start — NOT a menu) ═══════════
+We grepped the EXACT tokens the request itself contains and list where each one
+already appears below. Treat this as ONE extra clue — then STILL generate your
+own `keywords` from your understanding of the symptom (rule 6). The real fix
+keyword (e.g. `ORDER BY`, `IS NULL`) is usually NOT written in the request:
+invent it, do NOT just pick from this list.
+{literal_preview}
+══════════════════════════════════════════════════════════════════════
+"""
     return f"""Your task RIGHT NOW: read the software investigation request below and break it into a parallel research plan, then reply with ONLY a JSON object. This is a real, concrete task — act on it immediately. Do not reply conversationally, do not say "I'm ready", do not ask what to do. The request is already here:
 
 ═══════════════ INVESTIGATION REQUEST (decompose THIS) ═══════════════
 {seed_text}
 ══════════════════════════════════════════════════════════════════════
-{tree_part}
+{tree_part}{literal_part}
 Now cut that request into independent micro-tasks (axes) for free-tier worker
 agents, following the rules and output schema below.
 
@@ -241,13 +304,20 @@ def run_decompose(
         recipe_section1 = _extract_recipe_section1(recipe_path)
 
     repo_tree = build_repo_tree(codebase_root)
-    prompt = build_decompose_prompt(seed_text, recipe_section1, repo_tree)
+    literal_preview = build_literal_preview(seed_text, codebase_root)
+    prompt = build_decompose_prompt(seed_text, recipe_section1, repo_tree,
+                                    literal_preview)
     logger.info("Running decompose worker...")
-    logger.info("Prompt length: %d chars (seed=%d, recipe§1=%d, tree=%d)",
-                len(prompt), len(seed_text), len(recipe_section1), len(repo_tree))
+    logger.info("Prompt length: %d chars (seed=%d, recipe§1=%d, tree=%d, "
+                "literals=%d)", len(prompt), len(seed_text),
+                len(recipe_section1), len(repo_tree), len(literal_preview))
     if repo_tree:
         logger.info("repo tree: fed %d chars of real paths to the queen "
                     "(anchors file_globs on existing files)", len(repo_tree))
+    if literal_preview:
+        logger.info("literal pre-grep: fed %d chars of free head-start hits "
+                    "to the queen (bait, not a menu — rule 6 intact)",
+                    len(literal_preview))
 
     # Persist the exact prompt sent, so delivery problems are inspectable.
     try:

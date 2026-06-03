@@ -10,7 +10,7 @@ import os
 import subprocess
 
 from hive.decompose import (
-    build_repo_tree, build_decompose_prompt, _tree_useful,
+    build_repo_tree, build_decompose_prompt, build_literal_preview, _tree_useful,
 )
 
 
@@ -82,3 +82,47 @@ def test_prompt_embeds_tree_and_instructs_real_paths():
 def test_prompt_omits_tree_section_when_none():
     prompt = build_decompose_prompt("find the off-by-one", repo_tree="")
     assert "REALLY exist" not in prompt
+
+
+# ── Literal pre-grep (M012): free bait, never a menu ───────────────────────────
+
+def test_literal_preview_maps_seed_tokens_to_real_lines(tmp_path):
+    repo = _git_repo(tmp_path)
+    _add(repo, "server/db/orders.py",
+         "def get_pending(group):\n    return query(order_doc_id, group_head)\n")
+    subprocess.run(["git", "-C", repo, "commit", "-q", "-m", "x"], check=True)
+
+    # The seed NAMES the literal identifier; the grep resolves it to a real line.
+    preview = build_literal_preview(
+        "the function reading order_doc_id returns the wrong head", repo)
+    assert "order_doc_id" in preview
+    assert "server/db/orders.py:" in preview
+
+
+def test_literal_preview_empty_on_pure_symptom_seed(tmp_path):
+    # M012's predicted no-op: a symptom-only prose seed carries no literal token,
+    # so extract_keywords yields nothing → empty block → caller omits it.
+    repo = _git_repo(tmp_path)
+    _add(repo, "server/db/orders.py", "x = 1\n")
+    subprocess.run(["git", "-C", repo, "commit", "-q", "-m", "x"], check=True)
+
+    assert build_literal_preview("the ordering does not work right", repo) == ""
+
+
+def test_literal_preview_empty_when_no_root():
+    assert build_literal_preview("order_doc_id is wrong", None) == ""
+    assert build_literal_preview("order_doc_id is wrong", "") == ""
+
+
+def test_prompt_embeds_literal_preview_with_bait_framing():
+    prompt = build_decompose_prompt(
+        "fix it", literal_preview="order_doc_id:\n  server/db/orders.py:2  ...")
+    assert "LITERAL PRE-GREP" in prompt
+    assert "NOT a menu" in prompt          # anti-anchoring framing (M012 §4)
+    assert "invent it" in prompt           # rule 6 stays in force
+    assert "order_doc_id" in prompt
+
+
+def test_prompt_omits_literal_section_when_none():
+    prompt = build_decompose_prompt("fix it", literal_preview="")
+    assert "LITERAL PRE-GREP" not in prompt
