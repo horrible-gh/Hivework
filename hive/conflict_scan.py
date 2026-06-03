@@ -2,7 +2,8 @@
 
 Compares parsed comb dicts and detects:
   (a) root_cause_signal disagreement — different axes point to different root causes
-  (b) termination divergence — one axis says "resolved", another "needs_pm" etc.
+  (b) termination divergence — one axis says "resolved", another is unresolved
+      (needs_runtime / needs_external / any non-resolved value)
   (c) unresolved conditional reachability — axis has reachable=conditional and isn't closed
 
 Each conflict is a dict with:
@@ -105,9 +106,11 @@ def _extract_file_line_refs(text: str) -> set[str]:
 def _check_termination_divergence(combs: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Detect termination divergence between axes.
 
-    Conflict = one axis says "resolved" while another says "needs_pm", "needs_runtime",
-    or "needs_external" for what appears to be the same issue (shared cross_refs or
-    overlapping root_cause_signal).
+    Conflict = one axis says "resolved" while another is unresolved (any non-empty
+    termination that is not "resolved" — e.g. needs_runtime, needs_external, or a legacy
+    needs_pm in historical combs) for what appears to be the same issue (shared cross_refs
+    or overlapping root_cause_signal). Keyed on "not resolved" rather than an enumerated
+    list so a vocabulary change never silently stops detecting divergence.
     """
     conflicts = []
     resolved_axes = []
@@ -117,7 +120,7 @@ def _check_termination_divergence(combs: list[dict[str, Any]]) -> list[dict[str,
         aid = c.get("axis_id", "?")
         if term == "resolved":
             resolved_axes.append((aid, c))
-        elif term in ("needs_pm", "needs_runtime", "needs_external"):
+        elif term:  # any non-empty, non-resolved termination is "unresolved"
             unresolved_axes.append((aid, c, term))
 
     for aid_r, comb_r in resolved_axes:

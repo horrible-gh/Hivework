@@ -45,7 +45,9 @@ class TestParseCombD2(unittest.TestCase):
         self.assertEqual(self.parsed["axis_id"], "D2")
 
     def test_termination(self):
-        """D2 terminates as 'needs_pm'."""
+        """D2 terminates as 'needs_pm' — a RETIRED value preserved in this captured
+        comb. The parser must still read legacy combs verbatim (back-compat); the
+        judge no longer emits needs_pm (see comb_contract_v2.md)."""
         self.assertEqual(self.parsed["termination"], "needs_pm")
 
     def test_root_cause_signal_present(self):

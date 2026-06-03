@@ -214,11 +214,11 @@ def test_write_sweeps_staged_untracking_into_commit(tmp_path):
     assert "c1" in ids and "staged-sweep" in ids
 
 
-def test_not_ready_when_termination_needs_pm(tmp_path):
+def test_not_ready_when_termination_nothing_to_commit(tmp_path):
     repo = _repo(tmp_path)
     _write(repo, "a.py", "x = 1\n")
     plan = _plan([{"id": "c1", "message": "feat(core): add a", "files": ["a.py"]}],
-                 termination="needs_pm")
+                 termination="nothing_to_commit")
     proposal = build_commit_proposal(plan, repo)
     assert proposal["ready"] is False
 

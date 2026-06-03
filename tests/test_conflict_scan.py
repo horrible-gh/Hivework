@@ -1,7 +1,11 @@
 """Unit tests for hive.conflict_scan — inter-comb conflict detection.
 
-Uses real parsed comb data from smoke/loop/combs/ to verify:
-  - D2's termination=needs_pm with reachable=conditional triggers conflict
+Uses real parsed comb data from smoke/loop/combs/ to verify. NOTE: these captured
+combs carry the RETIRED termination ``needs_pm`` (the judge no longer emits it — there
+is no human-handoff class; see comb_contract_v2.md). conflict_scan now keys divergence
+on "not resolved" rather than an enumerated list, so it still detects these legacy
+combs; the tests double as a back-compat regression.
+  - D2's termination=needs_pm (legacy) with reachable=conditional triggers conflict
   - G's termination=needs_runtime is detected
   - RECONCILE2 resolves the conditional reachability (termination=resolved)
   - The actual conflict that led to RECONCILE2 being fired is reproduced

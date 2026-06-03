@@ -24,7 +24,9 @@ Key invariants (mirrored from recipes/edit_spec_contract_v1.md):
     ready. After authoring, specify re-reads the edits (a deterministic no-op check
     plus an independent model review) and downgrades a ready_to_apply spec that does
     not actually change the reported behavior. A ready claim that cannot be verified
-    is deferred to a human (needs_pm) rather than trusted.
+    loops back to re-investigate (needs_reinvestigation) rather than being trusted —
+    there is no "hand it to a human" terminal state (the tool fixes autonomously; an
+    unverifiable claim is re-worked, not punted).
 
 The author's role prompt is the contract file itself, loaded at runtime so the
 contract stays the single source of authoring rules (no duplicated prompt here).
@@ -36,11 +38,7 @@ import os
 import re
 from typing import Any
 
-from hive.investigate import (
-    CONVERGED_PATH_SECTION,
-    SEED_TARGET_SECTION,
-    _DO_NOT_EDIT_RE,
-)
+from hive.investigate import SEED_TARGET_SECTION
 from hive.parse import extract_first_json
 from hive.providers import call_worker
 
@@ -67,19 +65,22 @@ _REQUIRED_KEYS = ("edits", "deferred", "gate", "termination")
 # (imported there as VALID_TERMINATION) so the two can never drift. ``needs_runtime`` is
 # first-class: investigate.py instructs the author to emit it when a fix's correctness
 # depends on a runtime fact that cannot be confirmed statically (N174 — apply used to
-# reject it as "invalid" because its copy of this set was stale).
-VALID_TERMINATION = {"ready_to_apply", "needs_reinvestigation", "needs_pm", "needs_runtime"}
+# reject it as "invalid" because its copy of this set was stale). There is NO ``needs_pm``:
+# the tool's whole purpose is to fix autonomously, so there is no "hand this to a human"
+# terminal — a claim it cannot stand behind loops back to re-investigate, not punt.
+VALID_TERMINATION = {"ready_to_apply", "needs_reinvestigation", "needs_runtime"}
 _VALID_TERMINATION = VALID_TERMINATION  # backward-compatible local alias
 _STALE_STATUSES = {"stale", "not_found"}
 
 # Effectiveness-gate outcomes. An ineffective edit means the fix does not change
-# behavior, so the loop must re-investigate; an inconclusive review (the check
-# could not be obtained) instead defers the ready decision to a human.
+# behavior; an inconclusive review (the check could not be obtained) likewise cannot
+# vouch for a ready claim. BOTH loop back to re-investigate — the tool re-works the
+# fix autonomously rather than punting an unverifiable claim to a human.
 _INEFFECTIVE_TERMINATION = "needs_reinvestigation"
-_INCONCLUSIVE_TERMINATION = "needs_pm"
+_INCONCLUSIVE_TERMINATION = "needs_reinvestigation"
 
-# Decisiveness gate: a conservatively-authored needs_pm spec is promoted to
-# ready_to_apply only when every edit clears these bars (never a blanket drop).
+# Decisiveness gate: a conservatively-authored needs_reinvestigation spec whose edits are
+# all verified+effective+confident is promoted to ready_to_apply (never a blanket drop).
 _DECISIVE_CONFIDENCE = {"high", "medium"}
 # Deferred reasons that are "optional/surface" — they do not contradict the edits,
 # so their presence must not block applying an independently-verified edit.
@@ -475,7 +476,15 @@ def _normalize_spec(spec: dict[str, Any]) -> dict[str, Any]:
     - A spec containing a stale/not_found edit is not ready: if the author still
       claimed ready_to_apply, override it to needs_reinvestigation rather than
       presenting an unverified anchor as applicable.
+    - A legacy/stray ``needs_pm`` (the retired "hand it to a human" terminal) is
+      coerced to ``needs_reinvestigation``: the tool re-works the fix, it never punts.
     """
+    # needs_pm is retired — coerce any author/legacy emission to the autonomous loop-back
+    # so the decisiveness gate and apply see only the canonical vocabulary.
+    if spec.get("termination") == "needs_pm":
+        logger.info("specify: coercing retired termination needs_pm -> needs_reinvestigation")
+        spec["termination"] = "needs_reinvestigation"
+
     gate = spec.get("gate")
     if not isinstance(gate, dict):
         gate = {}
@@ -686,8 +695,8 @@ _REVIEW_CONTENT_MAX_LINES = 40
 
 # One terse JSON-only retry for the effectiveness review (mirrors judge's lever):
 # now that the reviewer runs on a tool-OFF API provider (deepinfra), a stray prose
-# wrapper or fence would otherwise degrade a ready spec straight to needs_pm. The
-# retry is a transport reparse — recorded to the ledger (a real paid call) but it
+# wrapper or fence would otherwise degrade a ready spec straight to needs_reinvestigation.
+# The retry is a transport reparse — recorded to the ledger (a real paid call) but it
 # does not multiply the review (still one logical effectiveness pass).
 _REVIEW_JSON_REMINDER = (
     "\n\n[Retry] Your previous response could not be parsed as the required JSON. "
@@ -883,8 +892,9 @@ def _apply_effectiveness_gate(
       ``coherent=false`` by the review, is ineffective → a ready_to_apply spec is
       downgraded to needs_reinvestigation (the fix does not work; loop back).
     - If no edit is flagged but the review was inconclusive (worker failed /
-      unparseable), a ready_to_apply spec is downgraded to needs_pm: effectiveness
-      could not be confirmed, so a human decides rather than the tool vouching.
+      unparseable), a ready_to_apply spec is downgraded to needs_reinvestigation:
+      effectiveness could not be confirmed, so the loop re-works it rather than the
+      tool vouching for an unverified claim.
     - The spec is never upgraded; only a ready claim is guarded.
     """
     edits = [e for e in (spec.get("edits") or []) if isinstance(e, dict)]
@@ -941,9 +951,10 @@ def _apply_effectiveness_gate(
         # review-ONLY "ineffective"/"incoherent" verdict on edits that are all VERIFIED and
         # part of a CROSS-FILE wiring is unreliable — the reviewer may have judged an edit
         # in isolation and missed that a back-end guard pairs with a front-end toast in
-        # another file. Do NOT declare a verified fix wrong and loop on that basis; defer
-        # to a human (needs_pm) instead. Only applies when there is NO certain finding and
-        # every flagged id came from the review.
+        # another file. Do NOT trust that lone verdict to declare a verified fix wrong; hold
+        # it as inconclusive (which loops back to re-investigate) rather than asserting the
+        # fix is broken. Only applies when there is NO certain finding and every flagged id
+        # came from the review.
         distinct_files = {e.get("file") for e in edits if e.get("file")}
         only_review = bool(review_flagged) and not certain_ids and \
             set(ineffective) == review_flagged
@@ -952,14 +963,14 @@ def _apply_effectiveness_gate(
             for e in edits if str(e.get("id", "?")) in review_flagged)
         if only_review and len(distinct_files) > 1 and flagged_all_verified:
             logger.warning("specify: review flagged %s as ineffective, but these are "
-                           "VERIFIED edits in a cross-file wiring — deferring to %s "
-                           "(not declaring the fix wrong)",
+                           "VERIFIED edits in a cross-file wiring — holding as "
+                           "inconclusive -> %s (not asserting the fix is wrong)",
                            sorted(review_flagged), _INCONCLUSIVE_TERMINATION)
             spec["termination"] = _INCONCLUSIVE_TERMINATION
             note = ("effectiveness gate: review judged " + ", ".join(sorted(review_flagged))
                     + " ineffective in isolation, but they are verified edits in a "
-                    "cross-file wiring — a human must confirm before applying rather than "
-                    "looping back")
+                    "cross-file wiring — re-investigating rather than asserting the fix "
+                    "is broken")
         else:
             logger.warning("specify: edits %s do not change the reported behavior but "
                            "termination=ready_to_apply — overriding to %s",
@@ -969,10 +980,10 @@ def _apply_effectiveness_gate(
                 f"{k} {v}" for k, v in sorted(ineffective.items()))
     elif inconclusive:
         logger.warning("specify: effectiveness review inconclusive — downgrading "
-                       "ready_to_apply to %s (human must confirm)", _INCONCLUSIVE_TERMINATION)
+                       "ready_to_apply to %s (re-investigate)", _INCONCLUSIVE_TERMINATION)
         spec["termination"] = _INCONCLUSIVE_TERMINATION
-        note = ("effectiveness gate: review inconclusive — human must confirm the "
-                "edits change the reported behavior before applying")
+        note = ("effectiveness gate: review inconclusive — re-investigating to confirm "
+                "the edits change the reported behavior before presenting as ready")
     else:
         return spec
 
@@ -988,7 +999,7 @@ def _apply_anchor_not_grounded_gate(spec: dict[str, Any]) -> dict[str, Any]:
     the grounding evidence is missing for that target. Emitting an edit for the same file is a
     logical contradiction — a file cannot be both ungroundable and successfully anchored.
     Remove the contradictory edit from edits[], keep only the deferred record, log the
-    contradiction, and downgrade a ready_to_apply claim to needs_pm.
+    contradiction, and downgrade a ready_to_apply claim to needs_reinvestigation.
     """
     deferred = [d for d in (spec.get("deferred") or []) if isinstance(d, dict)]
 
@@ -1023,7 +1034,7 @@ def _apply_anchor_not_grounded_gate(spec: dict[str, Any]) -> dict[str, Any]:
         "the same anchor)", contradictory)
     spec["edits"] = kept
     if spec.get("termination") == "ready_to_apply":
-        spec["termination"] = "needs_pm"
+        spec["termination"] = "needs_reinvestigation"
         note = ("anchor-not-grounded gate: edits %s removed — file also in deferred "
                 "as anchor_not_grounded (contradictory emit)" % contradictory)
         prev = str(spec.get("notes", "")).strip()
@@ -1032,21 +1043,24 @@ def _apply_anchor_not_grounded_gate(spec: dict[str, Any]) -> dict[str, Any]:
 
 
 def _apply_decisiveness_gate(spec: dict[str, Any]) -> dict[str, Any]:
-    """Promote a conservatively-authored needs_pm spec to ready_to_apply.
+    """Promote a conservatively-authored needs_reinvestigation spec to ready_to_apply.
 
     ``termination`` must reflect whether the edits in ``edits[]`` are safe to APPLY,
-    not whether the whole investigation is closed. A specify author often sets
-    needs_pm because the honey surfaced optional/policy directions (which land in
-    ``deferred[]``) even though the concrete edits are anchor-verified and passed the
-    effectiveness review. The effectiveness gate only ever downgrades, so without this
+    not whether the whole investigation is closed. A specify author often hedges to
+    needs_reinvestigation because the honey surfaced optional/policy directions (which
+    land in ``deferred[]``) even though the concrete edits are anchor-verified and passed
+    the effectiveness review. The effectiveness gate only ever downgrades, so without this
     there is no path to ready_to_apply and apply refuses an otherwise-safe fix.
 
-    This never lowers a bar on its own. It promotes needs_pm -> ready_to_apply ONLY
-    when every edit is verified/effective/confident AND every deferred item is optional
-    (not a contradiction of the edits). ``needs_reinvestigation`` is never promoted
-    (that means the fix does not work); an existing ``ready_to_apply`` is left untouched.
+    This never lowers a bar on its own. It promotes needs_reinvestigation -> ready_to_apply
+    ONLY when every edit is verified/effective/confident AND every deferred item is optional
+    (not a contradiction of the edits). The guards below make this safe: any spec the
+    effectiveness gate genuinely downgraded carries either ``inconclusive=True`` or a non-
+    empty ``ineffective_ids`` (or stale anchors), each of which trips an early return — so
+    only an over-conservative hedge on otherwise-clean edits is ever promoted. An existing
+    ``ready_to_apply`` is left untouched.
     """
-    if spec.get("termination") != "needs_pm":
+    if spec.get("termination") != "needs_reinvestigation":
         return spec
 
     # The promotion stands on the effectiveness review having actually run and been
@@ -1079,12 +1093,12 @@ def _apply_decisiveness_gate(spec: dict[str, Any]) -> dict[str, Any]:
             return spec
 
     spec["termination"] = "ready_to_apply"
-    note = ("decisiveness gate: promoted needs_pm -> ready_to_apply — every edit is "
-            "verified/effective and confident; deferred items remain surfaced as "
-            "optional for the PM")
+    note = ("decisiveness gate: promoted needs_reinvestigation -> ready_to_apply — every "
+            "edit is verified/effective and confident; deferred items remain surfaced as "
+            "optional directions")
     prev = str(spec.get("notes", "")).strip()
     spec["notes"] = f"{prev} {note}".strip() if prev else note
-    logger.info("specify: decisiveness gate promoted needs_pm -> ready_to_apply "
+    logger.info("specify: decisiveness gate promoted needs_reinvestigation -> ready_to_apply "
                 "(%d verified/effective edit(s), %d optional deferred)",
                 len(edits), len(deferred))
     return spec
@@ -1134,7 +1148,7 @@ def _apply_seed_coverage_gate(spec: dict[str, Any], honey_text: str) -> dict[str
     missed and the author's stated reason (so the gap is reported, not hidden).
 
     Diagnostics are recorded unconditionally; only a ``ready_to_apply`` claim is
-    downgraded (to needs_pm) — a spec already at needs_pm/needs_reinvestigation is
+    downgraded (to needs_reinvestigation) — a spec already at needs_reinvestigation is
     not vouching for completeness, so it is left as-is.
     """
     targets = _seed_target_files(honey_text)
@@ -1165,160 +1179,11 @@ def _apply_seed_coverage_gate(spec: dict[str, Any], honey_text: str) -> dict[str
 
     if missing and spec.get("termination") == "ready_to_apply":
         logger.warning("specify: seed-named edit target(s) not authored %s — "
-                       "downgrading ready_to_apply to needs_pm (a user-specified edit "
-                       "must not be silently dropped)", missing)
-        spec["termination"] = "needs_pm"
+                       "downgrading ready_to_apply to needs_reinvestigation (a user-"
+                       "specified edit must not be silently dropped)", missing)
+        spec["termination"] = "needs_reinvestigation"
         note = ("seed-coverage gate: seed-specified target(s) not authored — "
                 + "; ".join(f"{t} [{reasons[t]}]" for t in missing))
-        prev = str(spec.get("notes", "")).strip()
-        spec["notes"] = f"{prev} {note}".strip() if prev else note
-    return spec
-
-
-# ── Converge-scope gate (N177, 3rd run) ─────────────────────────────────────────
-# The honey now stitches the per-axis fragments into ONE causally-verified executed
-# path and attributes the defect to ONE node (``converge`` SUCCEEDED). Yet the single-
-# shot specify author still authored, EVERY run byte-for-byte identical, an edit at a
-# back-end function the honey cited NOWHERE and the seed told it to leave alone — pure
-# off-path speculation. The converge framing ("the per-axis localisations are
-# corroborating context, not separate edit sites") could not stop it because that is
-# prose to a single-shot author. This is the deterministic backstop, mirroring the
-# seed-coverage / anchor-not-grounded gates: when convergence SUCCEEDED, an anchor edit
-# whose file is cited nowhere in the honey is off the established path; and a file/symbol
-# the seed explicitly RULED OUT for editing is forbidden regardless of convergence. Both
-# are removed (kept on the spec for audit) and a ready_to_apply claim is downgraded.
-#
-# Deliberately one-directional and narrow (the N177 safety-net lesson): it only REMOVES
-# off-path edits — it never FORCES an edit at the converged node. An author that re-
-# grounded the converged locus against live code and honestly DEFERRED it (because the
-# live source did not actually exhibit the attributed mechanism — a phantom attribution)
-# must stay deferred, not be coerced into a fix. ``create_file`` edits are exempt — a
-# brand-new file is legitimately uncited.
-
-# A distinctive code identifier (snake_case / has a digit / camelCase, ≥5 chars) — used
-# to harvest the symbol a seed do-not-edit line names ("do NOT touch _parse_doc_workflow")
-# while ignoring plain English words on the same line ("touch", "change", "modify").
-_IDENT_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
-_FILEISH_RE = re.compile(r"[A-Za-z0-9_./\\-]+\.[A-Za-z0-9]+")
-
-
-def _looks_like_symbol(tok: str) -> bool:
-    return len(tok) >= 5 and (
-        "_" in tok or any(c.isdigit() for c in tok)
-        or re.search(r"[a-z][A-Z]", tok) is not None)
-
-
-def _converge_succeeded(honey_text: str) -> bool:
-    """True when the honey reports a SUCCESSFUL convergence (a verified single path).
-
-    Only then is an off-honey edit provably wrong: the executed path is established and
-    causally confirmed, so a file the path never touches contradicts it. When convergence
-    did NOT succeed the author's exploration off the honey may be the genuine lead, so the
-    off-path half of the gate stays silent.
-    """
-    return CONVERGED_PATH_SECTION in honey_text and "Convergence SUCCEEDED" in honey_text
-
-
-def _honey_cited_files(honey_text: str) -> set[str]:
-    """Every file the honey CITES anywhere (basename, lowercased) — the on-path universe.
-
-    The honey grounds and lists exactly the loci the investigation put on the table: the
-    converged path + attributed defect, the per-axis localisations, the seed-named targets,
-    and the lifted "Anchor ground truth" block. A file cited nowhere here was never part of
-    the investigation. Keyed on basename so abs/rel and path-shape differences never cause a
-    false "off-path".
-    """
-    return {os.path.basename(m.group(1)).lower()
-            for m in _CITATION_RE.finditer(honey_text)}
-
-
-def _requested_change_section(honey_text: str) -> str:
-    """The honey's embedded seed text (the '## Requested change / reported symptom' block)."""
-    out: list[str] = []
-    grab = False
-    for ln in honey_text.splitlines():
-        if ln.startswith("## Requested change"):
-            grab = True
-            continue
-        if grab and ln.startswith("## "):
-            break
-        if grab:
-            out.append(ln)
-    return "\n".join(out)
-
-
-def _seed_forbidden(seed_text: str) -> tuple[set[str], set[str]]:
-    """``(forbidden_file_basenames, forbidden_symbols)`` the seed RULED OUT for editing.
-
-    A file/symbol token on a seed line carrying a do-not-edit cue (``_DO_NOT_EDIT_RE``) is
-    forbidden. A do-not-edit cue WINS over an edit-intent cue on the same line — exactly
-    investigate's ``_seed_target_designation`` precedence (``if ruled_out or …``): the
-    do-not-edit line "Do NOT author an edit in queries.json" also contains the word "edit",
-    yet the file is still forbidden. Designation matters only for what becomes a seed TARGET
-    (handled in investigate); here we only collect what the seed forbade. Free, never raises.
-    """
-    forbid_files: set[str] = set()
-    forbid_syms: set[str] = set()
-    for line in seed_text.splitlines():
-        if not _DO_NOT_EDIT_RE.search(line):
-            continue
-        forbid_files |= {os.path.basename(t).lower() for t in _FILEISH_RE.findall(line)}
-        forbid_syms |= {t for t in _IDENT_RE.findall(line) if _looks_like_symbol(t)}
-    return forbid_files, forbid_syms
-
-
-def _apply_converge_scope_gate(spec: dict[str, Any], honey_text: str) -> dict[str, Any]:
-    """Remove off-path / seed-forbidden edits and guard a ready claim (see module note above)."""
-    if not isinstance(spec, dict):
-        return spec
-    converged = _converge_succeeded(honey_text)
-    forbid_files, forbid_syms = _seed_forbidden(_requested_change_section(honey_text))
-    if not converged and not forbid_files and not forbid_syms:
-        return spec  # nothing to enforce
-    cited = _honey_cited_files(honey_text)
-
-    edits = [e for e in (spec.get("edits") or []) if isinstance(e, dict)]
-    kept: list[dict] = []
-    removed: dict[str, str] = {}
-    for e in edits:
-        if e.get("kind", "edit") == "create_file":
-            kept.append(e)
-            continue
-        f = str(e.get("file", "") or "").replace("\\", "/")
-        base = os.path.basename(f).lower()
-        anchor = str(e.get("anchor_old", "") or "")
-        rationale = str(e.get("rationale", "") or "")
-        eid = str(e.get("id", "?"))
-        reason = ""
-        if base and base in forbid_files:
-            reason = f"file {f} ruled out by the seed (do-not-edit)"
-        else:
-            hit = next((s for s in forbid_syms
-                        if s in anchor or s in f or s in rationale), None)
-            if hit:
-                reason = f"edits {hit!r}, which the seed ruled out (do-not-edit)"
-            elif converged and base and base not in cited:
-                reason = (f"file {f} is cited nowhere in the successfully-converged honey "
-                          "(off the established path)")
-        if reason:
-            removed[eid] = reason
-        else:
-            kept.append(e)
-
-    if not removed:
-        return spec
-    logger.warning("specify: removing off-path / seed-forbidden edit(s) %s — %s",
-                   sorted(removed), "; ".join(f"{k}: {v}" for k, v in sorted(removed.items())))
-    spec["edits"] = kept
-    spec["converge_scope"] = {"removed": removed}
-    if spec.get("termination") == "ready_to_apply":
-        # Nothing on-path left → the fix is missing, loop back to author at the converged
-        # node (needs_reinvestigation); some on-path edit survived → a human confirms the
-        # partial spec (needs_pm). Either way the off-path edit never ships as ready.
-        remaining = [e for e in kept if e.get("kind", "edit") != "create_file"]
-        spec["termination"] = "needs_pm" if remaining else "needs_reinvestigation"
-        note = ("converge-scope gate: removed off-path/seed-forbidden edit(s) — "
-                + "; ".join(f"{k} [{v}]" for k, v in sorted(removed.items())))
         prev = str(spec.get("notes", "")).strip()
         spec["notes"] = f"{prev} {note}".strip() if prev else note
     return spec
@@ -1457,13 +1322,6 @@ def run_specify(
     spec = _normalize_spec(spec)
     spec = _apply_anchor_not_grounded_gate(spec)
 
-    # Converge-scope gate: with a SUCCEEDED convergence, an edit at a file the honey
-    # cited nowhere — or one the seed explicitly ruled out — is off-path speculation.
-    # Remove it BEFORE paying for the effectiveness review (N177 3rd run: specify
-    # deterministically authored a back-end edit off the converged front-end node and
-    # against the seed's do-not-edit guard, every run, byte-for-byte identical).
-    spec = _apply_converge_scope_gate(spec, honey_text)
-
     # Effectiveness gate: a second, independent pass that refuses to present edits
     # which are anchored but do not change the reported behavior as ready. The
     # reviewer may run on a different (cheaper, tool-OFF) provider than the author.
@@ -1478,7 +1336,7 @@ def run_specify(
 
     # Seed-coverage gate (runs LAST so it has final say): a file the user named as
     # an explicit edit target must become an edit, or a ready_to_apply spec is
-    # downgraded to needs_pm with the dropped target(s) reported (Defect 2 / T892).
+    # downgraded to needs_reinvestigation with the dropped target(s) reported (Defect 2 / T892).
     spec = _apply_seed_coverage_gate(spec, honey_text)
 
     problems = _validate_spec(spec)

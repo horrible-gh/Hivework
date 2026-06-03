@@ -47,7 +47,7 @@ DEFAULT_COMB_CONTRACT = """[Role] You are one Hivework free worker (drone). You 
   "regression": {{"commit":"<hash title / null>","what_changed":"<what changed and when / null>"}},
   "root_cause_signal": "<file:line if this axis directly pins the symptom's root cause, otherwise null>",
   "cross_refs": ["<other axis id>"],
-  "termination": "resolved | needs_runtime | needs_external | needs_pm",
+  "termination": "resolved | needs_runtime | needs_external",
   "notes": "<one line. if unclosed, what else needs to be looked at>"
 }}
 """

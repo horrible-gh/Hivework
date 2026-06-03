@@ -49,7 +49,9 @@ _DEFAULT_CONTRACT_PATH = os.path.join(
 
 # Structural expectations for the emitted commit-plan JSON.
 _REQUIRED_KEYS = ("commits", "gate", "termination")
-_VALID_TERMINATION = {"ready_to_commit", "needs_pm"}
+# No human-handoff terminal: there is no "ask a person" outcome. ``nothing_to_commit``
+# is a factual result (the working tree yields no safe commit), not a punt to a human.
+_VALID_TERMINATION = {"ready_to_commit", "nothing_to_commit"}
 
 # Conventional-commit types Hivework's contract allows.
 _ALLOWED_TYPES = ("feat", "fix", "docs", "chore", "refactor", "test", "style")

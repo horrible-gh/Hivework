@@ -8,7 +8,8 @@ The provider is mocked so these run without the copilot CLI. Coverage:
   ⑤ run_specify raises ValueError when the author emits no JSON
   ⑥ config exposes a 'specify' role and --model override reaches it
   ⑦ effectiveness gate: deterministic no-op + model review downgrade a ready spec
-    whose edits do not change the reported behavior; inconclusive review → needs_pm
+    whose edits do not change the reported behavior; inconclusive review →
+    needs_reinvestigation (there is no human-handoff terminal)
 """
 
 import json
@@ -139,9 +140,16 @@ class TestStampRoot(unittest.TestCase):
 class TestNormalizeSpec(unittest.TestCase):
     def test_forces_apply_false(self):
         spec = {"gate": {"apply": True}, "edits": [], "deferred": [],
-                "termination": "needs_pm"}
+                "termination": "needs_reinvestigation"}
         out = specify._normalize_spec(spec)
         self.assertIs(out["gate"]["apply"], False)
+
+    def test_retired_needs_pm_coerced_to_reinvestigation(self):
+        # needs_pm is retired (no human-handoff terminal); a stray emission is coerced.
+        spec = {"gate": {"apply": False}, "edits": [], "deferred": [],
+                "termination": "needs_pm"}
+        out = specify._normalize_spec(spec)
+        self.assertEqual(out["termination"], "needs_reinvestigation")
 
     def test_missing_gate_gets_apply_false(self):
         out = specify._normalize_spec({"edits": [], "deferred": []})
@@ -384,9 +392,9 @@ class TestEffectivenessGateUnit(unittest.TestCase):
             _fresh_ready(), ["E1"], {"E1": {"effective": True, "coherent": True}}, False)
         self.assertEqual(out["termination"], "needs_reinvestigation")
 
-    def test_inconclusive_downgrades_to_needs_pm(self):
+    def test_inconclusive_downgrades_to_reinvestigation(self):
         out = specify._apply_effectiveness_gate(_fresh_ready(), [], {}, True)
-        self.assertEqual(out["termination"], "needs_pm")
+        self.assertEqual(out["termination"], "needs_reinvestigation")
 
     def test_all_good_keeps_ready(self):
         out = specify._apply_effectiveness_gate(
@@ -395,13 +403,14 @@ class TestEffectivenessGateUnit(unittest.TestCase):
 
     def test_never_upgrades_a_non_ready_spec(self):
         spec = _fresh_ready()
-        spec["termination"] = "needs_pm"
+        spec["termination"] = "needs_reinvestigation"
         out = specify._apply_effectiveness_gate(
             spec, ["E1"], {"E1": {"effective": False}}, True)
-        self.assertEqual(out["termination"], "needs_pm")
+        self.assertEqual(out["termination"], "needs_reinvestigation")
 
     # N174 #3: a review-only "ineffective" verdict on VERIFIED edits in a CROSS-FILE
-    # wiring must not declare the fix wrong and loop back — defer to a human (needs_pm).
+    # wiring must not assert the fix is wrong; it is held as inconclusive, which loops
+    # back to re-investigate (there is no human-handoff terminal).
     def _cross_file_ready(self):
         return {
             "source_honey": "h.md", "codebase_root": "/code", "gate": {"apply": False},
@@ -413,12 +422,15 @@ class TestEffectivenessGateUnit(unittest.TestCase):
                  "replacement_new": "d", "anchor_status": "verified"},
             ]}
 
-    def test_cross_file_verified_review_ineffective_defers_to_needs_pm(self):
+    def test_cross_file_verified_review_ineffective_holds_inconclusive(self):
         out = specify._apply_effectiveness_gate(
             self._cross_file_ready(), [],
             {"E1": {"effective": False, "reason": "alone doesn't change behavior"}}, False)
-        self.assertEqual(out["termination"], "needs_pm")
+        # held as inconclusive → loops back to re-investigate, not asserted-wrong
+        self.assertEqual(out["termination"], "needs_reinvestigation")
         self.assertIn("E1", out["effectiveness"]["ineffective_ids"])
+        # the distinctive cross-file branch fired (note records why it is not asserted-wrong)
+        self.assertIn("cross-file wiring", out["notes"])
 
     def test_cross_file_but_unverified_still_reinvestigates(self):
         spec = self._cross_file_ready()
@@ -480,15 +492,15 @@ class TestRunSpecifyWithReview(unittest.TestCase):
         self.assertEqual(on_disk["termination"], "needs_reinvestigation")
         self.assertIn("E1", on_disk["effectiveness"]["ineffective_ids"])
 
-    def test_unparseable_review_downgrades_to_needs_pm(self):
-        # Unusable on BOTH the attempt and the retry → inconclusive → needs_pm.
+    def test_unparseable_review_downgrades_to_reinvestigation(self):
+        # Unusable on BOTH the attempt and the retry → inconclusive → needs_reinvestigation.
         with mock.patch.object(specify, "call_worker",
                                side_effect=[_wr(json.dumps(_READY_SPEC)),
                                             _wr("● no json\n"), _wr("still no json\n")]):
             spec = specify.run_specify(
                 honey_path=self.honey, codebase_root=self.tmp,
                 output_path=self.out, contract_path=self.contract)
-        self.assertEqual(spec["termination"], "needs_pm")
+        self.assertEqual(spec["termination"], "needs_reinvestigation")
 
 
 class TestReviewJsonRetry(unittest.TestCase):
@@ -545,9 +557,10 @@ class TestReviewJsonRetry(unittest.TestCase):
 
 
 class TestDecisivenessGate(unittest.TestCase):
-    """specify._apply_decisiveness_gate — guarded needs_pm -> ready_to_apply promotion."""
+    """specify._apply_decisiveness_gate — guarded needs_reinvestigation -> ready_to_apply
+    promotion of an over-conservative hedge whose edits are all verified+effective."""
 
-    def _needs_pm(self, **over):
+    def _hedged(self, **over):
         spec = {
             "edits": [{
                 "id": "E1", "file": "a.py",
@@ -555,20 +568,20 @@ class TestDecisivenessGate(unittest.TestCase):
                 "confidence": "medium", "anchor_status": "verified",
             }],
             "deferred": [{"issue": "optional UX option", "reason": "policy_direction"}],
-            "termination": "needs_pm",
+            "termination": "needs_reinvestigation",
             "effectiveness": {"inconclusive": False, "ineffective_ids": []},
-            "notes": "PM please confirm authoritative UX",
+            "notes": "hedged on authoritative UX",
         }
         spec.update(over)
         return spec
 
     def test_promotes_verified_effective_with_policy_deferred(self):
-        out = specify._apply_decisiveness_gate(self._needs_pm())
+        out = specify._apply_decisiveness_gate(self._hedged())
         self.assertEqual(out["termination"], "ready_to_apply")
         self.assertIn("decisiveness gate", out["notes"])
 
     def test_create_file_edit_promotes(self):
-        spec = self._needs_pm(edits=[{
+        spec = self._hedged(edits=[{
             "id": "E1", "kind": "create_file", "file": "new.py",
             "content": "x = 1\n", "confidence": "medium",
         }])
@@ -576,42 +589,50 @@ class TestDecisivenessGate(unittest.TestCase):
             specify._apply_decisiveness_gate(spec)["termination"], "ready_to_apply")
 
     def test_low_confidence_blocks(self):
-        spec = self._needs_pm()
+        spec = self._hedged()
         spec["edits"][0]["confidence"] = "low"
-        self.assertEqual(specify._apply_decisiveness_gate(spec)["termination"], "needs_pm")
+        self.assertEqual(specify._apply_decisiveness_gate(spec)["termination"],
+                         "needs_reinvestigation")
 
     def test_ineffective_id_blocks(self):
-        spec = self._needs_pm()
+        spec = self._hedged()
         spec["effectiveness"]["ineffective_ids"] = ["E1"]
-        self.assertEqual(specify._apply_decisiveness_gate(spec)["termination"], "needs_pm")
+        self.assertEqual(specify._apply_decisiveness_gate(spec)["termination"],
+                         "needs_reinvestigation")
 
     def test_inconclusive_blocks(self):
-        spec = self._needs_pm()
+        spec = self._hedged()
         spec["effectiveness"]["inconclusive"] = True
-        self.assertEqual(specify._apply_decisiveness_gate(spec)["termination"], "needs_pm")
+        self.assertEqual(specify._apply_decisiveness_gate(spec)["termination"],
+                         "needs_reinvestigation")
 
     def test_non_optional_deferred_blocks(self):
-        spec = self._needs_pm()
+        spec = self._hedged()
         spec["deferred"] = [{"issue": "x", "reason": "needs_runtime"}]
-        self.assertEqual(specify._apply_decisiveness_gate(spec)["termination"], "needs_pm")
+        self.assertEqual(specify._apply_decisiveness_gate(spec)["termination"],
+                         "needs_reinvestigation")
 
     def test_missing_effectiveness_key_blocks(self):
-        spec = self._needs_pm()
+        spec = self._hedged()
         del spec["effectiveness"]
-        self.assertEqual(specify._apply_decisiveness_gate(spec)["termination"], "needs_pm")
+        self.assertEqual(specify._apply_decisiveness_gate(spec)["termination"],
+                         "needs_reinvestigation")
 
     def test_unverified_anchor_blocks(self):
-        spec = self._needs_pm()
+        spec = self._hedged()
         spec["edits"][0]["anchor_status"] = "stale"
-        self.assertEqual(specify._apply_decisiveness_gate(spec)["termination"], "needs_pm")
+        self.assertEqual(specify._apply_decisiveness_gate(spec)["termination"],
+                         "needs_reinvestigation")
 
-    def test_never_upgrades_needs_reinvestigation(self):
-        spec = self._needs_pm(termination="needs_reinvestigation")
+    def test_leaves_needs_runtime_untouched(self):
+        # the gate only ever promotes a needs_reinvestigation hedge; needs_runtime is
+        # a concrete blocked-on-a-datum verdict and must never be promoted.
+        spec = self._hedged(termination="needs_runtime")
         self.assertEqual(
-            specify._apply_decisiveness_gate(spec)["termination"], "needs_reinvestigation")
+            specify._apply_decisiveness_gate(spec)["termination"], "needs_runtime")
 
     def test_leaves_ready_untouched(self):
-        spec = self._needs_pm(termination="ready_to_apply")
+        spec = self._hedged(termination="ready_to_apply")
         self.assertEqual(
             specify._apply_decisiveness_gate(spec)["termination"], "ready_to_apply")
 
@@ -973,7 +994,7 @@ class TestAnchorNotGroundedGate(unittest.TestCase):
         }
         out = specify._apply_anchor_not_grounded_gate(spec)
         self.assertEqual(out["edits"], [])
-        self.assertEqual(out["termination"], "needs_pm")
+        self.assertEqual(out["termination"], "needs_reinvestigation")
         self.assertIn("anchor-not-grounded gate", out["notes"])
 
     def test_no_anchor_not_grounded_deferred_leaves_spec_unchanged(self):
@@ -1023,7 +1044,7 @@ class TestAnchorNotGroundedGate(unittest.TestCase):
         }
         out = specify._apply_anchor_not_grounded_gate(spec)
         self.assertEqual(out["edits"], [])
-        self.assertEqual(out["termination"], "needs_pm")
+        self.assertEqual(out["termination"], "needs_reinvestigation")
 
     def test_needs_runtime_termination_is_valid(self):
         problems = specify._validate_spec({
@@ -1034,10 +1055,18 @@ class TestAnchorNotGroundedGate(unittest.TestCase):
         })
         self.assertEqual(problems, [])
 
+    def test_needs_pm_termination_is_retired_and_invalid(self):
+        # needs_pm is no longer part of the vocabulary (no human-handoff terminal).
+        self.assertNotIn("needs_pm", specify.VALID_TERMINATION)
+        problems = specify._validate_spec({
+            "edits": [], "deferred": [], "gate": {}, "termination": "needs_pm",
+        })
+        self.assertTrue(any("invalid termination" in p for p in problems))
+
 
 class TestSeedCoverageGate(unittest.TestCase):
     """Defect 2 (T892): a seed-named edit target must become an edit, or a ready
-    spec is downgraded to needs_pm with the dropped target reported."""
+    spec is downgraded to needs_reinvestigation with the dropped target reported."""
 
     def test_seed_target_files_parsed_from_section(self):
         self.assertEqual(
@@ -1054,7 +1083,7 @@ class TestSeedCoverageGate(unittest.TestCase):
             "termination": "ready_to_apply", "notes": "",
         }
         out = specify._apply_seed_coverage_gate(spec, _HONEY_WITH_TARGETS)
-        self.assertEqual(out["termination"], "needs_pm")
+        self.assertEqual(out["termination"], "needs_reinvestigation")
         # both seed targets are missing (only the FE view-state file was edited)
         self.assertIn("server/sql/queries/queries.json", out["seed_coverage"]["missing"])
         self.assertIn("client/tests/main/workflowViewState.spec.ts",
@@ -1088,139 +1117,6 @@ class TestSeedCoverageGate(unittest.TestCase):
         out = specify._apply_seed_coverage_gate(spec, _HONEY_WITH_TARGETS)
         self.assertEqual(out["termination"], "needs_reinvestigation")
         self.assertEqual(len(out["seed_coverage"]["missing"]), 2)
-
-
-def _converged_honey(*, extra_citations: str = "", seed: str = "") -> str:
-    """A honey announcing a SUCCESSFUL convergence on a front-end node.
-
-    Cites the converged FE path (workflowViewState.ts) and a couple of corroborating
-    localisations, but NOT the back-end _parse_doc_workflow file — so an edit there is
-    off-path. ``seed`` injects extra lines into the Requested-change block (e.g. a
-    do-not-edit guard); ``extra_citations`` adds more cited files.
-    """
-    return (
-        "# Hivework honey\n\n"
-        "## Requested change / reported symptom\n\n"
-        "The workflow bar shows DS as current when the head is M.\n"
-        + seed + "\n\n"
-        + specify.CONVERGED_PATH_SECTION + "\n\n"
-        "The converge stage stitched the path. **Convergence SUCCEEDED** — treat the "
-        "node below as the primary target.\n\n"
-        "Executed path:\n"
-        "1. [handler] server/api/workflow_head_routes.py:40-55 — get_workflow_head\n"
-        "2. [fe] client/src/main/workflow/workflowViewState.ts:213-226 — buildStepStates\n\n"
-        "### Primary edit target — attributed defect\n"
-        "- location: client/src/main/workflow/workflowViewState.ts:213-226\n\n"
-        "## Grounded localisations\n\n"
-        "### AX1 — head route\n"
-        "- location: server/api/workflow_head_routes.py:40-55\n"
-        + extra_citations + "\n"
-    )
-
-
-class TestConvergeScopeGate(unittest.TestCase):
-    """N177 (3rd run): with a SUCCEEDED convergence, an edit at a file the honey cites
-    nowhere — or one the seed ruled out — is off-path speculation; it is removed and a
-    ready claim downgraded. The gate never FORCES an edit at the converged node."""
-
-    def _be_edit_spec(self, term="ready_to_apply", **edit):
-        e = {"id": "E1", "file": "server/app/doc_workflow.py",
-             "anchor_old": "NON_HEAD_TYPES = {'M'}", "replacement_new": "NON_HEAD_TYPES = set()",
-             "rationale": "unexclude memo", "anchor_status": "verified", "confidence": "high"}
-        e.update(edit)
-        return {"edits": [e], "deferred": [], "termination": term, "notes": ""}
-
-    def test_off_path_edit_removed_and_downgraded(self):
-        spec = self._be_edit_spec()
-        out = specify._apply_converge_scope_gate(spec, _converged_honey())
-        self.assertEqual(out["edits"], [])               # off-path BE edit removed
-        self.assertIn("E1", out["converge_scope"]["removed"])
-        # nothing on-path remains → loop back to author at the converged node
-        self.assertEqual(out["termination"], "needs_reinvestigation")
-        self.assertIn("converge-scope gate", out["notes"])
-
-    def test_on_path_edit_at_converged_node_survives(self):
-        spec = {"edits": [{"id": "E1",
-                           "file": "client/src/main/workflow/workflowViewState.ts",
-                           "anchor_old": "head + 1", "replacement_new": "head",
-                           "anchor_status": "verified"}],
-                "deferred": [], "termination": "ready_to_apply", "notes": ""}
-        out = specify._apply_converge_scope_gate(spec, _converged_honey())
-        self.assertEqual(len(out["edits"]), 1)
-        self.assertEqual(out["termination"], "ready_to_apply")
-        self.assertNotIn("converge_scope", out)
-
-    def test_no_gate_when_convergence_not_successful(self):
-        # An unconverged honey gives the author latitude to surface a missed lead.
-        honey = _converged_honey().replace("**Convergence SUCCEEDED**", "convergence failed")
-        spec = self._be_edit_spec()
-        out = specify._apply_converge_scope_gate(spec, honey)
-        self.assertEqual(len(out["edits"]), 1)           # off-path edit kept
-        self.assertEqual(out["termination"], "ready_to_apply")
-
-    def test_partial_removal_downgrades_to_needs_pm(self):
-        spec = {"edits": [
-            {"id": "E1", "file": "client/src/main/workflow/workflowViewState.ts",
-             "anchor_old": "head + 1", "replacement_new": "head", "anchor_status": "verified"},
-            {"id": "E2", "file": "server/app/doc_workflow.py",
-             "anchor_old": "x", "replacement_new": "y", "anchor_status": "verified"}],
-            "deferred": [], "termination": "ready_to_apply", "notes": ""}
-        out = specify._apply_converge_scope_gate(spec, _converged_honey())
-        self.assertEqual([e["id"] for e in out["edits"]], ["E1"])
-        self.assertIn("E2", out["converge_scope"]["removed"])
-        self.assertEqual(out["termination"], "needs_pm")  # an on-path edit survived
-
-    def test_create_file_at_uncited_path_is_exempt(self):
-        spec = {"edits": [{"id": "E1", "kind": "create_file",
-                           "file": "client/src/main/workflow/newHelper.ts",
-                           "content": "export const x = 1\n"}],
-                "deferred": [], "termination": "ready_to_apply", "notes": ""}
-        out = specify._apply_converge_scope_gate(spec, _converged_honey())
-        self.assertEqual(len(out["edits"]), 1)
-        self.assertEqual(out["termination"], "ready_to_apply")
-
-    def test_seed_ruled_out_file_removed_even_without_convergence(self):
-        honey = _converged_honey(
-            seed="Do NOT author an edit in queries.json — it is correct.",
-        ).replace("**Convergence SUCCEEDED**", "convergence failed")
-        spec = {"edits": [{"id": "E1", "file": "server/sql/queries/queries.json",
-                           "anchor_old": "a", "replacement_new": "b",
-                           "anchor_status": "verified"}],
-                "deferred": [], "termination": "ready_to_apply", "notes": ""}
-        out = specify._apply_converge_scope_gate(spec, honey)
-        self.assertEqual(out["edits"], [])
-        self.assertIn("ruled out", out["converge_scope"]["removed"]["E1"])
-
-    def test_seed_ruled_out_symbol_removed_via_anchor(self):
-        # "do NOT touch _parse_doc_workflow" — the BE file is on the cited path, so the
-        # file-citation test would MISS it; the symbol guard catches it via the anchor.
-        honey = _converged_honey(
-            seed="The head source is correct. Do NOT touch _parse_doc_workflow.",
-            extra_citations="### AX2 — parser\n"
-            "- location: server/app/doc_workflow.py:80-95\n",
-        )
-        spec = self._be_edit_spec(
-            anchor_old="def _parse_doc_workflow(doc):\n    return NON_HEAD_TYPES")
-        out = specify._apply_converge_scope_gate(spec, honey)
-        self.assertEqual(out["edits"], [])
-        self.assertIn("_parse_doc_workflow", out["converge_scope"]["removed"]["E1"])
-
-    def test_seed_designated_symbol_is_not_forbidden(self):
-        # The same symbol on an edit-intent line is DESIGNATED, not ruled out → kept.
-        honey = _converged_honey(
-            seed="[Edit] Fix _parse_doc_workflow to include memos.",
-            extra_citations="- location: server/app/doc_workflow.py:80-95\n",
-        )
-        spec = self._be_edit_spec(
-            anchor_old="def _parse_doc_workflow(doc):\n    return NON_HEAD_TYPES")
-        out = specify._apply_converge_scope_gate(spec, honey)
-        self.assertEqual(len(out["edits"]), 1)           # designated → survives
-
-    def test_never_upgrades_a_non_ready_spec(self):
-        spec = self._be_edit_spec(term="needs_reinvestigation")
-        out = specify._apply_converge_scope_gate(spec, _converged_honey())
-        self.assertEqual(out["edits"], [])               # still removes the off-path edit
-        self.assertEqual(out["termination"], "needs_reinvestigation")  # not promoted
 
 
 class TestVerifyAnchorsLive(unittest.TestCase):
