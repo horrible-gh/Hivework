@@ -91,8 +91,7 @@ your authority — pick the best fit with this tie-break and proceed:
    feature behave as intended; prefer `feat` when it introduces new intended
    behaviour. Then commit — the type is a label, not a blocker.
 
-Do **NOT** set `termination: needs_pm` because you are unsure of the type. Pick one and
-emit `ready_to_commit`.
+Do **NOT** hedge because you are unsure of the type. Pick one and emit `ready_to_commit`.
 
 Examples:
 
@@ -162,13 +161,13 @@ Rules for the JSON:
   - `ready_to_commit` is your **default and near-always** termination. A well-formed
     working tree groups cleanly; even an ambiguous one is resolvable by deciding (and
     noting the assumption) or by deferring a single risky file to `leftover`.
-  - `needs_pm` — a last resort that should **essentially never** fire, because no human
-    is waiting to act on it (see the decider note at the top). Do **not** use it for:
-    uncertainty about the commit *type* (fix vs feat — choose per §4); uncertainty about
-    *how to group* (pick the most defensible grouping and note it); or one file you are
-    unsure about (put that file in `leftover` and commit the rest as `ready_to_commit`).
-    Only emit `needs_pm` if there is literally nothing you can commit safely — explain
-    why in a `note`.
+  - `nothing_to_commit` — a last resort that should **essentially never** fire. There is
+    NO "ask a human" outcome (no person is waiting to act on it); this is a factual
+    result, not a punt. Do **not** use it for: uncertainty about the commit *type* (fix vs
+    feat — choose per §4); uncertainty about *how to group* (pick the most defensible
+    grouping and note it); or one file you are unsure about (put that file in `leftover`
+    and commit the rest as `ready_to_commit`). Only emit `nothing_to_commit` if there is
+    literally nothing you can commit safely — explain why in a `note`.
 - Do not include files that are not in the working tree's change set.
 - The same file must not appear in more than one commit, nor in both a commit and
   `leftover`.

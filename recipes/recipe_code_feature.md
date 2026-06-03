@@ -42,8 +42,9 @@ The remaining A–G axes (per domain) are assigned to `steps[1]`, each with
   conform." Reference the contract-axis output as the tiebreaker — if a conflict contradicts the
   contract, the implementation axis changes, not the contract.
 - Termination classes: converged / needs_design (ambiguity in the original spec needs a D/R doc
-  update) / needs_pm (business judgment on scope or naming). A hard boundary is emitted together
-  with the evidence for why it cannot be closed in-loop.
+  update). There is NO "ask a human" class: a business judgment on scope or naming is surfaced by
+  RESOLVING with the best-supported proposal, not by punting to a person. A hard boundary is
+  emitted together with the evidence for why it cannot be closed in-loop.
 
 ## ③ Exit — honey output shape (code feature = **edit-spec-centric**)
 

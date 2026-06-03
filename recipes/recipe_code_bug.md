@@ -18,9 +18,9 @@ The remaining A–G (FE badge · submit UI · BE endpoint · async pipeline · D
 ## ② Loop — conflict re-investigation cap + termination classification
 
 - Round cap: **2**. (Code bugs usually converge in 1 round; if still unclosed after 2, classify as a hard boundary.)
-- **Conflict-detection trigger:** `root_cause_signal` mismatch between combs OR `termination` divergence (one resolved, another needs_pm, etc.).
+- **Conflict-detection trigger:** `root_cause_signal` mismatch between combs OR `termination` divergence (one resolved, another unresolved, etc.).
 - **Required fields in the re-investigation brief:** cite the file:line evidence of both conflicting conclusions, plus a narrowed question covering "only what is needed to resolve this contradiction." **Always ask about execution reachability** ("does that code actually run") — not merely "does the code exist."
-- Termination classes: converged / needs_runtime (execution logs required) / needs_external (external authority) / needs_pm (business judgment). A hard boundary is emitted "together with the evidence for why it cannot be closed."
+- Termination classes: converged / needs_runtime (execution logs required) / needs_external (external authority). There is NO "ask a human" class: a business/scope judgment is surfaced by RESOLVING with the best-supported proposal, not by punting to a person. A hard boundary is emitted "together with the evidence for why it cannot be closed."
 
 ## ③ Exit — honey output shape (code bug = **trace-centric**)
 

@@ -75,8 +75,8 @@ Digest has **no root-cause signal**. Conflict triggers are structural/coverage-b
 - **Reconcile:** dedup (assign the item to exactly one group, re-digest the other), gap-fill
   (assign orphan to nearest group), contradiction-surfacing (record the disagreement explicitly —
   never silently pick a winner).
-- **Termination classes:** `converged` / `needs_source` (item unreadable/ambiguous) / `needs_pm`
-  (scope judgment required).
+- **Termination classes:** `converged` / `needs_source` (item unreadable/ambiguous). There is no
+  "ask a human" class — a scope judgment is surfaced by converging on the best-supported call.
 
 ---
 
@@ -89,7 +89,7 @@ Digest has **no root-cause signal**. Conflict triggers are structural/coverage-b
 | Faithful lossy compression | The digest reduces the corpus; it does not extend it. |
 | No new facts | Nothing may appear that is not traceable to a source item. |
 | Every claim traces to a source item ID | Each statement cites the source item(s), e.g. `[#TR852]`. |
-| Gaps & contradictions surfaced | Open questions, contradictions, `needs_source`/`needs_pm` appear in a dedicated end block — never smoothed away. |
+| Gaps & contradictions surfaced | Open questions, contradictions, `needs_source` appear in a dedicated end block — never smoothed away. |
 
 The output shape is supplied by the ACTIVE PROFILE.
 
