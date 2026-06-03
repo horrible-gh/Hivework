@@ -11,6 +11,8 @@ Usage:
 import os, shutil, signal, subprocess, tempfile, time, logging
 from dataclasses import dataclass
 
+from hive import http_tools
+
 logger = logging.getLogger("hive.providers")
 
 
@@ -158,24 +160,29 @@ def _call_openai_compatible(model, prompt, cwd=None, timeout=120, *, system=None
     token counts (``response.usage.total_tokens``), surfaced on
     ``WorkerResult.real_tokens`` for the ledger's real_tokens column.
 
-    Tool-OFF single-shot path: this is a SINGLE chat completion with no tools and
-    no agent loop, so the model can't read local files — NOT because the OpenAI API
-    lacks function-calling (it has it), but because executing a tool that reads the
-    user's disk is inherently client-side work we haven't wired here yet. (copilot/
-    codex ship exactly that loop + local tools, which is why the agentic tool-ON
-    roles route to them today; giving this handler a tool loop would unlock tool-ON
-    over HTTP too, at the cost of per-token billing on long traces.) So ``cwd`` and
-    ``available_tools`` are accepted only for ``call_worker`` signature parity and
-    ignored (a non-empty ``available_tools`` is logged at debug). Intended for the
-    judge / converge / review roles, where a ~20s single round-trip is acceptable.
+    Two paths, selected by ``available_tools`` (same convention as copilot):
+
+      * Single-shot (tool-OFF): ``available_tools=[]`` — one chat completion, no
+        tools, no loop (~20s round-trip). The judge / converge / review roles use
+        this; it can't read local files and bills only the single exchange.
+      * Agentic (tool-ON): ``available_tools=None`` (all local tools) or a named
+        subset, AND a ``cwd`` to root them — runs ``hive.http_tools.run_agent_loop``,
+        which gives the model read_file / list_dir / grep over the codebase via the
+        OpenAI function-calling protocol and executes those calls client-side. This
+        is the missing client half that lets an HTTP-only operator (no copilot/
+        codex) run the tool-ON roles (queen / specify / …) over plain HTTP. Cost
+        note: a long agent trace bills per token across every round-trip — the
+        reason tool-ON defaults to flat-rate CLIs; output caps + an iteration bound
+        keep it bounded.
+
+    Without a ``cwd`` there is nothing to read, so any tool request degrades to the
+    single-shot path. ``real_tokens`` is the sum of ``usage.total_tokens`` over all
+    round-trips, for the ledger.
 
     Config errors (missing key, openai not installed) and API failures return a
     WorkerResult with exit_code=1 and the message on stderr — matching the
     copilot handler's contract so callers' existing error handling applies.
     """
-    if available_tools:
-        logger.debug("openai: ignoring available_tools=%s (no local tool access)",
-                     available_tools)
     api_key = os.environ.get(api_key_env)
     if not api_key:
         msg = f"{api_key_env} not set in environment"
@@ -196,23 +203,30 @@ def _call_openai_compatible(model, prompt, cwd=None, timeout=120, *, system=None
     if reasoning_effort:
         extra["reasoning_effort"] = reasoning_effort
 
-    logger.debug("call_worker openai: model=%s base_url=%s timeout=%d",
-                 model, base_url, timeout)
+    tool_names = http_tools.select_tools(available_tools, have_cwd=bool(cwd))
+    logger.debug("call_worker openai: model=%s base_url=%s timeout=%d tools=%s",
+                 model, base_url, timeout, tool_names or "none")
     client = OpenAI(api_key=api_key, base_url=base_url, timeout=timeout)
     t0 = time.monotonic()
     try:
-        resp = client.chat.completions.create(
-            model=model, messages=messages, temperature=temperature,
-            max_tokens=max_tokens, **extra)
+        if tool_names:
+            content, real_tokens = http_tools.run_agent_loop(
+                client, model, messages, root=cwd, tool_names=tool_names,
+                temperature=temperature, max_tokens=max_tokens, extra=extra)
+        else:
+            resp = client.chat.completions.create(
+                model=model, messages=messages, temperature=temperature,
+                max_tokens=max_tokens, **extra)
+            content = resp.choices[0].message.content or ""
+            usage = getattr(resp, "usage", None)
+            real_tokens = (getattr(usage, "total_tokens", None)
+                           if usage is not None else None)
     except Exception as e:
         latency_s = time.monotonic() - t0
         logger.warning("openai call failed (%.1fs): %s", latency_s, e)
         return WorkerResult(stdout="", stderr=str(e), exit_code=1, latency_s=latency_s)
     latency_s = time.monotonic() - t0
 
-    content = resp.choices[0].message.content or ""
-    usage = getattr(resp, "usage", None)
-    real_tokens = getattr(usage, "total_tokens", None) if usage is not None else None
     _tee_call(model, latency_s, 0, "")
     return WorkerResult(stdout=content, stderr="", exit_code=0,
                         latency_s=latency_s, real_tokens=real_tokens)
