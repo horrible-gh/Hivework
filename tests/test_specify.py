@@ -1090,6 +1090,139 @@ class TestSeedCoverageGate(unittest.TestCase):
         self.assertEqual(len(out["seed_coverage"]["missing"]), 2)
 
 
+def _converged_honey(*, extra_citations: str = "", seed: str = "") -> str:
+    """A honey announcing a SUCCESSFUL convergence on a front-end node.
+
+    Cites the converged FE path (workflowViewState.ts) and a couple of corroborating
+    localisations, but NOT the back-end _parse_doc_workflow file — so an edit there is
+    off-path. ``seed`` injects extra lines into the Requested-change block (e.g. a
+    do-not-edit guard); ``extra_citations`` adds more cited files.
+    """
+    return (
+        "# Hivework honey\n\n"
+        "## Requested change / reported symptom\n\n"
+        "The workflow bar shows DS as current when the head is M.\n"
+        + seed + "\n\n"
+        + specify.CONVERGED_PATH_SECTION + "\n\n"
+        "The converge stage stitched the path. **Convergence SUCCEEDED** — treat the "
+        "node below as the primary target.\n\n"
+        "Executed path:\n"
+        "1. [handler] server/api/workflow_head_routes.py:40-55 — get_workflow_head\n"
+        "2. [fe] client/src/main/workflow/workflowViewState.ts:213-226 — buildStepStates\n\n"
+        "### Primary edit target — attributed defect\n"
+        "- location: client/src/main/workflow/workflowViewState.ts:213-226\n\n"
+        "## Grounded localisations\n\n"
+        "### AX1 — head route\n"
+        "- location: server/api/workflow_head_routes.py:40-55\n"
+        + extra_citations + "\n"
+    )
+
+
+class TestConvergeScopeGate(unittest.TestCase):
+    """N177 (3rd run): with a SUCCEEDED convergence, an edit at a file the honey cites
+    nowhere — or one the seed ruled out — is off-path speculation; it is removed and a
+    ready claim downgraded. The gate never FORCES an edit at the converged node."""
+
+    def _be_edit_spec(self, term="ready_to_apply", **edit):
+        e = {"id": "E1", "file": "server/app/doc_workflow.py",
+             "anchor_old": "NON_HEAD_TYPES = {'M'}", "replacement_new": "NON_HEAD_TYPES = set()",
+             "rationale": "unexclude memo", "anchor_status": "verified", "confidence": "high"}
+        e.update(edit)
+        return {"edits": [e], "deferred": [], "termination": term, "notes": ""}
+
+    def test_off_path_edit_removed_and_downgraded(self):
+        spec = self._be_edit_spec()
+        out = specify._apply_converge_scope_gate(spec, _converged_honey())
+        self.assertEqual(out["edits"], [])               # off-path BE edit removed
+        self.assertIn("E1", out["converge_scope"]["removed"])
+        # nothing on-path remains → loop back to author at the converged node
+        self.assertEqual(out["termination"], "needs_reinvestigation")
+        self.assertIn("converge-scope gate", out["notes"])
+
+    def test_on_path_edit_at_converged_node_survives(self):
+        spec = {"edits": [{"id": "E1",
+                           "file": "client/src/main/workflow/workflowViewState.ts",
+                           "anchor_old": "head + 1", "replacement_new": "head",
+                           "anchor_status": "verified"}],
+                "deferred": [], "termination": "ready_to_apply", "notes": ""}
+        out = specify._apply_converge_scope_gate(spec, _converged_honey())
+        self.assertEqual(len(out["edits"]), 1)
+        self.assertEqual(out["termination"], "ready_to_apply")
+        self.assertNotIn("converge_scope", out)
+
+    def test_no_gate_when_convergence_not_successful(self):
+        # An unconverged honey gives the author latitude to surface a missed lead.
+        honey = _converged_honey().replace("**Convergence SUCCEEDED**", "convergence failed")
+        spec = self._be_edit_spec()
+        out = specify._apply_converge_scope_gate(spec, honey)
+        self.assertEqual(len(out["edits"]), 1)           # off-path edit kept
+        self.assertEqual(out["termination"], "ready_to_apply")
+
+    def test_partial_removal_downgrades_to_needs_pm(self):
+        spec = {"edits": [
+            {"id": "E1", "file": "client/src/main/workflow/workflowViewState.ts",
+             "anchor_old": "head + 1", "replacement_new": "head", "anchor_status": "verified"},
+            {"id": "E2", "file": "server/app/doc_workflow.py",
+             "anchor_old": "x", "replacement_new": "y", "anchor_status": "verified"}],
+            "deferred": [], "termination": "ready_to_apply", "notes": ""}
+        out = specify._apply_converge_scope_gate(spec, _converged_honey())
+        self.assertEqual([e["id"] for e in out["edits"]], ["E1"])
+        self.assertIn("E2", out["converge_scope"]["removed"])
+        self.assertEqual(out["termination"], "needs_pm")  # an on-path edit survived
+
+    def test_create_file_at_uncited_path_is_exempt(self):
+        spec = {"edits": [{"id": "E1", "kind": "create_file",
+                           "file": "client/src/main/workflow/newHelper.ts",
+                           "content": "export const x = 1\n"}],
+                "deferred": [], "termination": "ready_to_apply", "notes": ""}
+        out = specify._apply_converge_scope_gate(spec, _converged_honey())
+        self.assertEqual(len(out["edits"]), 1)
+        self.assertEqual(out["termination"], "ready_to_apply")
+
+    def test_seed_ruled_out_file_removed_even_without_convergence(self):
+        honey = _converged_honey(
+            seed="Do NOT author an edit in queries.json — it is correct.",
+        ).replace("**Convergence SUCCEEDED**", "convergence failed")
+        spec = {"edits": [{"id": "E1", "file": "server/sql/queries/queries.json",
+                           "anchor_old": "a", "replacement_new": "b",
+                           "anchor_status": "verified"}],
+                "deferred": [], "termination": "ready_to_apply", "notes": ""}
+        out = specify._apply_converge_scope_gate(spec, honey)
+        self.assertEqual(out["edits"], [])
+        self.assertIn("ruled out", out["converge_scope"]["removed"]["E1"])
+
+    def test_seed_ruled_out_symbol_removed_via_anchor(self):
+        # "do NOT touch _parse_doc_workflow" — the BE file is on the cited path, so the
+        # file-citation test would MISS it; the symbol guard catches it via the anchor.
+        honey = _converged_honey(
+            seed="The head source is correct. Do NOT touch _parse_doc_workflow.",
+            extra_citations="### AX2 — parser\n"
+            "- location: server/app/doc_workflow.py:80-95\n",
+        )
+        spec = self._be_edit_spec(
+            anchor_old="def _parse_doc_workflow(doc):\n    return NON_HEAD_TYPES")
+        out = specify._apply_converge_scope_gate(spec, honey)
+        self.assertEqual(out["edits"], [])
+        self.assertIn("_parse_doc_workflow", out["converge_scope"]["removed"]["E1"])
+
+    def test_seed_designated_symbol_is_not_forbidden(self):
+        # The same symbol on an edit-intent line is DESIGNATED, not ruled out → kept.
+        honey = _converged_honey(
+            seed="[Edit] Fix _parse_doc_workflow to include memos.",
+            extra_citations="- location: server/app/doc_workflow.py:80-95\n",
+        )
+        spec = self._be_edit_spec(
+            anchor_old="def _parse_doc_workflow(doc):\n    return NON_HEAD_TYPES")
+        out = specify._apply_converge_scope_gate(spec, honey)
+        self.assertEqual(len(out["edits"]), 1)           # designated → survives
+
+    def test_never_upgrades_a_non_ready_spec(self):
+        spec = self._be_edit_spec(term="needs_reinvestigation")
+        out = specify._apply_converge_scope_gate(spec, _converged_honey())
+        self.assertEqual(out["edits"], [])               # still removes the off-path edit
+        self.assertEqual(out["termination"], "needs_reinvestigation")  # not promoted
+
+
 class TestVerifyAnchorsLive(unittest.TestCase):
     """N175 E7: a 'verified' anchor must be re-confirmed against LIVE disk, not trusted
     from the author's claim. _verify_anchors_live downgrades a verified-but-absent or

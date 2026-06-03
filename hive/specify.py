@@ -36,7 +36,11 @@ import os
 import re
 from typing import Any
 
-from hive.investigate import SEED_TARGET_SECTION
+from hive.investigate import (
+    CONVERGED_PATH_SECTION,
+    SEED_TARGET_SECTION,
+    _DO_NOT_EDIT_RE,
+)
 from hive.parse import extract_first_json
 from hive.providers import call_worker
 
@@ -1171,6 +1175,155 @@ def _apply_seed_coverage_gate(spec: dict[str, Any], honey_text: str) -> dict[str
     return spec
 
 
+# ── Converge-scope gate (N177, 3rd run) ─────────────────────────────────────────
+# The honey now stitches the per-axis fragments into ONE causally-verified executed
+# path and attributes the defect to ONE node (``converge`` SUCCEEDED). Yet the single-
+# shot specify author still authored, EVERY run byte-for-byte identical, an edit at a
+# back-end function the honey cited NOWHERE and the seed told it to leave alone — pure
+# off-path speculation. The converge framing ("the per-axis localisations are
+# corroborating context, not separate edit sites") could not stop it because that is
+# prose to a single-shot author. This is the deterministic backstop, mirroring the
+# seed-coverage / anchor-not-grounded gates: when convergence SUCCEEDED, an anchor edit
+# whose file is cited nowhere in the honey is off the established path; and a file/symbol
+# the seed explicitly RULED OUT for editing is forbidden regardless of convergence. Both
+# are removed (kept on the spec for audit) and a ready_to_apply claim is downgraded.
+#
+# Deliberately one-directional and narrow (the N177 safety-net lesson): it only REMOVES
+# off-path edits — it never FORCES an edit at the converged node. An author that re-
+# grounded the converged locus against live code and honestly DEFERRED it (because the
+# live source did not actually exhibit the attributed mechanism — a phantom attribution)
+# must stay deferred, not be coerced into a fix. ``create_file`` edits are exempt — a
+# brand-new file is legitimately uncited.
+
+# A distinctive code identifier (snake_case / has a digit / camelCase, ≥5 chars) — used
+# to harvest the symbol a seed do-not-edit line names ("do NOT touch _parse_doc_workflow")
+# while ignoring plain English words on the same line ("touch", "change", "modify").
+_IDENT_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+_FILEISH_RE = re.compile(r"[A-Za-z0-9_./\\-]+\.[A-Za-z0-9]+")
+
+
+def _looks_like_symbol(tok: str) -> bool:
+    return len(tok) >= 5 and (
+        "_" in tok or any(c.isdigit() for c in tok)
+        or re.search(r"[a-z][A-Z]", tok) is not None)
+
+
+def _converge_succeeded(honey_text: str) -> bool:
+    """True when the honey reports a SUCCESSFUL convergence (a verified single path).
+
+    Only then is an off-honey edit provably wrong: the executed path is established and
+    causally confirmed, so a file the path never touches contradicts it. When convergence
+    did NOT succeed the author's exploration off the honey may be the genuine lead, so the
+    off-path half of the gate stays silent.
+    """
+    return CONVERGED_PATH_SECTION in honey_text and "Convergence SUCCEEDED" in honey_text
+
+
+def _honey_cited_files(honey_text: str) -> set[str]:
+    """Every file the honey CITES anywhere (basename, lowercased) — the on-path universe.
+
+    The honey grounds and lists exactly the loci the investigation put on the table: the
+    converged path + attributed defect, the per-axis localisations, the seed-named targets,
+    and the lifted "Anchor ground truth" block. A file cited nowhere here was never part of
+    the investigation. Keyed on basename so abs/rel and path-shape differences never cause a
+    false "off-path".
+    """
+    return {os.path.basename(m.group(1)).lower()
+            for m in _CITATION_RE.finditer(honey_text)}
+
+
+def _requested_change_section(honey_text: str) -> str:
+    """The honey's embedded seed text (the '## Requested change / reported symptom' block)."""
+    out: list[str] = []
+    grab = False
+    for ln in honey_text.splitlines():
+        if ln.startswith("## Requested change"):
+            grab = True
+            continue
+        if grab and ln.startswith("## "):
+            break
+        if grab:
+            out.append(ln)
+    return "\n".join(out)
+
+
+def _seed_forbidden(seed_text: str) -> tuple[set[str], set[str]]:
+    """``(forbidden_file_basenames, forbidden_symbols)`` the seed RULED OUT for editing.
+
+    A file/symbol token on a seed line carrying a do-not-edit cue (``_DO_NOT_EDIT_RE``) is
+    forbidden. A do-not-edit cue WINS over an edit-intent cue on the same line — exactly
+    investigate's ``_seed_target_designation`` precedence (``if ruled_out or …``): the
+    do-not-edit line "Do NOT author an edit in queries.json" also contains the word "edit",
+    yet the file is still forbidden. Designation matters only for what becomes a seed TARGET
+    (handled in investigate); here we only collect what the seed forbade. Free, never raises.
+    """
+    forbid_files: set[str] = set()
+    forbid_syms: set[str] = set()
+    for line in seed_text.splitlines():
+        if not _DO_NOT_EDIT_RE.search(line):
+            continue
+        forbid_files |= {os.path.basename(t).lower() for t in _FILEISH_RE.findall(line)}
+        forbid_syms |= {t for t in _IDENT_RE.findall(line) if _looks_like_symbol(t)}
+    return forbid_files, forbid_syms
+
+
+def _apply_converge_scope_gate(spec: dict[str, Any], honey_text: str) -> dict[str, Any]:
+    """Remove off-path / seed-forbidden edits and guard a ready claim (see module note above)."""
+    if not isinstance(spec, dict):
+        return spec
+    converged = _converge_succeeded(honey_text)
+    forbid_files, forbid_syms = _seed_forbidden(_requested_change_section(honey_text))
+    if not converged and not forbid_files and not forbid_syms:
+        return spec  # nothing to enforce
+    cited = _honey_cited_files(honey_text)
+
+    edits = [e for e in (spec.get("edits") or []) if isinstance(e, dict)]
+    kept: list[dict] = []
+    removed: dict[str, str] = {}
+    for e in edits:
+        if e.get("kind", "edit") == "create_file":
+            kept.append(e)
+            continue
+        f = str(e.get("file", "") or "").replace("\\", "/")
+        base = os.path.basename(f).lower()
+        anchor = str(e.get("anchor_old", "") or "")
+        rationale = str(e.get("rationale", "") or "")
+        eid = str(e.get("id", "?"))
+        reason = ""
+        if base and base in forbid_files:
+            reason = f"file {f} ruled out by the seed (do-not-edit)"
+        else:
+            hit = next((s for s in forbid_syms
+                        if s in anchor or s in f or s in rationale), None)
+            if hit:
+                reason = f"edits {hit!r}, which the seed ruled out (do-not-edit)"
+            elif converged and base and base not in cited:
+                reason = (f"file {f} is cited nowhere in the successfully-converged honey "
+                          "(off the established path)")
+        if reason:
+            removed[eid] = reason
+        else:
+            kept.append(e)
+
+    if not removed:
+        return spec
+    logger.warning("specify: removing off-path / seed-forbidden edit(s) %s — %s",
+                   sorted(removed), "; ".join(f"{k}: {v}" for k, v in sorted(removed.items())))
+    spec["edits"] = kept
+    spec["converge_scope"] = {"removed": removed}
+    if spec.get("termination") == "ready_to_apply":
+        # Nothing on-path left → the fix is missing, loop back to author at the converged
+        # node (needs_reinvestigation); some on-path edit survived → a human confirms the
+        # partial spec (needs_pm). Either way the off-path edit never ships as ready.
+        remaining = [e for e in kept if e.get("kind", "edit") != "create_file"]
+        spec["termination"] = "needs_pm" if remaining else "needs_reinvestigation"
+        note = ("converge-scope gate: removed off-path/seed-forbidden edit(s) — "
+                + "; ".join(f"{k} [{v}]" for k, v in sorted(removed.items())))
+        prev = str(spec.get("notes", "")).strip()
+        spec["notes"] = f"{prev} {note}".strip() if prev else note
+    return spec
+
+
 def _review_and_gate(
     spec: dict[str, Any],
     honey_text: str,
@@ -1303,6 +1456,13 @@ def run_specify(
     spec = _verify_anchors_live(spec, codebase_root, docs_root)
     spec = _normalize_spec(spec)
     spec = _apply_anchor_not_grounded_gate(spec)
+
+    # Converge-scope gate: with a SUCCEEDED convergence, an edit at a file the honey
+    # cited nowhere — or one the seed explicitly ruled out — is off-path speculation.
+    # Remove it BEFORE paying for the effectiveness review (N177 3rd run: specify
+    # deterministically authored a back-end edit off the converged front-end node and
+    # against the seed's do-not-edit guard, every run, byte-for-byte identical).
+    spec = _apply_converge_scope_gate(spec, honey_text)
 
     # Effectiveness gate: a second, independent pass that refuses to present edits
     # which are anchored but do not change the reported behavior as ready. The
