@@ -72,6 +72,7 @@ class TestInvestigateWiring(unittest.TestCase):
     def test_end_to_end_composition(self):
         cfg = load_config()
         cfg.judge.max_calls_per_axis = 1   # single judge call → no followup path
+        cfg.judge.votes_per_axis = 1       # one judgment per axis (pin: config SSOT=5)
         cfg.judge.max_axes = 3
 
         with tempfile.TemporaryDirectory() as td:
@@ -111,6 +112,7 @@ class TestInvestigateWiring(unittest.TestCase):
     def test_max_axes_caps_judged(self):
         cfg = load_config()
         cfg.judge.max_calls_per_axis = 1
+        cfg.judge.votes_per_axis = 1
         cfg.judge.max_axes = 1   # only the first leaf judged
 
         with tempfile.TemporaryDirectory() as td:
@@ -157,6 +159,7 @@ class TestInvestigateWiring(unittest.TestCase):
     def test_decisive_axis_not_dropped_under_default_ceiling(self):
         cfg = load_config()           # default max_axes=12 (runaway-ceiling)
         cfg.judge.max_calls_per_axis = 1
+        cfg.judge.votes_per_axis = 1
         result = self._run_five(cfg)
         self.assertEqual(result["axes_judged"], 5)
         self.assertIn("css_rules", {v["axis_id"] for v in result["verdicts"]})
@@ -164,6 +167,7 @@ class TestInvestigateWiring(unittest.TestCase):
     def test_truncation_warns_and_lists_dropped(self):
         cfg = load_config()
         cfg.judge.max_calls_per_axis = 1
+        cfg.judge.votes_per_axis = 1
         cfg.judge.max_axes = 3        # force the old cap → css_rules dropped
         with self.assertLogs("hive.investigate", level="WARNING") as cm:
             result = self._run_five(cfg)
@@ -189,6 +193,7 @@ class TestInvestigateWiring(unittest.TestCase):
     def test_warns_when_doc_topics_but_no_docs_root(self):
         cfg = load_config()
         cfg.judge.max_calls_per_axis = 1
+        cfg.judge.votes_per_axis = 1
         with tempfile.TemporaryDirectory() as td:
             out = os.path.join(td, "v.json")
             with mock.patch("hive.decompose.call_worker", return_value=_wr(self._DOC_AXIS)), \
@@ -214,6 +219,7 @@ class TestParallelJudging(unittest.TestCase):
         # verdicts must follow the judged order, so converge's input is unchanged.
         cfg = load_config()
         cfg.judge.max_calls_per_axis = 1
+        cfg.judge.votes_per_axis = 1
         cfg.judge.max_parallel = 4
         with tempfile.TemporaryDirectory() as td:
             out = os.path.join(td, "v.json")
@@ -235,6 +241,7 @@ class TestParallelJudging(unittest.TestCase):
         import threading
         cfg = load_config()
         cfg.judge.max_calls_per_axis = 1
+        cfg.judge.votes_per_axis = 1
         cfg.judge.max_parallel = 3
         barrier = threading.Barrier(3, timeout=10)
         peak = {"n": 0}
@@ -516,6 +523,83 @@ class TestSeedEditTargets(unittest.TestCase):
             self.assertIn("Seed-specified edit targets", honey)
             self.assertIn("AUTHOR them", honey)
             self.assertIn("server/sql/queries/queries.json:", honey)
+
+
+class TestApplyCallBudget(unittest.TestCase):
+    """max_total_calls: one-number cap → reduce votes first, then trim axes."""
+
+    def _axes(self, n):
+        return [{"id": f"A{i}"} for i in range(n)]
+
+    def test_zero_budget_is_unlimited(self):
+        j = self._axes(6)
+        judged, votes = INV._apply_call_budget(j, votes_cfg=5, max_calls=2, budget=0)
+        self.assertEqual(len(judged), 6)
+        self.assertEqual(votes, 5)
+
+    def test_budget_large_enough_no_reduction(self):
+        # 6 axes × 5 votes × 2 = 60 worst-case; budget 60 fits exactly.
+        judged, votes = INV._apply_call_budget(self._axes(6), 5, 2, budget=60)
+        self.assertEqual(len(judged), 6)
+        self.assertEqual(votes, 5)
+
+    def test_budget_reduces_votes_keeps_axes(self):
+        # 6 axes, max_calls=2, budget 40 → affordable votes = 40 // (6×2) = 3.
+        judged, votes = INV._apply_call_budget(self._axes(6), 5, 2, budget=40)
+        self.assertEqual(len(judged), 6)       # axis coverage preserved
+        self.assertEqual(votes, 3)
+        self.assertLessEqual(len(judged) * votes * 2, 40)   # worst-case ≤ budget
+
+    def test_budget_too_small_trims_axes_to_single_vote(self):
+        # 6 axes × 2 = 12 worst-case for even ONE vote each; budget 8 can't fit.
+        judged, votes = INV._apply_call_budget(self._axes(6), 5, 2, budget=8)
+        self.assertEqual(votes, 1)
+        self.assertEqual(len(judged), 4)       # 8 // 2 = 4 axes
+        self.assertLessEqual(len(judged) * votes * 2, 8)
+
+    def test_single_shot_votes_full_depth_under_budget(self):
+        # max_calls=1 (single-shot voting): 6 axes × 5 × 1 = 30 ≤ 40 → no cut.
+        judged, votes = INV._apply_call_budget(self._axes(6), 5, 1, budget=40)
+        self.assertEqual(len(judged), 6)
+        self.assertEqual(votes, 5)
+
+    def test_worst_case_never_exceeds_budget(self):
+        for n, v, mc, b in [(6, 5, 2, 40), (12, 5, 1, 40), (8, 4, 2, 13),
+                            (3, 7, 2, 5), (10, 5, 2, 100)]:
+            judged, votes = INV._apply_call_budget(self._axes(n), v, mc, b)
+            self.assertLessEqual(len(judged) * votes * mc, b,
+                                 f"n={n} v={v} mc={mc} b={b}")
+
+
+class TestConvergeFragments(unittest.TestCase):
+    """Best-of-N union expands into one converge fragment per distinct locus."""
+
+    def test_located_axis_expands_each_candidate(self):
+        verdicts = [{"axis_id": "A", "title": "t",
+                     "verdict": {"located": True, "file": "a.py", "lines": "1-2",
+                                 "reason": "r"},
+                     "candidates": [{"file": "a.py", "lines": "1-2", "reason": "r"},
+                                    {"file": "b.py", "lines": "9-9", "reason": "r2"}]}]
+        frags = INV._converge_fragments(verdicts)
+        self.assertEqual(len(frags), 2)
+        self.assertEqual({f["verdict"]["file"] for f in frags}, {"a.py", "b.py"})
+        self.assertTrue(all(f["axis_id"] == "A" for f in frags))
+
+    def test_unlocated_axis_passes_through_once(self):
+        v = {"axis_id": "B", "title": "t",
+             "verdict": {"located": False, "file": "", "lines": "", "reason": "refute"},
+             "candidates": []}
+        frags = INV._converge_fragments([v])
+        self.assertEqual(frags, [v])
+
+    def test_single_vote_is_one_fragment_per_axis(self):
+        # votes_per_axis=1 → one candidate per located axis → unchanged shape.
+        verdicts = [{"axis_id": "A", "title": "t",
+                     "verdict": {"located": True, "file": "a.py", "lines": "1", "reason": "r"},
+                     "candidates": [{"file": "a.py", "lines": "1", "reason": "r"}]}]
+        frags = INV._converge_fragments(verdicts)
+        self.assertEqual(len(frags), 1)
+        self.assertEqual(frags[0]["verdict"]["file"], "a.py")
 
 
 if __name__ == "__main__":

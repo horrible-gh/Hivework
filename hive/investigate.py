@@ -29,7 +29,7 @@ from typing import Any
 
 from hive.converge import run_converge
 from hive.decompose import run_decompose
-from hive.judge import run_judge
+from hive.judge import run_judge_votes
 from hive.retriever import _ripgrep, retrieve
 from hive.searchplan import (
     extract_doc_topics, extract_globs, extract_keywords, task_to_searchplan,
@@ -293,6 +293,60 @@ def seed_edit_targets(seed_text: str, code_root: str | None,
     return targets
 
 
+def _apply_call_budget(judged: list[dict[str, Any]], votes_cfg: int, max_calls: int,
+                       budget: int) -> tuple[list[dict[str, Any]], int]:
+    """Fit the run under ``max_total_calls`` — the one-number judge budget cap.
+
+    Returns ``(judged, effective_votes)`` such that the WORST-CASE judge calls,
+    ``len(judged) × effective_votes × max_calls``, is ≤ ``budget``. Pure and
+    deterministic. Strategy (M010 budget control): REDUCE VOTES first so axis
+    coverage is preserved and only the voting depth shrinks; only when even a
+    single vote across all axes overflows do we trim axes (and force one vote).
+    ``budget <= 0`` ⇒ unlimited, unchanged (today's behaviour). The ceiling is
+    worst-case (every vote assumed to spend ``max_calls``); actual runs land at or
+    under it because the re-judge does not always fire.
+    """
+    votes_cfg = max(1, int(votes_cfg))
+    max_calls = max(1, int(max_calls))
+    budget = int(budget or 0)
+    if budget <= 0 or not judged:
+        return judged, votes_cfg
+    if len(judged) * max_calls > budget:
+        keep = max(1, budget // max_calls)
+        return judged[:keep], 1
+    affordable = budget // (len(judged) * max_calls)
+    return judged, max(1, min(votes_cfg, affordable))
+
+
+def _converge_fragments(verdicts: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Expand each axis's best-of-N union into one converge fragment per locus.
+
+    converge stitches per-axis LOCATED fragments into one path, so the best-of-N
+    union must reach it as fragments, not collapse to the representative verdict
+    (M010 §5: union → causal gate, never majority — a 1/N locus is a candidate the
+    gate vets, not noise a vote count discards). For a located axis we emit one
+    fragment per distinct candidate ``(file, lines)``; an unlocated axis passes
+    through once so its refute reason stays as context. At ``votes_per_axis=1``
+    every located axis has exactly one candidate, so this yields one fragment per
+    axis — byte-identical to the pre-voting converge input.
+    """
+    out: list[dict[str, Any]] = []
+    for v in verdicts:
+        cands = v.get("candidates") or []
+        if cands:
+            for c in cands:
+                out.append({
+                    "axis_id": v.get("axis_id", "?"),
+                    "title": v.get("title", ""),
+                    "verdict": {"located": True, "file": c.get("file", ""),
+                                "lines": c.get("lines", ""),
+                                "reason": c.get("reason", "")},
+                })
+        else:
+            out.append(v)
+    return out
+
+
 def run_investigate(
     *,
     seed_text: str,
@@ -364,6 +418,26 @@ def run_investigate(
             "— a decisive axis may be among them; raise judge.max_axes in hive.config.json",
             cfg.judge.max_axes, len(leaves), len(dropped), dropped)
 
+    # ── Budget cap (max_total_calls): one hard ceiling on TOTAL judge model calls
+    # this run, honoured by reducing votes first (then axes). Computed AFTER the
+    # axis set is fixed and BEFORE the fan-out so every axis votes the same amount
+    # and the worst-case spend is bounded up front (not discovered mid-run).
+    votes_cfg = max(1, int(getattr(cfg.judge, "votes_per_axis", 1)))
+    max_calls_cfg = max(1, int(getattr(cfg.judge, "max_calls_per_axis", 2)))
+    # Voting runs single-shot per vote (run_judge_votes drops the re-judge when
+    # votes>1), so the ACTUAL per-vote cost is 1 call; max_calls_cfg only governs
+    # the votes=1 single-judgment path. Budget on the real per-vote cost so the cap
+    # neither over-throttles voting nor under-counts a votes=1 re-judge.
+    per_vote_calls = 1 if votes_cfg > 1 else max_calls_cfg
+    budget = int(getattr(cfg.judge, "max_total_calls", 0) or 0)
+    judged, effective_votes = _apply_call_budget(judged, votes_cfg, per_vote_calls, budget)
+    if budget > 0 and effective_votes != votes_cfg:
+        logger.info("max_total_calls=%d budget: votes_per_axis %d→%d over %d axes "
+                    "(worst-case ≤ %d judge calls = %d × %d × %d)",
+                    budget, votes_cfg, effective_votes, len(judged),
+                    len(judged) * effective_votes * per_vote_calls,
+                    len(judged), effective_votes, per_vote_calls)
+
     # ── ②..③ per axis: bridge → local retrieve (free) → JUDGE (budgeted).
     # The axes are INDEPENDENT: each judges only its own retrieve bundle against the
     # shared, read-only ``seed_files`` — nothing here reads another axis's verdict
@@ -425,12 +499,14 @@ def run_investigate(
                         gv.get("kept"), gv.get("dropped_empty"),
                         gv.get("dropped_overbroad"))
 
+        votes = effective_votes
         logger.info("[HIVE_STAGE] pipeline=investigate stage=3 name=judge axis=%s",
                     sp.axis_id)
-        logger.info("③ JUDGE [%s] (%s/%s, ≤%d calls)", sp.axis_id,
+        logger.info("③ JUDGE [%s] (%s/%s, ≤%d calls × %d vote(s))", sp.axis_id,
                     judge_role.provider, judge_role.model,
-                    cfg.judge.max_calls_per_axis)
-        jr = run_judge(
+                    per_vote_calls, votes)
+        jr = run_judge_votes(
+            votes=votes,
             plan_bundle=bundle, symptom=symptom, axis_globs=sp.file_globs,
             code_root=code_root, provider=judge_role.provider,
             model=judge_role.model, judge_cfg=cfg.judge, ledger=ledger,
@@ -438,6 +514,15 @@ def run_investigate(
             seed_axis=(sp.axis_id == "SEED_ANCHOR"),
         )
         v = jr["verdict"]
+        # Best-of-N tally (M010 §5): surface how the votes split across files so the
+        # union feeding converge is auditable — not to RANK candidates by count (a
+        # 1/N rare hit is kept on purpose; converge's causal gate decides, not votes).
+        if jr.get("votes", 1) > 1:
+            tally = jr.get("file_tally") or {}
+            tally_s = ", ".join(f"{os.path.basename(f) or '∅'}×{c}"
+                                for f, c in tally.items()) or "none located"
+            logger.info("   votes: located %d/%d  candidates: %s",
+                        jr.get("located_votes", 0), jr["votes"], tally_s)
         logger.info("   verdict: located=%s %s:%s — %s",
                     v.located, v.file, v.lines, v.reason)
         # Keep the merged bundle (first-pass + any follow-up) so converge sees the
@@ -461,6 +546,14 @@ def run_investigate(
             "calls_made": jr["calls_made"],
             "verdict": {"located": v.located, "file": v.file, "lines": v.lines,
                         "reason": v.reason},
+            # Best-of-N union: every distinct located locus across the votes. The
+            # representative ``verdict`` above is one of these (the most-voted file);
+            # the full set is expanded into converge fragments so the causal gate —
+            # not a vote count — decides which survive. At votes_per_axis=1 this is
+            # exactly the one representative locus (or empty when unlocated).
+            "votes": {"n": jr.get("votes", 1), "located": jr.get("located_votes", 0)},
+            "candidates": [{"file": c.file, "lines": c.lines, "reason": c.reason}
+                           for c in jr.get("candidates", [])],
         }
         return idx, verdict_entry, keep_bundle
 
@@ -503,8 +596,14 @@ def run_investigate(
         logger.info("④ converge (%s/%s) — stitch %d located verdict(s) into one path%s",
                     conv_role.provider, conv_role.model, located_n,
                     f" (DB data-state read available: {db_conn.kind})" if db_conn else "")
+        # Feed converge the EXPANDED best-of-N union (one fragment per distinct
+        # located locus), not the per-axis representatives — the causal gate vets
+        # the wider candidate net. The ≥2 gate above stays on AXES located (not
+        # fragment count), so a single noisy axis splitting into two files does not
+        # by itself trigger converge.
         cres = run_converge(
-            seed_text=seed_text, verdicts=verdicts, bundles=bundles,
+            seed_text=seed_text, verdicts=_converge_fragments(verdicts),
+            bundles=bundles,
             provider=conv_role.provider, model=conv_role.model, code_root=code_root,
             ledger=ledger, provider_kwargs=pk, k=k, max_hops=2, db_conn=db_conn)
         converge_dict = cres.as_dict()

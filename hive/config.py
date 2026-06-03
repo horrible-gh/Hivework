@@ -53,7 +53,8 @@ _DEFAULTS: dict[str, Any] = {
     # provider, judging all leaf axes costs cents, so we judge every leaf up to
     # this ceiling. A low cap (was 3) silently dropped decisive grep-once axes
     # past position N (N164: css_rules cut → specify ran blind → self-reversal).
-    "judge":   {"max_calls_per_axis": 2, "max_axes": 12, "max_parallel": 2},
+    "judge":   {"max_calls_per_axis": 2, "max_axes": 12, "max_parallel": 2,
+                "votes_per_axis": 1, "max_total_calls": 0},
     # Cost guard-rails. allow_swarm=false makes `hive.py run` refuse to launch the
     # open-ended swarm (fan-out + reconcile) and point at the cheap investigate path.
     "safety":  {"allow_swarm": True},
@@ -197,10 +198,27 @@ class JudgeConfig:
     enough to cover a normal decompose (5–10 leaves) and only guards against a
     pathological axis explosion. ``max_parallel`` caps concurrent judge calls —
     surfacing the whole budget here so spend is controllable rather than hidden.
+
+    ``votes_per_axis`` is best-of-N judge voting (M010 §5): each axis is judged N
+    times INDEPENDENTLY and the located loci are UNIONED (not majority) so a
+    noisy-but-correct rare hit survives and converge's causal gate — not a vote
+    count — decides precision. Default 1 = today's single judgment (opt-in,
+    zero extra cost); ~5 is the validated sweet spot on a cheap judge provider.
+
+    ``max_total_calls`` is the ONE-NUMBER budget cap: a hard ceiling on the TOTAL
+    judge model calls in a single investigate run, so cost is controllable without
+    reasoning about the ``axes × votes × calls`` product. When the worst case would
+    exceed it the pipeline first REDUCES votes (keep axis coverage, shrink voting
+    depth), then — only if even one vote across all axes overflows — trims axes. It
+    is a worst-case ceiling (assumes every vote spends ``max_calls_per_axis``); real
+    runs land at or under it since the re-judge does not always fire. 0 = unlimited
+    (today's behaviour).
     """
     max_calls_per_axis: int = 2
     max_axes: int = 12
     max_parallel: int = 2
+    votes_per_axis: int = 1
+    max_total_calls: int = 0
 
 
 @dataclass
@@ -363,6 +381,8 @@ def load_config(path: str | None = None) -> Config:
             max_calls_per_axis=int(judge_raw.get("max_calls_per_axis", 2)),
             max_axes=int(judge_raw.get("max_axes", 12)),
             max_parallel=int(judge_raw.get("max_parallel", 2)),
+            votes_per_axis=int(judge_raw.get("votes_per_axis", 1)),
+            max_total_calls=int(judge_raw.get("max_total_calls", 0)),
         ),
         safety=SafetyConfig(
             allow_swarm=bool(safety_raw.get("allow_swarm", True)),

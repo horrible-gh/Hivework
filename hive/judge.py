@@ -32,6 +32,7 @@ ones — see ``_verdict_is_grounded``.
 Like specify's effectiveness review, JUDGE never raises: a flaky/unparseable
 model response degrades to ``located=false`` rather than crashing the pipeline.
 """
+import dataclasses
 import json
 import logging
 from dataclasses import dataclass, field
@@ -503,3 +504,129 @@ def run_judge(*, plan_bundle: dict[str, Any], symptom: str, axis_globs: list[str
         "followup_bundle": followup_bundle,
         "history": history,
     }
+
+
+def _merge_vote_followups(combs: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """Pool every vote's follow-up windows into ONE bundle (deduped), or None.
+
+    A candidate located by vote *j* may cite a file only vote *j*'s follow-up
+    retrieve windowed; converge pools evidence across axes but per axis it gets a
+    single bundle. So we union the follow-up seeds/call-chain from all votes here
+    — every candidate then has its supporting window in the evidence converge sees,
+    not just the representative vote's. Deduped by (file, lines); ``None`` when no
+    vote ran a follow-up (mirrors run_judge's ``followup_bundle is None``).
+    """
+    seeds: list[dict[str, Any]] = []
+    call_chain: list[dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+    any_fu = False
+    for c in combs:
+        fu = c.get("followup_bundle")
+        if not fu:
+            continue
+        any_fu = True
+        for dst, key in (("seeds", "seeds"), ("call_chain", "call_chain")):
+            target = seeds if dst == "seeds" else call_chain
+            for s in fu.get(key) or []:
+                sig = (_norm_path(s.get("file", "")), str(s.get("lines", "")))
+                if sig in seen:
+                    continue
+                seen.add(sig)
+                target.append(s)
+    if not any_fu:
+        return None
+    return {"seeds": seeds, "call_chain": call_chain, "stats": {}}
+
+
+def run_judge_votes(*, votes: int, **judge_kwargs) -> dict[str, Any]:
+    """Best-of-N JUDGE for one axis: N INDEPENDENT verdicts, UNIONed (M010 §5).
+
+    The judge is noisy — in the equal-budget A/B a real locus was sometimes hit by
+    only 1 of N passes (axis A: 1/7), and the cheap-but-many-passes model won *per
+    dollar* precisely because more votes eventually caught those rare hits. This
+    wires that into the operating pipeline: each pass is a full, independent
+    :func:`run_judge` (same re-judge budget — exactly the harness that validated
+    the win, ``smoke/judge_ab_budget.py``); the located loci are then **unioned,
+    not voted by majority**. Majority would discard the 1/N rare-but-correct hit —
+    the very thing N passes exist to catch — so every distinct located ``(file,
+    lines)`` survives as a candidate and the DOWNSTREAM converge causal gate, not a
+    vote count, controls precision. N raises recall; converge pays for it.
+
+    Each vote is SINGLE-SHOT when voting (``votes > 1``): the per-vote re-judge
+    (``max_calls_per_axis=2``) is REDUNDANT under best-of-N — the union across N
+    votes already supplies the "look again" the re-judge gives within one vote. A
+    live N176 A/B confirmed single-shot voting matches re-judge voting on recall at
+    ~half the calls, so we force ``max_calls_per_axis=1`` inside voting and leave
+    the re-judge to the ``votes=1`` single-judgment path (config's value still
+    governs that). Net: ``votes > 1`` ⇒ a DETERMINISTIC ``axes × votes`` call count.
+
+    ``votes <= 1`` degrades EXACTLY to one ``run_judge`` (same calls, same verdict,
+    a one-element candidate list, untouched follow-up bundle) — the feature is
+    opt-in and zero-cost at N=1.
+
+    Returns the representative pass's ``run_judge`` comb dict (so existing callers
+    keep reading ``verdict``/``calls_made``/``need``/``followup_bundle``), with:
+      - ``calls_made``    summed across all votes,
+      - ``votes``         N actually attempted,
+      - ``located_votes`` how many passes located,
+      - ``candidates``    distinct located ``JudgeVerdict`` (the union), most-voted
+                          file first — the fragments converge should reason over,
+      - ``file_tally``    ``{normalised file: vote count}`` for logging/report,
+      - ``followup_bundle`` the POOLED follow-up windows of all votes (N>1).
+    The representative ``verdict`` is a located verdict from the most-voted file
+    (ties → earliest pass); when no pass located, the first pass's unlocated
+    verdict — so its refute/dismissal reason still reaches the honey.
+    """
+    n = max(1, int(votes))
+    # Voting ⇒ single-shot per vote: drop the redundant per-vote re-judge so the
+    # union (not a second call) does the "look again". Leaves votes=1 untouched.
+    if n > 1:
+        jc = judge_kwargs.get("judge_cfg")
+        if jc is not None and int(getattr(jc, "max_calls_per_axis", 1)) > 1:
+            judge_kwargs = dict(judge_kwargs)
+            judge_kwargs["judge_cfg"] = dataclasses.replace(jc, max_calls_per_axis=1)
+    combs = [run_judge(**judge_kwargs) for _ in range(n)]
+    located = [c["verdict"] for c in combs if c["verdict"].located]
+
+    # Vote tally by normalised file (first-seen order → stable tie-breaking).
+    tally: dict[str, int] = {}
+    order: list[str] = []
+    for v in located:
+        f = _norm_path(v.file)
+        if f not in tally:
+            tally[f] = 0
+            order.append(f)
+        tally[f] += 1
+
+    # Union of distinct located loci, deduped by (file, lines), ranked by the
+    # file's vote count then first-seen order. This is the set converge filters.
+    seen: set[tuple[str, str]] = set()
+    candidates: list[JudgeVerdict] = []
+    for v in sorted(located, key=lambda v: (-tally[_norm_path(v.file)],
+                                            order.index(_norm_path(v.file)))):
+        key = (_norm_path(v.file), (v.lines or "").strip())
+        if key in seen:
+            continue
+        seen.add(key)
+        candidates.append(v)
+
+    # Representative comb: a located pass on the most-voted file, else the first
+    # pass (keeps its unlocated reason). candidates[0] is already the top file.
+    if candidates:
+        top = _norm_path(candidates[0].file)
+        rep = next(c for c in combs
+                   if c["verdict"].located and _norm_path(c["verdict"].file) == top)
+    else:
+        rep = combs[0]
+
+    out = dict(rep)
+    out["calls_made"] = sum(c["calls_made"] for c in combs)
+    out["votes"] = n
+    out["located_votes"] = len(located)
+    out["candidates"] = candidates
+    out["file_tally"] = tally
+    # Only re-pool when there was actually more than one vote — at N=1 keep the
+    # single pass's own bundle untouched (exact run_judge equivalence).
+    if n > 1:
+        out["followup_bundle"] = _merge_vote_followups(combs)
+    return out

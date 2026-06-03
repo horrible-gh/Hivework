@@ -436,5 +436,140 @@ class TestSummarizeBundle(unittest.TestCase):
         self.assertIn("declarations", out)
 
 
+def _comb(located, file="", lines="", reason="", calls=1, fu=None, axis="ax"):
+    """A minimal run_judge comb dict (the unit under test aggregates these)."""
+    return {"axis_id": axis, "calls_made": calls, "need": None,
+            "followup_bundle": fu, "history": [],
+            "verdict": J.JudgeVerdict(axis_id=axis, located=located, file=file,
+                                      lines=lines, reason=reason)}
+
+
+class TestRunJudgeVotes(unittest.TestCase):
+    """Best-of-N voting: N independent run_judge passes → UNION of located loci.
+
+    Aggregation is tested in isolation by patching ``run_judge`` with scripted
+    combs; the N=1 case is exercised end-to-end through the real ``call_worker``
+    path to prove exact single-judgment equivalence.
+    """
+
+    _KW = dict(plan_bundle=PLAN_BUNDLE, symptom="s", axis_globs=["g"],
+               code_root="/x", provider="p", model="m")
+
+    def test_union_ranks_by_votecount_and_keeps_rare_hit(self):
+        # 2 votes on a.py, 1 on b.py → both survive (union, not majority); a.py
+        # ranks first (more votes) but b.py's 1/3 hit is NOT discarded.
+        combs = [_comb(True, "server/a.py", "1-2", "ra"),
+                 _comb(True, "server/a.py", "1-2", "ra2"),
+                 _comb(True, "server/b.py", "9-9", "rb")]
+        with mock.patch.object(J, "run_judge", side_effect=list(combs)):
+            out = J.run_judge_votes(votes=3, judge_cfg=JudgeConfig(), **self._KW)
+        self.assertEqual(out["votes"], 3)
+        self.assertEqual(out["located_votes"], 3)
+        self.assertEqual([c.file for c in out["candidates"]],
+                         ["server/a.py", "server/b.py"])
+        self.assertEqual(out["file_tally"], {"server/a.py": 2, "server/b.py": 1})
+        self.assertEqual(out["verdict"].file, "server/a.py")   # representative = top
+        self.assertEqual(out["calls_made"], 3)
+
+    def test_distinct_lines_same_file_are_distinct_candidates(self):
+        combs = [_comb(True, "a.py", "1-2", "r1"), _comb(True, "a.py", "40-41", "r2")]
+        with mock.patch.object(J, "run_judge", side_effect=list(combs)):
+            out = J.run_judge_votes(votes=2, judge_cfg=JudgeConfig(), **self._KW)
+        self.assertEqual([(c.file, c.lines) for c in out["candidates"]],
+                         [("a.py", "1-2"), ("a.py", "40-41")])
+
+    def test_minority_located_still_representative_and_unioned(self):
+        # Only 1 of 3 passes located → that locus is the axis's verdict AND a
+        # candidate (the recall lift: a rare hit surfaces, converge then vets it).
+        combs = [_comb(False, reason="refute1"), _comb(False, reason="refute2"),
+                 _comb(True, "server/b.py", "9-9", "found")]
+        with mock.patch.object(J, "run_judge", side_effect=list(combs)):
+            out = J.run_judge_votes(votes=3, judge_cfg=JudgeConfig(), **self._KW)
+        self.assertEqual(out["located_votes"], 1)
+        self.assertTrue(out["verdict"].located)
+        self.assertEqual(out["verdict"].file, "server/b.py")
+        self.assertEqual([c.file for c in out["candidates"]], ["server/b.py"])
+
+    def test_no_location_keeps_first_unlocated_reason(self):
+        combs = [_comb(False, reason="r-first"), _comb(False, reason="r-second")]
+        with mock.patch.object(J, "run_judge", side_effect=list(combs)):
+            out = J.run_judge_votes(votes=2, judge_cfg=JudgeConfig(), **self._KW)
+        self.assertEqual(out["candidates"], [])
+        self.assertFalse(out["verdict"].located)
+        self.assertEqual(out["verdict"].reason, "r-first")
+        self.assertEqual(out["located_votes"], 0)
+
+    def test_calls_made_summed_across_votes(self):
+        combs = [_comb(True, "a.py", "1", "r", calls=2),
+                 _comb(True, "a.py", "1", "r", calls=1)]
+        with mock.patch.object(J, "run_judge", side_effect=list(combs)):
+            out = J.run_judge_votes(votes=2, judge_cfg=JudgeConfig(), **self._KW)
+        self.assertEqual(out["calls_made"], 3)
+
+    def test_followup_bundles_pooled_when_n_gt_1(self):
+        fu1 = {"seeds": [{"file": "a.py", "lines": "1-2", "text": "x"}],
+               "call_chain": [], "stats": {}}
+        fu2 = {"seeds": [{"file": "b.py", "lines": "3-4", "text": "y"}],
+               "call_chain": [], "stats": {}}
+        combs = [_comb(True, "a.py", "1-2", "r", fu=fu1),
+                 _comb(True, "b.py", "3-4", "r", fu=fu2)]
+        with mock.patch.object(J, "run_judge", side_effect=list(combs)):
+            out = J.run_judge_votes(votes=2, judge_cfg=JudgeConfig(), **self._KW)
+        files = sorted(s["file"] for s in out["followup_bundle"]["seeds"])
+        self.assertEqual(files, ["a.py", "b.py"])
+
+    def test_n1_equivalent_to_single_run_judge(self):
+        # votes=1 runs the REAL run_judge once: same calls, located verdict, a
+        # one-element candidate list, and the follow-up bundle left untouched.
+        with mock.patch.object(J, "call_worker", return_value=_wr(VERDICT_NO_NEED)), \
+             mock.patch.object(J, "retrieve_followup") as fu:
+            out = J.run_judge_votes(
+                votes=1, plan_bundle=PLAN_BUNDLE, symptom="s", axis_globs=["g"],
+                code_root="/x", provider="copilot", model="gpt-5-mini",
+                judge_cfg=JudgeConfig(max_calls_per_axis=1))
+        self.assertEqual(out["votes"], 1)
+        self.assertEqual(out["calls_made"], 1)
+        self.assertEqual(out["located_votes"], 1)
+        self.assertEqual(len(out["candidates"]), 1)
+        self.assertTrue(out["verdict"].located)
+        self.assertIsNone(out["followup_bundle"])      # untouched at N=1
+        fu.assert_not_called()
+
+    def test_votes_zero_or_negative_clamped_to_one(self):
+        with mock.patch.object(J, "run_judge",
+                               side_effect=[_comb(True, "a.py", "1", "r")]):
+            out = J.run_judge_votes(votes=0, judge_cfg=JudgeConfig(), **self._KW)
+        self.assertEqual(out["votes"], 1)
+
+    def test_voting_forces_single_shot_per_vote(self):
+        # votes>1 → each run_judge must get max_calls_per_axis=1 (re-judge dropped),
+        # regardless of the configured value (N176 A/B: single-shot voting matches
+        # re-judge voting on recall at half the calls).
+        seen = []
+
+        def fake(**kw):
+            seen.append(kw["judge_cfg"].max_calls_per_axis)
+            return _comb(True, "a.py", "1", "r")
+
+        with mock.patch.object(J, "run_judge", side_effect=fake):
+            J.run_judge_votes(votes=3, judge_cfg=JudgeConfig(max_calls_per_axis=2),
+                              **self._KW)
+        self.assertEqual(seen, [1, 1, 1])
+
+    def test_single_vote_preserves_configured_rejudge(self):
+        # votes=1 is the single-judgment path → the configured re-judge budget
+        # (max_calls_per_axis=2) is left intact.
+        seen = []
+
+        def fake(**kw):
+            seen.append(kw["judge_cfg"].max_calls_per_axis)
+            return _comb(True, "a.py", "1", "r")
+
+        with mock.patch.object(J, "run_judge", side_effect=fake):
+            J.run_judge_votes(votes=1, judge_cfg=JudgeConfig(max_calls_per_axis=2),
+                              **self._KW)
+        self.assertEqual(seen, [2])
+
+
 if __name__ == "__main__":
     unittest.main()
