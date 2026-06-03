@@ -12,6 +12,7 @@ import os
 from hive.retriever import (
     _norm_glob, _validate_globs, _partition_globs, _abs_under, _widen_globs,
     _looks_like_label_ref, _extract_value, retrieve, SearchPlan,
+    _path_segs, _route_suffix_match, _resolve_http_bindings, _read_def_body,
 )
 
 ROOT = "C:/workspace/projects/Documents/projects/FlowGate"
@@ -460,3 +461,199 @@ def test_dense_file_does_not_collapse_distinct_query_lines(tmp_path):
     # at least the two result_doc_id-bearing queries surface as separate records
     rec_lines = {s["lines"] for s in out["code_snippets"]}
     assert len(rec_lines) >= 2, rec_lines
+
+
+# ── HTTP call-binding edge (N177): client fetch-URL literal → backend route handler.
+#    The crux miss — the judge grounded on a lexically-similar but WRONG handler
+#    (get_effective_head, literally "head") because the only path to the real source
+#    (_parse_doc_workflow, reached via /api/v1/documents/detail) is a cross-language
+#    URL-literal→route string join that keyword retrieval never builds.
+
+def test_path_segs_strips_and_splits():
+    assert _path_segs("/api/v1/documents/detail") == ["api", "v1", "documents", "detail"]
+    assert _path_segs("/detail/") == ["detail"]
+    assert _path_segs("/") == []
+
+
+def test_route_suffix_match_literal_tail():
+    # decorator carries only the router-relative tail; the mount prefix lives elsewhere.
+    url = _path_segs("/api/v1/documents/detail")
+    assert _route_suffix_match(url, _path_segs("/detail")) == (True, 1, 0)
+
+
+def test_route_suffix_match_param_segment_matches_any():
+    url = _path_segs("/api/v1/workflow/D031/head")
+    # {doc_id} param matches the "D031" segment; "head" matches literally.
+    assert _route_suffix_match(url, _path_segs("/workflow/{doc_id}/head")) == (True, 2, 1)
+
+
+def test_route_suffix_match_rejects_non_suffix():
+    url = _path_segs("/api/v1/documents/detail")
+    assert _route_suffix_match(url, _path_segs("/workflow/{doc_id}/head"))[0] is False
+    # longer than url → no match
+    assert _route_suffix_match(["detail"], ["a", "detail"])[0] is False
+
+
+def _make_fe_be_binding_tree(tmp_path):
+    """N177 in miniature: a FE bar reads workflow_head_type from /documents/detail;
+    a decoy BE route /workflow/{doc_id}/head returns get_effective_head (includes M);
+    the real source /detail → _parse_doc_workflow (excludes M) is reachable only via
+    the URL literal. There is also a /{doc_id} param route the param-match must lose to.
+    """
+    fe = tmp_path / "client" / "src" / "components"
+    fe.mkdir(parents=True)
+    (fe / "DocHeader.vue").write_text(
+        "async function fetchDoc(id) {\n"
+        "  const res = await getRequest(`/api/v1/documents/detail?doc_id=${id}`)\n"
+        "  doc.value = res.data\n"
+        "}\n"
+        "const workflowHeadType = computed(() => doc.value?.workflow_head_type ?? null)\n",
+        encoding="utf-8")
+    be = tmp_path / "server" / "routers"
+    be.mkdir(parents=True)
+    # decoy: the lexically-obvious "head" route — what keyword retrieval grabs.
+    (be / "workflow_head_routes.py").write_text(
+        'router = APIRouter(prefix="/api/v1")\n'
+        '@router.get("/workflow/{doc_id}/head")\n'
+        "def get_workflow_head(doc_id):\n"
+        "    head = get_effective_head(seq_id)  # includes M\n"
+        "    return {'workflow_head_type': head.get('type')}\n",
+        encoding="utf-8")
+    # real source: reached only by matching the /detail URL literal.
+    (be / "documents.py").write_text(
+        'router = APIRouter(prefix="/api/v1/documents")\n'
+        '@router.get("/{doc_id}")\n'
+        "def get_document(doc_id):\n"
+        "    return _parse_doc_workflow(doc)\n"
+        "\n"
+        '@router.get("/detail")\n'
+        "@require_permission('perm_document_read')\n"
+        "def get_document_rpc(doc_id):\n"
+        "    return _parse_doc_workflow(doc)  # NON_HEAD_TYPES excludes M\n",
+        encoding="utf-8")
+    return str(tmp_path)
+
+
+def test_resolve_http_bindings_lands_on_real_source_not_decoy(tmp_path):
+    root = _make_fe_be_binding_tree(tmp_path)
+    snippets = [{
+        "file": "client/src/components/DocHeader.vue",
+        "lines": "1-5",
+        "text": "const res = await getRequest(`/api/v1/documents/detail?doc_id=${id}`)\n",
+    }]
+    bindings = _resolve_http_bindings(snippets, root)
+    assert bindings, "no binding resolved for the /detail fetch"
+    b = bindings[0]
+    # the literal /detail route wins over the /{doc_id} param route (FastAPI precedence)
+    assert b["route"] == "/detail"
+    assert "documents.py" in b["file"]
+    # the handler body the judge now sees points at the REAL source, not the decoy.
+    assert "_parse_doc_workflow" in b["text"]
+    assert "get_effective_head" not in b["text"]
+    assert b["via"] == "http-binding"
+    assert b["ambiguous"] is False
+
+
+def test_retrieve_attaches_http_binding_to_call_chain(tmp_path):
+    # End-to-end: the wired retrieve() surfaces the resolved handler in call_chain
+    # so the judge consumes it with the rest of the evidence (no judge.py change).
+    root = _make_fe_be_binding_tree(tmp_path)
+    plan = SearchPlan(
+        axis_id="WF_HEAD",
+        keywords=["workflow_head_type", "getRequest", "fetchDoc"],
+        file_globs=["client/**/*.vue"],
+    )
+    out = retrieve(plan, root, max_hops=0)
+    assert out["stats"]["http_bindings"] >= 1, out["stats"]
+    handlers = [b for b in out["http_bindings"] if b["route"] == "/detail"]
+    assert handlers and "_parse_doc_workflow" in handlers[0]["text"]
+    # the resolved handler rides along in call_chain (what summarize_bundle renders).
+    assert any(s.get("via") == "http-binding" and "_parse_doc_workflow" in s.get("text", "")
+               for s in out["call_chain"])
+
+
+def test_resolve_http_bindings_ignores_non_http_callees(tmp_path):
+    # A non-fetch callee taking a "/x" string literal must NOT be treated as a
+    # binding (we only resolve known HTTP request callees — same tight discipline
+    # as label getters), else the bundle floods with noise.
+    root = _make_fe_be_binding_tree(tmp_path)
+    snippets = [{
+        "file": "x.ts", "lines": "1-1",
+        "text": "const p = path.join('/api/v1/documents/detail')\n"
+                "logger.info('/api/v1/documents/detail')\n",
+    }]
+    assert _resolve_http_bindings(snippets, root) == []
+
+
+def test_resolve_http_bindings_surfaces_duplicate_sources_as_ambiguous(tmp_path):
+    # Two distinct handlers declared for the SAME client path → ambiguous; BOTH are
+    # surfaced (never guess) — and duplicated sources for one screen value is itself
+    # the tangle worth flagging (the user's "millionth fix" churn).
+    fe = tmp_path / "client"
+    fe.mkdir(parents=True)
+    (fe / "api.ts").write_text(
+        "export const load = () => axios.get('/api/items/list')\n", encoding="utf-8")
+    be = tmp_path / "server"
+    be.mkdir(parents=True)
+    (be / "a.py").write_text(
+        '@router.get("/list")\ndef list_a():\n    return source_a()\n', encoding="utf-8")
+    (be / "b.py").write_text(
+        '@router.get("/list")\ndef list_b():\n    return source_b()\n', encoding="utf-8")
+    snippets = [{"file": "client/api.ts", "lines": "1-1",
+                 "text": "axios.get('/api/items/list')\n"}]
+    bindings = _resolve_http_bindings(snippets, str(tmp_path))
+    routes = {b["route"] for b in bindings}
+    assert routes == {"/list"}
+    assert len(bindings) == 2, [b["file"] for b in bindings]
+    assert all(b["ambiguous"] for b in bindings)
+
+
+def test_resolve_http_bindings_prefix_disambiguates_same_tail(tmp_path):
+    # Two routers declare the SAME decorator tail (/detail) but different prefixes;
+    # only the one whose prefix completes the client URL must resolve (FlowGate's
+    # real /documents vs /api/v1 legacy collision). Reading each router's OWN
+    # declared prefix breaks the tie deterministically — not a false ambiguity.
+    fe = tmp_path / "client"
+    fe.mkdir(parents=True)
+    (fe / "api.ts").write_text(
+        "const r = await getRequest('/api/v1/documents/detail?id=1')\n", encoding="utf-8")
+    be = tmp_path / "server"
+    be.mkdir(parents=True)
+    (be / "documents.py").write_text(
+        'router = APIRouter(prefix="/documents", tags=["Documents"])\n'
+        '@router.get("/detail")\ndef doc_detail():\n    return real_source()\n',
+        encoding="utf-8")
+    (be / "legacy.py").write_text(
+        'router = APIRouter(prefix="/api/v1", tags=["Legacy"])\n'
+        '@router.get("/detail")\ndef legacy_detail():\n    return legacy_source()\n',
+        encoding="utf-8")
+    snippets = [{"file": "client/api.ts", "lines": "1-1",
+                 "text": "getRequest('/api/v1/documents/detail?id=1')\n"}]
+    bindings = _resolve_http_bindings(snippets, str(tmp_path))
+    assert len(bindings) == 1, [(b["file"], b["full_path"]) for b in bindings]
+    b = bindings[0]
+    assert "documents.py" in b["file"] and b["full_path"] == "/documents/detail"
+    assert b["ambiguous"] is False
+    assert "real_source" in b["text"] and "legacy_source" not in b["text"]
+
+
+def test_read_def_body_reads_past_multiline_signature(tmp_path):
+    # Regression: a multi-line def signature whose closing ")" sits at the def's own
+    # indent stopped the body read INSIDE the signature, so the real work below was
+    # never read (FlowGate get_document → _parse_doc_workflow at +10 lines was lost).
+    f = tmp_path / "m.py"
+    f.write_text(
+        "def get_document(\n"
+        "    doc_id: str,\n"
+        "    current_user: dict = Depends(get_current_user),\n"
+        ") -> dict:\n"
+        '    """Fetch a single document."""\n'
+        "    doc = service.get(doc_id)\n"
+        "    return _parse_doc_workflow(doc)\n"
+        "\n"
+        "def other():\n"
+        "    pass\n",
+        encoding="utf-8")
+    out = _read_def_body(str(tmp_path), "m.py", 1)
+    assert "_parse_doc_workflow(doc)" in out["text"], out["text"]
+    assert "def other" not in out["text"]  # stops at the sibling def

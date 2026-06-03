@@ -477,8 +477,31 @@ def _read_def_body(root: str, relpath: str, line: int,
     if not (0 <= idx < len(all_lines)):
         return {"lines": f"{line}", "text": ""}
     def_indent = len(all_lines[idx]) - len(all_lines[idx].lstrip())
-    hi = idx + 1
-    for j in range(idx + 1, min(len(all_lines), idx + max_lines)):
+    end = min(len(all_lines), idx + max_lines)
+
+    # 1. Walk the (possibly multi-line) signature to its end. A multi-line
+    #    signature's closing ``)`` sits at the def's OWN indent (``) -> dict:``),
+    #    so naive indent-dedent detection stops INSIDE the signature and never
+    #    reaches the body (observed: get_document → _parse_doc_workflow at +10 was
+    #    never read). Track paren depth from the def line until balanced and the
+    #    body-opening ``:`` is seen.
+    sig_end = idx
+    depth = 0
+    seen_paren = False
+    for j in range(idx, end):
+        code = all_lines[j].split("#", 1)[0]
+        depth += code.count("(") - code.count(")")
+        if "(" in code:
+            seen_paren = True
+        sig_end = j
+        if (seen_paren and depth <= 0 and ":" in code) or \
+           (not seen_paren and ":" in code):
+            break
+
+    # 2. Read the body: lines indented deeper than the def, blank lines included,
+    #    until a line dedents to ≤ the def's indent (a sibling/module statement).
+    hi = sig_end + 1
+    for j in range(sig_end + 1, end):
         ln = all_lines[j]
         if not ln.strip():
             hi = j + 1
@@ -615,7 +638,12 @@ def _follow_calls(snippets: list[dict[str, Any]], globs: list[str], root: str,
                     if key in seen_defs:
                         continue
                     seen_defs.add(key)
-                    w = _read_window(root, h["file"], h["line"], k)
+                    # Read the whole def BODY, not a ±k window: a hit here is always
+                    # a ``def`` line, and the next hop's calls (and the bug) live in
+                    # the body below the signature — a fixed window centred on the
+                    # def reaches only the signature (M004 §6; the delegation hop
+                    # get_document → _parse_doc_workflow sits ~10 lines below its def).
+                    w = _read_def_body(root, h["file"], h["line"])
                     snip = {"file": h["file"], "lines": w["lines"],
                             "text": w["text"], "symbol": name,
                             "via": "call-chain"}
@@ -726,6 +754,210 @@ def _resolve_discriminators(snippets: list[dict[str, Any]], code_root: str,
     return total
 
 
+# ── HTTP call-binding edge (FE field → fetch URL literal → backend route → handler).
+# The crux miss (N177): a UI symptom's data source is reachable only by matching a
+# fetch URL *literal* in the client to the server route that fills it — a
+# cross-language string join that keyword/density retrieval never builds. So the
+# judge grounds on a lexically-similar but WRONG handler (e.g. ``get_effective_head``
+# — literally named "head") and misses the real source (``_parse_doc_workflow``,
+# reached only via ``/api/v1/documents/detail`` → ``@router.get("/detail")``). This
+# resolves that one edge: deterministic, free, language-neutral; same pattern as
+# :func:`_follow_calls` (symbol→def) and :func:`_resolve_discriminators` (key→value).
+
+# A client HTTP call: a fetch/axios/get-style callee taking a URL-path literal
+# (quote or backtick). Captures the STATIC leading path (up to the first query
+# ``?``, interpolation ``${``, or closing quote) — the dynamic tail is a path param.
+_HTTP_CALL_RE = re.compile(
+    r"""(?P<callee>[A-Za-z_$][\w.$]*)\s*(?:<[^>(){}]*>)?\s*\(\s*[`'"]\s*(?P<path>/[A-Za-z0-9_./:{}-]*)""")
+
+# Callee's LAST dotted segment that marks an HTTP request (so we don't treat every
+# function taking a "/x" string as a fetch). Tight on purpose — same discipline as
+# ``_LABEL_GETTERS``: resolving every ``f('/x')`` would flood the bundle.
+_HTTP_CALLEES = frozenset({
+    "get", "post", "put", "patch", "delete", "del", "head", "options",
+    "request", "fetch", "query", "mutate", "send",
+    "getrequest", "postrequest", "putrequest", "patchrequest", "deleterequest",
+    "getjson", "postjson", "httpget", "httppost",
+})
+
+# A backend route declaration: ``@router.get("/path")`` / ``@app.route('/path')`` —
+# a DECORATOR (FastAPI / Flask). The leading ``@`` is what tells a server route apart
+# from a CLIENT fetch call (``axios.get('/api/…')``), which otherwise matches the same
+# ``.get("/…")`` shape and would be miscollected as a route. (Narrow on purpose:
+# non-decorator routers like Express ``router.get('/p', cb)`` are out of scope until a
+# stack needs them — start with the FastAPI/Flask form FlowGate uses.)
+_ROUTE_DECL_RE = re.compile(
+    r"""@\s*[A-Za-z_][\w.]*\.(?P<verb>get|post|put|patch|delete|route|head|options)\s*\(\s*(['"])(?P<route>/[^'"]*)\2""",
+    re.IGNORECASE)
+
+# A router's OWN declared path prefix: ``APIRouter(prefix="/documents")`` /
+# ``Blueprint(..., url_prefix="/x")``. Two routes can declare the SAME decorator
+# tail (``/detail``) in different routers; their full paths differ only by this
+# prefix (FlowGate: ``/documents`` vs ``/api/v1`` → only the former completes
+# ``/api/v1/documents/detail``). Reading it disambiguates the collision
+# deterministically — it is the router's own construct, not the outer mount tree.
+_ROUTER_PREFIX_RE = re.compile(
+    r"""(?:APIRouter|Blueprint|Router)\s*\([^)]*?(?:url_)?prefix\s*=\s*(['"])(?P<prefix>/[^'"]*)\1""")
+
+
+def _path_segs(p: str) -> list[str]:
+    """Split a URL/route path into non-empty segments (strip leading/trailing /)."""
+    return [s for s in p.strip("/").split("/") if s]
+
+
+def _route_suffix_match(url_segs: list[str],
+                        route_segs: list[str]) -> tuple[bool, int, int]:
+    """Does ``route_segs`` segment-align as a SUFFIX of ``url_segs``?
+
+    The client sends a full path (``/api/v1/documents/detail``) while a backend
+    decorator usually carries only its router-relative tail (``/detail``) — the
+    mount prefix is assembled elsewhere (``include_router(prefix=...)``), often in
+    another file. Matching the decorator path as a segment-suffix of the URL,
+    with a ``{param}``/``:param``/``*`` route segment matching any one URL segment,
+    resolves the edge without parsing the whole mount tree.
+
+    Returns ``(matched, literal_segs, param_segs)`` — the latter two rank
+    specificity (a literal match beats a param match, FastAPI's own precedence).
+    """
+    if not route_segs or len(route_segs) > len(url_segs):
+        return (False, 0, 0)
+    tail = url_segs[len(url_segs) - len(route_segs):]
+    lit = par = 0
+    for u, r in zip(tail, route_segs):
+        if (r.startswith("{") and r.endswith("}")) or r.startswith(":") or r == "*":
+            par += 1
+        elif r.lower() == u.lower():
+            lit += 1
+        else:
+            return (False, 0, 0)
+    return (True, lit, par)
+
+
+def _read_def_below(root: str, relpath: str, line: int,
+                    search: int = 25) -> dict[str, Any]:
+    """Read the handler ``def`` body that follows a route decorator at ``line``.
+
+    A route decorator (and any stacked decorators like ``@require_permission``)
+    sits above the handler ``def``; scan downward to the first ``def``/``async def``
+    and read its whole body (:func:`_read_def_body`). Falls back to a small window
+    at the decorator if no def is found within ``search`` lines.
+    """
+    abspath = os.path.join(root, relpath)
+    try:
+        with open(abspath, "r", encoding="utf-8", errors="replace") as f:
+            all_lines = f.readlines()
+    except OSError:
+        return {"lines": str(line), "text": ""}
+    for j in range(line - 1, min(len(all_lines), line - 1 + search)):
+        st = all_lines[j].lstrip()
+        if st.startswith(("def ", "async def ")):
+            return _read_def_body(root, relpath, j + 1)
+    return _read_window(root, relpath, line, 8)
+
+
+def _router_prefix(code_root: str, relpath: str) -> str | None:
+    """The router's own declared path prefix for ``relpath``, or None.
+
+    Reads the file and matches the first ``APIRouter(prefix=...)`` /
+    ``Blueprint(url_prefix=...)`` literal. A non-literal prefix (f-string, var) is
+    left unresolved — better than guessing.
+    """
+    abspath = os.path.join(code_root, relpath)
+    try:
+        with open(abspath, "r", encoding="utf-8", errors="replace") as fh:
+            txt = fh.read()
+    except OSError:
+        return None
+    m = _ROUTER_PREFIX_RE.search(txt)
+    return m.group("prefix") if m else None
+
+
+def _collect_routes(code_root: str, max_hits: int = 400) -> list[dict[str, Any]]:
+    """Grep all backend route declarations once (free, bounded, deterministic).
+
+    Each route's match path is the router's declared ``prefix`` + the decorator
+    tail, so two routers sharing a decorator tail (``/detail``) are told apart by
+    their own prefixes when matched against the client URL.
+    """
+    routes: list[dict[str, Any]] = []
+    prefix_cache: dict[str, str | None] = {}
+    pat = r"@\s*[A-Za-z_][\w.]*\.(get|post|put|patch|delete|route|head|options)\s*\(\s*['\"]/"
+    for h in _ripgrep(pat, [], code_root, max_hits=max_hits):
+        m = _ROUTE_DECL_RE.search(h.get("text", ""))
+        if not m:
+            continue
+        f = h["file"]
+        if f not in prefix_cache:
+            prefix_cache[f] = _router_prefix(code_root, f)
+        prefix = prefix_cache[f]
+        route = m.group("route")
+        full = (prefix.rstrip("/") + route) if prefix else route
+        routes.append({
+            "file": f, "line": h["line"],
+            "verb": m.group("verb").lower(), "route": route,
+            "full_path": full, "segs": _path_segs(full),
+        })
+    return routes
+
+
+def _resolve_http_bindings(snippets: list[dict[str, Any]], code_root: str,
+                           max_urls: int = 12,
+                           max_candidates: int = 3) -> list[dict[str, Any]]:
+    """Resolve client fetch-URL literals to their backend route handlers (N177).
+
+    For each HTTP call URL literal in the snippets, find the backend route whose
+    declared path segment-matches the URL (most-specific wins; literal beats
+    param), and attach that handler's def body. When several equally-specific
+    routes match the same URL the binding is ``ambiguous`` and ALL are surfaced —
+    same "show candidates, never guess" rule as :func:`_resolve_key`. Distinct
+    handlers feeding one client path is itself a duplicated-source signal worth a
+    look. Pure-local, deterministic, zero model cost.
+    """
+    urls: dict[str, set[str]] = defaultdict(set)
+    for s in snippets:
+        for m in _HTTP_CALL_RE.finditer(s.get("text", "")):
+            if m.group("callee").split(".")[-1].lower() not in _HTTP_CALLEES:
+                continue
+            path = m.group("path").rstrip("/")
+            if path.count("/") < 1 or len(_path_segs(path)) < 1:
+                continue
+            urls[path].add(m.group("callee"))
+    if not urls:
+        return []
+
+    routes = _collect_routes(code_root)
+    if not routes:
+        return []
+
+    bindings: list[dict[str, Any]] = []
+    for path in sorted(urls)[:max_urls]:
+        usegs = _path_segs(path)
+        scored: list[tuple[int, int, int, dict[str, Any]]] = []
+        for r in routes:
+            ok, lit, par = _route_suffix_match(usegs, r["segs"])
+            if ok:
+                scored.append((len(r["segs"]), lit, -par, r))
+        if not scored:
+            continue
+        scored.sort(key=lambda t: (t[0], t[1], t[2]), reverse=True)
+        top = scored[0][:3]
+        # keep only routes tying the top specificity (genuine ambiguity), capped.
+        cands = [r for (a, b, c, r) in scored if (a, b, c) == top][:max_candidates]
+        for r in cands:
+            w = _read_def_below(code_root, r["file"], r["line"])
+            full = r.get("full_path", r["route"])
+            header = (f"# RESOLVED BINDING (hive): {r['verb'].upper()} {full} "
+                      f"← client {path}\n")
+            bindings.append({
+                "url": path, "route": r["route"], "full_path": full,
+                "verb": r["verb"], "file": r["file"], "lines": w["lines"],
+                "text": header + w["text"],
+                "via": "http-binding", "callees": sorted(urls[path]),
+                "ambiguous": len(cands) > 1,
+            })
+    return bindings
+
+
 def retrieve(plan: SearchPlan, code_root: str, docs_root: str | None = None,
              k: int = 6, top_files: int = 8,
              blame_files: int = 3, max_hops: int = 2,
@@ -790,6 +1022,20 @@ def retrieve(plan: SearchPlan, code_root: str, docs_root: str | None = None,
     resolved_refs = _resolve_discriminators(
         code_snippets + call_chain, code_root, docs_root)
 
+    # 3d. resolve HTTP call-binding edges (N177): match each client fetch-URL
+    #     literal to the backend route handler that fills it — the cross-language
+    #     string join keyword retrieval can't build, so the judge otherwise grounds
+    #     on a lexically-similar but wrong handler. Append the resolved handlers to
+    #     call_chain so the judge consumes them with the rest of the evidence.
+    http_bindings = _resolve_http_bindings(code_snippets + call_chain, code_root)
+    # Follow calls OUT of the resolved handlers (whole-tree, since the handler is
+    # server-side while the axis globs are usually client-side): a route handler
+    # commonly DELEGATES (get_document_rpc → get_document → _parse_doc_workflow),
+    # so the real source is one or two hops past the handler the URL points at.
+    binding_follow = (_follow_calls(http_bindings, [], code_root, k, max_hops)
+                      if http_bindings and max_hops > 0 else [])
+    call_chain = call_chain + http_bindings + binding_follow
+
     # 4. git blame/log on the highest-ranked files, around their densest region.
     git_history = []
     for f in ranked[:blame_files]:
@@ -845,6 +1091,7 @@ def retrieve(plan: SearchPlan, code_root: str, docs_root: str | None = None,
         "code_snippets": code_snippets,
         "call_chain": call_chain,
         "call_sites": call_sites,
+        "http_bindings": http_bindings,
         "git_history": git_history,
         "design_excerpts": design_excerpts,
         "stats": {
@@ -853,6 +1100,8 @@ def retrieve(plan: SearchPlan, code_root: str, docs_root: str | None = None,
             "files_windowed": min(len(ranked), top_files),
             "snippets": len(code_snippets),
             "call_chain": len(call_chain),
+            "http_bindings": len(http_bindings),
+            "http_bindings_ambiguous": sum(1 for b in http_bindings if b.get("ambiguous")),
             "resolved_refs": resolved_refs,
             "design_excerpts": len(design_excerpts),
             "ranked_files": ranked[:top_files],
