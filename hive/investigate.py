@@ -804,8 +804,14 @@ def _render_converge_section(converge: dict[str, Any] | None,
             out += [
                 "> Convergence succeeded and the executed path is established: author "
                 "the MINIMAL edit at the attributed defect above (re-anchoring from "
-                "live code per the contract). Do NOT return needs_reinvestigation — "
-                "the path that runs for this scenario is no longer ambiguous.",
+                "live code per the contract). The path is no longer ambiguous, so do NOT "
+                "loop back merely to re-locate it. BUT the `why this is the defect` above "
+                "is converge's reasoning — CONFIRM the claimed mechanism against the live "
+                "source before you anchor: if the live code does NOT actually exhibit it "
+                "(the signature/argument is fine, the branch/value already reads as "
+                "intended), the attribution is wrong — defer that edit (do not force one "
+                "at an already-correct locus) and say why, rather than authoring a phantom "
+                "fix.",
                 "",
             ]
         return out

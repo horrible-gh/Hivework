@@ -32,6 +32,8 @@ located verdicts (nothing to stitch otherwise → free skip, no model call).
 from __future__ import annotations
 
 import logging
+import os
+import re
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -185,12 +187,86 @@ def _known_files(verdicts: list[dict[str, Any]], windows: list[dict[str, Any]]) 
     return files
 
 
+# ── Live-code grounding (N177) ──────────────────────────────────────────────────
+# converge runs tool-OFF on the judge's pooled snippets, which are COMPACTED
+# (``_EVIDENCE_CHARS``) and only as fresh/complete as each axis's retrieve. With only a
+# partial view converge once FABRICATED a code mechanism — it attributed an "argument
+# mismatch" to a FE call site whose live signature was actually fine, marked the
+# cause→symptom check ``consistent``, and the honey then crowned that phantom as the
+# primary edit target (the human PM read it as a confirmed fix). The symmetric antidote
+# to the [Confirmed data state] DB block: lift the CURRENT full text at each LOCATED
+# fragment's file:lines and inject it as AUTHORITATIVE code so the causal check rules on
+# live source, not a truncated snippet. Deterministic, free (no model call), never raises
+# — the converge analog of specify's anchor-grounding pre-flight.
+_CODE_LIFT_PAD = 3            # lines of context around each fragment's cited range
+_CODE_LIFT_MAX_PER = 80       # per-fragment line cap (a huge range is clamped)
+_CODE_LIFT_MAX_TOTAL = 400    # total line budget across all lifts
+
+
+def _parse_line_range(spec: str) -> tuple[int, int] | None:
+    """Parse a ``"lo-hi"`` / ``"lo"`` fragment-line string into ``(lo, hi)`` (or None)."""
+    m = re.match(r"\s*(\d+)\s*(?:-\s*(\d+))?", str(spec or ""))
+    if not m:
+        return None
+    lo = int(m.group(1))
+    hi = int(m.group(2)) if m.group(2) else lo
+    return (lo, hi) if hi >= lo else (hi, lo)
+
+
+def _lift_live_code(located: list[dict[str, Any]], code_root: str | None) -> str:
+    """Lift CURRENT live text at each located fragment's file:lines → authoritative block.
+
+    Reads the real source at exactly the loci the converger is about to reason over so its
+    causal check is grounded on live code (N177), not on the compacted retrieved snippets.
+    Deterministic, free, never raises; an unresolvable / empty / oversized citation is
+    simply skipped (it never fabricates). Total lift is bounded by ``_CODE_LIFT_MAX_TOTAL``.
+    """
+    if not code_root:
+        return ""
+    seen: set[tuple[str, int, int]] = set()
+    parts: list[str] = []
+    total = 0
+    for v in located:
+        vd = v.get("verdict") or {}
+        rel = (vd.get("file") or "").replace("\\", "/").strip().lstrip("/")
+        rng = _parse_line_range(vd.get("lines", ""))
+        if not rel or not rng:
+            continue
+        lo = max(1, rng[0] - _CODE_LIFT_PAD)
+        hi = rng[1] + _CODE_LIFT_PAD
+        if hi - lo + 1 > _CODE_LIFT_MAX_PER:
+            hi = lo + _CODE_LIFT_MAX_PER - 1
+        key = (rel.lower(), lo, hi)
+        if key in seen:
+            continue
+        seen.add(key)
+        try:
+            with open(os.path.join(code_root, rel), "r",
+                      encoding="utf-8", errors="replace") as f:
+                all_lines = f.readlines()
+        except OSError:
+            continue
+        clipped_hi = min(hi, len(all_lines))
+        if clipped_hi < lo:
+            continue
+        text = "".join(all_lines[lo - 1:clipped_hi]).rstrip("\n")
+        if not text.strip():
+            continue
+        n = text.count("\n") + 1
+        if parts and total + n > _CODE_LIFT_MAX_TOTAL:
+            break
+        total += n
+        parts.append(f"--- {rel}:{lo}-{clipped_hi} (live)\n{text}")
+    return "\n".join(parts)
+
+
 def build_converge_prompt(seed_text: str, located: list[dict[str, Any]],
                           unlocated: list[dict[str, Any]],
                           windows: list[dict[str, Any]],
                           data_state_block: str = "",
                           db_available: bool = False,
-                          db_schema: str = "") -> str:
+                          db_schema: str = "",
+                          code_state_block: str = "") -> str:
     """Build the single converge prompt: fragments + evidence → one path + one node.
 
     ``data_state_block`` is the optional ``[Confirmed data state]`` section: on the
@@ -286,6 +362,23 @@ def build_converge_prompt(seed_text: str, located: list[dict[str, Any]],
     # from whatever code was retrieved and mis-named the table (NR174: it asked for
     # ``items`` when the real table is ``workflow_sequence_items``, so the read came back
     # empty). Handing it the authoritative list makes the data_reads name real objects.
+    # Live source at the located loci (N177): AUTHORITATIVE over the pooled snippets,
+    # which are compacted and may be stale/partial. This is what stops converge
+    # attributing a code mechanism that the real source does not actually exhibit.
+    code_state = ""
+    if code_state_block.strip():
+        code_state = (
+            "\n[Confirmed code — ACTUAL current source read live from the located loci; "
+            "this is FACT, not a retrieved snippet. Run your cause→symptom check against "
+            "THIS text. If your attributed defect claims a mechanism that this live source "
+            "does NOT actually show — a signature/argument mismatch that is not present, a "
+            "default/guard/branch that reads differently here, a value already equal to what "
+            "you would change it to — that attribution is CONTRADICTED: do NOT attribute the "
+            "defect to it (set causal_check.verdict=\"contradicted\" and, per [Keep hunting], "
+            "point the next search elsewhere). The pooled evidence windows below may be "
+            "COMPACTED or partial; where they differ from this block, THIS block wins.]\n"
+            + code_state_block.strip() + "\n")
+
     schema_block = ""
     if db_available and db_schema.strip():
         schema_block = (
@@ -317,7 +410,7 @@ produces the reported symptom (step 3 below is where you check that).
 
 [Reported scenario / seed]
 {_trunc(seed_text, 2000)}
-{confirmed_block}{db_avail_block}{schema_block}
+{confirmed_block}{db_avail_block}{schema_block}{code_state}
 [Located fragments — each is ONE node candidate, from a different axis]
 {frags}
 {unloc_block}
@@ -595,7 +688,8 @@ def _converge_once(seed_text: str, located: list[dict[str, Any]],
                    unlocated: list[dict[str, Any]], windows: list[dict[str, Any]],
                    known: set[str], provider: str, model: str, pk: dict[str, Any],
                    ledger, timeout: int, data_state_block: str = "",
-                   db_available: bool = False, db_schema: str = "") -> ConvergeResult:
+                   db_available: bool = False, db_schema: str = "",
+                   code_state_block: str = "") -> ConvergeResult:
     """One logical converge call (with a transport-level JSON-only reparse). Never raises.
 
     The reparse retry handles a model that wrapped the JSON in prose — it is a
@@ -606,7 +700,8 @@ def _converge_once(seed_text: str, located: list[dict[str, Any]],
     instead of inventing stored values (N173).
     """
     prompt = build_converge_prompt(seed_text, located, unlocated, windows,
-                                   data_state_block, db_available, db_schema)
+                                   data_state_block, db_available, db_schema,
+                                   code_state_block)
     attempt_prompt = prompt
     parsed: dict[str, Any] | None = None
     for attempt in range(2):
@@ -836,6 +931,14 @@ def run_converge(*, seed_text: str, verdicts: list[dict[str, Any]],
     windows = _evidence_windows(bundles)
     known = _known_files(verdicts, windows)
 
+    # Live-code grounding (N177): lift the CURRENT source at the located loci so the
+    # causal check rules on real code, not on the compacted retrieved snippets. Free,
+    # deterministic; empty when no code_root is given (degrades to the snippet-only path).
+    code_state_block = _lift_live_code(located, code_root)
+    if code_state_block:
+        logger.info("converge: live-code grounding lifted %d located locus block(s)",
+                    code_state_block.count("--- "))
+
     # Tool-OFF single-shot (mirrors judge): no file/shell access, decide on the bundle.
     pk = dict(provider_kwargs or {})
     pk.setdefault("available_tools", [])
@@ -847,7 +950,8 @@ def run_converge(*, seed_text: str, verdicts: list[dict[str, Any]],
     db_schema = _render_schema_block(schema_map)
     res = _converge_once(seed_text, located, unlocated, windows, known,
                          provider, model, pk, ledger, timeout,
-                         db_available=db_available, db_schema=db_schema)
+                         db_available=db_available, db_schema=db_schema,
+                         code_state_block=code_state_block)
     logger.info("converge: %s", res.summary)
 
     # ── Data-state read (N172/N173): the verdict hinges on a STORED row value static
@@ -891,7 +995,7 @@ def run_converge(*, seed_text: str, verdicts: list[dict[str, Any]],
         res2 = _converge_once(seed_text, located, unlocated, windows, known,
                               provider, model, pk, ledger, timeout,
                               data_state_block=combined, db_available=db_available,
-                              db_schema=db_schema)
+                              db_schema=db_schema, code_state_block=code_state_block)
         logger.info("converge: data re-pass %d → %s", rounds, res2.summary)
         v2 = (res2.causal_check or {}).get("verdict")
         if v2 in ("consistent", "contradicted") and backed:
@@ -950,10 +1054,13 @@ def run_converge(*, seed_text: str, verdicts: list[dict[str, Any]],
                 # Put the freshly-fetched link FIRST so it survives the window cap.
                 merged = _dedup_windows(extra + windows)
                 known2 = known | {_norm(w.get("file", "")) for w in extra if w.get("file")}
+                # Re-lift live code at the merged loci (the follow-up may add new files).
                 res2 = _converge_once(seed_text, located, unlocated, merged, known2,
                                       provider, model, pk, ledger, timeout,
                                       data_state_block=data_block,
-                                      db_available=db_available, db_schema=db_schema)
+                                      db_available=db_available, db_schema=db_schema,
+                                      code_state_block=_lift_live_code(located, code_root)
+                                      or code_state_block)
                 logger.info("converge: re-pass → %s", res2.summary)
                 # Adopt the re-pass only if it actually converged; otherwise keep the
                 # first result, which at least named the missing link for the author.
