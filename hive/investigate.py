@@ -44,6 +44,14 @@ logger = logging.getLogger("hive.investigate")
 # ``hive.specify.SEED_TARGET_SECTION`` (imported from here).
 SEED_TARGET_SECTION = "## Seed-specified edit targets"
 
+# Header for the honey section that announces a SUCCESSFUL convergence: the single
+# executed call path stitched together + a causally-verified attributed defect.
+# specify reads this back (imported from here) so it KNOWS the path is established —
+# an authored edit at a file the converged honey cites nowhere is then off-path
+# speculation, not a fix on the verified path. Keep the literal in sync with the
+# header emitted by ``_render_converge_section`` below.
+CONVERGED_PATH_SECTION = "## Converged call path (the single executed path — START HERE)"
+
 # Optional channel for the requester's own words — the direct message/hints the
 # caller (a chat operator, or a FlowGate rejection note) supplies alongside the
 # seed. It is OPT-IN (the ``--comment`` flag); when absent nothing changes. We fold
@@ -751,7 +759,7 @@ def _render_converge_section(converge: dict[str, Any] | None,
     if converge.get("converged") and converge.get("attributed_defect"):
         ad = converge["attributed_defect"]
         out += [
-            "## Converged call path (the single executed path — START HERE)",
+            CONVERGED_PATH_SECTION,
             "",
             "The independent axes below each located ONE fragment of what is really "
             "a SINGLE call path. The converge stage stitched them into the one path "
