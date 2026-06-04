@@ -270,6 +270,28 @@ UNDECIDABLE_NO_READS_OUT = json.dumps({
 })
 
 
+# N180: a CONSISTENT verdict certified on a live DB read, attributing to the query node
+# (db/workflow_sequences.py) while LEAVING the SEED_ANCHOR fragment (the render-layer key
+# hypothesis at api/workflow_head_routes.py) OFF the path and UNMENTIONED in the trace.
+# The data read returns a row (backed) — so the consistency is data-certified, exactly the
+# shape the dropped-peer domain guard must demote.
+N180_DATA_CERT_OUT = json.dumps({
+    "converged": True,
+    "path": [{"node": "db_fn", "file": "db/workflow_sequences.py", "lines": "45-57",
+              "symbol": "build_module_query"}],
+    "attributed_defect": {"node": "db_fn", "file": "db/workflow_sequences.py",
+                          "lines": "45-57", "why": "query omits project_modules — add UNION"},
+    "causal_check": {
+        "verdict": "consistent",
+        "data_state_assumptions": ["modules exist in project_modules"],
+        "trace": "after the UNION the query returns the module rows",
+        "need_data_state": [],
+        "data_reads": [{"table": "documents", "where": {"doc_id": "D1"},
+                        "columns": ["doc_review_status"]}]},
+    "missing_link": None,
+})
+
+
 def _tmp_db_with_doc(review_status):
     d = tempfile.mkdtemp()
     path = os.path.join(d, "t.db")
@@ -362,6 +384,58 @@ class TestConvergeDataRead(unittest.TestCase):
         self.assertFalse(res.converged)
         self.assertEqual(res.causal_check["verdict"], "contradicted")
         self.assertTrue(res.data_state_backed)
+
+    def test_n180_data_certified_consistent_dropping_peer_is_demoted(self):
+        """N180: a `consistent` certified on a live DB read must NOT stay converged while a
+        DISTINCT-locus located peer (the render-layer key hypothesis) was dropped unrefuted.
+        A DB read proves rows exist, never that a render symptom is resolved."""
+        def fake(provider, model, prompt, cwd=None, timeout=300, **kw):
+            return _wr(N180_DATA_CERT_OUT)
+        db = _tmp_db_with_doc("approved")  # documents row D1 exists → the read is BACKED
+        with mock.patch.object(C, "call_worker", side_effect=fake):
+            res = C.run_converge(seed_text="the module selector renders empty",
+                                 verdicts=LOCATED_VERDICTS, bundles=BUNDLES,
+                                 provider="deepinfra", model="m",
+                                 code_root="/repo", db_conn=db)
+        self.assertTrue(res.data_state_backed)        # the verdict WAS data-certified
+        self.assertFalse(res.converged)               # demoted — no ready half-fix ships
+        self.assertIn("dropped_peer", res.causal_check)
+        self.assertEqual(res.causal_check["dropped_peer"]["axis_id"], "SEED_ANCHOR")
+        self.assertIn("api/workflow_head_routes.py",
+                      res.causal_check["dropped_peer"]["file"])
+
+    def test_n180_guard_silent_when_peer_addressed_in_trace(self):
+        """The REFUTE-BEFORE-DROP escape: if the converger mentions/refutes the peer in its
+        trace, the drop is deliberate, not silent — the guard stays quiet and converged holds."""
+        out = json.loads(N180_DATA_CERT_OUT)
+        out["causal_check"]["trace"] += (" — the api/workflow_head_routes.py mapping is "
+                                         "reachable but already reads the correct key, not "
+                                         "the cause")
+        payload = json.dumps(out)
+        def fake(provider, model, prompt, cwd=None, timeout=300, **kw):
+            return _wr(payload)
+        db = _tmp_db_with_doc("approved")
+        with mock.patch.object(C, "call_worker", side_effect=fake):
+            res = C.run_converge(seed_text="the module selector renders empty",
+                                 verdicts=LOCATED_VERDICTS, bundles=BUNDLES,
+                                 provider="deepinfra", model="m",
+                                 code_root="/repo", db_conn=db)
+        self.assertTrue(res.converged)
+        self.assertNotIn("dropped_peer", res.causal_check or {})
+
+    def test_n180_guard_silent_without_data_backing(self):
+        """The guard targets DATA-certified consistencies ONLY: a consistent ruled on CODE
+        (no DB read backing) with a dropped peer is left to the prompt-level contract, so a
+        normal red-herring drop is never demoted by this guard."""
+        def fake(provider, model, prompt, cwd=None, timeout=300, **kw):
+            return _wr(N180_DATA_CERT_OUT)
+        with mock.patch.object(C, "call_worker", side_effect=fake):
+            res = C.run_converge(seed_text="the module selector renders empty",
+                                 verdicts=LOCATED_VERDICTS, bundles=BUNDLES,
+                                 provider="deepinfra", model="m",
+                                 code_root="/repo", db_conn=None)
+        self.assertFalse(res.data_state_backed)
+        self.assertTrue(res.converged)                # not data-certified → guard inert
 
     def test_no_db_conn_leaves_undecidable_unresolved(self):
         """Without a DB connection the data read is skipped — the static path stands."""
@@ -1011,6 +1085,30 @@ class TestHoneyConvergeSection(unittest.TestCase):
         self.assertIn("do not loop back merely to re-locate", honey.lower())
         self.assertIn("confirm the claimed mechanism against the live source", honey.lower())
 
+    def test_honey_renders_n180_dropped_peer_section(self):
+        """A demoted (dropped-peer) convergence renders as a RE-EXAMINE target routing to
+        needs_reinvestigation — NOT as a ready primary edit at the data-certified node."""
+        converge = {
+            "converged": False,
+            "path": [{"node": "db_fn", "file": "db/workflow_sequences.py",
+                      "lines": "45-57", "symbol": "build_module_query"}],
+            "attributed_defect": {"node": "db_fn", "file": "db/workflow_sequences.py",
+                                  "lines": "45-57", "why": "query omits project_modules"},
+            "causal_check": {
+                "verdict": "consistent",
+                "trace": "after the UNION rows return [N180 guard] ...",
+                "dropped_peer": {"axis_id": "SEED_ANCHOR",
+                                 "file": "api/workflow_head_routes.py", "lines": "93-102",
+                                 "reason": "response key is module_id; FE reads module"}},
+            "missing_link": None}
+        honey = render_local_honey(self._result(converge, "fix"),
+                                   "the module selector renders empty")
+        self.assertIn("dropped a competing hypothesis", honey)
+        self.assertIn("api/workflow_head_routes.py:93-102", honey)
+        self.assertIn("needs_reinvestigation", honey)
+        # must NOT be presented as a ready primary edit at the data-certified node
+        self.assertNotIn("Primary edit target", honey)
+
     def test_diagnostic_seed_says_path_is_deliverable(self):
         converge = {
             "converged": True, "path": [],
@@ -1132,6 +1230,151 @@ class TestConvergeLiveCodeGrounding(unittest.TestCase):
             C.run_converge(seed_text="trace", verdicts=LOCATED_VERDICTS,
                            bundles=BUNDLES, provider="deepinfra", model="m")
         self.assertNotIn("Confirmed code", prompts[0])
+
+
+# ── N179: seed-negation grounding + multiple independent defects ───────────────
+# A genuine multi-locus convergence: the primary defect PLUS two SEPARATE ones in
+# different code (the highlight mapping, the step-state computation, the status badge).
+MULTI_LOCUS_OUT = json.dumps({
+    "converged": True,
+    "path": [
+        {"node": "fe", "file": "client/src/main/DocWorkflow.vue", "lines": "80-90",
+         "symbol": "stepClass"},
+    ],
+    "attributed_defect": {"node": "fe", "file": "client/src/app.css", "lines": "12-14",
+                          "why": "the active-step selector paints blue, not the seed's "
+                                 "corrected colour"},
+    "additional_defects": [
+        {"node": "fe", "file": "client/src/main/DocInfoPanel.vue", "lines": "40-52",
+         "why": "the status badge never flips wf_in_progress → done"},
+        {"node": "handler", "file": "server/workflow_decision_service.py", "lines": "70-95",
+         "why": "the computed step index is off by one"},
+    ],
+    "causal_check": {"verdict": "consistent", "data_state_assumptions": [],
+                     "trace": "reproduces", "need_data_state": []},
+    "missing_link": None,
+})
+
+
+class TestSeedNegationAndMultiLocus(unittest.TestCase):
+    """N179: converge must not re-assert a seed-NEGATED value as the intent, and a
+    scenario with several INDEPENDENT defects must surface each, not collapse to one."""
+
+    def test_prompt_carries_seed_negation_grounding(self):
+        prompts = []
+
+        def fake(provider, model, prompt, cwd=None, timeout=300, **kw):
+            prompts.append(prompt)
+            return _wr(CONVERGED_OUT)
+
+        with mock.patch.object(C, "call_worker", side_effect=fake):
+            C.run_converge(seed_text="yellow is a hallucination; it should be blue",
+                           verdicts=LOCATED_VERDICTS, bundles=BUNDLES,
+                           provider="deepinfra", model="m")
+        self.assertIn("Seed is ground truth", prompts[0])
+        self.assertIn("INVERTS the requirement", prompts[0])
+
+    def test_prompt_carries_multi_locus_contract(self):
+        prompts = []
+
+        def fake(provider, model, prompt, cwd=None, timeout=300, **kw):
+            prompts.append(prompt)
+            return _wr(CONVERGED_OUT)
+
+        with mock.patch.object(C, "call_worker", side_effect=fake):
+            C.run_converge(seed_text="three separate things are wrong",
+                           verdicts=LOCATED_VERDICTS, bundles=BUNDLES,
+                           provider="deepinfra", model="m")
+        self.assertIn("additional_defects", prompts[0])
+        self.assertIn("MULTIPLE INDEPENDENT loci", prompts[0])
+
+    def test_additional_defects_parsed(self):
+        with mock.patch.object(C, "call_worker", return_value=_wr(MULTI_LOCUS_OUT)):
+            res = C.run_converge(seed_text="s", verdicts=LOCATED_VERDICTS,
+                                 bundles=BUNDLES, provider="deepinfra", model="m")
+        self.assertTrue(res.converged)
+        self.assertEqual(len(res.additional_defects), 2)
+        files = {d["file"] for d in res.additional_defects}
+        self.assertIn("client/src/main/DocInfoPanel.vue", files)
+        self.assertIn("server/workflow_decision_service.py", files)
+
+    def test_additional_defects_in_as_dict(self):
+        with mock.patch.object(C, "call_worker", return_value=_wr(MULTI_LOCUS_OUT)):
+            res = C.run_converge(seed_text="s", verdicts=LOCATED_VERDICTS,
+                                 bundles=BUNDLES, provider="deepinfra", model="m")
+        self.assertIn("additional_defects", res.as_dict())
+        self.assertEqual(len(res.as_dict()["additional_defects"]), 2)
+
+    def test_additional_defect_unmatched_file_flagged_not_dropped(self):
+        out = json.dumps({
+            "converged": True,
+            "path": [{"node": "fe", "file": "api/workflow_head_routes.py", "lines": "93-102"}],
+            "attributed_defect": {"node": "fe", "file": "api/workflow_head_routes.py",
+                                  "lines": "93-102", "why": "x"},
+            "additional_defects": [
+                {"node": "other", "file": "totally/unknown/thing.py", "lines": "1-2",
+                 "why": "separate bug"}],
+            "causal_check": {"verdict": "consistent", "data_state_assumptions": [],
+                             "trace": "t", "need_data_state": []},
+            "missing_link": None,
+        })
+        with mock.patch.object(C, "call_worker", return_value=_wr(out)):
+            res = C.run_converge(seed_text="s", verdicts=LOCATED_VERDICTS,
+                                 bundles=BUNDLES, provider="deepinfra", model="m")
+        self.assertEqual(len(res.additional_defects), 1)
+        self.assertTrue(res.additional_defects[0].get("ungrounded"))
+
+    def test_additional_defect_duplicating_primary_is_dropped(self):
+        out = json.dumps({
+            "converged": True,
+            "path": [{"node": "db_fn", "file": "db/workflow_sequences.py", "lines": "45-57"}],
+            "attributed_defect": {"node": "db_fn", "file": "db/workflow_sequences.py",
+                                  "lines": "45-57", "why": "x"},
+            "additional_defects": [
+                {"node": "db_fn", "file": "db/workflow_sequences.py", "lines": "45-57",
+                 "why": "same locus restated"}],
+            "causal_check": {"verdict": "consistent", "data_state_assumptions": [],
+                             "trace": "t", "need_data_state": []},
+            "missing_link": None,
+        })
+        with mock.patch.object(C, "call_worker", return_value=_wr(out)):
+            res = C.run_converge(seed_text="s", verdicts=LOCATED_VERDICTS,
+                                 bundles=BUNDLES, provider="deepinfra", model="m")
+        self.assertEqual(res.additional_defects, [])
+
+    def test_single_defect_has_empty_additional(self):
+        with mock.patch.object(C, "call_worker", return_value=_wr(CONVERGED_OUT)):
+            res = C.run_converge(seed_text="s", verdicts=LOCATED_VERDICTS,
+                                 bundles=BUNDLES, provider="deepinfra", model="m")
+        self.assertEqual(res.additional_defects, [])
+
+    def test_honey_renders_multi_locus_targets(self):
+        result = {
+            "verdicts": LOCATED_VERDICTS, "axes_judged": 2, "axes_total": 2,
+            "seed_kind": "fix",
+            "converge": json.loads(MULTI_LOCUS_OUT),
+        }
+        # carry the parsed-and-grounded converge dict the way investigate does
+        with mock.patch.object(C, "call_worker", return_value=_wr(MULTI_LOCUS_OUT)):
+            cres = C.run_converge(seed_text="s", verdicts=LOCATED_VERDICTS,
+                                  bundles=BUNDLES, provider="deepinfra", model="m")
+        result["converge"] = cres.as_dict()
+        honey = render_local_honey(result, "the colour, the index AND the badge are wrong")
+        self.assertIn("MULTIPLE INDEPENDENT defects", honey)
+        self.assertIn("Additional independent defects", honey)
+        self.assertIn("## Converge-attributed edit targets", honey)
+        self.assertIn("client/src/main/DocInfoPanel.vue", honey)
+        self.assertIn("server/workflow_decision_service.py", honey)
+
+    def test_honey_single_defect_emits_no_target_section(self):
+        with mock.patch.object(C, "call_worker", return_value=_wr(CONVERGED_OUT)):
+            cres = C.run_converge(seed_text="s", verdicts=LOCATED_VERDICTS,
+                                  bundles=BUNDLES, provider="deepinfra", model="m")
+        result = {"verdicts": LOCATED_VERDICTS, "axes_judged": 2, "axes_total": 2,
+                  "seed_kind": "fix", "converge": cres.as_dict()}
+        honey = render_local_honey(result, "one thing is wrong")
+        self.assertNotIn("## Converge-attributed edit targets", honey)
+        self.assertNotIn("Additional independent defects", honey)
 
 
 if __name__ == "__main__":

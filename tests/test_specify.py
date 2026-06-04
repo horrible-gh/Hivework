@@ -1456,6 +1456,101 @@ class TestSeedCoverageGate(unittest.TestCase):
         self.assertEqual(len(out["seed_coverage"]["missing"]), 2)
 
 
+_HONEY_MULTI_LOCUS = (
+    "## Converged — MULTIPLE INDEPENDENT defects (START HERE)\n\n"
+    "### Additional independent defects — each needs its OWN edit\n\n"
+    "- client/src/main/DocInfoPanel.vue:40-52 [fe] — badge never flips\n"
+    "- server/workflow_decision_service.py:70-95 [handler] — step index off\n\n"
+    "## Converge-attributed edit targets (author or explicitly defer EACH)\n\n"
+    "- client/src/app.css:12-14\n"
+    "- client/src/main/DocInfoPanel.vue:40-52\n"
+    "- server/workflow_decision_service.py:70-95\n\n"
+    "## Grounded localisations (investigation evidence — NOT a list of edit sites)\n\n"
+    "- SEED_ANCHOR: located\n"
+)
+
+
+class TestConvergeCoverageGate(unittest.TestCase):
+    """N179: a genuine MULTI-locus convergence must not ship a ready spec that authored
+    an edit for only some of the independent loci. Fires only when converge declared
+    ≥2 independent loci (single-defect converges emit no section → no-op)."""
+
+    def test_loci_parsed_from_section(self):
+        self.assertEqual(
+            specify._converge_target_loci(_HONEY_MULTI_LOCUS),
+            ["client/src/app.css",
+             "client/src/main/DocInfoPanel.vue",
+             "server/workflow_decision_service.py"])
+
+    def test_downgrades_ready_when_only_one_locus_covered(self):
+        # The N179 shape: 3 independent loci declared, only the app.css selector authored.
+        spec = {
+            "edits": [{"id": "E1", "file": "client/src/app.css"}],
+            "deferred": [], "termination": "ready_to_apply", "notes": "",
+        }
+        out = specify._apply_converge_coverage_gate(spec, _HONEY_MULTI_LOCUS)
+        self.assertEqual(out["termination"], "needs_reinvestigation")
+        self.assertEqual(out["reinvestigation"]["reason_code"],
+                         specify.RI_CONVERGE_LOCUS_UNCOVERED)
+        uncovered = out["converge_coverage"]["uncovered"]
+        self.assertEqual(len(uncovered), 2)  # both non-css loci are uncovered
+        self.assertIn("client/src/main/DocInfoPanel.vue", uncovered)
+        self.assertIn("server/workflow_decision_service.py", uncovered)
+        self.assertIn("converge-coverage gate", out["notes"])
+
+    def test_passes_when_every_locus_edited(self):
+        spec = {
+            "edits": [
+                {"id": "E1", "file": "client/src/app.css"},
+                {"id": "E2", "file": "client/src/main/DocInfoPanel.vue"},
+                {"id": "E3", "file": "server/workflow_decision_service.py"}],
+            "deferred": [], "termination": "ready_to_apply", "notes": "",
+        }
+        out = specify._apply_converge_coverage_gate(spec, _HONEY_MULTI_LOCUS)
+        self.assertEqual(out["termination"], "ready_to_apply")
+        self.assertEqual(out["converge_coverage"]["uncovered"], [])
+
+    def test_count_escape_tolerates_reground(self):
+        # Three distinct edits (enough to plausibly cover every locus) even though one
+        # lands on a re-grounded file converge did not literally name → not downgraded.
+        spec = {
+            "edits": [
+                {"id": "E1", "file": "client/src/app.css"},
+                {"id": "E2", "file": "client/src/main/DocInfoPanel.vue"},
+                {"id": "E3", "file": "server/workflow_decision_other.py"}],
+            "deferred": [], "termination": "ready_to_apply", "notes": "",
+        }
+        out = specify._apply_converge_coverage_gate(spec, _HONEY_MULTI_LOCUS)
+        self.assertEqual(out["termination"], "ready_to_apply")
+
+    def test_explicit_defer_counts_as_covered(self):
+        spec = {
+            "edits": [
+                {"id": "E1", "file": "client/src/app.css"},
+                {"id": "E2", "file": "client/src/main/DocInfoPanel.vue"}],
+            "deferred": [{"issue": "workflow_decision_service.py needs runtime row state",
+                          "reason": "needs_runtime"}],
+            "termination": "ready_to_apply", "notes": "",
+        }
+        out = specify._apply_converge_coverage_gate(spec, _HONEY_MULTI_LOCUS)
+        self.assertEqual(out["termination"], "ready_to_apply")
+        self.assertEqual(out["converge_coverage"]["uncovered"], [])
+
+    def test_noop_when_single_locus_or_no_section(self):
+        spec = {"edits": [{"id": "E1", "file": "x.css"}],
+                "termination": "ready_to_apply"}
+        out = specify._apply_converge_coverage_gate(spec, "no converge section here")
+        self.assertEqual(out["termination"], "ready_to_apply")
+        self.assertNotIn("converge_coverage", out)
+
+    def test_records_diagnostics_but_does_not_upgrade_non_ready(self):
+        spec = {"edits": [{"id": "E1", "file": "client/src/app.css"}],
+                "deferred": [], "termination": "needs_reinvestigation"}
+        out = specify._apply_converge_coverage_gate(spec, _HONEY_MULTI_LOCUS)
+        self.assertEqual(out["termination"], "needs_reinvestigation")
+        self.assertEqual(len(out["converge_coverage"]["uncovered"]), 2)
+
+
 class TestReinvestigationReason(unittest.TestCase):
     """Step A: every gate that lands a spec in needs_reinvestigation stamps a
     machine-readable ``spec['reinvestigation']`` reason so the reactive bridge can
