@@ -636,6 +636,64 @@ class TestDecisivenessGate(unittest.TestCase):
         self.assertEqual(
             specify._apply_decisiveness_gate(spec)["termination"], "ready_to_apply")
 
+    def test_substantive_deferred_no_longer_promotes(self):
+        # multi_file_design / not_expressible_as_edit left the optional set (N176):
+        # the decisiveness gate must NOT promote a hedge that punted a substantive fix.
+        for reason in ("multi_file_design", "not_expressible_as_edit"):
+            spec = self._hedged()
+            spec["deferred"] = [{"issue": "real fix spans BE+FE", "reason": reason}]
+            self.assertEqual(
+                specify._apply_decisiveness_gate(spec)["termination"],
+                "needs_reinvestigation", reason)
+
+
+class TestDeferredSubstanceGate(unittest.TestCase):
+    """specify._apply_deferred_substance_gate — a ready_to_apply spec that punted a
+    substantive fix to deferred[] is downgraded (N176 cheap-path guard)."""
+
+    def _ready(self, deferred):
+        return {
+            "edits": [{"id": "E1", "file": "Modal.vue",
+                       "anchor_old": "x", "replacement_new": "y",
+                       "confidence": "high", "anchor_status": "verified"}],
+            "deferred": deferred,
+            "termination": "ready_to_apply",
+            "notes": "fixed the front-end",
+        }
+
+    def test_multi_file_design_downgrades(self):
+        spec = specify._apply_deferred_substance_gate(
+            self._ready([{"issue": "list_routes ignores project_modules (BE+FE)",
+                          "reason": "multi_file_design"}]))
+        self.assertEqual(spec["termination"], "needs_reinvestigation")
+        self.assertEqual(spec["reinvestigation"]["reason_code"],
+                         specify.RI_DEFERRED_ROOT_CAUSE)
+        self.assertIn("deferred-substance gate", spec["notes"])
+
+    def test_not_expressible_as_edit_downgrades(self):
+        spec = specify._apply_deferred_substance_gate(
+            self._ready([{"issue": "backend query rewrite",
+                          "reason": "not_expressible_as_edit"}]))
+        self.assertEqual(spec["termination"], "needs_reinvestigation")
+        self.assertEqual(spec["reinvestigation"]["reason_code"],
+                         specify.RI_DEFERRED_ROOT_CAUSE)
+
+    def test_policy_direction_is_exempt(self):
+        spec = specify._apply_deferred_substance_gate(
+            self._ready([{"issue": "could add a tooltip", "reason": "policy_direction"}]))
+        self.assertEqual(spec["termination"], "ready_to_apply")
+        self.assertNotIn("reinvestigation", spec)
+
+    def test_only_acts_on_ready(self):
+        spec = self._ready([{"issue": "x", "reason": "multi_file_design"}])
+        spec["termination"] = "needs_runtime"
+        self.assertEqual(
+            specify._apply_deferred_substance_gate(spec)["termination"], "needs_runtime")
+
+    def test_no_deferred_is_noop(self):
+        spec = specify._apply_deferred_substance_gate(self._ready([]))
+        self.assertEqual(spec["termination"], "ready_to_apply")
+
 
 class TestGroundAnchors(unittest.TestCase):
     """Anchor-grounding pre-flight: lift CURRENT live values at cited file:line

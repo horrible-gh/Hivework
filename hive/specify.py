@@ -82,9 +82,23 @@ _INCONCLUSIVE_TERMINATION = "needs_reinvestigation"
 # Decisiveness gate: a conservatively-authored needs_reinvestigation spec whose edits are
 # all verified+effective+confident is promoted to ready_to_apply (never a blanket drop).
 _DECISIVE_CONFIDENCE = {"high", "medium"}
-# Deferred reasons that are "optional/surface" — they do not contradict the edits,
-# so their presence must not block applying an independently-verified edit.
-_OPTIONAL_DEFERRED_REASONS = {"policy_direction", "not_expressible_as_edit", "multi_file_design"}
+# Deferred reasons that are genuinely "optional/surface" — a side note that does not
+# contradict the edits, so its presence must not block applying an independently-verified
+# edit. ONLY policy_direction qualifies: a policy/UX suggestion the fix does not depend on.
+#
+# ``not_expressible_as_edit`` and ``multi_file_design`` were here too — that was the N176
+# hole. They do not mean "optional"; they mean "the real fix is BIGGER than what I
+# authored" (it spans multiple files, or could not be reduced to a single anchored edit).
+# Treating them as harmless let specify ship the easy half of a fix as ready_to_apply while
+# filing the hard root cause as a footnote (N176: a front-end one-liner shipped "done"
+# while the back-end cause that actually clears the symptom sat in deferred). They now live
+# in _SUBSTANTIVE_DEFERRED_REASONS and BLOCK a ready claim instead of being waved through.
+_OPTIONAL_DEFERRED_REASONS = {"policy_direction"}
+# Deferred reasons that say a SUBSTANTIVE fix was punted — very often the actual root
+# cause, filed away while the symptom-level edits ship. A ready_to_apply spec carrying one
+# of these is downgraded to needs_reinvestigation (the deferred-substance gate) so the loop
+# re-works the full fix rather than vouching for the partial one.
+_SUBSTANTIVE_DEFERRED_REASONS = {"not_expressible_as_edit", "multi_file_design"}
 
 # ── Structured reinvestigation reason codes (Step A) ───────────────────────────
 # Every site that lands a spec in needs_reinvestigation stamps a MACHINE-READABLE
@@ -98,6 +112,7 @@ _OPTIONAL_DEFERRED_REASONS = {"policy_direction", "not_expressible_as_edit", "mu
 #   ineffective           → exclude the ruled-out node, re-converge
 #   inconclusive          → re-review / re-converge (effectiveness unconfirmed)
 #   seed_target_uncovered → re-author the edit for the dropped seed target
+#   deferred_root_cause   → re-retrieve the punted substantive fix's axis (if thin)
 #   legacy_coerce         → a retired needs_pm coerced here (no real gap)
 #   author_declared       → the author itself emitted NR (read its own detail)
 RI_STALE_ANCHOR = "stale_anchor"
@@ -105,6 +120,7 @@ RI_ANCHOR_NOT_GROUNDED = "anchor_not_grounded"
 RI_INEFFECTIVE = "ineffective"
 RI_INCONCLUSIVE = "inconclusive"
 RI_SEED_TARGET_UNCOVERED = "seed_target_uncovered"
+RI_DEFERRED_ROOT_CAUSE = "deferred_root_cause"
 RI_LEGACY_COERCE = "legacy_coerce"
 RI_AUTHOR_DECLARED = "author_declared"
 
@@ -1293,6 +1309,49 @@ def _apply_decisiveness_gate(spec: dict[str, Any]) -> dict[str, Any]:
     return spec
 
 
+def _apply_deferred_substance_gate(spec: dict[str, Any]) -> dict[str, Any]:
+    """Downgrade a ready_to_apply spec that punted a SUBSTANTIVE fix to deferred[].
+
+    A deferred item whose reason says the real fix is bigger than what was authored —
+    it spans multiple files (``multi_file_design``) or could not be reduced to a single
+    anchored edit (``not_expressible_as_edit``) — is not a harmless footnote. It is very
+    often the actual root cause, filed away while the easy, symptom-level edits ship as
+    "done". This is the N176 cheap-path: a front-end one-liner marked ready_to_apply while
+    the back-end cause that actually clears the symptom sat in deferred. When such a
+    deferral rides alongside a ready_to_apply spec we cannot vouch that the fix works, so
+    we downgrade to needs_reinvestigation and let the loop re-work the FULL fix.
+
+    Scope/limits (the deliberate side-effect): ``policy_direction`` (a genuine side note)
+    is exempt; ``anchor_not_grounded`` has its own earlier gate. A spec that legitimately
+    fixes the request AND merely notes a broader future refactor as multi_file_design will
+    also be sent back — that over-rejection is the accepted cost: an extra cheap re-run is
+    far better than shipping a non-fix (the failure this gate exists to stop). Never
+    upgrades; only guards a ready claim.
+    """
+    if spec.get("termination") != "ready_to_apply":
+        return spec
+    deferred = spec.get("deferred") if isinstance(spec.get("deferred"), list) else []
+    punted: list[str] = []
+    for d in deferred:
+        if not isinstance(d, dict):
+            continue
+        if str(d.get("reason", "")).lower() in _SUBSTANTIVE_DEFERRED_REASONS:
+            punted.append(str(d.get("issue", "") or d.get("reason", ""))[:160])
+    if not punted:
+        return spec
+
+    note = ("deferred-substance gate: ready_to_apply downgraded — a substantive fix was "
+            "punted to deferred[] (" + "; ".join(punted) + "); the authored edits address "
+            "only the surface, so the fix is not vouched until the deferred root cause is "
+            "re-worked")
+    _set_reinvestigation(spec, reason_code=RI_DEFERRED_ROOT_CAUSE,
+                         gate="deferred_substance", note=note)
+    logger.warning("specify: deferred-substance gate downgraded ready_to_apply -> "
+                   "needs_reinvestigation — substantive fix punted to deferred[] (%s)",
+                   "; ".join(punted))
+    return spec
+
+
 def _seed_target_files(honey_text: str) -> list[str]:
     """Parse the honey's "Seed-specified edit targets" section into file paths.
 
@@ -1527,6 +1586,13 @@ def run_specify(
     # Decisiveness gate: a verified+effective edit must be applyable even when the
     # honey also surfaced optional/policy directions (which sit in deferred[]).
     spec = _apply_decisiveness_gate(spec)
+
+    # Deferred-substance gate (N176): a ready_to_apply spec that punted a substantive fix
+    # (multi_file_design / not_expressible_as_edit) to deferred[] is shipping only the
+    # surface — downgrade so the loop re-works the deferred root cause instead of vouching
+    # for the partial fix. Runs after decisiveness (which no longer promotes when such a
+    # deferral is present) so it also guards an author-emitted ready.
+    spec = _apply_deferred_substance_gate(spec)
 
     # Seed-coverage gate (runs LAST so it has final say): a file the user named as
     # an explicit edit target must become an edit, or a ready_to_apply spec is
