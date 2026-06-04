@@ -895,6 +895,298 @@ def _incomplete_wiring_ids(spec: dict[str, Any], codebase_root: str) -> dict[str
     return incomplete
 
 
+# ── Callee-contract grounding (N175 round-2) ───────────────────────────────────
+# _incomplete_wiring_ids above proves an added import is USED; it does NOT prove the
+# call is invoked CORRECTLY. N175 round-2: an edit added a real, used call —
+# ``showToast(t('...'), 'danger')`` — but the toast util's actual signature takes the
+# severity differently (an options object, not the 2nd positional), so the literal
+# 'danger' rendered in the toast BODY. The author GUESSED the signature because the
+# callee's definition was never on the table, and the tool-OFF reviewer could not catch
+# it because the review prompt carried only the edits, not the callee's real contract.
+#
+# The constructive fix (mirroring ground_anchors): lift each CALLED symbol's real
+# definition out of the module the edit imports it from (or the edited file itself) and
+# put that signature on the table — for the author (so it writes the call right) AND the
+# reviewer (so it can flag a mis-invoked call). Pure-local, free, deterministic, never
+# raises; a symbol whose def we cannot resolve is simply skipped (never fabricated), so
+# it can never manufacture a phantom "signature mismatch" (the converge.py:194 trap).
+
+# An identifier (optionally ``obj.method``) immediately followed by "(" — a call. The
+# negative look-behind stops us splitting ``a.b(`` into a spurious ``b`` match's prefix.
+_CALL_EXPR_RE = re.compile(r"(?<![\w.$])([A-Za-z_$][\w$]*)\s*\(")
+# The module specifier of a JS/TS import or require, and a Python ``from x.y import``.
+_RE_MODULE_FROM = re.compile(r"""\bfrom\s*['"]([^'"]+)['"]""")
+_RE_MODULE_REQUIRE = re.compile(r"""\brequire\s*\(\s*['"]([^'"]+)['"]\s*\)""")
+_RE_MODULE_PY = re.compile(r"^\s*from\s+([\w.]+)\s+import\b")
+# Calls never worth grounding (keywords / framework-ubiquitous / globals). The
+# def-existence filter drops most external calls already; this kills obvious noise
+# cheaply so we don't waste a resolve probe on ``if(`` / ``t(`` / ``JSON(``.
+_CALL_GROUND_SKIP = frozenset({
+    "if", "for", "while", "switch", "return", "catch", "function", "await", "typeof",
+    "new", "delete", "void", "do", "else", "t", "$t", "tc", "$tc", "n", "$n",
+    "ref", "computed", "watch", "reactive", "emit", "defineProps", "defineEmits",
+    "require", "import", "Boolean", "Number", "String", "Array", "Object", "JSON",
+    "Math", "Promise", "parseInt", "parseFloat", "isNaN", "console", "setTimeout",
+    "setInterval", "print", "len", "str", "int", "float", "list", "dict", "set",
+    "tuple", "range", "super", "self", "this",
+})
+# Front-end source roots an ``@/x`` / ``~/x`` alias resolves to when no explicit alias
+# map is configured (Vite/Vue/webpack convention). Tried in order, under each tree root.
+_ALIAS_SUBROOTS = ("", "src", "client/src", "app/src", "frontend/src", "ui/src", "web/src")
+_MODULE_EXTS = ("", ".ts", ".tsx", ".js", ".jsx", ".mjs", ".vue", ".py")
+_MODULE_INDEX = ("index.ts", "index.tsx", "index.js", "index.jsx", "index.mjs", "index.vue")
+_CALLEE_GROUND_MAX = 6        # cap on distinct callee contracts lifted (prompt budget)
+_CALLEE_SIG_MAX_LINES = 24    # per-symbol lift cap (full signature + a little body shape)
+
+
+def _called_symbols(text: str) -> list[str]:
+    """Distinct symbols invoked as ``name(`` in ``text`` (skiplist removed), in order."""
+    out: list[str] = []
+    seen: set[str] = set()
+    for m in _CALL_EXPR_RE.finditer(text or ""):
+        name = m.group(1)
+        if name in _CALL_GROUND_SKIP or name in seen:
+            continue
+        seen.add(name)
+        out.append(name)
+    return out
+
+
+def _module_specifiers(text: str) -> list[str]:
+    """Module paths imported/required in ``text`` (JS ``from '…'`` / ``require('…')`` /
+    Python ``from x.y import``), de-duplicated in first-seen order."""
+    specs: list[str] = []
+    seen: set[str] = set()
+    for rx in (_RE_MODULE_FROM, _RE_MODULE_REQUIRE):
+        for m in rx.finditer(text or ""):
+            s = m.group(1)
+            if s and s not in seen:
+                seen.add(s); specs.append(s)
+    for line in (text or "").splitlines():
+        m = _RE_MODULE_PY.match(line)
+        if m and m.group(1) not in seen:
+            seen.add(m.group(1)); specs.append(m.group(1))
+    return specs
+
+
+def _resolve_module_file(spec: str, from_file: str | None, roots: list[str]) -> str | None:
+    """Resolve an import specifier to an on-disk file under one of ``roots``.
+
+    Handles relative (``./x``, ``../x``), alias (``@/x``, ``~/x``), bare-as-path, and
+    Python dotted (``a.b.c``) specifiers, probing the usual extensions and ``index.*``.
+    Returns the first existing file, or None (an external/lib specifier resolves to
+    nothing and is simply not grounded). Never raises.
+    """
+    spec = (spec or "").strip()
+    if not spec:
+        return None
+    bases: list[tuple[str, str]] = []  # (root, relpath-without-ext)
+    if spec.startswith("."):
+        if from_file is None:
+            return None
+        rel = os.path.normpath(os.path.join(os.path.dirname(from_file), spec))
+        for root in roots:
+            bases.append((root, rel))
+    elif spec[:2] in ("@/", "~/"):
+        sub = spec[2:]
+        for sr in _ALIAS_SUBROOTS:
+            for root in roots:
+                bases.append((root, os.path.join(sr, sub)))
+    elif "/" not in spec and "." in spec and not spec.startswith("@"):
+        # Python dotted module path (a.b.c) → a/b/c. (A JS bare lib like "lodash.merge"
+        # also lands here, but it won't exist under a root, so it resolves to None.)
+        rel = spec.replace(".", "/")
+        for sr in _ALIAS_SUBROOTS:
+            for root in roots:
+                bases.append((root, os.path.join(sr, rel)))
+    else:
+        # bare specifier: external lib OR a project alias-less path; try as a path.
+        for sr in _ALIAS_SUBROOTS:
+            for root in roots:
+                bases.append((root, os.path.join(sr, spec)))
+    for root, rel in bases:
+        for ext in _MODULE_EXTS:
+            p = os.path.join(root, rel + ext)
+            if os.path.isfile(p):
+                return p
+        for idx in _MODULE_INDEX:
+            p = os.path.join(root, rel, idx)
+            if os.path.isfile(p):
+                return p
+    return None
+
+
+def _find_symbol_def(text: str, symbol: str) -> tuple[int, list[str]] | None:
+    """Locate where ``symbol`` is DEFINED in ``text``. Returns ``(line_idx, lines)`` or None.
+
+    Recognises the common JS/TS/Vue and Python definition shapes (function decl, const/
+    let arrow or function expression, object/class method, ``def``). Conservative — only
+    a real definition line matches, not a call — so an unresolved symbol yields None and
+    is never grounded with a wrong region.
+    """
+    s = re.escape(symbol)
+    pats = (
+        rf"^\s*(?:export\s+)?(?:default\s+)?(?:async\s+)?function\s*\*?\s*{s}\s*[(<]",
+        rf"^\s*(?:export\s+)?(?:default\s+)?(?:const|let|var)\s+{s}\s*[:=]",
+        rf"^\s*(?:export\s+)?(?:public\s+|private\s+|protected\s+|static\s+|async\s+)*"
+        rf"{s}\s*\([^)]*\)\s*(?::[^={{]+)?\{{",          # class/object method
+        rf"^\s*{s}\s*:\s*(?:async\s+)?function\b",        # obj prop: function
+        rf"^\s*{s}\s*:\s*(?:async\s+)?\([^)]*\)\s*=>",    # obj prop: arrow
+        rf"^\s*def\s+{s}\s*\(",                           # python
+    )
+    lines = (text or "").split("\n")
+    for i, line in enumerate(lines):
+        for p in pats:
+            if re.search(p, line):
+                return i, lines
+    return None
+
+
+def _lift_signature(lines: list[str], idx: int, max_lines: int) -> str:
+    """Lift the def at ``lines[idx]`` forward: the whole (possibly multi-line) parameter
+    list plus a few body lines, capped at ``max_lines``. Enough to reveal arg names,
+    order and the options-object shape without dragging the whole function in."""
+    out: list[str] = []
+    depth = 0
+    seen_paren = False
+    body_grace = 5
+    for j in range(idx, min(len(lines), idx + max_lines)):
+        line = lines[j]
+        out.append(line)
+        depth += line.count("(") - line.count(")")
+        if "(" in line:
+            seen_paren = True
+        if seen_paren and depth <= 0:
+            body_grace -= 1
+            if body_grace <= 0:
+                break
+    return "\n".join(out).rstrip()
+
+
+def _relpath_under(path: str, roots: list[str]) -> str:
+    """Path relative to the first root that contains it (for a readable citation)."""
+    ap = os.path.abspath(path)
+    for root in roots:
+        ar = os.path.abspath(root)
+        if ap.startswith(ar + os.sep):
+            return os.path.relpath(ap, ar).replace("\\", "/")
+    return os.path.basename(path)
+
+
+def _collect_callee_contracts(
+    items: list[tuple[str, str, str | None]], roots: list[str],
+    max_symbols: int = _CALLEE_GROUND_MAX,
+) -> list[tuple[str, dict[str, str]]]:
+    """Resolve the real definition of each project symbol CALLED across ``items``.
+
+    Each item is ``(call_text, import_text, edit_file)``: ``call_text`` is scanned for
+    ``name(`` calls, ``import_text`` for the module(s) those names come from, and
+    ``edit_file`` lets a locally-defined callee resolve too. Returns an ordered list of
+    ``(symbol, {"file": rel, "text": signature})`` for symbols whose def we could read
+    from one of those module files. Bounded by ``max_symbols``; never raises.
+    """
+    contracts: dict[str, dict[str, str]] = {}
+    order: list[str] = []
+    file_cache: dict[str, str] = {}
+
+    def _read(p: str) -> str:
+        if p not in file_cache:
+            try:
+                with open(p, "r", encoding="utf-8", errors="replace") as fh:
+                    file_cache[p] = fh.read()
+            except OSError:
+                file_cache[p] = ""
+        return file_cache[p]
+
+    for call_text, import_text, edit_file in items:
+        symbols = _called_symbols(call_text)
+        if not symbols:
+            continue
+        search_files: list[str] = []
+        for spec in _module_specifiers(import_text):
+            f = _resolve_module_file(spec, edit_file, roots)
+            if f and f not in search_files:
+                search_files.append(f)
+        if edit_file:
+            for root in roots:
+                p = os.path.join(root, edit_file)
+                if os.path.isfile(p) and p not in search_files:
+                    search_files.append(p)
+                    break
+        if not search_files:
+            continue
+        for sym in symbols:
+            if sym in contracts:
+                continue
+            for f in search_files:
+                found = _find_symbol_def(_read(f), sym)
+                if not found:
+                    continue
+                i, flines = found
+                contracts[sym] = {"file": _relpath_under(f, roots),
+                                  "text": _lift_signature(flines, i, _CALLEE_SIG_MAX_LINES)}
+                order.append(sym)
+                break
+            if len(contracts) >= max_symbols:
+                break
+        if len(contracts) >= max_symbols:
+            break
+    return [(s, contracts[s]) for s in order[:max_symbols]]
+
+
+def _render_callee_block(contracts: list[tuple[str, dict[str, str]]]) -> str:
+    """Render resolved callee contracts as a prompt section. '' when there are none."""
+    if not contracts:
+        return ""
+    parts = [
+        "## Callee contracts (real signatures of the functions these edits CALL)", "",
+        "Each block below is the ACTUAL definition lifted live from the codebase of a "
+        "function the edits invoke. Write/keep every call so its arguments match THIS "
+        "signature exactly — correct argument ORDER and shape (e.g. an options object "
+        "vs a positional value). A call that does not match the signature shown here is "
+        "wired but MIS-INVOKED and will not behave as intended.", "",
+    ]
+    for sym, c in contracts:
+        parts += [f"--- {sym}  (defined in {c['file']})", "```", c["text"], "```", ""]
+    return "\n".join(parts)
+
+
+def _edit_call_items(spec: dict[str, Any],
+                     codebase_root: str | None = None) -> list[tuple[str, str, str | None]]:
+    """Build ``_collect_callee_contracts`` items, grouped PER FILE across all edits.
+
+    A real fix wires a call ACROSS sibling edits: one edit adds ``import {useToast}``
+    (E2), another adds ``const {showToast} = useToast()`` (E3), a third writes the
+    ``showToast(...)`` call (E4). Grouping every edit on a file into one item is what
+    lets the import in E2 resolve the module for the call in E4 — a per-edit view would
+    see the call with no import and never ground the signature (the actual N175 spec
+    shape). ``call_text`` is the union of the edits' ADDED text (so only newly-written
+    calls are grounded, not every call already in the file); ``import_text`` is the
+    POST-edit file when readable (so a call to a PRE-EXISTING import resolves too),
+    falling back to the added union.
+    """
+    by_file: dict[str, list[str]] = {}
+    order: list[str] = []
+    for e in spec.get("edits") or []:
+        if not isinstance(e, dict):
+            continue
+        f = e.get("file")
+        body = (e.get("content") if e.get("kind", "edit") == "create_file"
+                else e.get("replacement_new")) or ""
+        if not body:
+            continue
+        if f not in by_file:
+            by_file[f] = []
+            order.append(f)
+        by_file[f].append(body)
+    post = _post_edit_files(spec, codebase_root) if codebase_root else {}
+    items: list[tuple[str, str, str | None]] = []
+    for f in order:
+        added = "\n".join(by_file[f])
+        items.append((added, post.get(f) or added, f))
+    return items
+
+
 # How many lines of a create_file's content to surface to the effectiveness
 # reviewer — enough to judge "non-empty and on-target" without ballooning the prompt.
 _REVIEW_CONTENT_MAX_LINES = 40
@@ -962,6 +1254,14 @@ def build_review_prompt(honey_text: str, spec: dict[str, Any], codebase_root: st
             }
         blocks.append(json.dumps(block, ensure_ascii=False, indent=2))
     edits_json = "\n".join(blocks) if blocks else "(no edits)"
+    # Callee-contract grounding (N175 round-2): lift the REAL signature of each function
+    # the edits call so the tool-OFF reviewer can catch a wired-but-mis-invoked call (e.g.
+    # wrong argument order) — it cannot open files, so without this it has no signature to
+    # check against. Empty when nothing resolves (never fabricated → no phantom mismatch).
+    roots = [r for r in (codebase_root, docs_root) if r]
+    callee_block = _render_callee_block(
+        _collect_callee_contracts(_edit_call_items(spec, codebase_root), roots))
+    callee_section = ("\n" + callee_block + "\n") if callee_block else ""
     return f"""[Role] You are an INDEPENDENT effectiveness reviewer for Hivework's specify stage. \
 You did not author these edits. Your only job is to catch edits that are anchored \
 correctly but do not actually fix anything. Do not rewrite the edits; only judge them.
@@ -974,7 +1274,7 @@ correctly but do not actually fix anything. Do not rewrite the edits; only judge
 
 [The proposed edits to judge]
 {edits_json}
-
+{callee_section}
 [Judge each edit]
 For every edit decide three booleans, applying the criterion that matches the edit's kind:
 - effective:
@@ -982,6 +1282,12 @@ For every edit decide three booleans, applying the criterion that matches the ed
 behavior the honey identified as wrong? An edit that is functionally inert — a no-op \
 assignment, a guard whose condition can never be true, a value set to what it already is, \
 a change with no runtime effect — is effective=false EVEN THOUGH its anchor is valid. \
+MIS-INVOKED CALL: when a "Callee contracts" section is shown above, an edit that calls one \
+of those functions with arguments that DO NOT MATCH the signature shown — wrong argument \
+ORDER, a positional value where an options object is expected, too few/many args — is \
+effective=false (the call is wired but mis-invoked, so it does not produce the intended \
+behavior). Judge this ONLY against a signature actually shown above; if a callee is not \
+shown, do NOT guess a mismatch. \
 Re-open the live files to judge reachability and effect; do not assume. \
 CRUCIAL — judge each edit AS PART OF THE WHOLE EDIT SET, not in isolation. A correct fix \
 is often WIRED ACROSS FILES (e.g. a back-end guard in one file PLUS the front-end toast \
@@ -1522,6 +1828,18 @@ def run_specify(
         if gdiag["unresolved"]:
             logger.debug("specify: anchor-grounding could not resolve %s",
                          gdiag["unresolved"])
+
+        # Callee-contract grounding (N175 round-2): when the honey itself quotes a call
+        # and the import it comes from, lift that function's REAL signature so the author
+        # writes the call with the right argument order/shape instead of guessing. The
+        # reliable detection backstop is the same lift inside build_review_prompt (keyed
+        # off the actual edits); this prose-keyed pass is best-effort prevention. Free.
+        roots = [r for r in (codebase_root, docs_root) if r]
+        cblock = _render_callee_block(
+            _collect_callee_contracts([(honey_text, honey_text, None)], roots))
+        if cblock:
+            honey_text = honey_text + "\n\n" + cblock
+            logger.info("specify: callee-grounding lifted signature(s) for the author prompt")
 
     contract_text = load_contract(contract_path)
     prompt = build_specify_prompt(honey_text, contract_text, codebase_root, docs_root,

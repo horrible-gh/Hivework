@@ -353,6 +353,142 @@ class TestIncompleteWiring(unittest.TestCase):
         self.assertIn("E1", out["effectiveness"]["ineffective_ids"])
 
 
+class TestCalleeContractGrounding(unittest.TestCase):
+    """N175 round-2: an edit adds a USED call (showToast) but with the wrong argument
+    order, because the callee's real signature was never on the table. We lift each
+    called symbol's real definition out of the module the edit imports it from so the
+    author writes the call right AND the tool-OFF reviewer can flag a mis-invoked call."""
+
+    def setUp(self):
+        self.root = tempfile.mkdtemp()
+        comp = os.path.join(self.root, "client", "src", "composables")
+        os.makedirs(comp, exist_ok=True)
+        # The toast composable whose REAL signature takes (options) — NOT (msg, severity).
+        with open(os.path.join(comp, "useToast.ts"), "w", encoding="utf-8") as f:
+            f.write(
+                "export function useToast() {\n"
+                "  function showToast(options: { message: string; severity?: string }) {\n"
+                "    toasts.push(options)\n"
+                "  }\n"
+                "  return { showToast }\n"
+                "}\n")
+
+    def _modal_edit(self):
+        return {"edits": [{
+            "id": "E1", "file": "client/src/NewRequirementModal.vue",
+            "anchor_old": "// marker",
+            "replacement_new": (
+                "import { useToast } from '@/composables/useToast'\n"
+                "const { showToast } = useToast()\n"
+                "showToast(t('main.x.error_group_r_exists'), 'danger')\n"),
+        }]}
+
+    def test_called_symbols_filters_keywords(self):
+        syms = specify._called_symbols("if (a) { showToast(x); JSON(y); foo() }")
+        self.assertIn("showToast", syms)
+        self.assertIn("foo", syms)
+        self.assertNotIn("if", syms)
+        self.assertNotIn("JSON", syms)
+
+    def test_resolve_alias_module(self):
+        f = specify._resolve_module_file(
+            "@/composables/useToast", None, [self.root])
+        self.assertIsNotNone(f)
+        self.assertTrue(f.endswith("useToast.ts"))
+
+    def test_resolve_relative_module(self):
+        f = specify._resolve_module_file(
+            "./useToast", "client/src/composables/Other.ts", [self.root])
+        self.assertIsNotNone(f)
+        self.assertTrue(f.endswith("useToast.ts"))
+
+    def test_external_module_resolves_to_none(self):
+        self.assertIsNone(specify._resolve_module_file("vue", None, [self.root]))
+
+    def test_collect_lifts_real_signature(self):
+        contracts = specify._collect_callee_contracts(
+            specify._edit_call_items(self._modal_edit()), [self.root])
+        syms = {s for s, _ in contracts}
+        self.assertIn("showToast", syms)
+        sig = dict(contracts)["showToast"]["text"]
+        # The real signature (options object) is now on the table — the author's guessed
+        # positional ('danger') call can be seen to not match it.
+        self.assertIn("options", sig)
+        self.assertIn("severity", sig)
+
+    def test_unresolved_callee_is_not_fabricated(self):
+        # A call to a symbol with no resolvable def yields no contract (no phantom).
+        edit = {"edits": [{
+            "id": "E1", "file": "client/src/NewRequirementModal.vue",
+            "anchor_old": "// m",
+            "replacement_new": "mysteryHelper(a, b)\n"}]}
+        contracts = specify._collect_callee_contracts(
+            specify._edit_call_items(edit), [self.root])
+        self.assertEqual(contracts, [])
+
+    def test_review_prompt_carries_callee_signature(self):
+        prompt = specify.build_review_prompt("honey", self._modal_edit(), self.root)
+        self.assertIn("## Callee contracts", prompt)   # the rendered block (not just mandate)
+        self.assertIn("showToast", prompt)
+        self.assertIn("severity", prompt)        # the real signature reached the reviewer
+        self.assertIn("MIS-INVOKED", prompt)     # the mandate to flag a mismatched call
+
+    def test_review_prompt_no_block_when_nothing_resolves(self):
+        # The MANDATE always names "Callee contracts"; the rendered BLOCK ('## …') only
+        # appears when a callee actually resolved. Nothing resolves here → no block.
+        edit = {"edits": [{"id": "E1", "file": "x.py",
+                           "anchor_old": "a", "replacement_new": "b = 1"}]}
+        prompt = specify.build_review_prompt("honey", edit, self.root)
+        self.assertNotIn("## Callee contracts", prompt)
+
+    def test_real_n175_shape_import_and_call_in_separate_edits(self):
+        # The ACTUAL N175 spec: E2 adds the import, E3 the binding, E4 the wrong-order
+        # call — three edits on ONE file. Per-edit grounding would see E4's call with no
+        # import and miss it; per-file aggregation resolves the module from E2 so the real
+        # signature still reaches the reviewer. Mirrors FlowGate's relative './common/useToast'.
+        comp = os.path.join(self.root, "client", "src", "main", "components", "common")
+        os.makedirs(comp, exist_ok=True)
+        with open(os.path.join(comp, "useToast.ts"), "w", encoding="utf-8") as f:
+            f.write("export function useToast() {\n"
+                    "  function showToast(message: string, type: ToastType = 'info') {\n"
+                    "    toasts.value.push({ message, type })\n"
+                    "  }\n"
+                    "  return { toasts, showToast }\n"
+                    "}\n")
+        modal = "client/src/main/components/NewRequirementModal.vue"
+        os.makedirs(os.path.dirname(os.path.join(self.root, modal)), exist_ok=True)
+        with open(os.path.join(self.root, modal), "w", encoding="utf-8") as f:
+            f.write("// imports\n// binding\n// handler\n")
+        spec = {"edits": [
+            {"id": "E2", "file": modal, "anchor_old": "// imports",
+             "replacement_new": "// imports\nimport { useToast } from './common/useToast'"},
+            {"id": "E3", "file": modal, "anchor_old": "// binding",
+             "replacement_new": "// binding\nconst { showToast } = useToast()"},
+            {"id": "E4", "file": modal, "anchor_old": "// handler",
+             "replacement_new": "// handler\nshowToast('danger', t('main.x.error_group_r_exists'))"},
+        ]}
+        contracts = dict(specify._collect_callee_contracts(
+            specify._edit_call_items(spec, self.root), [self.root]))
+        self.assertIn("showToast", contracts)
+        # The real signature (message FIRST, type SECOND) is grounded — the swapped call
+        # ('danger' first) can now be seen to be mis-invoked.
+        self.assertIn("message: string, type", contracts["showToast"]["text"])
+        prompt = specify.build_review_prompt("honey", spec, self.root)
+        self.assertIn("## Callee contracts", prompt)
+        self.assertIn("showToast(message: string", prompt)
+
+    def test_local_def_resolves_without_import(self):
+        # A callee defined in the EDITED file itself (no import) still grounds.
+        with open(os.path.join(self.root, "helpers.py"), "w", encoding="utf-8") as f:
+            f.write("def compute(scale, offset):\n    return scale + offset\n")
+        edit = {"edits": [{"id": "E1", "file": "helpers.py",
+                           "anchor_old": "# call", "replacement_new": "compute(1, 2)\n"}]}
+        contracts = dict(specify._collect_callee_contracts(
+            specify._edit_call_items(edit), [self.root]))
+        self.assertIn("compute", contracts)
+        self.assertIn("def compute(scale, offset)", contracts["compute"]["text"])
+
+
 class TestEffectivenessGateUnit(unittest.TestCase):
     def test_ineffective_review_downgrades(self):
         out = specify._apply_effectiveness_gate(
