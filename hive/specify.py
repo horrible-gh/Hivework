@@ -667,6 +667,53 @@ def _verify_anchors_live(spec: dict[str, Any], codebase_root: str,
     return spec
 
 
+# Edit-object fields the author may flatten onto the spec ROOT when it emits a single
+# edit WITHOUT the edits[] envelope. Moved back into the edit on rewrap; everything not
+# listed (gate, effectiveness, deferred, termination, notes, source_honey, codebase_root)
+# is envelope-level and stays at the root.
+_EDIT_LEVEL_KEYS = (
+    "id", "file", "anchor_old", "replacement_new", "rationale", "evidence",
+    "confidence", "anchor_status", "anchor_drift", "kind", "content", "occurrence",
+)
+
+
+def _rewrap_flattened_edit(spec: dict[str, Any]) -> dict[str, Any]:
+    """Salvage a single edit the author flattened into the spec root.
+
+    A well-formed spec carries its edits inside ``edits[]``; the envelope itself never
+    holds ``anchor_old``/``replacement_new``. When an author emits ONE edit with those
+    fields hoisted to the root and no ``edits`` list, every downstream pass that iterates
+    ``spec["edits"]`` no-ops and the (often perfectly good) fix is silently dropped as
+    "0 edits, not ready" (N175: a verified, high-confidence showToast/i18n fix was lost
+    to exactly this shape). Detect that and wrap the root's edit-level fields back into
+    ``edits=[{...}]`` so the normal verify/effectiveness/decisiveness pipeline can rule on
+    it — the decisiveness gate, not this salvage, decides ready_to_apply.
+
+    Conservative by construction: fires ONLY when ``edits`` is missing/empty AND the root
+    looks like a concrete edit (an anchor pair, or a create_file with content) — a shape a
+    real envelope never has, so false positives are not possible. Never raises.
+    """
+    edits = spec.get("edits")
+    if isinstance(edits, list) and edits:
+        return spec  # already a proper envelope
+    is_anchor_edit = bool(spec.get("anchor_old")) and bool(spec.get("replacement_new"))
+    is_create = (spec.get("kind") == "create_file"
+                 and bool(str(spec.get("content") or "").strip()))
+    if not (is_anchor_edit or is_create):
+        return spec  # not a flattened edit — leave untouched
+    edit = {k: spec.pop(k) for k in _EDIT_LEVEL_KEYS if k in spec}
+    edit.setdefault("id", "E1")
+    spec["edits"] = [edit]
+    spec.setdefault("deferred", [])
+    # No termination rode at the root; default to the conservative loop-back so the
+    # decisiveness gate (after anchor-verification + the effectiveness review) is what
+    # promotes to ready_to_apply, never this salvage on its own.
+    spec.setdefault("termination", "needs_reinvestigation")
+    logger.warning("specify: author flattened a single edit onto the spec root (no "
+                   "edits[]) — rewrapped as edits[1] so the fix is not dropped")
+    return spec
+
+
 def _normalize_spec(spec: dict[str, Any]) -> dict[str, Any]:
     """Enforce Stage-1 invariants and reconcile internal inconsistencies.
 
@@ -1881,6 +1928,10 @@ def run_specify(
         break
 
     spec = extract_first_json(wr.stdout)  # raises ValueError if no JSON found
+    # Rewrap BEFORE any edits[]-iterating pass: if the author flattened a single edit onto
+    # the spec root (no edits[] envelope), wrap it so the fix is not silently dropped as
+    # "0 edits, not ready" (N175). No-op for a well-formed spec.
+    spec = _rewrap_flattened_edit(spec)
     # Deterministic anchor disambiguation FIRST: when sibling edits share an identical,
     # non-unique anchor (same literal in two branches), widen each anchor with adjacent
     # live lines so it targets one occurrence uniquely — rescuing a fix that would

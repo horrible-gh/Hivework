@@ -176,6 +176,71 @@ class TestNormalizeSpec(unittest.TestCase):
         self.assertEqual(out["termination"], "ready_to_apply")
 
 
+class TestRewrapFlattenedEdit(unittest.TestCase):
+    """specify._rewrap_flattened_edit — salvage a single edit the author flattened
+    onto the spec root (no edits[] envelope) so it is not dropped as 0 edits (N175)."""
+
+    def _flattened(self):
+        # The exact N175 shape: one verified, high-confidence edit's fields hoisted to
+        # the root with envelope-level gate/effectiveness alongside, but no edits[].
+        return {
+            "id": "E5",
+            "file": "client/src/main/components/NewRequirementModal.vue",
+            "anchor_old": "} finally {",
+            "replacement_new": "  showToast(msg, 'danger')\n} finally {",
+            "rationale": "surface readable toast",
+            "confidence": "high",
+            "anchor_status": "verified",
+            "gate": {"apply": False},
+            "effectiveness": {"inconclusive": False, "ineffective_ids": []},
+        }
+
+    def test_flattened_edit_is_wrapped(self):
+        out = specify._rewrap_flattened_edit(self._flattened())
+        self.assertIsInstance(out.get("edits"), list)
+        self.assertEqual(len(out["edits"]), 1)
+        self.assertEqual(out["edits"][0]["id"], "E5")
+        self.assertEqual(out["edits"][0]["anchor_status"], "verified")
+        # Edit-level fields are moved off the root.
+        self.assertNotIn("anchor_old", out)
+        self.assertNotIn("replacement_new", out)
+
+    def test_envelope_level_keys_stay_at_root(self):
+        out = specify._rewrap_flattened_edit(self._flattened())
+        self.assertEqual(out["gate"], {"apply": False})
+        self.assertIn("effectiveness", out)
+        self.assertEqual(out["deferred"], [])
+        self.assertEqual(out["termination"], "needs_reinvestigation")
+
+    def test_wrapped_flattened_edit_reaches_ready_via_decisiveness(self):
+        # The salvage itself only loops back; the existing decisiveness gate is what
+        # promotes a verified/effective/confident edit to ready_to_apply.
+        out = specify._rewrap_flattened_edit(self._flattened())
+        out = specify._apply_decisiveness_gate(out)
+        self.assertEqual(out["termination"], "ready_to_apply")
+
+    def test_create_file_flattened_is_wrapped(self):
+        spec = {"kind": "create_file", "file": "a/b.py", "content": "x = 1\n",
+                "confidence": "high"}
+        out = specify._rewrap_flattened_edit(spec)
+        self.assertEqual(len(out["edits"]), 1)
+        self.assertEqual(out["edits"][0]["kind"], "create_file")
+
+    def test_proper_envelope_untouched(self):
+        spec = {"edits": [{"id": "E1", "anchor_status": "verified"}], "deferred": [],
+                "gate": {"apply": False}, "termination": "ready_to_apply"}
+        out = specify._rewrap_flattened_edit(spec)
+        self.assertEqual(out["edits"], [{"id": "E1", "anchor_status": "verified"}])
+        self.assertEqual(out["termination"], "ready_to_apply")
+
+    def test_non_edit_root_untouched(self):
+        # A spec with no edits[] and no edit-shaped root (e.g. a pure NR) is left alone.
+        spec = {"deferred": [], "termination": "needs_reinvestigation",
+                "notes": "no concrete edit"}
+        out = specify._rewrap_flattened_edit(spec)
+        self.assertNotIn("edits", out)
+
+
 class TestValidateSpec(unittest.TestCase):
     def test_clean_spec_has_no_problems(self):
         self.assertEqual(specify._validate_spec(_READY_SPEC), [])
