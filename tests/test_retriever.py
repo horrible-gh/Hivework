@@ -14,6 +14,7 @@ from hive.retriever import (
     _looks_like_label_ref, _extract_value, retrieve, SearchPlan,
     _path_segs, _route_suffix_match, _resolve_http_bindings, _read_def_body,
     _resolve_peer_patterns, _stacking_profile,
+    _harvest_inscope_fetch_urls, _covered_ranges, _follow_calls,
 )
 
 ROOT = "C:/workspace/projects/Documents/projects/FlowGate"
@@ -766,3 +767,101 @@ def test_peer_pattern_attaches_to_call_chain(tmp_path):
     assert out["stats"]["peer_patterns"] >= 1, out["stats"]
     assert any(s.get("via") == "peer-pattern" and "Teleport" in s.get("text", "")
                for s in out["call_chain"])
+
+
+# ── FETCH-HARVEST grounding: surface the fetch that feeds an "empty UI variable"
+# symptom even when keyword density landed BETWEEN the windows and missed it, so the
+# producer chain (route → service → store query) reaches the converger. Mirrors the
+# live FlowGate "module selector never renders" miss: currentModules' keyword cluster
+# sat on the assignment/render while the getRequest that feeds it fell in a gap, so the
+# /api/v1/projects → get_projects_with_modules → store ("'' AS module") chain never
+# entered the bundle and the converger stranded on symptom-side red herrings.
+
+def _make_empty_var_tree(tmp_path):
+    """FE assigns an 'empty' var from a fetch placed in a KEYWORD GAP; BE producer
+    chain bottoms out at a store query that hardcodes the field empty."""
+    fe = tmp_path / "client" / "src" / "components"
+    fe.mkdir(parents=True)
+    gap = "\n".join(f"  // step {i}: massage the response payload" for i in range(12))
+    (fe / "NewReqModal.vue").write_text(
+        "const currentModules = ref([])\n"                       # L1: keyword hit
+        "\n"
+        "async function load() {\n"
+        + gap + "\n"                                             # padding (no keyword)
+        "  const res = await getRequest('/api/v1/projects')\n"   # fetch in the GAP
+        + gap + "\n"                                             # padding (no keyword)
+        "  const selected = res.data.projects[0]\n"
+        "  currentModules.value = selected.modules\n"            # symptom assignment
+        "}\n",
+        encoding="utf-8")
+    be = tmp_path / "server" / "routes"
+    be.mkdir(parents=True)
+    (be / "list_routes.py").write_text(
+        'router = APIRouter(prefix="/api/v1")\n'
+        '@router.get("/projects")\n'
+        "def api_projects():\n"
+        "    return {'projects': get_projects_with_modules()}\n",
+        encoding="utf-8")
+    svc = tmp_path / "server" / "svc"
+    svc.mkdir(parents=True)
+    (svc / "process_service.py").write_text(
+        "def get_projects_with_modules():\n"
+        "    rows = get_allowed_projects()\n"
+        "    return rows\n",
+        encoding="utf-8")
+    store = tmp_path / "server" / "db"
+    store.mkdir(parents=True)
+    (store / "store.py").write_text(
+        "def get_allowed_projects():\n"
+        "    # BUG: module column is hardcoded empty — every project gets no modules\n"
+        "    return run(\"SELECT project_id, project_name, '' AS module FROM projects\")\n",
+        encoding="utf-8")
+    return str(tmp_path)
+
+
+def test_covered_ranges_parses_line_spans():
+    snips = [{"file": "a.vue", "lines": "10-20"}, {"file": "a.vue", "lines": "30"},
+             {"file": "b.vue", "lines": "5-7"}]
+    assert _covered_ranges(snips, "a.vue") == [(10, 20), (30, 30)]
+    assert _covered_ranges(snips, "b.vue") == [(5, 7)]
+
+
+def test_harvest_surfaces_fetch_in_keyword_gap(tmp_path):
+    root = _make_empty_var_tree(tmp_path)
+    # The keyword windows cover the currentModules mentions (top and bottom) but NOT
+    # the getRequest in the middle gap — exactly the live miss.
+    snippets = [
+        {"file": "client/src/components/NewReqModal.vue", "lines": "1-3"},
+        {"file": "client/src/components/NewReqModal.vue", "lines": "28-30"},
+    ]
+    # Without harvest the fetch URL is invisible → no binding can cross to the backend.
+    assert _resolve_http_bindings(snippets, root) == []
+    harvest = _harvest_inscope_fetch_urls(snippets, root)
+    assert any("/api/v1/projects" in h["text"] for h in harvest), harvest
+    assert all(h["via"] == "fetch-harvest" for h in harvest)
+    # With the harvested fetch in scope, the boundary resolver crosses to the handler.
+    bindings = _resolve_http_bindings(snippets + harvest, root)
+    assert any(b["route"] == "/projects" for b in bindings), bindings
+
+
+def test_harvest_skips_fetch_already_in_scope(tmp_path):
+    root = _make_empty_var_tree(tmp_path)
+    # When a window already covers the fetch line, harvest must NOT duplicate it.
+    full = [{"file": "client/src/components/NewReqModal.vue", "lines": "1-30"}]
+    assert _harvest_inscope_fetch_urls(full, root) == []
+
+
+def test_retrieve_reaches_store_query_through_harvested_fetch(tmp_path):
+    # End-to-end: a module-keyword axis that misses the fetch still unrolls the full
+    # producer chain to the store query that hardcodes the field empty (the real defect).
+    root = _make_empty_var_tree(tmp_path)
+    plan = SearchPlan(
+        axis_id="EMPTY_MODULES",
+        keywords=["currentModules", "modules"],
+        file_globs=["client/**/*.vue"],
+    )
+    out = retrieve(plan, root)
+    assert out["stats"]["fetch_harvest"] >= 1, out["stats"]
+    chain_text = "\n".join(s.get("text", "") for s in out["call_chain"])
+    assert "'' AS module" in chain_text, "producer chain did not reach the store query"
+    assert "get_projects_with_modules" in chain_text
