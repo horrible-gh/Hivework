@@ -958,6 +958,84 @@ def _resolve_http_bindings(snippets: list[dict[str, Any]], code_root: str,
     return bindings
 
 
+def _covered_ranges(snippets: list[dict[str, Any]], rel: str) -> list[tuple[int, int]]:
+    """The (lo, hi) line ranges already windowed for ``rel`` in the bundle."""
+    ranges: list[tuple[int, int]] = []
+    for s in snippets:
+        if (s.get("file") or "").replace("\\", "/") != rel:
+            continue
+        m = re.match(r"(\d+)(?:-(\d+))?", str(s.get("lines", "")).strip())
+        if not m:
+            continue
+        lo = int(m.group(1))
+        hi = int(m.group(2)) if m.group(2) else lo
+        ranges.append((lo, hi))
+    return ranges
+
+
+def _harvest_inscope_fetch_urls(snippets: list[dict[str, Any]], code_root: str,
+                                k: int = 4, max_files: int = 8,
+                                max_urls_per_file: int = 6) -> list[dict[str, Any]]:
+    """Pull HTTP-call URL literals from files ALREADY in the bundle into scope.
+
+    ``_resolve_http_bindings`` can only cross the FE→BE boundary for a fetch URL that
+    a keyword window happened to capture. When the symptom is "UI variable X stays
+    empty", keyword density clusters on the RENDER / assignment of X, and the
+    ``getRequest('/api/v1/projects')`` that ACTUALLY feeds X frequently sits in a GAP
+    BETWEEN those windows (observed: NewRequirementModal's fetch at line 242 fell
+    between the ``module`` windows at 228±k and 265±k). The producer chain — route
+    handler → service → store query — then never enters the bundle, so the converger
+    sees only the symptom-side red herrings and cannot reach the real defect (a store
+    query that hardcodes the empty field).
+
+    For each distinct file that already contributed a snippet, grep its HTTP-call URL
+    literals and add a small ±k window around any whose line is NOT already covered by
+    an in-scope window. The downstream :func:`_resolve_http_bindings` then resolves the
+    newly-surfaced URL to its backend, and the call-follow unrolls the rest of the
+    producer chain (the existing machinery already reaches the leaf store query once
+    the URL is present — this is purely the missing UPSTREAM step).
+
+    Pure-local, deterministic, zero model cost; never invents (only real lines from
+    files already in scope); bounded by ``max_files`` / ``max_urls_per_file``. This is
+    GROUNDING — it adds context, it gates nothing; a spurious harvest is at worst a
+    real-but-unused fetch window (mild noise), never a wrong edit.
+    """
+    seen_files: list[str] = []
+    for s in snippets:
+        rel = (s.get("file") or "").replace("\\", "/")
+        if rel and rel not in seen_files:
+            seen_files.append(rel)
+
+    out: list[dict[str, Any]] = []
+    for rel in seen_files[:max_files]:
+        text = _read_text(code_root, rel)
+        if not text:
+            continue
+        covered = _covered_ranges(snippets, rel)
+        added_lines: list[int] = []
+        added = 0
+        for i, line in enumerate(text.splitlines(), start=1):
+            if added >= max_urls_per_file:
+                break
+            m = _HTTP_CALL_RE.search(line)
+            if not m:
+                continue
+            if m.group("callee").split(".")[-1].lower() not in _HTTP_CALLEES:
+                continue
+            if any(lo <= i <= hi for lo, hi in covered):
+                continue                          # the fetch is already in scope
+            if any(abs(i - j) <= k for j in added_lines):
+                continue                          # already harvested an adjacent fetch
+            w = _read_window(code_root, rel, i, k)
+            if not w["text"]:
+                continue
+            out.append({"file": rel, "lines": w["lines"], "text": w["text"],
+                        "via": "fetch-harvest"})
+            added_lines.append(i)
+            added += 1
+    return out
+
+
 # ── PEER-IMPLEMENTATION grounding (sibling-pattern resolver).
 # The fix for a class of defects is not in the buggy file's own numbers but in how
 # the codebase ALREADY solves the same concern in a SIBLING (z-index/stacking: a
@@ -1200,14 +1278,22 @@ def retrieve(plan: SearchPlan, code_root: str, docs_root: str | None = None,
     #     string join keyword retrieval can't build, so the judge otherwise grounds
     #     on a lexically-similar but wrong handler. Append the resolved handlers to
     #     call_chain so the judge consumes them with the rest of the evidence.
-    http_bindings = _resolve_http_bindings(code_snippets + call_chain, code_root)
+    # 3d-pre: harvest fetch-URL literals from files ALREADY in the bundle so the
+    #     boundary resolver below sees the fetch that FEEDS the symptom even when
+    #     keyword density landed BETWEEN the windows and missed the fetch line. Without
+    #     this, a "UI variable stays empty" symptom strands the converger on the
+    #     render/assignment side and the producer chain (route → service → store query)
+    #     never enters the bundle. Pure grounding; gates nothing.
+    fetch_harvest = _harvest_inscope_fetch_urls(code_snippets + call_chain, code_root)
+    http_bindings = _resolve_http_bindings(
+        code_snippets + call_chain + fetch_harvest, code_root)
     # Follow calls OUT of the resolved handlers (whole-tree, since the handler is
     # server-side while the axis globs are usually client-side): a route handler
     # commonly DELEGATES (get_document_rpc → get_document → _parse_doc_workflow),
     # so the real source is one or two hops past the handler the URL points at.
     binding_follow = (_follow_calls(http_bindings, [], code_root, k, max_hops)
                       if http_bindings and max_hops > 0 else [])
-    call_chain = call_chain + http_bindings + binding_follow
+    call_chain = call_chain + http_bindings + binding_follow + fetch_harvest
 
     # 3e. peer-implementation grounding: when a component file in the bundle handles a
     #     registered concern (today: stacking/layering) DIFFERENTLY from its same-dir
@@ -1285,6 +1371,7 @@ def retrieve(plan: SearchPlan, code_root: str, docs_root: str | None = None,
             "call_chain": len(call_chain),
             "http_bindings": len(http_bindings),
             "http_bindings_ambiguous": sum(1 for b in http_bindings if b.get("ambiguous")),
+            "fetch_harvest": len(fetch_harvest),
             "peer_patterns": len(peer_patterns),
             "resolved_refs": resolved_refs,
             "design_excerpts": len(design_excerpts),
