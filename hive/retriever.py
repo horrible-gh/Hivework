@@ -28,7 +28,7 @@ import re
 import subprocess
 from collections import defaultdict
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Callable
 
 # identifier immediately followed by "(" — a call site (optionally x.method()).
 _CALL_RE = re.compile(r"(?:\.|\b)([A-Za-z_][A-Za-z0-9_]{2,})\s*\(")
@@ -958,6 +958,179 @@ def _resolve_http_bindings(snippets: list[dict[str, Any]], code_root: str,
     return bindings
 
 
+# ── PEER-IMPLEMENTATION grounding (sibling-pattern resolver).
+# The fix for a class of defects is not in the buggy file's own numbers but in how
+# the codebase ALREADY solves the same concern in a SIBLING (z-index/stacking: a
+# toast sits behind a modal not because its z-index is low — it is 2000 — but
+# because a sibling overlay escapes its stacking context via ``<Teleport to="body">``
+# and the toast does not). Keyword/density retrieval can't see this: the discriminating
+# fact is the ASYMMETRY between two files, not text inside one. Same family as
+# :func:`_resolve_http_bindings` (cross-file join, deterministic, never invents).
+#
+# DISCIPLINE — fires ONLY at the necessary moment, by construction:
+#   1. signal gate   — a file ALREADY in the bundle must carry the concern's signal
+#                      (so the axis is already looking at it); else stays silent.
+#   2. asymmetry gate — its same-dir sibling overlays must handle the concern
+#                      INCONSISTENTLY; if they all match the target, nothing is shown.
+#   3. never invents  — only real sibling lines are lifted (cf. :func:`_resolve_key`).
+# The downside of a spurious fire is a real-but-irrelevant sibling snippet (mild
+# noise), never a fabricated mismatch.
+#
+# GENERAL mechanism, TIGHT enumerable registry: add a concern (each needing a
+# concrete greppable signal + an asymmetry rule) ONE at a time — same growth path as
+# ``_HTTP_CALLEES`` (started with FlowGate's FastAPI form, Express deferred). Today
+# the registry holds exactly one concern: stacking/layering.
+
+_PEER_EXTS = frozenset({".vue", ".jsx", ".tsx", ".js", ".ts", ".svelte"})
+
+# Stacking signals. ``z-?index`` matches CSS ``z-index:`` and JS ``zIndex:`` (case-
+# insensitive). Teleport/portal is how an overlay ESCAPES its parent stacking context.
+_STK_TELEPORT_RE = re.compile(r"<\s*(?:teleport|portal)\b|createportal\b", re.IGNORECASE)
+_STK_POSITION_RE = re.compile(r"position\s*:\s*(fixed|absolute|sticky)\b", re.IGNORECASE)
+_STK_ZINDEX_RE = re.compile(r"z-?index\s*:\s*(\d+)", re.IGNORECASE)
+
+
+@dataclass
+class _PeerConcern:
+    """One registered concern for :func:`_resolve_peer_patterns`.
+
+    ``profile`` reads a file's text → an approach dict carrying ``applies`` (signal
+    gate). ``asymmetric`` decides whether target vs sibling approaches disagree
+    enough to surface. ``render`` produces the prompt block. Adding a concern is
+    adding one of these — the resolver loop is concern-agnostic.
+    """
+
+    name: str
+    profile: Callable[[str], dict[str, Any]]
+    asymmetric: Callable[[dict[str, Any], list[dict[str, Any]]], bool]
+    render: Callable[[str, dict[str, Any], list[tuple[str, dict[str, Any]]]], str]
+
+
+def _stacking_profile(text: str) -> dict[str, Any]:
+    """A file's approach to stacking/layering. ``applies`` = it is a layered overlay."""
+    pos = _STK_POSITION_RE.search(text)
+    zs = [int(m.group(1)) for m in _STK_ZINDEX_RE.finditer(text)]
+    return {
+        "applies": bool(pos) or bool(zs),     # an overlay (positioned and/or z-indexed)
+        "teleports": bool(_STK_TELEPORT_RE.search(text)),
+        "zindex": max(zs) if zs else None,
+        "position": pos.group(1).lower() if pos else None,
+    }
+
+
+def _stacking_asymmetric(t: dict[str, Any], sibs: list[dict[str, Any]]) -> bool:
+    """Fire only when overlay siblings DISAGREE with the target on context-escape.
+
+    Teleport/portal usage is the discriminating, actionable signal (a raw z-index
+    delta is noisy — many legitimate values coexist). If every comparable sibling
+    escapes the same way the target does, there is nothing to show → silent.
+    """
+    return any(s["teleports"] != t["teleports"] for s in sibs)
+
+
+def _stacking_render(rel: str, tprof: dict[str, Any],
+                     sib_profs: list[tuple[str, dict[str, Any]]]) -> str:
+    """Render the target-vs-siblings stacking comparison for the judge/author."""
+    def _line(name: str, p: dict[str, Any]) -> str:
+        bits = [f"teleport={'YES' if p['teleports'] else 'NO'}"]
+        if p.get("zindex") is not None:
+            bits.append(f"z-index={p['zindex']}")
+        if p.get("position"):
+            bits.append(f"position:{p['position']}")
+        return f"{name}: " + ", ".join(bits)
+
+    out = [
+        "# PEER PATTERN (hive): stacking/layering — this overlay and its sibling "
+        "overlays escape their stacking context INCONSISTENTLY. A high z-index alone "
+        "does not lift an element above a sibling drawn in a higher stacking context; "
+        "matching how the siblings escape (e.g. <Teleport to=\"body\">) is usually the "
+        "real fix, not bumping the number. Compare:",
+        _line(rel + "  <-- target", tprof),
+    ]
+    out += [_line(sib, p) for sib, p in sib_profs]
+    return "\n".join(out)
+
+
+_PEER_CONCERNS: list[_PeerConcern] = [
+    _PeerConcern("stacking", _stacking_profile, _stacking_asymmetric, _stacking_render),
+]
+
+
+def _read_text(root: str, relpath: str) -> str:
+    """Read a whole file's text ('' on failure). For peer-profile comparison."""
+    try:
+        with open(os.path.join(root, relpath), "r",
+                  encoding="utf-8", errors="replace") as fh:
+            return fh.read()
+    except OSError:
+        return ""
+
+
+def _peer_files(code_root: str, rel_target: str) -> list[str]:
+    """Same-directory siblings of ``rel_target`` in the component-class extensions."""
+    rel_target = rel_target.replace("\\", "/")
+    d = os.path.dirname(rel_target)
+    abs_d = os.path.join(code_root, d) if d else code_root
+    sibs: list[str] = []
+    try:
+        for name in sorted(os.listdir(abs_d)):
+            rel = f"{d}/{name}" if d else name
+            if rel == rel_target:
+                continue
+            if os.path.splitext(name)[1].lower() in _PEER_EXTS:
+                sibs.append(rel)
+    except OSError:
+        pass
+    return sibs
+
+
+def _resolve_peer_patterns(snippets: list[dict[str, Any]], code_root: str,
+                           max_targets: int = 3,
+                           max_siblings: int = 12) -> list[dict[str, Any]]:
+    """Surface how SIBLINGS already solve a concern this file handles differently.
+
+    For each component file in the bundle that carries a registered concern's signal
+    (gate 1), compare its approach to its same-dir sibling overlays; emit a block
+    ONLY when they disagree (gate 2). Pure-local, deterministic, zero model cost;
+    never fabricates (only real sibling lines). See the registry note above.
+    """
+    out: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for s in snippets:
+        rel = (s.get("file") or "").replace("\\", "/")
+        if not rel or rel in seen:
+            continue
+        if os.path.splitext(rel)[1].lower() not in _PEER_EXTS:
+            continue
+        target_text = _read_text(code_root, rel)
+        if not target_text:
+            continue
+        seen.add(rel)
+        for concern in _PEER_CONCERNS:
+            tprof = concern.profile(target_text)
+            if not tprof.get("applies"):
+                continue                                  # gate 1: signal absent
+            sib_profs: list[tuple[str, dict[str, Any]]] = []
+            for sib in _peer_files(code_root, rel)[:max_siblings]:
+                sp = concern.profile(_read_text(code_root, sib))
+                if sp.get("applies"):                     # only comparable overlays
+                    sib_profs.append((sib, sp))
+            if not sib_profs:
+                continue
+            if not concern.asymmetric(tprof, [p for _, p in sib_profs]):
+                continue                                  # gate 2: siblings agree
+            out.append({
+                "file": rel, "lines": s.get("lines", "1-1"),
+                "text": concern.render(rel, tprof, sib_profs),
+                "via": "peer-pattern", "concern": concern.name,
+                "siblings": [sib for sib, _ in sib_profs],
+            })
+            break                                         # one concern per target
+        if len(out) >= max_targets:
+            break
+    return out
+
+
 def retrieve(plan: SearchPlan, code_root: str, docs_root: str | None = None,
              k: int = 6, top_files: int = 8,
              blame_files: int = 3, max_hops: int = 2,
@@ -1036,6 +1209,15 @@ def retrieve(plan: SearchPlan, code_root: str, docs_root: str | None = None,
                       if http_bindings and max_hops > 0 else [])
     call_chain = call_chain + http_bindings + binding_follow
 
+    # 3e. peer-implementation grounding: when a component file in the bundle handles a
+    #     registered concern (today: stacking/layering) DIFFERENTLY from its same-dir
+    #     sibling overlays, surface the asymmetry — the discriminating fact is between
+    #     two files (toast lacks <Teleport> a sibling uses), invisible to keyword
+    #     retrieval. Self-gating: silent unless a signal-bearing file is present AND its
+    #     siblings disagree. Rides in call_chain so the judge consumes it (no judge.py change).
+    peer_patterns = _resolve_peer_patterns(code_snippets + call_chain, code_root)
+    call_chain = call_chain + peer_patterns
+
     # 4. git blame/log on the highest-ranked files, around their densest region.
     git_history = []
     for f in ranked[:blame_files]:
@@ -1092,6 +1274,7 @@ def retrieve(plan: SearchPlan, code_root: str, docs_root: str | None = None,
         "call_chain": call_chain,
         "call_sites": call_sites,
         "http_bindings": http_bindings,
+        "peer_patterns": peer_patterns,
         "git_history": git_history,
         "design_excerpts": design_excerpts,
         "stats": {
@@ -1102,6 +1285,7 @@ def retrieve(plan: SearchPlan, code_root: str, docs_root: str | None = None,
             "call_chain": len(call_chain),
             "http_bindings": len(http_bindings),
             "http_bindings_ambiguous": sum(1 for b in http_bindings if b.get("ambiguous")),
+            "peer_patterns": len(peer_patterns),
             "resolved_refs": resolved_refs,
             "design_excerpts": len(design_excerpts),
             "ranked_files": ranked[:top_files],

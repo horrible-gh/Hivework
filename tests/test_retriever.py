@@ -13,6 +13,7 @@ from hive.retriever import (
     _norm_glob, _validate_globs, _partition_globs, _abs_under, _widen_globs,
     _looks_like_label_ref, _extract_value, retrieve, SearchPlan,
     _path_segs, _route_suffix_match, _resolve_http_bindings, _read_def_body,
+    _resolve_peer_patterns, _stacking_profile,
 )
 
 ROOT = "C:/workspace/projects/Documents/projects/FlowGate"
@@ -657,3 +658,111 @@ def test_read_def_body_reads_past_multiline_signature(tmp_path):
     out = _read_def_body(str(tmp_path), "m.py", 1)
     assert "_parse_doc_workflow(doc)" in out["text"], out["text"]
     assert "def other" not in out["text"]  # stops at the sibling def
+
+
+# ── PEER-IMPLEMENTATION grounding (sibling-pattern resolver).
+#    The live FlowGate N175 z-index shape: a toast overlay with z-index:2000 sits
+#    behind a modal because it does NOT escape its stacking context, while a sibling
+#    overlay in the SAME common/ folder uses <Teleport to="body">. The fix is in the
+#    asymmetry between the two files, not in either file's number — invisible to
+#    keyword/density retrieval.
+
+def _make_stacking_tree(tmp_path):
+    comp = tmp_path / "client" / "src" / "components" / "common"
+    comp.mkdir(parents=True)
+    # target: overlay with a HIGH z-index but no teleport (the buggy toast).
+    (comp / "ToastContainer.vue").write_text(
+        "<template>\n  <div class=\"toast-host\"><slot/></div>\n</template>\n"
+        "<style scoped>\n.toast-host { position: fixed; z-index: 2000; }\n</style>\n",
+        encoding="utf-8")
+    # sibling overlay that DOES escape via Teleport — the corrective pattern.
+    (comp / "ContextMenu.vue").write_text(
+        "<template>\n  <Teleport to=\"body\">\n    <ul class=\"menu\"/>\n  </Teleport>\n</template>\n"
+        "<style scoped>\n.menu { position: absolute; z-index: 1500; }\n</style>\n",
+        encoding="utf-8")
+    # a non-overlay sibling (no position/z-index) must be ignored as incomparable.
+    (comp / "PlainButton.vue").write_text(
+        "<template>\n  <button><slot/></button>\n</template>\n", encoding="utf-8")
+    return str(tmp_path)
+
+
+def test_peer_pattern_surfaces_teleport_asymmetry(tmp_path):
+    root = _make_stacking_tree(tmp_path)
+    snippets = [{
+        "file": "client/src/components/common/ToastContainer.vue",
+        "lines": "4-5",
+        "text": ".toast-host { position: fixed; z-index: 2000; }\n",
+    }]
+    out = _resolve_peer_patterns(snippets, root)
+    assert out, "no peer pattern surfaced for the toast overlay"
+    p = out[0]
+    assert p["via"] == "peer-pattern" and p["concern"] == "stacking"
+    # the corrective sibling (teleport) is named; the incomparable plain one is not.
+    assert any("ContextMenu.vue" in s for s in p["siblings"])
+    assert all("PlainButton.vue" not in s for s in p["siblings"])
+    # the rendered block tells the judge the real lever is Teleport, not the number.
+    assert "Teleport" in p["text"] and "teleport=NO" in p["text"]
+    assert "teleport=YES" in p["text"]
+
+
+def test_peer_pattern_silent_when_siblings_agree(tmp_path):
+    # If every comparable overlay escapes the same way as the target, there is no
+    # asymmetry to show → resolver stays silent (gate 2 = "only when needed").
+    comp = tmp_path / "client" / "src" / "components"
+    comp.mkdir(parents=True)
+    (comp / "ToastContainer.vue").write_text(
+        "<template><Teleport to=\"body\"><div/></Teleport></template>\n"
+        "<style>.t { position: fixed; z-index: 2000; }</style>\n", encoding="utf-8")
+    (comp / "ContextMenu.vue").write_text(
+        "<template><Teleport to=\"body\"><ul/></Teleport></template>\n"
+        "<style>.m { position: absolute; z-index: 1500; }</style>\n", encoding="utf-8")
+    snippets = [{"file": "client/src/components/ToastContainer.vue",
+                 "lines": "2-2", "text": "z-index: 2000;"}]
+    assert _resolve_peer_patterns(snippets, str(tmp_path)) == []
+
+
+def test_peer_pattern_silent_for_non_overlay_target(tmp_path):
+    # Gate 1: a file with no stacking signal at all never triggers the resolver,
+    # even if a sibling is a teleporting overlay.
+    comp = tmp_path / "src"
+    comp.mkdir(parents=True)
+    (comp / "Plain.vue").write_text(
+        "<template><button/></template>\n", encoding="utf-8")
+    (comp / "Menu.vue").write_text(
+        "<template><Teleport to=\"body\"><ul/></Teleport></template>\n"
+        "<style>.m { position: absolute; z-index: 9; }</style>\n", encoding="utf-8")
+    snippets = [{"file": "src/Plain.vue", "lines": "1-1", "text": "<button/>"}]
+    assert _resolve_peer_patterns(snippets, str(tmp_path)) == []
+
+
+def test_peer_pattern_ignores_non_component_files(tmp_path):
+    # A backend .py handler riding in call_chain (e.g. an http-binding result) must
+    # not be probed for stacking peers — the registry is component-class only.
+    be = tmp_path / "server"
+    be.mkdir(parents=True)
+    (be / "h.py").write_text("def f():\n    return {'z-index': 2000}\n", encoding="utf-8")
+    snippets = [{"file": "server/h.py", "lines": "1-2", "text": "z-index 2000"}]
+    assert _resolve_peer_patterns(snippets, str(tmp_path)) == []
+
+
+def test_stacking_profile_reads_css_and_js_zindex():
+    css = _stacking_profile(".x { position: fixed; z-index: 2000; }")
+    assert css["applies"] and css["zindex"] == 2000 and css["position"] == "fixed"
+    assert css["teleports"] is False
+    js = _stacking_profile("const s = { zIndex: 50 }; createPortal(x, document.body)")
+    assert js["applies"] and js["zindex"] == 50 and js["teleports"] is True
+
+
+def test_peer_pattern_attaches_to_call_chain(tmp_path):
+    # End-to-end: wired retrieve() surfaces the asymmetry in call_chain so the judge
+    # consumes it with the rest of the evidence (no judge.py change).
+    root = _make_stacking_tree(tmp_path)
+    plan = SearchPlan(
+        axis_id="TOAST_ZINDEX",
+        keywords=["toast-host", "z-index", "position"],
+        file_globs=["client/**/*.vue"],
+    )
+    out = retrieve(plan, root, max_hops=0)
+    assert out["stats"]["peer_patterns"] >= 1, out["stats"]
+    assert any(s.get("via") == "peer-pattern" and "Teleport" in s.get("text", "")
+               for s in out["call_chain"])
