@@ -34,6 +34,7 @@ from typing import Any
 
 from hive.specify import (
     RI_ANCHOR_NOT_GROUNDED,
+    RI_CONVERGE_LOCUS_UNCOVERED,
     RI_DATASOURCE_REGRESSION,
     RI_DEFERRED_ROOT_CAUSE,
     RI_INCONCLUSIVE,
@@ -45,6 +46,7 @@ logger = logging.getLogger("hive.reinvestigate")
 
 ACTION_RE_RETRIEVE = "re_retrieve"
 ACTION_RE_CONVERGE = "re_converge"
+ACTION_RE_AUTHOR = "re_author"
 ACTION_TERMINATE = "terminate"
 
 # A reason whose gap is MISSING/UNGROUNDED evidence — a narrow re-retrieve of the
@@ -59,6 +61,12 @@ _RETRIEVE_REASONS = frozenset(
 # A reason whose gap is a causal/effectiveness CONTRADICTION — the evidence is present
 # but the stitch was wrong; re-converge with the refuted node excluded (M013 §2 table).
 _CONVERGE_REASONS = frozenset({RI_INEFFECTIVE, RI_INCONCLUSIVE})
+# A reason whose gap is AUTHORING, not evidence: converge already declared N independent
+# loci (the evidence is present and the stitch is right), but the author under-produced —
+# fewer edits than loci. Re-fetching or re-stitching adds nothing; the cheap fix is to
+# RE-AUTHOR the SAME honey (the per-locus contract now drives one edit per declared locus).
+# No model evidence gap, so this never re-fetches — it re-runs specify on the same evidence.
+_REAUTHOR_REASONS = frozenset({RI_CONVERGE_LOCUS_UNCOVERED})
 # Everything else (stale_anchor → specify-local re-anchor, not a re-investigate;
 # legacy_coerce / author_declared → no machine-routable evidence gap) → honest terminate.
 
@@ -74,7 +82,7 @@ class ReinvestPlan:
 
     @property
     def will_rerun(self) -> bool:
-        return self.action in (ACTION_RE_RETRIEVE, ACTION_RE_CONVERGE)
+        return self.action in (ACTION_RE_RETRIEVE, ACTION_RE_CONVERGE, ACTION_RE_AUTHOR)
 
 
 def _thin_axes(verdicts: list[dict[str, Any]]) -> list[str]:
@@ -114,6 +122,16 @@ def plan_reinvestigation(spec: dict[str, Any],
             ACTION_TERMINATE, reason,
             rationale=(f"{reason}: no axis came back thin — the evidence was sufficient, so "
                        "re-fetching the same scope adds nothing (honest NR)"))
+
+    if reason in _REAUTHOR_REASONS:
+        cov = spec.get("converge_coverage") or {}
+        loci = cov.get("loci") or []
+        return ReinvestPlan(
+            ACTION_RE_AUTHOR, reason,
+            axis_ids=[str(t) for t in loci],
+            rationale=(f"{reason}: converge declared {len(loci)} independent loci but the "
+                       "author under-covered — re-author the SAME honey (evidence already "
+                       "present; one edit per locus per the contract), no re-fetch"))
 
     if reason in _CONVERGE_REASONS:
         loc = _located(verdicts)
@@ -180,6 +198,19 @@ def run_reinvestigation_loop(spec: dict[str, Any], result: dict[str, Any], *, cf
            and rnd < rounds
            and spec.get("termination") == "needs_reinvestigation"):
         rnd += 1
+        # Re-author: the evidence is already present (converge declared the loci) — the gap
+        # is the author under-covering, not missing/contradicted evidence. Re-run specify on
+        # the SAME honey (the per-locus contract drives full coverage); do NOT re-fetch and
+        # do NOT apply the honey-unchanged guard (the honey is unchanged BY DESIGN here).
+        if plan.action == ACTION_RE_AUTHOR:
+            log.info("reinvestigation live: re-authoring the same honey (round %d/%d) — "
+                     "converge declared %d loci, author under-covered",
+                     rnd, rounds, len(plan.axis_ids))
+            spec = respecify()
+            log.info("reinvestigation live: round %d/%d → termination=%s",
+                     rnd, rounds, spec.get("termination", "?"))
+            plan = log_plan(spec, result.get("verdicts"))
+            continue
         prev_honey = read_honey()
         new_result = rerun(plan, result)
         if new_result is None:

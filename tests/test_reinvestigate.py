@@ -12,11 +12,11 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from hive.reinvestigate import (
     plan_reinvestigation, run_reinvestigation_loop, ReinvestPlan,
-    ACTION_RE_RETRIEVE, ACTION_RE_CONVERGE, ACTION_TERMINATE,
+    ACTION_RE_RETRIEVE, ACTION_RE_CONVERGE, ACTION_RE_AUTHOR, ACTION_TERMINATE,
 )
 from hive.specify import (
-    RI_ANCHOR_NOT_GROUNDED, RI_AUTHOR_DECLARED, RI_DEFERRED_ROOT_CAUSE,
-    RI_INCONCLUSIVE, RI_INEFFECTIVE,
+    RI_ANCHOR_NOT_GROUNDED, RI_AUTHOR_DECLARED, RI_CONVERGE_LOCUS_UNCOVERED,
+    RI_DEFERRED_ROOT_CAUSE, RI_INCONCLUSIVE, RI_INEFFECTIVE,
     RI_LEGACY_COERCE, RI_SEED_TARGET_UNCOVERED, RI_STALE_ANCHOR,
 )
 
@@ -98,6 +98,40 @@ class TestConvergeRouting(unittest.TestCase):
                                     [_verdict("A", located=True), _verdict("B")])
         self.assertEqual(plan.action, ACTION_TERMINATE)
         self.assertIn("re-stitch", plan.rationale)
+
+
+class TestReauthorRouting(unittest.TestCase):
+    """Multi-locus under-coverage → re_author (re-run specify on the SAME honey, no fetch).
+
+    The bug this closes: converge_locus_uncovered used to be stamped by the gate but was
+    absent from every routing set, so the router fell through to terminate — the under-
+    covered multi-locus spec dead-ended instead of looping back to re-author.
+    """
+
+    def _spec(self, loci):
+        s = _nr_spec(RI_CONVERGE_LOCUS_UNCOVERED)
+        s["converge_coverage"] = {"loci": loci, "uncovered": loci[1:]}
+        return s
+
+    def test_under_coverage_routes_to_re_author(self):
+        plan = plan_reinvestigation(
+            self._spec(["a.py:1", "b.vue:2", "c.ts:3"]), [])
+        self.assertEqual(plan.action, ACTION_RE_AUTHOR)
+        self.assertTrue(plan.will_rerun)
+        self.assertEqual(plan.axis_ids, ["a.py:1", "b.vue:2", "c.ts:3"])
+
+    def test_re_author_does_not_depend_on_thin_axes(self):
+        # Evidence is present (converge declared the loci); routing must NOT require a
+        # thin axis the way re_retrieve does — re-author on sufficient evidence still fires.
+        plan = plan_reinvestigation(
+            self._spec(["a.py:1", "b.vue:2"]),
+            [_verdict("A", thin=False), _verdict("B", thin=False)])
+        self.assertEqual(plan.action, ACTION_RE_AUTHOR)
+
+    def test_re_author_safe_without_coverage_field(self):
+        plan = plan_reinvestigation(_nr_spec(RI_CONVERGE_LOCUS_UNCOVERED), [])
+        self.assertEqual(plan.action, ACTION_RE_AUTHOR)
+        self.assertEqual(plan.axis_ids, [])
 
 
 class TestTerminalReasons(unittest.TestCase):
@@ -218,6 +252,38 @@ class TestReinvestigationLoop(unittest.TestCase):
             rerun=lambda p, r: r, respecify=lambda: READY,
             read_honey=lambda: "h", log_plan=_route)
         self.assertEqual(spec["termination"], "ready_to_apply")
+
+
+def _route_reauthor(spec, _verdicts):
+    """Stand-in: re_author while NR, terminate once cleared."""
+    if spec.get("termination") == "needs_reinvestigation":
+        return ReinvestPlan(ACTION_RE_AUTHOR, "converge_locus_uncovered",
+                            axis_ids=["a", "b"])
+    return ReinvestPlan(ACTION_TERMINATE, "")
+
+
+class TestReauthorLoop(unittest.TestCase):
+    """The re_author branch re-runs specify on the SAME honey: no re-fetch, and the
+    honey-unchanged guard must NOT apply (the honey is unchanged by design)."""
+
+    def test_re_author_respecifies_without_rerun(self):
+        calls = []
+        spec, _ = run_reinvestigation_loop(
+            dict(NR), {"verdicts": []}, cfg=_cfg(True, 2),
+            rerun=lambda p, r: calls.append("rerun") or r,
+            respecify=lambda: calls.append("respec") or READY,
+            read_honey=lambda: "same", log_plan=_route_reauthor)  # honey never changes
+        self.assertEqual(spec["termination"], "ready_to_apply")
+        self.assertEqual(calls, ["respec"])         # re-authored; NEVER re-fetched
+
+    def test_re_author_caps_at_max_rounds_when_persistent(self):
+        respec = []
+        run_reinvestigation_loop(
+            dict(NR), {"verdicts": []}, cfg=_cfg(True, 2),
+            rerun=lambda p, r: r,
+            respecify=lambda: respec.append(1) or dict(NR),  # stays NR (still under-covers)
+            read_honey=lambda: "same", log_plan=_route_reauthor)
+        self.assertEqual(len(respec), 2)            # bounded — no busy-loop on same honey
 
 
 if __name__ == "__main__":
