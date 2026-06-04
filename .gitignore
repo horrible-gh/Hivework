@@ -1,5 +1,6 @@
-# Hivework config
+# Hivework custom
 hive.config.json
+/state/
 
 # Claude / local
 /.claude/
