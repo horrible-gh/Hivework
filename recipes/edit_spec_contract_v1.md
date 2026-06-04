@@ -28,6 +28,19 @@ Test each fix direction in the honey against one question: "can this be expresse
   Reasons: "not_expressible_as_edit" (it is a direction, not a concrete change) | "needs_runtime" (needs execution evidence to decide) | "policy_direction" (business/architecture decision, not a local edit) | "multi_file_design" (a coordinated cross-file change that is a design task, not a local before→after).
 - SPECIAL CASE — the honey's premise is FALSE, not merely stale: if, on reading live code, the "bug" simply does not exist — the code already does the right thing (e.g. the honey says "rename column X→Y" but the live table actually uses X), or the cited file/schema/migration is absent — then there is NO edit to make and it is NOT a cross-file design task. Record it in `deferred[]` with reason "not_expressible_as_edit", stays_as "investigation", set termination = "needs_reinvestigation", and in `notes` state plainly that live code CONTRADICTS the honey's premise, citing the live file:line you found. Do NOT reach for "multi_file_design" as a catch-all when the real situation is "no bug here — the honey was wrong".
 
+[Runtime verify — the red test that closes the loop]
+The missing connecting line between *a bug* and *a failing test* is the one thing that lets a round self-close instead of being re-investigated forever. The materials are already in your hands: the `rationale` says what the fix must achieve, and `anchor_old` (red/buggy state) vs `replacement_new` (green/fixed state) are exactly the before/after. So for a code-bug fix, ALSO author a **narrow red test** as an EDIT into the target's own test tree (a `create_file` under `tests/`/`server/tests/`, or an anchor edit appending one test function) that asserts the rationale: it must FAIL on the current (un-fixed) code and PASS once your source edit is applied. This is a focused pytest case — NOT a whole-app reproduction. Then add a top-level `verify` block:
+
+```
+"verify": {
+  "red_test_node": "server/tests/test_x.py::test_symptom_gone",  // the exact node to run
+  "test_edit_ids": ["E2"],     // which edits[] entries are the red test (the rest are the source fix)
+  "rationale": "<one line: the symptom this test pins>"
+}
+```
+
+Trust comes from the OBSERVED transition, never your word: apply runs the node with ONLY the test edit (must be RED — proves it reproduces), then with the source fix on top (must be GREEN). A test that is already green WITHOUT the fix is rejected as non-biting. Author the test so red-before is real. When you genuinely cannot lower the rationale to a narrow test (it needs whole-app state, a browser, external I/O), OMIT the `verify` block — do not fabricate a test that cannot bite.
+
 [Stage-1 safety] `gate.apply` is ALWAYS false at this stage. specify proposes; the PM applies. Auto-apply behind the gate is a later promotion, not now. Never write to the target codebase yourself.
 
 [Gate] List the concrete commands that should run after a human applies the edits (compile / lint / the narrowest target tests that exercise the changed lines). If a gate command later fails, that failure is new evidence and feeds back into investigation (reconcile loop) — the same way a conflict triggers re-investigation.
@@ -60,6 +73,11 @@ Test each fix direction in the honey against one question: "can this be expresse
     "commands": ["<compile/lint/target-test command>", "..."],
     "apply": false
   },
+  "verify": {
+    "red_test_node": "<test node id apply runs red→green, e.g. server/tests/test_x.py::test_y>",
+    "test_edit_ids": ["<edits[] ids that ARE the red test; omit to fall back to tests/ path convention>"],
+    "rationale": "<one line: the symptom this red test pins>"
+  },
   "termination": "ready_to_apply | needs_reinvestigation | needs_runtime",
   "notes": "<one line. if anything is stale/not_found or self-excluded, say what the loop should look at next>"
 }
@@ -69,7 +87,7 @@ Test each fix direction in the honey against one question: "can this be expresse
 - If every actionable fix landed in `deferred[]` (nothing was expressible as an edit), set termination = "needs_reinvestigation" and say so in notes; do not invent edits to fill the array.
 - An edit whose anchor_status is "stale" or "not_found" must NOT be presented as ready: set termination = "needs_reinvestigation".
 - CONTRADICTION RULE: an `anchor_not_grounded` or `needs_runtime` deferred item for a file is a hard BLOCK — do NOT also emit an edit for that same file. A direction belongs in ONE place: edits[] (grounded) OR deferred[] (ungrounded). Emitting both is contradictory and the edit will be removed by the post-authoring gate.
-- TERMINATION `needs_runtime`: use when the direction cannot be resolved from static evidence alone — the investigation needs a runtime fact (which loader key executes, which row is the active head, what review status a record carries). Pair with a deferred[] entry (reason: "needs_runtime") naming the exact fact needed. This is distinct from `needs_reinvestigation` (more code evidence would help): `needs_runtime` names a concrete datum that, once supplied, would unblock the investigation.
+- TERMINATION `needs_runtime`: this is NO LONGER a punt to a human for logs. It means the fix's effectiveness can only be settled by EXECUTION — so emit it together with a `verify` block whose `red_test_node` is the test that, once run red→green, settles it. apply runs that test for you (red baseline → apply fix → green). Reserve a bare `needs_runtime` with NO authorable red test for the genuinely un-testable runtime fact (which loader key executes, which row is the active head) — and prefer authoring the red test whenever the rationale CAN be pinned by one. This stays distinct from `needs_reinvestigation` (more code evidence would help).
 - NO HUMAN-HANDOFF TERMINAL: there is no `needs_pm`/"ask a human" outcome. The tool fixes autonomously. If you cannot stand behind a fix, emit `needs_reinvestigation` (loop back and try again) — never punt the decision to a person. A genuine product/design choice (e.g. whether to change documented behavior) is surfaced by PROPOSING the edit anyway: apply is propose-only, so the human reviews the concrete proposal before it is written — that is the review point, not a termination flag.
 - EFFECTIVENESS: every edit must actually change the behavior the honey identified. An edit that is anchored correctly but functionally inert — a no-op assignment, a guard whose condition can never be true, a value set to what it already is, a whitespace-only change — is NOT a fix. Do not emit it as an edit, and never set termination = "ready_to_apply" for it. specify enforces this after you author: a deterministic no-op check plus an independent effectiveness review downgrade a ready spec whose edits do not change the reported behavior, and a ready claim that cannot be verified, to needs_reinvestigation (loop back — never a human handoff).
 - MULTIPLE INDEPENDENT DEFECTS — ONE EDIT PER LOCUS: when the honey carries a "## Converge-attributed edit targets" section listing TWO OR MORE `- path:line` bullets, convergence has declared that many SEPARATE, independent bugs. Each listed locus is its own defect and MUST become its own concrete edit in `edits[]` (or an explicit `deferred[]` entry stating why that specific locus cannot be lowered). Do NOT collapse several loci into one edit, and do NOT ship only the easiest locus while the others stay broken — emit one edit per declared locus. A ready_to_apply spec authoring FEWER edits than declared loci is downgraded to needs_reinvestigation by the post-authoring gate, so cover every locus the first time.
