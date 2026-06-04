@@ -32,6 +32,7 @@ The author's role prompt is the contract file itself, loaded at runtime so the
 contract stays the single source of authoring rules (no duplicated prompt here).
 """
 
+import difflib
 import json
 import logging
 import os
@@ -39,7 +40,7 @@ import re
 from typing import Any
 
 from hive import dbread
-from hive.investigate import SEED_TARGET_SECTION
+from hive.investigate import SEED_TARGET_SECTION, CONVERGE_TARGET_SECTION
 from hive.parse import extract_first_json
 from hive.providers import call_worker
 
@@ -113,6 +114,7 @@ _SUBSTANTIVE_DEFERRED_REASONS = {"not_expressible_as_edit", "multi_file_design"}
 #   ineffective           → exclude the ruled-out node, re-converge
 #   inconclusive          → re-review / re-converge (effectiveness unconfirmed)
 #   seed_target_uncovered → re-author the edit for the dropped seed target
+#   converge_locus_uncovered → re-author the dropped INDEPENDENT defect locus (multi-locus)
 #   deferred_root_cause   → re-retrieve the punted substantive fix's axis (if thin)
 #   legacy_coerce         → a retired needs_pm coerced here (no real gap)
 #   author_declared       → the author itself emitted NR (read its own detail)
@@ -121,6 +123,7 @@ RI_ANCHOR_NOT_GROUNDED = "anchor_not_grounded"
 RI_INEFFECTIVE = "ineffective"
 RI_INCONCLUSIVE = "inconclusive"
 RI_SEED_TARGET_UNCOVERED = "seed_target_uncovered"
+RI_CONVERGE_LOCUS_UNCOVERED = "converge_locus_uncovered"
 RI_DEFERRED_ROOT_CAUSE = "deferred_root_cause"
 RI_DATASOURCE_REGRESSION = "datasource_regression"
 RI_LEGACY_COERCE = "legacy_coerce"
@@ -666,6 +669,110 @@ def _verify_anchors_live(spec: dict[str, Any], codebase_root: str,
         logger.warning("specify: anchor drift — edits %s claimed 'verified' but their "
                        "anchor is absent/non-unique in live code; downgraded so the "
                        "spec is not presented as ready", drifted)
+    return spec
+
+
+def _norm_anchor_line(line: str) -> str:
+    """Collapse a line to its whitespace-insignificant form for anchor matching."""
+    return re.sub(r"\s+", " ", line.strip())
+
+
+def _reanchor_drifted(spec: dict[str, Any], codebase_root: str,
+                      docs_root: str | None = None) -> dict[str, Any]:
+    """Recover an anchor that drifted by WHITESPACE only — re-lift the exact live bytes.
+
+    N178: a single high-confidence edit whose ``anchor_old`` is a few bytes off against
+    live (indentation widened, a tab vs spaces, a trailing space, a CRLF) dies as
+    ``not_found``, and the loop has NO deterministic recovery — it routes to a
+    needs_reinvestigation that, for ``stale_anchor``, the reactive bridge can only
+    terminate ("re-anchor is specify-local, not routable"). The design always meant
+    ``stale_anchor → re-anchor against live source`` (the comment at the reason-code
+    table) but that pass was never built. This is it.
+
+    For each edit ``_verify_anchors_live`` just downgraded to ``not_found`` (count 0 —
+    NOT ``stale``/count>1, which is a genuine ambiguity ``_disambiguate_anchors`` owns),
+    find the UNIQUE contiguous live region whose lines equal ``anchor_old`` line-for-line
+    ONCE insignificant whitespace is normalized. Re-lift those EXACT live bytes as the new
+    ``anchor_old`` (so apply finds it), and rebuild ``replacement_new`` so its UNCHANGED
+    context lines come from live verbatim while the author's CHANGED lines (the real edit)
+    are kept as authored — the change is preserved, only the surrounding bytes are
+    re-synced to live. On success the edit is re-marked ``verified``.
+
+    Strictly fail-closed: a drift that is NOT a provable 1:1 whitespace re-sync (no match,
+    more than one normalized match, a mismatched line count, or a rebuild that collapses to
+    a no-op or to a non-unique anchor) is left as ``not_found`` so ``_normalize_spec`` still
+    downgrades it — an honest NR beats a guessed location. Free, local, deterministic,
+    never raises, never fabricates a location.
+    """
+    roots = [r for r in (codebase_root, docs_root) if r]
+    recovered: list[str] = []
+    for e in spec.get("edits") or []:
+        if not isinstance(e, dict) or e.get("kind", "edit") == "create_file":
+            continue
+        if str(e.get("anchor_status", "")).lower() != "not_found":
+            continue  # only a count==0 drift is a re-anchor candidate (stale=ambiguous)
+        anchor = e.get("anchor_old") or ""
+        repl = e.get("replacement_new") or ""
+        rel = e.get("file") or ""
+        if not anchor or not rel:
+            continue
+        text: str | None = None
+        for root in roots:
+            p = os.path.join(root, rel)
+            if os.path.isfile(p):
+                try:
+                    with open(p, "r", encoding="utf-8", errors="replace") as fh:
+                        text = fh.read()
+                except OSError:
+                    text = None
+                break
+        if text is None:
+            continue
+
+        a_keep = anchor.splitlines(keepends=True)
+        if not a_keep:
+            continue
+        norm_a = [_norm_anchor_line(ln) for ln in a_keep]
+        live_keep = text.splitlines(keepends=True)
+        norm_live = [_norm_anchor_line(ln) for ln in live_keep]
+        n = len(a_keep)
+        # contiguous windows of live whose normalized lines equal anchor's, exactly once
+        hits = [i for i in range(0, len(live_keep) - n + 1)
+                if norm_live[i:i + n] == norm_a]
+        if len(hits) != 1:
+            continue  # 0 = genuinely gone; >1 = ambiguous — both stay not_found (honest)
+        i = hits[0]
+        live_window = live_keep[i:i + n]
+        new_anchor = "".join(live_window)
+        if text.count(new_anchor) != 1:
+            continue  # the re-lifted bytes must themselves be unique for apply to target
+
+        # Rebuild replacement: context (lines equal between author's anchor & replacement)
+        # comes from LIVE verbatim; changed lines come from the author's replacement.
+        r_keep = repl.splitlines(keepends=True)
+        norm_r = [_norm_anchor_line(ln) for ln in r_keep]
+        rebuilt: list[str] = []
+        for tag, a1, a2, b1, b2 in difflib.SequenceMatcher(
+                a=norm_a, b=norm_r, autojunk=False).get_opcodes():
+            if tag == "equal":
+                rebuilt.extend(live_window[a1:a2])  # unchanged context → live bytes
+            else:
+                rebuilt.extend(r_keep[b1:b2])        # author's change → as authored
+        new_repl = "".join(rebuilt)
+        if _normalize_ws(new_repl) == _normalize_ws(new_anchor):
+            continue  # rebuilt to a no-op — refuse to vouch (leave as not_found)
+
+        e["anchor_old"] = new_anchor
+        e["replacement_new"] = new_repl
+        e["anchor_status"] = "verified"
+        e.pop("anchor_drift", None)
+        e["reanchored"] = (
+            f"whitespace-drift re-anchor in {rel}: anchor_old was byte-off against live; "
+            "re-lifted the exact live text (context from live, change preserved)")
+        recovered.append(str(e.get("id", "?")))
+    if recovered:
+        logger.info("specify: re-anchored %s — anchor drifted by whitespace only, "
+                    "re-lifted exact live text (no re-investigation needed)", recovered)
     return spec
 
 
@@ -1887,6 +1994,88 @@ def _apply_seed_coverage_gate(spec: dict[str, Any], honey_text: str) -> dict[str
     return spec
 
 
+def _converge_target_loci(honey_text: str) -> list[str]:
+    """Parse the honey's "Converge-attributed edit targets" section into file paths.
+
+    converge emits this section ONLY when a scenario has MULTIPLE INDEPENDENT defects
+    (N179) — the primary attributed defect PLUS each additional_defect, one ``- path:line``
+    bullet per locus. A single-defect convergence produces no such section, so this returns
+    ``[]`` and the gate is a no-op there. One entry per declared locus (NOT deduped by file
+    — two independent defects in the same file are two loci), order-preserving.
+    """
+    files: list[str] = []
+    in_section = False
+    for line in honey_text.splitlines():
+        if line.startswith(CONVERGE_TARGET_SECTION):
+            in_section = True
+            continue
+        if in_section:
+            if line.startswith("## "):
+                break
+            s = line.strip()
+            if s.startswith("- "):
+                tok = s[2:].strip().strip("`")
+                m = re.match(r"([A-Za-z0-9_][A-Za-z0-9_./\\-]*\.[A-Za-z0-9]+)", tok)
+                if m:
+                    files.append(m.group(1).replace("\\", "/").lstrip("/"))
+    return files
+
+
+def _apply_converge_coverage_gate(spec: dict[str, Any], honey_text: str) -> dict[str, Any]:
+    """A genuine MULTI-locus convergence must not ship a ready spec covering only some.
+
+    N179: the seed enumerated THREE separate broken outputs; converge collapsed them to one
+    selector edit and the spec still terminated ready_to_apply — the user saw two of the
+    three symptoms unchanged. When converge declares the scenario has MULTIPLE INDEPENDENT
+    defects (≥2 loci listed in ``CONVERGE_TARGET_SECTION``), each locus must become an edit
+    or an explicit defer; otherwise a ready_to_apply claim is downgraded.
+
+    Deliberately keyed off converge's OWN structured multi-locus declaration, NOT off any
+    natural-language parse of the seed (the N177 rabbit hole) — and it fires ONLY in the
+    multi-locus case, so a single-node convergence (where specify legitimately re-grounds the
+    one attributed locus onto a different-but-correct file) is NEVER fought. ``addressed``
+    tolerates a legitimate re-ground/consolidation via a COUNT escape: ≥ as many distinct
+    edits as declared loci passes. The gate bites only the clear under-coverage case (fewer
+    edits than independent loci, with an uncovered locus that was not deferred). Downgrade-
+    only; records diagnostics unconditionally and never promotes a non-ready spec.
+    """
+    loci = _converge_target_loci(honey_text)
+    if len(loci) < 2:
+        return spec  # not a declared multi-locus convergence → nothing to enforce
+    edits = [e for e in (spec.get("edits") or []) if isinstance(e, dict)]
+    edited = [str(e.get("file", "")).replace("\\", "/").lstrip("/")
+              for e in edits if e.get("file")]
+    deferred = spec.get("deferred") if isinstance(spec.get("deferred"), list) else []
+
+    def _aligned(t: str) -> bool:
+        tb = os.path.basename(t)
+        return any(e == t or e.endswith("/" + t) or t.endswith("/" + e)
+                   or os.path.basename(e) == tb for e in edited)
+
+    def _deferred(t: str) -> bool:
+        tb = os.path.basename(t)
+        return any(isinstance(d, dict) and tb in str(d.get("issue", "")) for d in deferred)
+
+    uncovered = [t for t in loci if not _aligned(t) and not _deferred(t)]
+    # Count escape: as many distinct edits as declared loci is enough — a re-ground may
+    # land each locus on a different (correct) file than converge named, and the gate must
+    # not fight that. It bites only when there are FEWER edits than independent loci.
+    addressed_enough = len(edits) >= len(loci)
+    spec["converge_coverage"] = {"loci": loci, "uncovered": uncovered}
+
+    if uncovered and not addressed_enough and spec.get("termination") == "ready_to_apply":
+        logger.warning("specify: converge declared %d INDEPENDENT defect loci but only %d "
+                       "edit(s) authored — downgrading ready_to_apply (uncovered: %s)",
+                       len(loci), len(edits), uncovered)
+        note = (f"converge-coverage gate: converge attributed {len(loci)} INDEPENDENT "
+                f"defect loci but only {len(edits)} edit(s) authored — uncovered: "
+                + "; ".join(uncovered))
+        _set_reinvestigation(spec, reason_code=RI_CONVERGE_LOCUS_UNCOVERED,
+                             gate="converge_coverage", note=note,
+                             detail="; ".join(uncovered))
+    return spec
+
+
 def _review_and_gate(
     spec: dict[str, Any],
     honey_text: str,
@@ -2041,6 +2230,12 @@ def run_specify(
     # that is absent/non-unique, so _normalize_spec's stale-anchor rule then refuses to
     # present it as ready (N175 E7 — verified-without-live-recheck).
     spec = _verify_anchors_live(spec, codebase_root, docs_root)
+    # Whitespace-drift re-anchor (N178): an anchor that drifted by insignificant whitespace
+    # only is re-synced to the exact live bytes here — re-lifting the live text so apply
+    # finds it, with the author's change preserved. This is the specify-local re-anchor the
+    # reason-code table always promised; recovering it deterministically keeps a sound,
+    # high-confidence fix out of a needs_reinvestigation that the bridge can only terminate.
+    spec = _reanchor_drifted(spec, codebase_root, docs_root)
     spec = _normalize_spec(spec)
     spec = _apply_anchor_not_grounded_gate(spec)
 
@@ -2064,10 +2259,17 @@ def run_specify(
     # deferral is present) so it also guards an author-emitted ready.
     spec = _apply_deferred_substance_gate(spec)
 
-    # Seed-coverage gate (runs LAST so it has final say): a file the user named as
-    # an explicit edit target must become an edit, or a ready_to_apply spec is
-    # downgraded to needs_reinvestigation with the dropped target(s) reported (Defect 2 / T892).
+    # Seed-coverage gate: a file the user named as an explicit edit target must become an
+    # edit, or a ready_to_apply spec is downgraded with the dropped target(s) reported
+    # (Defect 2 / T892).
     spec = _apply_seed_coverage_gate(spec, honey_text)
+
+    # Converge-coverage gate (runs LAST so it has final say): when converge declared the
+    # scenario has MULTIPLE INDEPENDENT defects (N179), a ready_to_apply spec that authored
+    # an edit for only SOME of the loci is downgraded — shipping the easy locus while the
+    # others stay broken on screen is exactly the false-ready this catches. No-op unless
+    # converge itself declared ≥2 independent loci, so a single-defect converge is untouched.
+    spec = _apply_converge_coverage_gate(spec, honey_text)
 
     # Step A finalizer: if the spec lands in needs_reinvestigation but NO gate stamped a
     # structured reason, the AUTHOR itself emitted it — record that so the reactive bridge

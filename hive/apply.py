@@ -44,7 +44,10 @@ from typing import Any
 from hive import backup as backup_store
 # Share the ONE canonical termination vocabulary with specify so apply never rejects a
 # value specify legitimately emits (N174: 'needs_runtime' was missing from apply's copy).
+# Reuse specify's deterministic import↔usage wiring check so the import-pairing rule below
+# applies the SAME logic to the would-be-written subset (no second, drifting copy).
 from hive.specify import VALID_TERMINATION as _VALID_TERMINATION
+from hive.specify import _incomplete_wiring_ids
 
 logger = logging.getLogger("hive.apply")
 
@@ -399,6 +402,26 @@ def build_proposal(spec: dict[str, Any], codebase_root: str) -> dict[str, Any]:
     # to needs_reinvestigation and block an already-ready root-cause fix (T892 E1).
     for r in edit_results:
         r["writable"] = bool(r["applicable"]) and str(r["id"]) not in ineffective
+
+    # Import↔usage atomicity (N178): a partial write can land an import edit whose paired
+    # USAGE edit is held (its anchor drifted), leaving a dangling import. We assemble ONLY
+    # the would-be-written edits and reuse specify's wiring check: an edit whose added
+    # import binding is unused once we keep just the writable subset is held too, so the
+    # import and its use ship all-or-nothing. (When every edit is writable the binding is
+    # used, so nothing is held — this only bites a genuine partial split.) Runs BEFORE the
+    # test-hold below so holding an import cascades correctly into source_unwritable.
+    edits_by_id = {str(e.get("id", "?")): e for e in edits if isinstance(e, dict)}
+    writable_now = [edits_by_id[str(r["id"])] for r in edit_results
+                    if r["writable"] and str(r["id"]) in edits_by_id]
+    if len(writable_now) < len(edit_results):  # only meaningful on a partial split
+        dangling = _incomplete_wiring_ids({"edits": writable_now}, codebase_root)
+        for r in edit_results:
+            if str(r["id"]) in dangling and r["writable"]:
+                r["writable"] = False
+                r["held_reason"] = (
+                    "import edit held: its added binding is unused without a held sibling "
+                    f"edit — {dangling[str(r['id'])]} (writing it alone leaves a dangling "
+                    "import)")
 
     # Partial atomicity (Defect 3): a test-expectation edit must not be written ahead
     # of the source edit it asserts. --partial decides writability per edit, so a clean

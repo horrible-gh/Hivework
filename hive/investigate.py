@@ -45,6 +45,14 @@ logger = logging.getLogger("hive.investigate")
 # ``hive.specify.SEED_TARGET_SECTION`` (imported from here).
 SEED_TARGET_SECTION = "## Seed-specified edit targets"
 
+# Header for the machine-parseable list of loci converge attributed when a scenario has
+# MULTIPLE INDEPENDENT defects (N179): the primary attributed_defect PLUS each
+# additional_defect. Emitted ONLY in that multi-locus case (a single-defect convergence
+# produces no such section). specify's converge-coverage gate reads it back to refuse a
+# ready_to_apply spec that authored an edit for only SOME of the independent loci. Keep
+# the literal in sync with ``hive.specify.CONVERGE_TARGET_SECTION`` (imported from here).
+CONVERGE_TARGET_SECTION = "## Converge-attributed edit targets"
+
 # Optional channel for the requester's own words — the direct message/hints the
 # caller (a chat operator, or a FlowGate rejection note) supplies alongside the
 # seed. It is OPT-IN (the ``--comment`` flag); when absent nothing changes. We fold
@@ -794,17 +802,36 @@ def _render_converge_section(converge: dict[str, Any] | None,
     out: list[str] = []
     if converge.get("converged") and converge.get("attributed_defect"):
         ad = converge["attributed_defect"]
-        out += [
-            "## Converged call path (the single executed path — START HERE)",
-            "",
-            "The independent axes below each located ONE fragment of what is really "
-            "a SINGLE call path. The converge stage stitched them into the one path "
-            "that actually executes for this scenario and attributed the defect to "
-            "ONE node. **Convergence SUCCEEDED** — treat the node below as the "
-            "primary target; the per-axis localisations further down are corroborating "
-            "context for it, not separate edit sites.",
-            "",
-        ]
+        extra = [d for d in (converge.get("additional_defects") or [])
+                 if isinstance(d, dict) and (d.get("file") or d.get("node"))]
+        if extra:
+            # Multi-locus (N179): the scenario has SEVERAL independent defects. Do NOT
+            # tell the author the other loci are mere context — they are SEPARATE edit
+            # sites (rendered in full below + a machine list specify's coverage gate reads).
+            out += [
+                "## Converged — MULTIPLE INDEPENDENT defects (START HERE)",
+                "",
+                "The converge stage stitched the executed path and found this scenario "
+                "is NOT one defect: it has SEVERAL independent failures, each in "
+                "different code and each needing its OWN fix. Treat the primary node "
+                "below as ONE target and the 'Additional independent defects' section as "
+                "the OTHER edit sites this scenario requires — author (or explicitly "
+                "defer with a reason) an edit for EACH. Shipping only the primary is a "
+                "half-fix.",
+                "",
+            ]
+        else:
+            out += [
+                "## Converged call path (the single executed path — START HERE)",
+                "",
+                "The independent axes below each located ONE fragment of what is really "
+                "a SINGLE call path. The converge stage stitched them into the one path "
+                "that actually executes for this scenario and attributed the defect to "
+                "ONE node. **Convergence SUCCEEDED** — treat the node below as the "
+                "primary target; the per-axis localisations further down are corroborating "
+                "context for it, not separate edit sites.",
+                "",
+            ]
         path = converge.get("path") or []
         if path:
             out.append("Executed path:")
@@ -835,6 +862,22 @@ def _render_converge_section(converge: dict[str, Any] | None,
             out.append("")
         # PASTE the real rows the read returned (N173) — the grounding for the verdict.
         out += _render_data_state_lines(converge)
+        # Multi-locus (N179): render EACH additional independent defect as its own edit
+        # target, then a machine-parseable list (primary + each extra) that specify's
+        # converge-coverage gate reads back to refuse a ready spec covering only some.
+        if extra:
+            out += ["### Additional independent defects — each needs its OWN edit", ""]
+            for d in extra:
+                flag = " (⚠ attributed file not in evidence — re-confirm it exists)" \
+                    if d.get("ungrounded") else ""
+                loc = f"{d.get('file', '')}:{d.get('lines', '')}".strip(":")
+                out.append(f"- {loc}{flag} [{d.get('node', '?')}] — {d.get('why', '')}")
+            out.append("")
+            out += [CONVERGE_TARGET_SECTION + " (author or explicitly defer EACH)", ""]
+            out.append(f"- {ad.get('file', '')}:{ad.get('lines', '')}")
+            for d in extra:
+                out.append(f"- {d.get('file', '')}:{d.get('lines', '')}")
+            out.append("")
         if seed_kind == "diagnostic":
             out += [
                 "> **This seed is DIAGNOSTIC (trace/map), not a change request.** The "
@@ -860,14 +903,52 @@ def _render_converge_section(converge: dict[str, Any] | None,
             ]
         return out
 
+    cc = converge.get("causal_check") or {}
+    cv = cc.get("verdict")
+    ad = converge.get("attributed_defect")
+
+    # ── Dropped-peer domain guard (N180): converge attributed a defect and certified its
+    # cause→symptom check ``consistent`` — but ON A LIVE DB READ (a data-state fact) while
+    # silently dropping a competing located hypothesis that names a RENDER/binding-layer
+    # mechanism. A DB read proves rows EXIST, never that a render symptom is resolved, so
+    # the verdict was certified on the wrong evidence domain and the dropped peer may be
+    # the real cause. The converge guard demoted it to not-converged and stamped the peer;
+    # render it as a re-examine target (NOT a ready edit) and route to reinvestigation.
+    dp = cc.get("dropped_peer")
+    if dp and ad:
+        aloc = f"{ad.get('file', '')}:{ad.get('lines', '')}".strip(":")
+        ploc = f"{dp.get('file', '')}:{dp.get('lines', '')}".strip(":")
+        out += [
+            "## Convergence certified on DATA but dropped a competing hypothesis — re-examine",
+            "",
+            f"The converge stage attributed the defect to `{aloc}` ({ad.get('node', '?')}) "
+            f"and certified its cause→symptom check **consistent on a live DB read** (a "
+            f"data-state fact). BUT a competing located hypothesis at `{ploc}` (axis "
+            f"{dp.get('axis_id', '?')}) was left off the path and NEVER refuted. A DB read "
+            f"can prove rows EXIST; it CANNOT prove a RENDER / binding-layer symptom is "
+            f"resolved — so this verdict is certified on the WRONG evidence domain, and "
+            f"`{ploc}` may be the real cause (e.g. a response key the front-end reads under "
+            f"a different name, so adding rows / a UNION upstream leaves the screen empty). "
+            f"**Do NOT author a ready edit at `{aloc}` on the strength of this convergence.**",
+            "",
+            f"- dropped (unrefuted) hypothesis: {ploc} — {dp.get('reason', '')}",
+            "",
+            "> Return **needs_reinvestigation** naming BOTH the data-certified node "
+            f"`{aloc}` AND the unrefuted competing locus `{ploc}`. The re-stitch must "
+            "either causally REFUTE the competing locus against LIVE CODE (trace the "
+            "producer's emitted key → the consumer's read of it and show they AGREE), or "
+            "attribute / author the fix THERE — not ship the data-only fix alone. If the "
+            "seed names concrete edit targets (see below), author those.",
+            "",
+        ]
+        out += _render_data_state_lines(converge)
+        return out
+
     # ── Causal failure (N170): the converger reached a node on the executed path
     # but the cause→symptom check did NOT confirm it produces the symptom. This is
     # NOT a primary edit target — emitting it as one is exactly the N170 defect
     # (a reachable-but-innocent ORDER BY clause authored into a wrong edit). Route
     # it to reinvestigation (contradicted) or data-state confirmation (undecidable).
-    cc = converge.get("causal_check") or {}
-    cv = cc.get("verdict")
-    ad = converge.get("attributed_defect")
     if cv in ("contradicted", "undecidable", "unverified") and ad:
         loc = f"{ad.get('file', '')}:{ad.get('lines', '')}".strip(":")
         out += [

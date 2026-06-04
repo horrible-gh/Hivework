@@ -103,6 +103,15 @@ class ConvergeResult:
     converged: bool = False
     path: list[dict[str, Any]] = field(default_factory=list)
     attributed_defect: dict[str, Any] | None = None
+    # Additional INDEPENDENT defects (N179). converge's core job is to attribute ONE node
+    # on ONE call path — but some scenarios enumerate SEVERAL distinct broken outputs that
+    # do NOT share a cause (e.g. "the highlight colour is wrong AND the step index is off
+    # AND the status badge never flips"). Folding those into one node ships a half-fix while
+    # terminating ready_to_apply. When (and only when) the scenario genuinely needs fixes at
+    # multiple independent loci, the converger lists the non-primary ones here; the honey
+    # renders each as its OWN edit target and specify's converge-coverage gate refuses to
+    # call a spec ready that covered only some. Empty in the common single-defect case.
+    additional_defects: list[dict[str, Any]] = field(default_factory=list)
     missing_link: dict[str, Any] | None = None
     causal_check: dict[str, Any] | None = None
     summary: str = ""
@@ -123,6 +132,7 @@ class ConvergeResult:
             "converged": self.converged,
             "path": self.path,
             "attributed_defect": self.attributed_defect,
+            "additional_defects": self.additional_defects,
             "missing_link": self.missing_link,
             "causal_check": self.causal_check,
             "summary": self.summary,
@@ -408,6 +418,18 @@ reached in this scenario) — say so by leaving it off the path. Reachability is
 NECESSARY but NOT SUFFICIENT: a node can be on the executed path yet not be what \
 produces the reported symptom (step 3 below is where you check that).
 
+[Seed is ground truth — do NOT invert it] The scenario may explicitly DECLARE an \
+observed value WRONG — a worker/AI hallucination, a stale artifact, or just "this is not \
+what it should be" — and state what the CORRECT value/state is instead. When it does, the \
+seed's stated CORRECT value is GROUND TRUTH: the defect is that the code emits the NEGATED \
+(wrong) value, and a fix must make it emit the seed's CORRECT one. NEVER write an \
+attribution whose ``why`` restores the value the seed called wrong as the "intended" / \
+"expected" output. (Example — seed: "the active step is painted YELLOW, but that is a \
+worker hallucination; it should be BLUE." A ``why`` of "the active step is not painted \
+yellow as intended" INVERTS the requirement: it re-crowns the seed-NEGATED value as the \
+goal.) If your ``why`` would re-assert a seed-negated value as the intent, you have read \
+the seed backwards — flip your reasoning before emitting.
+
 [Reported scenario / seed]
 {_trunc(seed_text, 2000)}
 {confirmed_block}{db_avail_block}{schema_block}{code_state}
@@ -466,9 +488,42 @@ a TRUNCATED flag appears, re-read with the ranking predicate as the filter — t
 right, sharp condition.) When the query already yields the expected row, that query is \
 NOT the defect even if a fork in the seed pointed at it: on a data question the live rows \
 outrank the seed's framing, and the real cause lies on a DIFFERENT resolver / render path.
+   - SYMPTOM DOMAIN — match the EVIDENCE you certify on to the KIND of symptom. A live \
+DB / stored-value read (your ``data_reads``) can only certify a verdict about a STORED \
+VALUE: which row is selected, what status/id a field holds. It can NEVER certify a \
+RENDER / SHAPE / BINDING symptom — an element that is empty or missing on screen, a \
+selector that does not appear, a response KEY the front-end reads under a DIFFERENT name \
+(e.g. the handler emits ``module_id`` but the FE reads ``module``, so the list comes back \
+empty). For those the deciding fact lives in CODE: trace the PRODUCER's emitted \
+field/key to the CONSUMER's read of it and rule "consistent" ONLY if they AGREE. "The \
+query now returns rows" does NOT prove "the consumer renders them" — if a competing \
+fragment says the consumer reads a different key, adding rows / a UNION upstream leaves \
+the symptom fully intact. Do NOT let a ``data_reads`` result that merely proves rows \
+EXIST stand in for a render-layer cause→symptom check, and do NOT rule "consistent" on a \
+render/binding symptom from a DB read alone.
+   - REFUTE BEFORE YOU DROP — when you leave a located fragment OFF the path, that is a \
+claim it is a RED HERRING. If that fragment names a DISTINCT mechanism that could \
+INDEPENDENTLY produce the reported symptom (a different file/key/branch, not a \
+corroborating view of the SAME chain), you may not drop it SILENTLY: either causally \
+REFUTE it (show, against live code, that it cannot produce the symptom) and say so in \
+your ``trace``, or carry it as an additional INDEPENDENT defect (step 5). This is \
+especially binding when your own attribution is certified only on a data read — the \
+fragment you are about to discard may be the render-layer cause your DB read cannot see.
 4. If — and only if — two adjacent nodes cannot be connected because a needed \
 callee/symbol is NOT shown in the evidence, set converged=false and NAME the missing \
 link instead of guessing.
+5. MULTI-LOCUS check — is this ONE defect, or SEVERAL INDEPENDENT ones? Most scenarios \
+are a single defect on a single path: attribute the one node above and leave \
+``additional_defects`` EMPTY. But some reporters enumerate SEVERAL DISTINCT broken \
+outputs that do NOT share a cause — e.g. "(1) the highlight colour is wrong, (2) the \
+step index is off, AND (3) the status badge never flips to done" — three independent \
+failures in different code, each needing its OWN fix. When (and ONLY when) the scenario \
+genuinely requires fixes at MULTIPLE INDEPENDENT loci (distinct outputs, NOT corroborating \
+views of one call chain), put the PRIMARY one in ``attributed_defect`` and EACH of the \
+others in ``additional_defects`` with its own node/file/lines/why. Do NOT fold genuinely \
+separate defects into one node, and do NOT pad ``additional_defects`` with corroborating \
+context for a single defect — list a locus there only when LEAVING IT OUT would ship a \
+half-fix.
 
 [Gate] Only a "consistent" causal check is actionable downstream. When your check is \
 "contradicted" or "undecidable", STILL fill attributed_defect with the node you \
@@ -497,6 +552,7 @@ refutation into the next, better-aimed search instead of a rejection.
     {{ "node": "endpoint|handler|db_fn|sql_key|fe|other", "file": "<repo-relative>", "lines": "<start-end>", "symbol": "<fn/route/key name>" }}
   ],
   "attributed_defect": {{ "node": "<which node above>", "file": "<repo-relative>", "lines": "<start-end>", "why": "<one line: the wrong behaviour here>" }},
+  "additional_defects": [ {{ "node": "endpoint|handler|db_fn|sql_key|fe|other", "file": "<repo-relative>", "lines": "<start-end>", "why": "<the SEPARATE wrong behaviour at this INDEPENDENT locus>" }} ],
   "causal_check": {{ "verdict": "consistent|contradicted|undecidable", "data_state_assumptions": ["<the row/field values the scenario forces>"], "trace": "<what the attributed code outputs under those assumptions, and whether it reproduces the symptom>", "need_data_state": ["<when undecidable: the exact stored row state / fixture to confirm>"], "data_reads": [ {{ "id": "<short name for chaining, optional>", "table": "<table name from the evidence>", "where": {{ "<key column>": "<literal row selector OR {{\\"from\\": \\"<prior read id>\\", \\"column\\": \\"<column to carry over>\\"}}>" }}, "columns": ["<column(s) whose value decides the verdict>"] }} ] }},
   "missing_link": null
 }}
@@ -609,6 +665,28 @@ def _result_from(parsed: dict[str, Any] | None,
         if af and not any(_aligns(af, kf) for kf in known_files):
             attributed["ungrounded"] = True
 
+    # Additional INDEPENDENT defects (N179) — soft-grounded exactly like the primary:
+    # an entry whose file we cannot path-align is annotated ``ungrounded`` for the
+    # author to re-confirm, never dropped (the converger legitimately names a locus
+    # that lived only in an axis's call_sites). The primary is never duplicated here.
+    additional: list[dict[str, Any]] = []
+    prim_key = (_norm(attributed["file"]), str(attributed.get("lines", ""))) \
+        if attributed else None
+    for x in (parsed.get("additional_defects") or []):
+        if not isinstance(x, dict) or not (x.get("file") or x.get("node")):
+            continue
+        d = {
+            "node": str(x.get("node", "") or ""),
+            "file": str(x.get("file", "") or ""),
+            "lines": str(x.get("lines", "") or ""),
+            "why": str(x.get("why", "") or ""),
+        }
+        if prim_key and (_norm(d["file"]), d["lines"]) == prim_key:
+            continue  # same locus as the primary → not a separate defect
+        if d["file"] and not any(_aligns(d["file"], kf) for kf in known_files):
+            d["ungrounded"] = True
+        additional.append(d)
+
     ml_raw = parsed.get("missing_link")
     missing: dict[str, Any] | None = None
     if isinstance(ml_raw, dict) and (ml_raw.get("between") or ml_raw.get("need")):
@@ -665,8 +743,9 @@ def _result_from(parsed: dict[str, Any] | None,
         summary = "not converged"
 
     return ConvergeResult(converged=converged, path=path,
-                          attributed_defect=attributed, missing_link=missing,
-                          causal_check=causal, summary=summary, raw=parsed)
+                          attributed_defect=attributed, additional_defects=additional,
+                          missing_link=missing, causal_check=causal, summary=summary,
+                          raw=parsed)
 
 
 def _dedup_windows(windows: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -902,6 +981,74 @@ def _fetch_data_state(data_reads: list[dict[str, Any]], db_conn) -> str:
     return block
 
 
+def _dropped_peer_guard(res: ConvergeResult, located: list[dict[str, Any]],
+                        data_backed: bool) -> ConvergeResult:
+    """N180: a DATA-certified ``consistent`` must not ship while a DISTINCT-locus located
+    peer was dropped WITHOUT refutation.
+
+    The failure (N180): the converger attributed the defect to one node, certified its
+    cause→symptom check ``consistent`` on a LIVE DB READ (a data-state fact), and silently
+    left a competing located fragment off the path — one naming a RENDER / binding-layer
+    mechanism (a response key the FE reads under a different name) — neither refuted nor
+    carried as an additional defect. A DB read proves rows EXIST; it cannot prove a
+    render-layer symptom is resolved, so that ``consistent`` is certified on the WRONG
+    evidence domain and the dropped peer may be the real cause. We demote to NOT-converged
+    (stops a half-fix shipping ready_to_apply) and stamp ``dropped_peer`` so the honey
+    routes it to reinvestigation (re-stitch: refute the peer against live code, or fix it).
+
+    DELIBERATELY TIGHT (the N177 over-fire lesson): fires ONLY when the verdict is
+    ``consistent`` AND was data-backed (a live read returned rows) AND a located peer sits
+    at a DISTINCT file on NONE of {path, attributed, additional_defects} AND is never even
+    MENTIONED in the causal trace. A consistency certified on CODE (no data read), or one
+    whose trace addresses the peer, is untouched — and the [REFUTE BEFORE YOU DROP] prompt
+    rule pushes the converger to MENTION why it drops a peer, which satisfies the trace
+    check and keeps this guard silent in the legitimate red-herring case. Worst-case false
+    fire costs one extra reinvestigation pass, never a wrong edit (fail toward re-examine).
+    """
+    if not (res.converged and data_backed):
+        return res
+    cc = res.causal_check or {}
+    if cc.get("verdict") != "consistent":
+        return res
+    ad = res.attributed_defect or {}
+    # Files the convergence already ACCOUNTS for — anything here is on the path / a named
+    # target, i.e. NOT "dropped". A located peer aligning to one of these is fine.
+    accounted = {_norm(ad.get("file", ""))}
+    for n in res.path or []:
+        accounted.add(_norm(n.get("file", "")))
+    for d in res.additional_defects or []:
+        accounted.add(_norm(d.get("file", "")))
+    accounted.discard("")
+    trace = (cc.get("trace") or "").lower()
+    for v in located:
+        vd = v.get("verdict") or {}
+        pf = _norm(vd.get("file", ""))
+        if not pf or any(_aligns(pf, a) for a in accounted):
+            continue  # not located, or this fragment IS on the convergence
+        base = pf.rsplit("/", 1)[-1]
+        if base and base in trace:
+            continue  # the converger addressed / refuted this peer in its reasoning
+        # A genuinely unaddressed, distinct-locus located peer while DATA-certified.
+        peer = {"axis_id": str(v.get("axis_id", "?")), "file": vd.get("file", ""),
+                "lines": vd.get("lines", ""), "reason": vd.get("reason", "")}
+        res.converged = False
+        res.causal_check = {
+            **cc, "dropped_peer": peer,
+            "trace": (cc.get("trace") or "")
+            + f" [N180 guard] verdict certified on a live DB read (data state) but the "
+              f"competing located hypothesis at {peer['file']}:{peer['lines']} (axis "
+              f"{peer['axis_id']}) was neither placed on the path nor refuted; a data read "
+              f"cannot confirm a render-layer symptom — re-examine it."}
+        res.summary = (
+            f"not converged: data-certified consistent at "
+            f"{ad.get('file', '')}:{ad.get('lines', '')} dropped an UNREFUTED competing "
+            f"hypothesis at {peer['file']}:{peer['lines']} (N180 domain guard)")
+        logger.info("converge: N180 guard demoted — data-certified consistent dropped "
+                    "unrefuted peer %s:%s", peer["file"], peer["lines"])
+        return res
+    return res
+
+
 def run_converge(*, seed_text: str, verdicts: list[dict[str, Any]],
                  bundles: list[dict[str, Any]], provider: str, model: str,
                  code_root: str | None = None, ledger=None,
@@ -1066,6 +1213,13 @@ def run_converge(*, seed_text: str, verdicts: list[dict[str, Any]],
                 # first result, which at least named the missing link for the author.
                 if res2.converged:
                     res = res2
+
+    # ── Dropped-peer domain guard (N180): a ``consistent`` certified on a live DB read
+    # must not stay converged while a DISTINCT-locus located peer was dropped without
+    # refutation — a data read cannot vouch for a render/binding-layer cause. Runs on the
+    # FINAL result (after any data-read / missing-link re-pass); demotes to not-converged
+    # and stamps the peer so the honey routes it to reinvestigation. Tight by design.
+    res = _dropped_peer_guard(res, located, data_backed)
 
     # Carry the live-DB read onto whichever result we return so the honey can PASTE the
     # real rows (or honestly report that the read was attempted but returned nothing).
