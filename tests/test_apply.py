@@ -462,5 +462,75 @@ class TestPartialApply(unittest.TestCase):
         self.assertTrue(proposal["applied_partial"])
 
 
+class TestIsTestFile(unittest.TestCase):
+    """Path-convention recognition that drives partial atomicity."""
+
+    def test_recognizes_test_conventions(self):
+        for p in ("tests/test_documents.py", "server/tests/foo.py",
+                  "test_documents.py", "documents_test.py",
+                  "client/Comp.spec.ts", "client/Comp.test.tsx",
+                  "src/__tests__/x.js", "a\\tests\\b.py"):
+            self.assertTrue(apply._is_test_file(p), p)
+
+    def test_rejects_source_paths(self):
+        for p in ("server/documents.py", "client/MainPanel.vue",
+                  "hive/specify.py", "", "latest.py"):
+            self.assertFalse(apply._is_test_file(p), p)
+
+
+class TestPartialAtomicity(unittest.TestCase):
+    """Defect 3 (M-head): --partial must not write a test-expectation edit ahead of the
+    source edit it asserts. If a source edit is unwritable, its test siblings are held."""
+
+    def setUp(self):
+        self.root = tempfile.mkdtemp()
+        # source file present; test file present
+        with open(os.path.join(self.root, "documents.py"), "w", encoding="utf-8") as f:
+            f.write("HEAD = {'R'}\nother = 1\n")
+        os.makedirs(os.path.join(self.root, "tests"), exist_ok=True)
+        with open(os.path.join(self.root, "tests", "test_documents.py"), "w",
+                  encoding="utf-8") as f:
+            f.write("assert head == 'DS'\n")
+
+    def _spec_code_fails_test_ok(self):
+        # E1 (source) anchor is NOT in the file → unwritable; E2 (test) IS applicable.
+        return _spec([
+            _edit("MISSING = {'R','M','Q'}", "MISSING = {'R','Q'}",
+                  file="documents.py", eid="E1"),
+            _edit("assert head == 'DS'", "assert head == 'M'",
+                  file="tests/test_documents.py", eid="E2"),
+        ], termination="needs_reinvestigation", codebase_root=self.root)
+
+    def test_test_edit_held_when_source_edit_unwritable(self):
+        p = apply.build_proposal(self._spec_code_fails_test_ok(), self.root)
+        # the applicable test edit must NOT be writable while its source sibling failed
+        self.assertEqual(p["writable_ids"], [])
+        self.assertFalse(p["partial_ready"])
+        e2 = next(r for r in p["edits"] if r["id"] == "E2")
+        self.assertIn("held_reason", e2)
+
+    def test_test_edit_writable_when_all_source_edits_writable(self):
+        # source edit now applicable → its test sibling is free to ship in the same round
+        with open(os.path.join(self.root, "documents.py"), "w", encoding="utf-8") as f:
+            f.write("HEAD = {'R','M','Q'}\nother = 1\n")
+        spec = _spec([
+            _edit("HEAD = {'R','M','Q'}", "HEAD = {'R','Q'}",
+                  file="documents.py", eid="E1"),
+            _edit("assert head == 'DS'", "assert head == 'M'",
+                  file="tests/test_documents.py", eid="E2"),
+        ], termination="needs_reinvestigation", codebase_root=self.root)
+        p = apply.build_proposal(spec, self.root)
+        self.assertEqual(sorted(p["writable_ids"]), ["E1", "E2"])
+
+    def test_pure_test_only_spec_is_unaffected(self):
+        # no source edits at all → vacuously all source writable → test edit stays writable
+        spec = _spec([
+            _edit("assert head == 'DS'", "assert head == 'M'",
+                  file="tests/test_documents.py", eid="E2"),
+        ], termination="needs_reinvestigation", codebase_root=self.root)
+        p = apply.build_proposal(spec, self.root)
+        self.assertEqual(p["writable_ids"], ["E2"])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -62,6 +62,25 @@ EMPTY_CONTENT = "empty_content"  # content empty/whitespace-only → not applica
 POST_APPLY_BROKEN = "post_apply_broken"  # anchor unique but the applied result is broken
 
 
+# A test-expectation edit must never be written ahead of the source edit it asserts
+# (Defect 3 / partial atomicity). We recognise test files by path convention so that an
+# unwritable source edit can hold its test siblings out of a partial write.
+_TEST_PATH_RE = re.compile(
+    r"(?:^|/)(?:tests?|__tests__)/"             # inside a tests/ test/ __tests__/ dir
+    r"|(?:^|/)test_[^/]+$"                       # file named test_*.*
+    r"|(?:^|/)[^/]+_test\.[^./]+$"               # file named *_test.ext
+    r"|(?:^|/)[^/]+\.(?:test|spec)\.[^./]+$",    # file named *.test.ext / *.spec.ext
+    re.IGNORECASE,
+)
+
+
+def _is_test_file(rel_path: str) -> bool:
+    """True when a path is a test file/dir by convention (tests/ dir, test_*, *_test, *.spec.*)."""
+    if not rel_path:
+        return False
+    return bool(_TEST_PATH_RE.search(rel_path.replace("\\", "/")))
+
+
 def load_spec(spec_path: str) -> dict[str, Any]:
     """Load the edit-spec JSON (the SSOT produced by specify)."""
     with open(spec_path, "r", encoding="utf-8") as f:
@@ -331,6 +350,25 @@ def build_proposal(spec: dict[str, Any], codebase_root: str) -> dict[str, Any]:
     # to needs_reinvestigation and block an already-ready root-cause fix (T892 E1).
     for r in edit_results:
         r["writable"] = bool(r["applicable"]) and str(r["id"]) not in ineffective
+
+    # Partial atomicity (Defect 3): a test-expectation edit must not be written ahead
+    # of the source edit it asserts. --partial decides writability per edit, so a clean
+    # test-edit could land while its paired code-edit failed (non-unique / drifted
+    # anchor) — leaving the suite asserting behavior the code does not yet have, which is
+    # worse than writing nothing. We cannot cheaply prove the exact code↔test pairing, so
+    # we hold ALL test edits whenever ANY source (non-test) edit is unwritable. Over-
+    # holding is safe (the held edit just waits for the next round); writing a test ahead
+    # of its code is not.
+    test_ids = {str(r["id"]) for r in edit_results if _is_test_file(r["file"])}
+    source_unwritable = any(
+        not r["writable"] for r in edit_results if str(r["id"]) not in test_ids)
+    if source_unwritable and test_ids:
+        for r in edit_results:
+            if str(r["id"]) in test_ids and r["writable"]:
+                r["writable"] = False
+                r["held_reason"] = (
+                    "test-expectation edit held: a source edit in this spec is not "
+                    "applicable — writing it alone would assert unshipped behavior")
     writable_ids = [r["id"] for r in edit_results if r["writable"]]
 
     reasons: list[str] = []
