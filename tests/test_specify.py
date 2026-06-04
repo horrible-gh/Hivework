@@ -14,6 +14,7 @@ The provider is mocked so these run without the copilot CLI. Coverage:
 
 import json
 import os
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -23,7 +24,7 @@ from unittest import mock
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from hive import specify
-from hive.config import load_config
+from hive.config import DbConnection, load_config
 from hive.providers import WorkerResult
 
 
@@ -416,6 +417,83 @@ class TestIncompleteWiring(unittest.TestCase):
             spec, [], {}, False, incomplete_wiring={"E1": "incomplete wiring — imported 'useToast' is never used"})
         self.assertEqual(out["termination"], "needs_reinvestigation")
         self.assertIn("E1", out["effectiveness"]["ineffective_ids"])
+
+
+class TestDatasourceRegressionGate(unittest.TestCase):
+    """N176: an edit that switches a SQL read's primary FROM table to an empty / sparser /
+    missing table (checked against the live DB) is a data-source regression — flagged
+    deterministically so a ready spec loops back to re-retrieve the real source."""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.db = os.path.join(self.dir, "t.db")
+        c = sqlite3.connect(self.db)
+        c.execute("CREATE TABLE groups (project_id TEXT, module TEXT)")
+        c.executemany("INSERT INTO groups VALUES (?,?)",
+                      [("test", "none"), ("test", "alpha")])  # 2 rows
+        c.execute("CREATE TABLE project_modules (project_id TEXT, name TEXT)")
+        c.execute("INSERT INTO project_modules VALUES ('test','alpha')")  # 1 row
+        c.execute("CREATE TABLE empty_modules (project_id TEXT, name TEXT)")  # 0 rows
+        c.commit()
+        c.close()
+        self.conn = DbConnection(kind="sqlite", path=self.db)
+
+    def _spec(self, old_sql, new_sql):
+        return {"edits": [{"id": "E1", "file": "list_routes.py",
+                           "anchor_old": old_sql, "replacement_new": new_sql}]}
+
+    def test_swap_to_sparser_table_is_flagged(self):
+        spec = self._spec(
+            'rows = q("SELECT DISTINCT module FROM groups WHERE project_id = ?", [p])',
+            'rows = q("SELECT name AS module FROM project_modules WHERE project_id = ?", [p])')
+        flagged = specify._datasource_regression_ids(spec, self.conn)
+        self.assertIn("E1", flagged)
+        self.assertIn("project_modules", flagged["E1"])
+        self.assertIn("groups", flagged["E1"])
+
+    def test_swap_to_empty_table_is_flagged(self):
+        spec = self._spec('SELECT module FROM groups WHERE project_id = ?',
+                          'SELECT name FROM empty_modules WHERE project_id = ?')
+        flagged = specify._datasource_regression_ids(spec, self.conn)
+        self.assertIn("E1", flagged)
+        self.assertIn("EMPTY", flagged["E1"])
+
+    def test_swap_to_missing_table_is_flagged(self):
+        spec = self._spec('SELECT module FROM groups',
+                          'SELECT name FROM nonexistent_table')
+        flagged = specify._datasource_regression_ids(spec, self.conn)
+        self.assertIn("E1", flagged)
+        self.assertIn("does not exist", flagged["E1"])
+
+    def test_swap_to_richer_table_not_flagged(self):
+        # project_modules (1) -> groups (2): coverage grows, not a regression
+        spec = self._spec('SELECT name FROM project_modules',
+                          'SELECT DISTINCT module FROM groups')
+        self.assertEqual(specify._datasource_regression_ids(spec, self.conn), {})
+
+    def test_same_table_not_flagged(self):
+        spec = self._spec('SELECT module FROM groups WHERE project_id = ?',
+                          'SELECT DISTINCT module FROM groups WHERE project_id = ? ORDER BY module')
+        self.assertEqual(specify._datasource_regression_ids(spec, self.conn), {})
+
+    def test_no_db_conn_is_no_op(self):
+        spec = self._spec('SELECT module FROM groups',
+                          'SELECT name FROM project_modules')
+        self.assertEqual(specify._datasource_regression_ids(spec, None), {})
+
+    def test_non_sql_edit_ignored(self):
+        spec = self._spec("x = 1", "x = 2")
+        self.assertEqual(specify._datasource_regression_ids(spec, self.conn), {})
+
+    def test_gate_downgrades_and_routes_to_retrieve(self):
+        spec = _fresh_ready()
+        out = specify._apply_effectiveness_gate(
+            spec, [], {}, False,
+            datasource_ids={"E1": "data-source regression — groups -> project_modules"})
+        self.assertEqual(out["termination"], "needs_reinvestigation")
+        self.assertIn("E1", out["effectiveness"]["ineffective_ids"])
+        self.assertEqual(out["reinvestigation"]["reason_code"],
+                         specify.RI_DATASOURCE_REGRESSION)
 
 
 class TestCalleeContractGrounding(unittest.TestCase):

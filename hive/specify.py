@@ -38,6 +38,7 @@ import os
 import re
 from typing import Any
 
+from hive import dbread
 from hive.investigate import SEED_TARGET_SECTION
 from hive.parse import extract_first_json
 from hive.providers import call_worker
@@ -121,6 +122,7 @@ RI_INEFFECTIVE = "ineffective"
 RI_INCONCLUSIVE = "inconclusive"
 RI_SEED_TARGET_UNCOVERED = "seed_target_uncovered"
 RI_DEFERRED_ROOT_CAUSE = "deferred_root_cause"
+RI_DATASOURCE_REGRESSION = "datasource_regression"
 RI_LEGACY_COERCE = "legacy_coerce"
 RI_AUTHOR_DECLARED = "author_declared"
 
@@ -942,6 +944,88 @@ def _incomplete_wiring_ids(spec: dict[str, Any], codebase_root: str) -> dict[str
     return incomplete
 
 
+# The PRIMARY read source of a SQL statement embedded in code — the first ``FROM <table>``.
+# An alias (``FROM project_modules pm``) is captured as the table only (\w stops at the
+# space). Case-insensitive; DML-read keyword only (we ground the source a SELECT returns).
+_RE_SQL_FROM = re.compile(r"\bFROM\s+([A-Za-z_][A-Za-z0-9_]*)", re.IGNORECASE)
+
+
+def _primary_from_table(text: str) -> str | None:
+    """The first ``FROM <table>`` in a code blob, or None — the read's primary source."""
+    m = _RE_SQL_FROM.search(text or "")
+    return m.group(1) if m else None
+
+
+def _datasource_regression_ids(spec: dict[str, Any], db_conn: Any) -> dict[str, str]:
+    """Edit ids that switch a SQL read's PRIMARY source table to an empty/sparser one → id→reason.
+
+    N176: the author rewrote a working modules query from ``SELECT DISTINCT module FROM
+    groups`` (2 rows) to a ``project_modules``-first read (1 row) on the GUESS that
+    ``project_modules`` is "authoritative" — never grounding the claim against the live DB,
+    so the dropdown lost a module. This is the data-location analogue of the callee-contract
+    gap (N175): a factual claim ("the data lives in table X") emitted as ready without being
+    grounded. When a live DB connection is configured for the codebase, we check it
+    deterministically: an anchor edit whose replacement changes the FIRST ``FROM`` table of
+    a read is flagged when the new table is MISSING, EMPTY (0 rows), or holds STRICTLY FEWER
+    rows than the table it abandoned. Fail-closed: no db_conn, or any introspection/count
+    failure, simply skips (never a false positive on a DB we cannot read). Downgrade-only —
+    a flagged spec loops back to re-investigate (a cheap re-run beats a wrong apply).
+    """
+    if db_conn is None:
+        return {}
+    try:
+        schema = dbread.list_schema(db_conn)
+    except dbread.DbReadError:
+        return {}
+    if not schema:
+        return {}
+    # case-insensitive table-name resolution against the live catalog
+    by_lower = {t.lower(): t for t in schema}
+
+    counts: dict[str, int] = {}
+    def _count(real_table: str) -> int | None:
+        if real_table not in counts:
+            try:
+                counts[real_table] = dbread.count_rows(db_conn, real_table)
+            except dbread.DbReadError:
+                return None
+        return counts[real_table]
+
+    findings: dict[str, str] = {}
+    for e in spec.get("edits") or []:
+        if not isinstance(e, dict) or e.get("kind", "edit") == "create_file":
+            continue
+        old_primary = _primary_from_table(e.get("anchor_old") or "")
+        new_primary = _primary_from_table(e.get("replacement_new") or "")
+        if not new_primary or not old_primary:
+            continue
+        if new_primary.lower() == old_primary.lower():
+            continue  # primary read source unchanged → nothing to ground
+        eid = str(e.get("id", "?"))
+        new_real = by_lower.get(new_primary.lower())
+        if new_real is None:
+            findings[eid] = (
+                f"data-source not grounded — edit switches the primary read to table "
+                f"{new_primary!r}, which does not exist in the live DB")
+            continue
+        n_new = _count(new_real)
+        if n_new is None:
+            continue  # cannot count → skip (fail-closed)
+        if n_new == 0:
+            findings[eid] = (
+                f"data-source regression — edit switches the primary read from "
+                f"{old_primary!r} to {new_primary!r}, which is EMPTY (0 rows) in the live DB")
+            continue
+        old_real = by_lower.get(old_primary.lower())
+        n_old = _count(old_real) if old_real else None
+        if n_old is not None and n_new < n_old:
+            findings[eid] = (
+                f"data-source regression — edit switches the primary read from "
+                f"{old_primary!r} ({n_old} rows) to {new_primary!r} ({n_new} rows), reducing "
+                f"coverage; verify against the live DB which table actually holds the data")
+    return findings
+
+
 # ── Callee-contract grounding (N175 round-2) ───────────────────────────────────
 # _incomplete_wiring_ids above proves an added import is USED; it does NOT prove the
 # call is invoked CORRECTLY. N175 round-2: an edit added a real, used call —
@@ -1444,6 +1528,7 @@ def _apply_effectiveness_gate(
     judgments: dict[str, dict],
     inconclusive: bool,
     incomplete_wiring: dict[str, str] | None = None,
+    datasource_ids: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """Downgrade a ready spec that contains ineffective edits or could not be verified.
 
@@ -1459,6 +1544,7 @@ def _apply_effectiveness_gate(
     edits = [e for e in (spec.get("edits") or []) if isinstance(e, dict)]
     noop_set = {str(x) for x in noop_ids}
     incomplete = {str(k): v for k, v in (incomplete_wiring or {}).items()}
+    datasource = {str(k): v for k, v in (datasource_ids or {}).items()}
     ineffective: dict[str, str] = {}
     certain_ids: set[str] = set()      # deterministic findings (no-op / incomplete wiring)
     review_flagged: set[str] = set()   # findings from the LLM review only
@@ -1475,6 +1561,13 @@ def _apply_effectiveness_gate(
         # wiring is half-done — flag it the same way as a no-op (the fix won't work).
         if eid in incomplete:
             ineffective[eid] = incomplete[eid]
+            certain_ids.add(eid)
+            continue
+        # Deterministic data-source grounding (N176): a SQL read switched to an
+        # empty/sparser/missing table (checked against the live DB) won't return the
+        # rows the symptom needs — a certain finding, same as a no-op.
+        if eid in datasource:
+            ineffective[eid] = datasource[eid]
             certain_ids.add(eid)
             continue
         j = judgments.get(eid)
@@ -1536,7 +1629,11 @@ def _apply_effectiveness_gate(
                            sorted(ineffective), _INEFFECTIVE_TERMINATION)
             note = "effectiveness gate: " + "; ".join(
                 f"{k} {v}" for k, v in sorted(ineffective.items()))
-            reason_code = RI_INEFFECTIVE
+            # A data-source regression is an evidence gap (we read the wrong table),
+            # not a wrong causal stitch — route it to re_retrieve to find the real
+            # source rather than re_converge.
+            reason_code = (RI_DATASOURCE_REGRESSION
+                           if set(ineffective) & set(datasource) else RI_INEFFECTIVE)
     elif inconclusive:
         logger.warning("specify: effectiveness review inconclusive — downgrading "
                        "ready_to_apply to %s (re-investigate)", _INCONCLUSIVE_TERMINATION)
@@ -1799,15 +1896,17 @@ def _review_and_gate(
     ledger=None,
     provider_kwargs: dict | None = None,
     docs_root: str | None = None,
+    db_conn: Any = None,
 ) -> dict[str, Any]:
     """Run both halves of the effectiveness gate and adjust the spec's termination."""
     noop_ids = _deterministic_noop_ids(spec)
     incomplete_wiring = _incomplete_wiring_ids(spec, codebase_root)
+    datasource_ids = _datasource_regression_ids(spec, db_conn)
     judgments, inconclusive = review_effectiveness(
         honey_text, spec, codebase_root, model, provider, ledger, provider_kwargs,
         docs_root=docs_root)
     return _apply_effectiveness_gate(spec, noop_ids, judgments, inconclusive,
-                                     incomplete_wiring)
+                                     incomplete_wiring, datasource_ids)
 
 
 def run_specify(
@@ -1826,6 +1925,7 @@ def run_specify(
     review_provider: str | None = None,
     author_timeout: int = _AUTHOR_TIMEOUT_DEFAULT,
     author_retries: int = 0,
+    db_conn: Any = None,
 ) -> dict[str, Any]:
     """Run the specify stage: honey + live code → edit-spec JSON.
 
@@ -1950,7 +2050,8 @@ def run_specify(
     if review:
         spec = _review_and_gate(spec, honey_text, codebase_root,
                                 review_model or model, review_provider or provider,
-                                ledger, provider_kwargs, docs_root=docs_root)
+                                ledger, provider_kwargs, docs_root=docs_root,
+                                db_conn=db_conn)
 
     # Decisiveness gate: a verified+effective edit must be applyable even when the
     # honey also surfaced optional/policy directions (which sit in deferred[]).
