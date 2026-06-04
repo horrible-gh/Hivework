@@ -56,8 +56,15 @@ def create_bundle(
 
     Captures each file's current bytes BEFORE any edit is applied, so a later
     ``restore_bundle`` reproduces the exact pre-write state. Returns a dict with
-    ``dir`` (bundle path), ``originals`` (rel -> original text, for in-process
+    ``dir`` (bundle path), ``originals`` (rel -> original *bytes*, for in-process
     rollback), and the manifest.
+
+    Snapshots are taken in BINARY (``rb``/``wb``) — never text mode. A text-mode
+    round-trip rewrites line endings to the host's ``os.linesep`` (LF→CRLF on
+    Windows, CRLF→LF elsewhere), so a snapshot of a file whose EOL differs from
+    the platform default would no longer be byte-identical to the original and a
+    restore could not reproduce the exact pre-edit state (the EOL-drift FlowGate
+    hit). Binary keeps the snapshot bit-for-bit.
 
     ``created_paths`` lists files that do not yet exist and will be written by
     this run. They have no bytes to snapshot, so the bundle records them under
@@ -79,17 +86,17 @@ def create_bundle(
     # would land in a missing directory.
     os.makedirs(bundle_dir, exist_ok=True)
 
-    originals: dict[str, str] = {}
+    originals: dict[str, bytes] = {}
     saved: list[str] = []
     for rel in rel_paths:
         abs_src = os.path.join(codebase_root, rel)
-        with open(abs_src, "r", encoding="utf-8") as f:
-            text = f.read()
-        originals[rel] = text
+        with open(abs_src, "rb") as f:
+            data = f.read()
+        originals[rel] = data
         abs_dst = os.path.join(files_dir, rel)
         os.makedirs(os.path.dirname(abs_dst), exist_ok=True)
-        with open(abs_dst, "w", encoding="utf-8") as f:
-            f.write(text)
+        with open(abs_dst, "wb") as f:
+            f.write(data)
         saved.append(rel)
 
     created: list[str] = list(created_paths) if created_paths else []
