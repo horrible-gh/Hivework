@@ -368,6 +368,41 @@ class TestRunApplyWrite(unittest.TestCase):
         with self.assertRaises(ValueError):
             apply.run_apply(self.spec_path, write=True)
 
+    def test_write_preserves_crlf_and_restore_round_trips(self):
+        # Regression (FlowGate EOL drift): a CRLF file must stay CRLF after a write,
+        # and the backup must restore it byte-for-byte. The LF-based anchor still
+        # matches the CRLF file because matching runs on '\n'-normalized text.
+        crlf = b"before\r\nx = 1\r\nafter\r\n"
+        with open(self.target, "wb") as f:
+            f.write(crlf)
+        self._write_spec(_spec([_edit("x = 1", "x = 2")], codebase_root=self.root))
+        proposal = apply.run_apply(
+            self.spec_path, write=True, backup_root=self.backup_root, ttl_hours=24)
+        self.assertTrue(proposal["write"]["ok"])
+        with open(self.target, "rb") as f:
+            self.assertEqual(f.read(), b"before\r\nx = 2\r\nafter\r\n")  # CRLF kept
+        # Snapshot is the verbatim pre-write bytes → restore is byte-exact.
+        from hive import backup as _bk
+        _bk.restore_bundle(proposal["write"]["bundle"])
+        with open(self.target, "rb") as f:
+            self.assertEqual(f.read(), crlf)
+
+    def test_write_preserves_lf_on_any_platform(self):
+        # A pure-LF file must NOT be rewritten to the host os.linesep (LF→CRLF on
+        # Windows was the exact corruption that broke restore byte-fidelity).
+        lf = b"const a = 1\nconst b = 2\n"
+        target = os.path.join(self.root, "x.ts")
+        with open(target, "wb") as f:
+            f.write(lf)
+        self._write_spec(_spec(
+            [_edit("const a = 1", "const a = 99", file="x.ts")],
+            codebase_root=self.root))
+        proposal = apply.run_apply(
+            self.spec_path, write=True, backup_root=self.backup_root, ttl_hours=24)
+        self.assertTrue(proposal["write"]["ok"])
+        with open(target, "rb") as f:
+            self.assertEqual(f.read(), b"const a = 99\nconst b = 2\n")  # still LF
+
     def test_multiple_edits_same_file_compose(self):
         with open(self.target, "w", encoding="utf-8") as f:
             f.write("a = 1\nb = 2\n")

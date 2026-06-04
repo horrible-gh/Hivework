@@ -87,6 +87,54 @@ def load_spec(spec_path: str) -> dict[str, Any]:
         return json.load(f)
 
 
+_UTF8_BOM = b"\xef\xbb\xbf"
+
+
+def _norm_nl(s: str) -> str:
+    """Normalize any EOL flavour in ``s`` to ``\\n`` (universal-newline form)."""
+    return s.replace("\r\n", "\n").replace("\r", "\n")
+
+
+def _decode_preserving(raw: bytes) -> tuple[str, str, bool]:
+    """Decode file bytes to ``\\n``-normalized text, remembering its EOL + BOM.
+
+    Returns ``(text, eol, had_bom)`` where ``text`` is normalized to ``\\n`` so the
+    LF-based anchors specify captures match regardless of the file's on-disk EOL,
+    ``eol`` is the file's dominant newline (``\\r\\n`` / ``\\n`` / ``\\r``) and
+    ``had_bom`` flags a UTF-8 BOM. Pairing this with :func:`_encode_preserving`
+    lets apply re-write a file in its ORIGINAL EOL + encoding rather than the
+    host's ``os.linesep`` — Hive must never reformat a file it only edited a few
+    lines of (the EOL-drift FlowGate hit).
+    """
+    had_bom = raw.startswith(_UTF8_BOM)
+    if had_bom:
+        raw = raw[len(_UTF8_BOM):]
+    s = raw.decode("utf-8")
+    crlf = s.count("\r\n")
+    cr = s.count("\r") - crlf
+    lf = s.count("\n") - crlf
+    if crlf and crlf >= lf and crlf >= cr:
+        eol = "\r\n"
+    elif cr and cr > lf:
+        eol = "\r"
+    else:
+        eol = "\n"
+    return _norm_nl(s), eol, had_bom
+
+
+def _encode_preserving(text: str, eol: str, had_bom: bool) -> bytes:
+    """Inverse of :func:`_decode_preserving`: re-apply EOL + BOM, encode UTF-8."""
+    body = text if eol == "\n" else text.replace("\n", eol)
+    data = body.encode("utf-8")
+    return _UTF8_BOM + data if had_bom else data
+
+
+def _read_text_preserving(abs_path: str) -> tuple[str, str, bool]:
+    """Read a file as ``\\n``-normalized text plus its (eol, had_bom) fingerprint."""
+    with open(abs_path, "rb") as f:
+        return _decode_preserving(f.read())
+
+
 def render_unified_diff(rel_path: str, original: str, modified: str) -> str:
     """Render a git-style unified diff from ``original`` to ``modified``.
 
@@ -218,8 +266,10 @@ def evaluate_edit(edit: dict[str, Any], codebase_root: str) -> dict[str, Any]:
     edit_id = edit.get("id", "?")
     rel_path = edit.get("file", "")
     kind = edit.get("kind", "edit")
-    anchor_old = edit.get("anchor_old", "")
-    replacement_new = edit.get("replacement_new", "")
+    # Normalize anchor/replacement EOL to '\n' so matching is EOL-agnostic against
+    # the '\n'-normalized file text (the file's real EOL is re-applied at write time).
+    anchor_old = _norm_nl(edit.get("anchor_old", ""))
+    replacement_new = _norm_nl(edit.get("replacement_new", ""))
 
     result: dict[str, Any] = {
         "id": edit_id,
@@ -267,8 +317,7 @@ def evaluate_edit(edit: dict[str, Any], codebase_root: str) -> dict[str, Any]:
         result["messages"].append(f"file not found under codebase root: {rel_path}")
         return result
 
-    with open(abs_path, "r", encoding="utf-8") as f:
-        file_text = f.read()
+    file_text, _eol, _bom = _read_text_preserving(abs_path)
 
     if anchor_old == replacement_new:
         result["status"] = NO_CHANGE
@@ -476,15 +525,16 @@ def write_edits(
         result["reason"] = f"could not snapshot originals for backup: {e}"
         return result
     result["bundle"] = bundle["dir"]
-    originals: dict[str, str] = bundle["originals"]
+    originals: dict[str, bytes] = bundle["originals"]
     created_written: list[str] = []  # create_file paths written so far (for rollback)
 
     def _rollback() -> None:
-        for rel, text in originals.items():
+        # Restore the exact pre-write bytes (binary) — a text-mode rewrite here would
+        # re-normalize EOL and defeat the whole point of the snapshot.
+        for rel, data in originals.items():
             try:
-                with open(os.path.join(codebase_root, rel), "w",
-                          encoding="utf-8") as f:
-                    f.write(text)
+                with open(os.path.join(codebase_root, rel), "wb") as f:
+                    f.write(data)
             except OSError as e:
                 logger.error("rollback failed for %s: %s", rel, e)
         for rel in created_written:
@@ -509,17 +559,20 @@ def write_edits(
                 return result
             content = edit.get("content", "")
             os.makedirs(os.path.dirname(abs_path) or ".", exist_ok=True)
-            with open(abs_path, "w", encoding="utf-8") as f:
-                f.write(content)
+            # Binary write: emit the spec's content bytes verbatim (no os.linesep
+            # translation), so a new file isn't silently reformatted to host EOL.
+            with open(abs_path, "wb") as f:
+                f.write(content.encode("utf-8"))
             created_written.append(rel)
             if rel not in written:
                 written.append(rel)
             continue
 
-        anchor_old = edit.get("anchor_old", "")
-        replacement_new = edit.get("replacement_new", "")
-        with open(abs_path, "r", encoding="utf-8") as f:
-            text = f.read()
+        anchor_old = _norm_nl(edit.get("anchor_old", ""))
+        replacement_new = _norm_nl(edit.get("replacement_new", ""))
+        # Read '\n'-normalized text for matching, but remember the file's real EOL
+        # and BOM so the rewrite preserves them byte-for-byte.
+        text, eol, had_bom = _read_text_preserving(abs_path)
         occurrences = text.count(anchor_old) if anchor_old else 0
         if occurrences != 1:
             result["reason"] = (
@@ -529,8 +582,8 @@ def write_edits(
             return result
 
         modified = text.replace(anchor_old, replacement_new, 1)
-        with open(abs_path, "w", encoding="utf-8") as f:
-            f.write(modified)
+        with open(abs_path, "wb") as f:
+            f.write(_encode_preserving(modified, eol, had_bom))
         if rel not in written:
             written.append(rel)
 
