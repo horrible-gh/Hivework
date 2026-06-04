@@ -1119,6 +1119,91 @@ class TestSeedCoverageGate(unittest.TestCase):
         self.assertEqual(len(out["seed_coverage"]["missing"]), 2)
 
 
+class TestReinvestigationReason(unittest.TestCase):
+    """Step A: every gate that lands a spec in needs_reinvestigation stamps a
+    machine-readable ``spec['reinvestigation']`` reason so the reactive bridge can
+    route by cause. The structured field is the single source of truth (last gate
+    wins) and is cleared when a spec is promoted back to ready_to_apply."""
+
+    def test_normalize_stale_anchor_stamps_reason(self):
+        spec = _fresh_ready()
+        spec["edits"][0]["anchor_status"] = "stale"
+        out = specify._normalize_spec(spec)
+        self.assertEqual(out["termination"], "needs_reinvestigation")
+        self.assertEqual(out["reinvestigation"]["reason_code"], specify.RI_STALE_ANCHOR)
+        self.assertEqual(out["reinvestigation"]["gate"], "normalize")
+
+    def test_normalize_legacy_needs_pm_stamps_reason(self):
+        out = specify._normalize_spec({"edits": [], "termination": "needs_pm"})
+        self.assertEqual(out["reinvestigation"]["reason_code"], specify.RI_LEGACY_COERCE)
+
+    def test_effectiveness_ineffective_stamps_reason(self):
+        out = specify._apply_effectiveness_gate(
+            _fresh_ready(), [],
+            {"E1": {"effective": False, "coherent": True, "reason": "never reached"}}, False)
+        self.assertEqual(out["reinvestigation"]["reason_code"], specify.RI_INEFFECTIVE)
+        self.assertEqual(out["reinvestigation"]["gate"], "effectiveness")
+
+    def test_effectiveness_inconclusive_stamps_reason(self):
+        out = specify._apply_effectiveness_gate(_fresh_ready(), [], {}, True)
+        self.assertEqual(out["reinvestigation"]["reason_code"], specify.RI_INCONCLUSIVE)
+
+    def test_anchor_not_grounded_stamps_reason(self):
+        spec = {
+            "edits": [{"id": "E1", "file": "server/sql/queries/queries.json",
+                       "anchor_old": "x", "replacement_new": "y",
+                       "anchor_status": "verified"}],
+            "deferred": [{"issue": "queries.json not in evidence",
+                          "reason": "anchor_not_grounded"}],
+            "termination": "ready_to_apply", "notes": "",
+        }
+        out = specify._apply_anchor_not_grounded_gate(spec)
+        self.assertEqual(out["reinvestigation"]["reason_code"],
+                         specify.RI_ANCHOR_NOT_GROUNDED)
+
+    def test_seed_coverage_stamps_reason(self):
+        spec = {
+            "edits": [{"id": "E1", "file": "server/sql/queries/queries.json"}],
+            "deferred": [], "termination": "ready_to_apply", "notes": "",
+        }
+        out = specify._apply_seed_coverage_gate(spec, _HONEY_WITH_TARGETS)
+        self.assertEqual(out["reinvestigation"]["reason_code"],
+                         specify.RI_SEED_TARGET_UNCOVERED)
+        self.assertIn("workflowViewState.spec.ts", out["reinvestigation"]["detail"])
+
+    def test_decisiveness_promotion_clears_reason(self):
+        # A downgraded spec carrying a structured reason, when promoted back to ready,
+        # must not keep a stale reinvestigation field.
+        spec = {
+            "edits": [{"id": "E1", "file": "a.py", "anchor_old": "x = 1",
+                       "replacement_new": "x = 2", "confidence": "high",
+                       "anchor_status": "verified"}],
+            "deferred": [{"issue": "optional", "reason": "policy_direction"}],
+            "termination": "needs_reinvestigation",
+            "effectiveness": {"inconclusive": False, "ineffective_ids": []},
+            "reinvestigation": {"reason_code": specify.RI_INEFFECTIVE, "gate": "x",
+                                "detail": "stale"},
+            "notes": "",
+        }
+        out = specify._apply_decisiveness_gate(spec)
+        self.assertEqual(out["termination"], "ready_to_apply")
+        self.assertNotIn("reinvestigation", out)
+
+    def test_author_declared_reason_filled_by_finalizer(self):
+        spec = {"termination": "needs_reinvestigation",
+                "notes": "author could not ground the head hop"}
+        out = specify._ensure_reinvestigation_reason(spec)
+        self.assertEqual(out["reinvestigation"]["reason_code"],
+                         specify.RI_AUTHOR_DECLARED)
+        self.assertIn("head hop", out["reinvestigation"]["detail"])
+
+    def test_finalizer_strips_reason_from_non_nr_spec(self):
+        spec = {"termination": "ready_to_apply",
+                "reinvestigation": {"reason_code": "stale"}}
+        out = specify._ensure_reinvestigation_reason(spec)
+        self.assertNotIn("reinvestigation", out)
+
+
 class TestVerifyAnchorsLive(unittest.TestCase):
     """N175 E7: a 'verified' anchor must be re-confirmed against LIVE disk, not trusted
     from the author's claim. _verify_anchors_live downgrades a verified-but-absent or

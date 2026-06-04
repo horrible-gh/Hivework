@@ -10,8 +10,8 @@ import unittest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from hive.searchplan import (
-    extract_doc_topics, extract_globs, extract_keywords, task_to_searchplan,
-    is_visibility_symptom, with_visibility_probe,
+    coverage_risk, extract_doc_topics, extract_globs, extract_keywords,
+    task_to_searchplan, is_visibility_symptom, with_visibility_probe,
 )
 from hive.retriever import SearchPlan
 
@@ -189,6 +189,30 @@ class TestVisibilityProbe(unittest.TestCase):
         # case-insensitive de-dupe: v-if not duplicated
         self.assertEqual(twice.keywords.count("v-if"), 1)
         self.assertEqual(once.keywords, twice.keywords)
+
+
+class TestCoverageRisk(unittest.TestCase):
+    """The queen's coverage_risk self-doubt flag normalises to "thin"|"ok" (B1)."""
+
+    def test_canonical_thin(self):
+        self.assertEqual(coverage_risk({"coverage_risk": "thin"}), "thin")
+
+    def test_canonical_ok(self):
+        self.assertEqual(coverage_risk({"coverage_risk": "ok"}), "ok")
+
+    def test_synonyms_coerce_to_thin(self):
+        for v in ("high", "risky", "low", "weak", "uncertain", "true", "THIN", " Thin "):
+            self.assertEqual(coverage_risk({"coverage_risk": v}), "thin", v)
+
+    def test_bool_true_is_thin_false_is_ok(self):
+        self.assertEqual(coverage_risk({"coverage_risk": True}), "thin")
+        self.assertEqual(coverage_risk({"coverage_risk": False}), "ok")
+
+    def test_absent_or_empty_defaults_ok(self):
+        # Opt-in: a queen that never emitted the field is NOT treated as flagged.
+        for task in ({}, {"coverage_risk": ""}, {"coverage_risk": None},
+                     {"coverage_risk": "anything-else"}, {"id": "A"}):
+            self.assertEqual(coverage_risk(task), "ok", task)
 
 
 if __name__ == "__main__":

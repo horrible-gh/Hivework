@@ -147,3 +147,12 @@ def test_prompt_embeds_literal_preview_with_bait_framing():
 def test_prompt_omits_literal_section_when_none():
     prompt = build_decompose_prompt("fix it", literal_preview="")
     assert "LITERAL PRE-GREP" not in prompt
+
+
+def test_contract_carries_coverage_risk_self_doubt_flag():
+    # B1: the queen is asked to self-flag axes whose blind grep may find nothing,
+    # so a downstream (flag ∧ empty-FIND) check can reinforce only those.
+    prompt = build_decompose_prompt("fix it")
+    assert "coverage_risk" in prompt
+    assert '"thin"' in prompt                  # the canonical flag value
+    assert "self-doubt" in prompt              # framed as confidence, not a verdict

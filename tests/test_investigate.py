@@ -17,7 +17,13 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from hive import investigate as INV
 from hive.config import load_config
 from hive.providers import WorkerResult
-from hive.investigate import render_local_honey, _prioritize_axes
+from hive.investigate import (
+    render_local_honey, _prioritize_axes, _axis_coverage, _coverage_phrase,
+    rerun_reinvestigation,
+)
+from hive.reinvestigate import (
+    ReinvestPlan, ACTION_RE_CONVERGE, ACTION_RE_RETRIEVE,
+)
 
 
 def _wr(stdout: str) -> WorkerResult:
@@ -637,6 +643,181 @@ class TestConvergeFragments(unittest.TestCase):
         frags = INV._converge_fragments(verdicts)
         self.assertEqual(len(frags), 1)
         self.assertEqual(frags[0]["verdict"]["file"], "a.py")
+
+
+class TestAxisCoverage(unittest.TestCase):
+    """(B2/#5) The (flag ∧ thin) sufficiency tag — free, deterministic."""
+
+    def _stats(self, *, raw=5, snips=3, dropped=None, kept=None):
+        gv = {}
+        if dropped is not None:
+            gv["dropped_empty"] = dropped
+        if kept is not None:
+            gv["kept"] = kept
+        return {"raw_hits": raw, "snippets": snips, "glob_validation": gv}
+
+    def test_flagged_and_empty_find_needs_reinforcement(self):
+        cov = _axis_coverage(True, self._stats(raw=0, snips=0))
+        self.assertTrue(cov["flagged"])
+        self.assertTrue(cov["thin"])
+        self.assertTrue(cov["needs_reinforcement"])
+        self.assertFalse(cov["sufficient"])
+
+    def test_flagged_but_find_not_empty_is_sufficient(self):
+        # queen self-doubt that the FIND disproves → no reinforcement.
+        cov = _axis_coverage(True, self._stats(raw=5, snips=3))
+        self.assertTrue(cov["flagged"])
+        self.assertFalse(cov["thin"])
+        self.assertFalse(cov["needs_reinforcement"])
+        self.assertTrue(cov["sufficient"])
+
+    def test_thin_without_flag_does_not_reinforce(self):
+        cov = _axis_coverage(False, self._stats(raw=0, snips=0))
+        self.assertTrue(cov["thin"])
+        self.assertFalse(cov["needs_reinforcement"])
+
+    def test_all_globs_empty_is_thin(self):
+        cov = _axis_coverage(True, self._stats(raw=2, snips=1,
+                                               dropped=["x/*.py"], kept=[]))
+        self.assertTrue(cov["thin"])
+        self.assertTrue(cov["needs_reinforcement"])
+
+    def test_globs_dropped_but_some_kept_not_thin_on_that_signal(self):
+        # one empty glob but another kept + real hits → not starved.
+        cov = _axis_coverage(False, self._stats(raw=4, snips=2,
+                                                dropped=["x/*.py"], kept=["y/*.py"]))
+        self.assertFalse(cov["thin"])
+
+
+class TestCoveragePhrase(unittest.TestCase):
+    """(C/#5) honey clause separating a retrieval gap from a reasoning gap."""
+
+    def test_needs_reinforcement_phrase(self):
+        p = _coverage_phrase({"needs_reinforcement": True, "thin": True})
+        self.assertIn("THIN", p)
+        self.assertIn("re-retrieve", p)
+
+    def test_thin_unflagged_phrase(self):
+        p = _coverage_phrase({"needs_reinforcement": False, "thin": True})
+        self.assertIn("thin", p)
+        self.assertNotIn("THIN", p)
+
+    def test_sufficient_phrase_directs_honest_defer(self):
+        p = _coverage_phrase({"needs_reinforcement": False, "thin": False,
+                              "sufficient": True})
+        self.assertIn("sufficient", p)
+        self.assertIn("defer honestly", p)
+
+    def test_missing_tag_is_empty(self):
+        self.assertEqual(_coverage_phrase(None), "")
+        self.assertEqual(_coverage_phrase({}), " — evidence sufficient (the FIND "
+                         "retrieved code here): retrieval was NOT the gap, so defer "
+                         "honestly — re-fetching the same scope will not help")
+
+
+class TestHoneyCoverageRendering(unittest.TestCase):
+    """The local honey surfaces the sufficiency tag on unlocated axes (C/#5)."""
+
+    def _result(self, coverage):
+        return {
+            "axes_judged": 1, "axes_total": 1, "seed_kind": "fix", "converge": None,
+            "verdicts": [{
+                "axis_id": "A", "title": "thin axis",
+                "verdict": {"located": False, "file": "", "lines": "", "reason": "no hit"},
+                "candidates": [], "coverage": coverage,
+            }],
+        }
+
+    def test_thin_axis_renders_reretrieve_hint(self):
+        honey = render_local_honey(self._result(
+            {"needs_reinforcement": True, "thin": True, "sufficient": False}),
+            "fix the bug")
+        self.assertIn("EVIDENCE note", honey)
+        self.assertIn("re-retrieve", honey)
+
+    def test_sufficient_axis_directs_honest_defer(self):
+        honey = render_local_honey(self._result(
+            {"needs_reinforcement": False, "thin": False, "sufficient": True}),
+            "fix the bug")
+        self.assertIn("defer honestly", honey)
+
+    def test_verdict_without_coverage_omits_note(self):
+        r = self._result(None)
+        r["verdicts"][0].pop("coverage")
+        honey = render_local_honey(r, "fix the bug")
+        self.assertNotIn("EVIDENCE note", honey)
+
+
+class TestRerunReinvestigation(unittest.TestCase):
+    """Reaction #3 LIVE re-run: gated, bounded, reuses converge on re-grounded evidence."""
+
+    def setUp(self):
+        self.cfg = load_config()
+        self.tmp = tempfile.mkdtemp(prefix="hive_reinv_")
+        self.honey = os.path.join(self.tmp, "h.honey.md")
+
+    def _located_verdicts(self):
+        def v(axis):
+            return {"axis_id": axis, "title": f"axis {axis}",
+                    "search_plan": {"keywords": ["k"], "file_globs": ["s/*.py"],
+                                    "doc_topics": []},
+                    "verdict": {"located": True, "file": f"{axis}.py", "lines": "1-2",
+                                "reason": "r"},
+                    "candidates": [{"file": f"{axis}.py", "lines": "1-2", "reason": "r"}]}
+        return [v("A"), v("B")]
+
+    def _result(self, verdicts):
+        return {"axes_judged": len(verdicts), "axes_total": len(verdicts),
+                "seed_kind": "fix", "converge": None, "verdicts": verdicts}
+
+    def _plan(self, action):
+        return ReinvestPlan(action=action, reason_code="ineffective",
+                            axis_ids=["A", "B"])
+
+    def test_live_off_is_noop(self):
+        self.cfg.reinvestigation.live = False
+        with mock.patch.object(INV, "run_converge") as rc:
+            out = rerun_reinvestigation(
+                self._plan(ACTION_RE_CONVERGE), self._result(self._located_verdicts()),
+                seed_text="s", code_root=".", docs_root=None, cfg=self.cfg,
+                honey_out=self.honey)
+        self.assertIsNone(out)
+        rc.assert_not_called()                     # gated BEFORE any spend
+
+    def test_re_converge_live_restitches_and_rerenders_honey(self):
+        self.cfg.reinvestigation.live = True
+        cres = mock.MagicMock()
+        cres.as_dict.return_value = {"converged": True, "summary": "re-stitched"}
+        with mock.patch.object(INV, "run_converge", return_value=cres), \
+             mock.patch.object(INV, "retrieve", return_value={"axis_id": "X", "stats": {}}):
+            out = rerun_reinvestigation(
+                self._plan(ACTION_RE_CONVERGE), self._result(self._located_verdicts()),
+                seed_text="s", code_root=".", docs_root=None, cfg=self.cfg,
+                honey_out=self.honey)
+        self.assertIsNotNone(out)
+        self.assertEqual(out["converge"], {"converged": True, "summary": "re-stitched"})
+        self.assertTrue(os.path.exists(self.honey))   # honey re-rendered for re-specify
+
+    def test_re_converge_under_two_located_returns_none(self):
+        self.cfg.reinvestigation.live = True
+        one = self._located_verdicts()[:1]
+        with mock.patch.object(INV, "run_converge") as rc, \
+             mock.patch.object(INV, "retrieve", return_value={"stats": {}}):
+            out = rerun_reinvestigation(
+                self._plan(ACTION_RE_CONVERGE), self._result(one),
+                seed_text="s", code_root=".", docs_root=None, cfg=self.cfg,
+                honey_out=self.honey)
+        self.assertIsNone(out)
+        rc.assert_not_called()                     # nothing to re-stitch → no spend
+
+    def test_re_retrieve_live_does_not_spend_yet(self):
+        # re_retrieve re-judge is intentionally not wired — must not re-spend on specify.
+        self.cfg.reinvestigation.live = True
+        out = rerun_reinvestigation(
+            self._plan(ACTION_RE_RETRIEVE), self._result(self._located_verdicts()),
+            seed_text="s", code_root=".", docs_root=None, cfg=self.cfg,
+            honey_out=self.honey)
+        self.assertIsNone(out)
 
 
 if __name__ == "__main__":

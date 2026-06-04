@@ -86,6 +86,46 @@ class TestConfigSafety(unittest.TestCase):
         cfg = self._load({"judge": {"max_axes": 2}})
         self.assertTrue(cfg.safety.allow_swarm)
 
+    def test_reinforce_independent_of_allow_swarm(self):
+        # B3 reinforcement has its OWN switch: enabling it must not flip allow_swarm,
+        # and its caps parse independently.
+        cfg = self._load({"safety": {"allow_swarm": False},
+                          "reinforce": {"enabled": True, "max_workers": 3,
+                                        "max_total_calls": 9}})
+        self.assertFalse(cfg.safety.allow_swarm)        # legacy swarm stays off
+        self.assertTrue(cfg.reinforce.enabled)
+        self.assertEqual(cfg.reinforce.max_workers, 3)
+        self.assertEqual(cfg.reinforce.max_total_calls, 9)
+
+    def test_reinforce_defaults_off(self):
+        cfg = self._load({"judge": {"max_axes": 2}})
+        self.assertFalse(cfg.reinforce.enabled)
+
+    def test_reinvestigation_defaults(self):
+        # Live re-run off by default; cap defaults to 2 (one re-run + one confirm).
+        cfg = self._load({"judge": {"max_axes": 2}})
+        self.assertFalse(cfg.reinvestigation.live)
+        self.assertEqual(cfg.reinvestigation.max_rounds, 2)
+
+    def test_reinvestigation_overrides_honored(self):
+        cfg = self._load({"reinvestigation": {"live": True, "max_rounds": 3}})
+        self.assertTrue(cfg.reinvestigation.live)
+        self.assertEqual(cfg.reinvestigation.max_rounds, 3)
+
+    def test_scout_defaults_to_swarm_when_unset(self):
+        # The B3 reinforcement worker (scout) inherits the swarm model when not named,
+        # so an existing roles.swarm config keeps working unchanged.
+        cfg = self._load({"roles": {"swarm": {"provider": "openai", "model": "m120"}}})
+        self.assertEqual(cfg.scout.provider, "openai")
+        self.assertEqual(cfg.scout.model, "m120")
+
+    def test_scout_override_is_independent_of_swarm(self):
+        cfg = self._load({"roles": {"swarm": {"provider": "openai", "model": "m120"},
+                                    "scout": {"provider": "copilot",
+                                              "model": "claude-sonnet-4.5"}}})
+        self.assertEqual(cfg.scout.model, "claude-sonnet-4.5")   # the reinforcement lever
+        self.assertEqual(cfg.swarm.model, "m120")                # legacy swarm untouched
+
 
 class TestConfigPartialFile(unittest.TestCase):
     """Partial config file: only override swarm model; others stay default."""
