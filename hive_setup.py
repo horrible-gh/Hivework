@@ -50,6 +50,13 @@ REPO = os.path.dirname(os.path.abspath(__file__))
 CONFIG = os.path.join(REPO, "hive.config.json")
 CONFIG_EXAMPLE = os.path.join(REPO, "hive.config.example.json")
 
+
+class GoBack(Exception):
+    """Raised by a text prompt when the user hits Ctrl+C to abort the CURRENT input
+    and return to the enclosing menu - instead of an uncaught KeyboardInterrupt that
+    kills the whole program (the old behaviour forced a quit + re-launch). Menu loops
+    catch this and redisplay, so Ctrl+C means 'back', not 'lose everything'."""
+
 # ── UI shim: prefer rich, fall back to plain stdio so a deps-less direct run still
 #    works. All text is ASCII so neither path can hit a code-page encode error.
 try:
@@ -78,12 +85,16 @@ try:
             return Prompt.ask(prompt, password=True, default="", show_default=False)
         except EOFError:
             return ""
+        except KeyboardInterrupt:
+            raise GoBack  # Ctrl+C aborts this input -> back to the menu, not a crash
 
     def ask_text(prompt: str, default: str = "") -> str:
         try:
             return Prompt.ask(prompt, default=default).strip()
         except EOFError:
             return default
+        except KeyboardInterrupt:
+            raise GoBack  # Ctrl+C aborts this input -> back to the menu, not a crash
 
     def ask_choice(prompt: str, choices: list[str], default: str) -> str:
         # EOF (piped/closed stdin) returns the default so menu loops terminate
@@ -112,15 +123,19 @@ except Exception:  # rich not installed (direct run before pip install) - plain 
     def ask_secret(prompt: str) -> str:
         try:
             return getpass.getpass(prompt + " ").strip()
-        except (EOFError, KeyboardInterrupt):
+        except EOFError:
             return ""
+        except KeyboardInterrupt:
+            raise GoBack  # Ctrl+C aborts this input -> back to the menu, not a crash
 
     def ask_text(prompt: str, default: str = "") -> str:
         suffix = f" [{default}]" if default else ""
         try:
             val = input(f"{prompt}{suffix}: ").strip()
-        except (EOFError, KeyboardInterrupt):
+        except EOFError:
             return default
+        except KeyboardInterrupt:
+            raise GoBack  # Ctrl+C aborts this input -> back to the menu, not a crash
         return val or default
 
     def ask_choice(prompt: str, choices: list[str], default: str) -> str:
@@ -628,16 +643,19 @@ def show_status() -> None:
 # ── Menus ────────────────────────────────────────────────────────────────────────
 def menu_config() -> None:
     while True:
-        choice = select_one("Config file",
-                            [("1", "Create hive.config.json from the example (if missing)"),
-                             ("2", "Show status"),
-                             ("b", "Back")], "b")
-        if choice == "1":
-            bootstrap_config()
-        elif choice == "2":
-            show_status()
-        else:
-            return
+        try:
+            choice = select_one("Config file",
+                                [("1", "Create hive.config.json from the example (if missing)"),
+                                 ("2", "Show status"),
+                                 ("b", "Back")], "b")
+            if choice == "1":
+                bootstrap_config()
+            elif choice == "2":
+                show_status()
+            else:
+                return
+        except GoBack:
+            continue  # Ctrl+C in a sub-prompt -> redisplay this menu
 
 
 def _edit_role(data: dict, name: str, available: set[str] | None = None) -> None:
@@ -705,20 +723,23 @@ def _custom_roles(data: dict, available: set[str]) -> None:
     just-applied preset."""
     info("\nCustom roles - provider menu is limited to the providers you selected.")
     while True:
-        roles = data.get("roles", {})
-        role_choices: list[tuple[str, str]] = []
-        for i, (name, desc) in enumerate(_ROLES, 1):
-            r = roles.get(name, {})
-            role_choices.append(
-                (str(i), f"{name:9s} {str(r.get('provider','-')):9s} "
-                         f"{str(r.get('model','-')):22s} {desc}"))
-        role_choices.append(("d", "Done (saves the config)"))
-        choice = select_one("Edit which role?", role_choices, "d")
-        if choice == "d":
-            _save_config_data(data)
-            ok(f"Saved config -> {CONFIG}")
-            return
-        _edit_role(data, _ROLES[int(choice) - 1][0], available)
+        try:
+            roles = data.get("roles", {})
+            role_choices: list[tuple[str, str]] = []
+            for i, (name, desc) in enumerate(_ROLES, 1):
+                r = roles.get(name, {})
+                role_choices.append(
+                    (str(i), f"{name:9s} {str(r.get('provider','-')):9s} "
+                             f"{str(r.get('model','-')):22s} {desc}"))
+            role_choices.append(("d", "Done (saves the config)"))
+            choice = select_one("Edit which role?", role_choices, "d")
+            if choice == "d":
+                _save_config_data(data)
+                ok(f"Saved config -> {CONFIG}")
+                return
+            _edit_role(data, _ROLES[int(choice) - 1][0], available)
+        except GoBack:
+            continue  # Ctrl+C while editing a role -> back to the role list
 
 
 def menu_guided(data: dict) -> None:
@@ -802,6 +823,7 @@ def menu_models() -> None:
 
 def menu_tokens() -> None:
     while True:
+      try:
         info("\nAPI tokens (stored OUTSIDE the repo - keys never live in the code):")
         info(f"  file: {_secrets_path()}")
         keys = _read_env()
@@ -853,31 +875,37 @@ def menu_tokens() -> None:
                 continue
             val = ask_secret(f"Value for {name} (blank = empty):")
             ok(f"{name} {_upsert_env(name, val.strip())}.")
+      except GoBack:
+        continue  # Ctrl+C in a token sub-prompt -> redisplay this menu
 
 
 def main() -> None:
     banner("Hivework setup")
     info("Menu-driven and idempotent - pick what to manage; nothing is forced.")
+    info("Tip: while typing a value, Ctrl+C goes BACK to the menu (it no longer quits).")
     show_status()
     while True:
-        choice = select_one("What do you want to manage?",
-            [("1", "Config file        - create / show hive.config.json"),
-             ("2", "Models & providers - guided: check providers, pick a preset or customize"),
-             ("3", "API tokens         - endpoint + keys in the secrets file"),
-             ("4", "Show status"),
-             ("q", "Quit")], "q")
-        if choice == "1":
-            menu_config()
-        elif choice == "2":
-            menu_models()
-        elif choice == "3":
-            menu_tokens()
-        elif choice == "4":
-            show_status()
-        else:
-            info("\nDone. Standalone runs read the secrets file automatically;")
-            info("via the launcher, the launcher's environment wins.")
-            return
+        try:
+            choice = select_one("What do you want to manage?",
+                [("1", "Config file        - create / show hive.config.json"),
+                 ("2", "Models & providers - guided: check providers, pick a preset or customize"),
+                 ("3", "API tokens         - endpoint + keys in the secrets file"),
+                 ("4", "Show status"),
+                 ("q", "Quit")], "q")
+            if choice == "1":
+                menu_config()
+            elif choice == "2":
+                menu_models()
+            elif choice == "3":
+                menu_tokens()
+            elif choice == "4":
+                show_status()
+            else:
+                info("\nDone. Standalone runs read the secrets file automatically;")
+                info("via the launcher, the launcher's environment wins.")
+                return
+        except GoBack:
+            continue  # stray Ctrl+C from a deep prompt -> never quits, just redisplay
 
 
 if __name__ == "__main__":
