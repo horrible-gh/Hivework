@@ -127,6 +127,43 @@ class TestConfigSafety(unittest.TestCase):
         self.assertEqual(cfg.swarm.model, "m120")                # legacy swarm untouched
 
 
+class TestTestRunners(unittest.TestCase):
+    """The per-codebase test_runners block (runtime red→green verify)."""
+
+    def _load(self, overrides):
+        tmpdir = tempfile.mkdtemp()
+        path = os.path.join(tmpdir, "hive.config.json")
+        with open(path, "w") as f:
+            json.dump(overrides, f)
+        return load_config(path=path)
+
+    def test_no_runners_by_default(self):
+        cfg = load_config(path="/nonexistent/hive.config.json")
+        self.assertEqual(cfg.test_runners, {})
+        self.assertIsNone(cfg.test_runner_for_codebase("/x/FlowGate"))
+
+    def test_runner_parsed_and_matched_by_key(self):
+        cfg = self._load({"test_runners": {"flowgate": {
+            "command": ["python", "-m", "pytest", "-q"], "cwd": "server",
+            "timeout_sec": 120, "env": {"PYTHONUNBUFFERED": "1"}}}})
+        r = cfg.test_runner_for_codebase("C:/work/FlowGate")
+        self.assertIsNotNone(r)
+        self.assertEqual(r.command, ["python", "-m", "pytest", "-q"])
+        self.assertEqual(r.cwd, "server")
+        self.assertEqual(r.timeout_sec, 120)
+        self.assertEqual(r.env, {"PYTHONUNBUFFERED": "1"})
+
+    def test_command_string_is_split(self):
+        cfg = self._load({"test_runners": {"x": {"command": "pytest -q"}}})
+        self.assertEqual(cfg.test_runners["x"].command, ["pytest", "-q"])
+
+    def test_explicit_codebase_binding_wins(self):
+        cfg = self._load({"test_runners": {"runner1": {
+            "command": ["pytest"], "codebase": "/abs/MyApp"}}})
+        self.assertIsNotNone(cfg.test_runner_for_codebase("/abs/MyApp"))
+        self.assertIsNone(cfg.test_runner_for_codebase("/abs/Other"))
+
+
 class TestConfigPartialFile(unittest.TestCase):
     """Partial config file: only override swarm model; others stay default."""
 

@@ -189,6 +189,31 @@ class DbConnection:
 
 
 @dataclass
+class RunnerConfig:
+    """One target codebase's test-runner command (for the runtime red→green verify).
+
+    NEUTRAL by design — no FlowGate (or any caller) semantics, mirroring
+    :class:`DbConnection`. ``command`` is the base argv to launch the target's test
+    suite (e.g. ``["python", "-m", "pytest", "-q"]``); ``verify_red_green`` appends
+    the specify-named red-test node id as the final positional argument, which pytest
+    / unittest ``-k`` targets / most runners accept. ``cwd`` is where to launch it
+    (relative paths resolve under the run's ``--codebase`` root, so ``"server"`` runs
+    pytest inside ``…/FlowGate/server`` where its conftest + DB fixtures live).
+
+    ``env`` injects extra environment for the run (e.g. a venv ``PATH`` / a test DB
+    URL) on top of the inherited environment. ``codebase`` optionally binds this entry
+    to an explicit codebase path; when absent the entry is matched to a run by its key
+    vs the ``--codebase`` leaf name (case-insensitive), so ``"flowgate"`` matches
+    ``…/FlowGate`` — the exact resolution :class:`DbConnection` uses.
+    """
+    command: list[str] = field(default_factory=list)
+    cwd: str = ""
+    timeout_sec: int = 300
+    env: dict[str, str] = field(default_factory=dict)
+    codebase: str = ""
+
+
+@dataclass
 class SafetyConfig:
     """Cost guard-rails enforced by the CLI before any spend.
 
@@ -305,6 +330,10 @@ class Config:
     # Empty by default — the converge data-state read is SKIPPED when a run's codebase
     # has no entry (graceful: converge falls back to its static path / needs_data).
     db_connections: dict[str, DbConnection] = field(default_factory=dict)
+    # Per-codebase test runners, keyed by a short name (e.g. "flowgate"). Empty by
+    # default — the runtime red→green verify (hive.verify) is SKIPPED when a run's
+    # codebase has no entry (graceful, exactly like db_connections above).
+    test_runners: dict[str, RunnerConfig] = field(default_factory=dict)
 
     def db_for_codebase(self, codebase_root: str | None) -> DbConnection | None:
         """Resolve the DB connection for a run's ``--codebase`` path, or None.
@@ -327,6 +356,27 @@ class Config:
         for key, conn in self.db_connections.items():
             if key.strip().lower() == leaf:
                 return conn
+        return None
+
+    def test_runner_for_codebase(self, codebase_root: str | None) -> "RunnerConfig | None":
+        """Resolve the test runner for a run's ``--codebase`` path, or None.
+
+        Same match order as :meth:`db_for_codebase`: an explicit ``codebase`` binding
+        wins, else the entry whose KEY equals the codebase's leaf folder name
+        (case-insensitive). Returns None when nothing matches (the common no-runner
+        case → runtime verify is skipped), never raises.
+        """
+        if not codebase_root or not self.test_runners:
+            return None
+        norm = codebase_root.replace("\\", "/").rstrip("/").lower()
+        leaf = norm.rsplit("/", 1)[-1]
+        for runner in self.test_runners.values():
+            cb = (runner.codebase or "").replace("\\", "/").rstrip("/").lower()
+            if cb and (cb == norm or norm.endswith("/" + cb) or cb.endswith("/" + norm)):
+                return runner
+        for key, runner in self.test_runners.items():
+            if key.strip().lower() == leaf:
+                return runner
         return None
 
     def role(self, name: str) -> RoleConfig:
@@ -405,6 +455,25 @@ def load_config(path: str | None = None) -> Config:
         str(k): _db_conn(v) for k, v in db_raw.items() if isinstance(v, dict)
     }
 
+    runners_raw = merged.get("test_runners", {})
+
+    def _runner(d: dict) -> RunnerConfig:
+        cmd = d.get("command", [])
+        if isinstance(cmd, str):
+            cmd = cmd.split()
+        env = d.get("env", {})
+        return RunnerConfig(
+            command=[str(x) for x in cmd] if isinstance(cmd, list) else [],
+            cwd=str(d.get("cwd", "")),
+            timeout_sec=int(d.get("timeout_sec", 300)),
+            env={str(k): str(v) for k, v in env.items()} if isinstance(env, dict) else {},
+            codebase=str(d.get("codebase", "")),
+        )
+
+    test_runners = {
+        str(k): _runner(v) for k, v in runners_raw.items() if isinstance(v, dict)
+    }
+
     def _role(name: str, default_model: str = "gpt-5-mini") -> RoleConfig:
         r = roles.get(name, {})
         timeout = r.get("timeout_sec")
@@ -469,4 +538,5 @@ def load_config(path: str | None = None) -> Config:
                 commit_raw.get("filename_only_threshold", 50)),
         ),
         db_connections=db_connections,
+        test_runners=test_runners,
     )
