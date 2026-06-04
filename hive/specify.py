@@ -481,6 +481,118 @@ forcing an anchor edit against an existing file.
 """
 
 
+def _unique_line_window(text: str, start: int, end: int,
+                        max_grow: int = 12) -> tuple[str, int] | None:
+    """Grow ``[start, end)`` outward to whole-line boundaries until that slice is unique.
+
+    Returns ``(window_text, window_start_offset)`` once ``text.count(window_text) == 1``,
+    or ``None`` if it cannot be made unique within ``max_grow`` lines of context on each
+    side. Used to disambiguate a literal that repeats across branches. Deterministic,
+    never raises.
+    """
+    ls = text.rfind("\n", 0, start) + 1              # start of the line holding `start`
+    le = text.find("\n", end)
+    le = len(text) if le == -1 else le + 1           # just past the line holding `end-1`
+    for grow in range(0, max_grow + 1):
+        ws = ls
+        for _ in range(grow):
+            if ws == 0:
+                break
+            prev = text.rfind("\n", 0, ws - 1)
+            ws = 0 if prev == -1 else prev + 1
+        we = le
+        for _ in range(grow):
+            if we >= len(text):
+                break
+            nxt = text.find("\n", we)
+            we = len(text) if nxt == -1 else nxt + 1
+        window = text[ws:we]
+        if text.count(window) == 1:
+            return window, ws
+    return None
+
+
+def _disambiguate_anchors(spec: dict[str, Any], codebase_root: str,
+                          docs_root: str | None = None) -> dict[str, Any]:
+    """Widen a non-unique anchor into a uniquely-targeting one (free, deterministic).
+
+    A literal can appear byte-identical in several branches (e.g. the same
+    ``NON_HEAD_TYPES = {...}`` guard in two code paths). When the author writes one edit
+    per occurrence but anchors them all with that identical snippet, apply sees
+    ``occurrences > 1`` and refuses every one as ``anchor_ambiguous`` — the whole fix
+    dead-ends in re-investigation over a purely mechanical collision (the M-head case).
+
+    This pass closes that the safe way: for a group of edits that share the SAME
+    ``(file, anchor_old)`` where the anchor occurs in live source exactly as many times
+    as there are edits in the group AND all of them carry the SAME ``replacement_new``
+    (so which occurrence maps to which edit is immaterial), each edit's ``anchor_old`` is
+    grown with adjacent live lines until it targets one occurrence uniquely, and its
+    ``replacement_new`` is grown the identical way so the inner change is preserved
+    byte-for-byte. Anything that cannot be made provably unique is left untouched for
+    ``_verify_anchors_live`` to downgrade as before. Runs BEFORE the live-verify pass so a
+    successfully widened anchor then passes the uniqueness bar and stays ``verified``.
+    Never raises; skips ``create_file`` edits and files it cannot read.
+    """
+    roots = [r for r in (codebase_root, docs_root) if r]
+    groups: dict[tuple[str, str], list[dict]] = {}
+    for e in spec.get("edits") or []:
+        if not isinstance(e, dict) or e.get("kind", "edit") == "create_file":
+            continue
+        anchor = e.get("anchor_old") or ""
+        rel = e.get("file") or ""
+        if anchor and rel:
+            groups.setdefault((rel, anchor), []).append(e)
+
+    for (rel, anchor), group in groups.items():
+        if len(group) < 2:
+            continue  # a lone edit on a non-unique anchor is genuinely ambiguous — leave it
+        replacements = {e.get("replacement_new") for e in group}
+        if len(replacements) != 1:
+            continue  # differing replacements → occurrence↔edit mapping is not safe to guess
+        text: str | None = None
+        for root in roots:
+            p = os.path.join(root, rel)
+            if os.path.isfile(p):
+                try:
+                    with open(p, "r", encoding="utf-8", errors="replace") as fh:
+                        text = fh.read()
+                except OSError:
+                    text = None
+                break
+        if text is None:
+            continue
+        starts: list[int] = []
+        i = text.find(anchor)
+        while i != -1:
+            starts.append(i)
+            i = text.find(anchor, i + 1)
+        if len(starts) != len(group):
+            continue  # occurrence count must match edit count to assign one-to-one safely
+        repl = next(iter(replacements)) or ""
+        windows: list[tuple[int, tuple[str, int]]] = []
+        for occ in starts:
+            win = _unique_line_window(text, occ, occ + len(anchor))
+            if win is None:
+                break
+            windows.append((occ, win))
+        if len(windows) != len(starts):
+            continue  # at least one occurrence could not be made unique — leave the group
+        for e, (occ, (w_text, w_start)) in zip(group, windows):
+            a = occ - w_start
+            b = a + len(anchor)
+            new_repl = w_text[:a] + repl + w_text[b:]
+            if text.count(w_text) != 1 or w_text == new_repl:
+                continue  # belt-and-braces: only rewrite to a unique, still-changing anchor
+            e["anchor_old"] = w_text
+            e["replacement_new"] = new_repl
+            e["anchor_disambiguated"] = (
+                f"anchor_old occurred {len(starts)}x in live {rel}; widened with adjacent "
+                "lines to target one occurrence uniquely")
+        logger.info("specify: disambiguated %d non-unique anchors in %s (widened to "
+                    "unique windows)", len(group), rel)
+    return spec
+
+
 def _verify_anchors_live(spec: dict[str, Any], codebase_root: str,
                          docs_root: str | None = None) -> dict[str, Any]:
     """Re-read each anchor from LIVE disk and downgrade a false ``verified`` status.
@@ -1392,9 +1504,14 @@ def run_specify(
         break
 
     spec = extract_first_json(wr.stdout)  # raises ValueError if no JSON found
-    # Deterministic anchor drift check FIRST: re-read each 'verified' anchor from live
-    # disk and downgrade any that is absent/non-unique, so _normalize_spec's stale-anchor
-    # rule then refuses to present it as ready (N175 E7 — verified-without-live-recheck).
+    # Deterministic anchor disambiguation FIRST: when sibling edits share an identical,
+    # non-unique anchor (same literal in two branches), widen each anchor with adjacent
+    # live lines so it targets one occurrence uniquely — rescuing a fix that would
+    # otherwise dead-end in apply's anchor_ambiguous over a mechanical collision.
+    spec = _disambiguate_anchors(spec, codebase_root, docs_root)
+    # Then the drift check: re-read each 'verified' anchor from live disk and downgrade any
+    # that is absent/non-unique, so _normalize_spec's stale-anchor rule then refuses to
+    # present it as ready (N175 E7 — verified-without-live-recheck).
     spec = _verify_anchors_live(spec, codebase_root, docs_root)
     spec = _normalize_spec(spec)
     spec = _apply_anchor_not_grounded_gate(spec)

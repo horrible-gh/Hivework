@@ -1256,5 +1256,86 @@ class TestVerifyAnchorsLive(unittest.TestCase):
         self.assertEqual(out["edits"][0]["anchor_status"], "verified")
 
 
+class TestDisambiguateAnchors(unittest.TestCase):
+    """M-head case: the same literal repeats in two branches. Sibling edits sharing that
+    non-unique anchor are widened with adjacent live lines so each targets one occurrence
+    uniquely — instead of dead-ending in apply's anchor_ambiguous."""
+
+    # a file where NON_HEAD_TYPES = {"R","M","Q"} appears in TWO distinct branches
+    _SRC = (
+        "def group_head(items):\n"
+        "    # group branch\n"
+        "    NON_HEAD_TYPES = {\"R\",\"M\",\"Q\"}\n"
+        "    return pick(items, NON_HEAD_TYPES)\n"
+        "\n"
+        "def seq_items(items):\n"
+        "    # sequence branch\n"
+        "    NON_HEAD_TYPES = {\"R\",\"M\",\"Q\"}\n"
+        "    return order(items, NON_HEAD_TYPES)\n"
+    )
+
+    def _edit(self, eid):
+        return {"id": eid, "file": "documents.py",
+                "anchor_old": "NON_HEAD_TYPES = {\"R\",\"M\",\"Q\"}",
+                "replacement_new": "NON_HEAD_TYPES = {\"R\",\"Q\"}",
+                "anchor_status": "verified"}
+
+    def _spec(self, edits):
+        return {"edits": edits, "deferred": [], "gate": {"apply": False},
+                "termination": "ready_to_apply"}
+
+    def test_identical_sibling_anchors_widened_to_unique(self):
+        with tempfile.TemporaryDirectory() as root:
+            with open(os.path.join(root, "documents.py"), "w", encoding="utf-8") as fh:
+                fh.write(self._SRC)
+            spec = self._spec([self._edit("E1"), self._edit("E2")])
+            out = specify._disambiguate_anchors(spec, root)
+            with open(os.path.join(root, "documents.py"), encoding="utf-8") as fh:
+                text = fh.read()
+        anchors = [e["anchor_old"] for e in out["edits"]]
+        # each widened anchor is now uniquely present in live source
+        for a in anchors:
+            self.assertEqual(text.count(a), 1, a)
+        self.assertNotEqual(anchors[0], anchors[1])
+        for e in out["edits"]:
+            self.assertIn("anchor_disambiguated", e)
+            # the inner change survives byte-for-byte inside the widened replacement
+            self.assertIn("NON_HEAD_TYPES = {\"R\",\"Q\"}", e["replacement_new"])
+
+    def test_widened_pair_then_survives_live_verify(self):
+        # the whole point: after widening, _verify_anchors_live keeps them 'verified'
+        with tempfile.TemporaryDirectory() as root:
+            with open(os.path.join(root, "documents.py"), "w", encoding="utf-8") as fh:
+                fh.write(self._SRC)
+            spec = self._spec([self._edit("E1"), self._edit("E2")])
+            spec = specify._disambiguate_anchors(spec, root)
+            out = specify._verify_anchors_live(spec, root)
+        self.assertEqual([e["anchor_status"] for e in out["edits"]],
+                         ["verified", "verified"])
+
+    def test_single_edit_non_unique_is_left_alone(self):
+        # a lone edit on a non-unique anchor is genuinely ambiguous → not widened
+        with tempfile.TemporaryDirectory() as root:
+            with open(os.path.join(root, "documents.py"), "w", encoding="utf-8") as fh:
+                fh.write(self._SRC)
+            spec = self._spec([self._edit("E1")])
+            out = specify._disambiguate_anchors(spec, root)
+        self.assertNotIn("anchor_disambiguated", out["edits"][0])
+        self.assertEqual(out["edits"][0]["anchor_old"],
+                         "NON_HEAD_TYPES = {\"R\",\"M\",\"Q\"}")
+
+    def test_differing_replacements_not_disambiguated(self):
+        # if the two edits want DIFFERENT replacements, the occurrence↔edit mapping is
+        # not safe to guess → leave them for the downgrade path
+        with tempfile.TemporaryDirectory() as root:
+            with open(os.path.join(root, "documents.py"), "w", encoding="utf-8") as fh:
+                fh.write(self._SRC)
+            e1, e2 = self._edit("E1"), self._edit("E2")
+            e2["replacement_new"] = "NON_HEAD_TYPES = {\"R\"}"
+            out = specify._disambiguate_anchors(self._spec([e1, e2]), root)
+        for e in out["edits"]:
+            self.assertNotIn("anchor_disambiguated", e)
+
+
 if __name__ == "__main__":
     unittest.main()
