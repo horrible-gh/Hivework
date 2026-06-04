@@ -201,3 +201,25 @@ def test_run_apply_verify_blocks_when_non_biting(tmp_path):
     assert proposal["runtime_verify"]["transition"] == verify.T_NO_BITE
     assert proposal["ready"] is False
     assert any("runtime verify" in r for r in proposal["not_ready_reasons"])
+
+
+def test_rebase_node_to_cwd_translates_path(tmp_path):
+    # spec references files from codebase_root; a runner with cwd=server must get the
+    # node rebased to cwd-relative or pytest looks for server/server/... and errors.
+    root = str(tmp_path)
+    os.makedirs(os.path.join(root, "server", "tests"))
+    with open(os.path.join(root, "server", "tests", "test_x.py"), "w") as f:
+        f.write("def test_x():\n    assert True\n")
+    cwd = os.path.join(root, "server")
+    node = "server/tests/test_x.py::test_x"
+    assert verify._rebase_node_to_cwd(node, root, cwd) == "tests/test_x.py::test_x"
+
+
+def test_rebase_node_leaves_dotted_and_missing_alone(tmp_path):
+    root = str(tmp_path)
+    cwd = os.path.join(root, "server")
+    # dotted unittest id (no path separator) — untouched
+    assert verify._rebase_node_to_cwd("pkg.mod.TestY", root, cwd) == "pkg.mod.TestY"
+    # a path that does not exist on disk — untouched (never guess)
+    assert verify._rebase_node_to_cwd(
+        "server/tests/missing.py::t", root, cwd) == "server/tests/missing.py::t"

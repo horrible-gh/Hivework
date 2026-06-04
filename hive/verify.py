@@ -205,6 +205,33 @@ def _touched_paths(edits: list[dict]) -> tuple[list[str], list[str]]:
     return rel_paths, created
 
 
+def _rebase_node_to_cwd(node: str, codebase_root: str, cwd: str) -> str:
+    """Rebase a red-test node's FILE part from codebase-root-relative to runner-cwd-relative.
+
+    The spec references every file relative to ``codebase_root`` (so the test edit's path is
+    e.g. ``server/tests/test_x.py``), but the runner executes from its own ``cwd`` (e.g.
+    ``server``). Handing pytest ``server/tests/test_x.py::t`` from cwd ``server`` makes it
+    look for ``server/server/tests/...`` → collection error → a spurious red_indeterminate.
+    We translate the path so pytest resolves it (``tests/test_x.py::t``). Only the file part
+    (before ``::``) is touched, and only when it is a real path under ``codebase_root`` that
+    lands inside ``cwd``; a dotted node id (``pkg.mod.Test``) or an out-of-cwd path is left
+    verbatim. Never raises.
+    """
+    if not node or ("/" not in node and os.sep not in node.split("::", 1)[0]):
+        return node
+    file_part, sep, rest = node.partition("::")
+    try:
+        abs_file = os.path.normpath(os.path.join(codebase_root, file_part))
+        if not os.path.exists(abs_file):
+            return node
+        rel = os.path.relpath(abs_file, cwd)
+    except ValueError:
+        return node
+    if rel.startswith(".."):          # file is not under the runner cwd — don't guess
+        return node
+    return rel.replace(os.sep, "/") + sep + rest
+
+
 def verify_red_green(
     spec: dict[str, Any],
     codebase_root: str,
@@ -259,7 +286,10 @@ def verify_red_green(
     verdict["bundle"] = bundle["dir"]
 
     def _run() -> dict[str, Any]:
-        return run_node(runner.command, cwd, node, runner.timeout_sec,
+        # Rebase here (not once up front): the test file only exists on disk after the
+        # red-baseline write, and the rebase confirms the path against the live tree.
+        node_id = _rebase_node_to_cwd(node, codebase_root, cwd)
+        return run_node(runner.command, cwd, node_id, runner.timeout_sec,
                         getattr(runner, "env", None) or None)
 
     try:
