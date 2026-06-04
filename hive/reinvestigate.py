@@ -34,6 +34,7 @@ from typing import Any
 
 from hive.specify import (
     RI_ANCHOR_NOT_GROUNDED,
+    RI_DATASOURCE_REGRESSION,
     RI_DEFERRED_ROOT_CAUSE,
     RI_INCONCLUSIVE,
     RI_INEFFECTIVE,
@@ -50,8 +51,11 @@ ACTION_TERMINATE = "terminate"
 # starved axis can recover it (only worth firing where an axis actually came back thin).
 # deferred_root_cause joins these: the punted substantive fix's axis was never grounded
 # as an edit, so re-fetching that thin axis is the cheapest path to the missing evidence.
+# datasource_regression joins too: the edit read the wrong table, so the real source has
+# to be re-retrieved (N176) — not a causal-stitch error, so re_retrieve, not re_converge.
 _RETRIEVE_REASONS = frozenset(
-    {RI_SEED_TARGET_UNCOVERED, RI_ANCHOR_NOT_GROUNDED, RI_DEFERRED_ROOT_CAUSE})
+    {RI_SEED_TARGET_UNCOVERED, RI_ANCHOR_NOT_GROUNDED, RI_DEFERRED_ROOT_CAUSE,
+     RI_DATASOURCE_REGRESSION})
 # A reason whose gap is a causal/effectiveness CONTRADICTION — the evidence is present
 # but the stitch was wrong; re-converge with the refuted node excluded (M013 §2 table).
 _CONVERGE_REASONS = frozenset({RI_INEFFECTIVE, RI_INCONCLUSIVE})

@@ -388,6 +388,7 @@ def run_pipeline(args: argparse.Namespace) -> None:
                     review_provider=review_role.provider,
                     ledger=ldg,
                     provider_kwargs=provider_kwargs,
+                    db_conn=cfg.db_for_codebase(args.codebase),
                     **specify_kwargs,
                 )
                 logger.info("Edit-spec: %s (%d edits, %d deferred, termination=%s)",
@@ -573,7 +574,8 @@ def run_investigate_command(args: argparse.Namespace) -> None:
                     contract_path=args.contract, model=specify_role.model,
                     provider=specify_role.provider, review_model=review_role.model,
                     review_provider=review_role.provider, ledger=ldg2,
-                    provider_kwargs=provider_kwargs, **specify_kwargs)
+                    provider_kwargs=provider_kwargs,
+                    db_conn=cfg.db_for_codebase(args.codebase), **specify_kwargs)
                 logger.info("Edit-spec: %s (%d edits, %d deferred, termination=%s)",
                             spec_out, len(spec.get("edits") or []),
                             len(spec.get("deferred") or []),
@@ -661,6 +663,7 @@ def run_specify_command(args: argparse.Namespace) -> None:
             review_provider=review_role.provider,
             ledger=ldg,
             provider_kwargs=provider_kwargs,
+            db_conn=cfg.db_for_codebase(args.codebase),
             **specify_kwargs,
         )
         ldg.finish_run(honey_path=args.out, axes_n=len(spec.get("edits") or []),
