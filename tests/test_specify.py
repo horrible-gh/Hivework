@@ -405,6 +405,39 @@ class TestIncompleteWiring(unittest.TestCase):
         ]}
         self.assertEqual(specify._incomplete_wiring_ids(spec, self.root), {})
 
+    def test_test_file_edit_exempt_from_wiring(self):
+        # a red test (create_file under tests/) with an unused import must NOT be flagged:
+        # its correctness is the red→green run, not import usage.
+        spec = {"edits": [{
+            "id": "E2", "kind": "create_file", "file": "server/tests/test_x.py",
+            "content": "import os\n\ndef test_x():\n    assert 1 + 1 == 2\n"}],
+            "verify": {"test_edit_ids": ["E2"]}}
+        self.assertEqual(specify._incomplete_wiring_ids(spec, self.root), {})
+
+    def test_test_edit_id_exempt_even_off_tests_path(self):
+        # exemption also keys off verify.test_edit_ids, not only the path
+        spec = {"edits": [{
+            "id": "E2", "kind": "create_file", "file": "checks/probe_x.py",
+            "content": "import os\n\ndef test_x():\n    assert True\n"}],
+            "verify": {"test_edit_ids": ["E2"]}}
+        self.assertEqual(specify._incomplete_wiring_ids(spec, self.root), {})
+
+    def test_future_import_in_create_file_not_flagged(self):
+        # Real regression: a create_file red test opens with the idiomatic
+        # `from __future__ import annotations`. That binding is a compiler directive
+        # never referenced by name, so the unused-import check must NOT flag it (it
+        # previously did, downgrading a valid red test to needs_reinvestigation).
+        spec = {"edits": [{
+            "id": "E3", "kind": "create_file", "file": "tests/test_new.py",
+            "content": ("from __future__ import annotations\n\n"
+                        "def test_x():\n    assert 1 + 1 == 2\n"),
+        }]}
+        self.assertEqual(specify._incomplete_wiring_ids(spec, self.root), {})
+
+    def test_future_import_line_yields_no_names(self):
+        # the unit underneath: a future-statement binds no usable name
+        self.assertEqual(specify._imported_names("from __future__ import annotations"), [])
+
     def test_unreadable_file_is_skipped(self):
         spec = {"edits": [{
             "id": "E1", "file": "nope.js", "anchor_old": "a",
@@ -1767,6 +1800,73 @@ class TestDisambiguateAnchors(unittest.TestCase):
             out = specify._disambiguate_anchors(self._spec([e1, e2]), root)
         for e in out["edits"]:
             self.assertNotIn("anchor_disambiguated", e)
+
+
+class TestFixtureGrounding(unittest.TestCase):
+    """Red-test isolation grounding: lift the target's pytest fixtures from conftest so
+    the author builds a data-dependent red test on the isolated harness, not get_store()."""
+
+    def setUp(self):
+        self.root = tempfile.mkdtemp()
+
+    def _conftest(self, rel, text):
+        p = os.path.join(self.root, rel)
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        with open(p, "w", encoding="utf-8") as f:
+            f.write(text)
+
+    def test_lifts_fixture_name_and_summary(self):
+        self._conftest("server/tests/conftest.py",
+                       'import pytest\n\n'
+                       '@pytest.fixture(scope="session")\n'
+                       'def all_migrations_db():\n'
+                       '    """Create a test database with all migrations applied."""\n'
+                       '    yield None\n\n'
+                       '@pytest.fixture\n'
+                       'def test_db(all_migrations_db):\n'
+                       '    """Provide a test database connection."""\n'
+                       '    yield all_migrations_db\n')
+        fx = specify._collect_test_fixtures(self.root)
+        names = dict(fx)
+        self.assertIn("all_migrations_db", names)
+        self.assertIn("test_db", names)
+        self.assertEqual(names["all_migrations_db"],
+                         "Create a test database with all migrations applied.")
+        block = specify._render_fixture_block(fx)
+        self.assertIn("test_db", block)
+        self.assertIn("NEVER let a red test read/write the production", block)
+
+    def test_no_conftest_yields_empty(self):
+        self.assertEqual(specify._collect_test_fixtures(self.root), [])
+        self.assertEqual(specify._render_fixture_block([]), "")
+
+    def test_missing_root_is_safe(self):
+        self.assertEqual(specify._collect_test_fixtures(""), [])
+        self.assertEqual(specify._collect_test_fixtures("/no/such/dir/xyz"), [])
+
+    def test_lifts_db_test_wiring_example(self):
+        # a test that patches get_store to a TestStore on a test DB — the wiring pattern
+        self._conftest("server/tests/test_settings.py",
+                       'from unittest.mock import patch\n'
+                       'from modules.flow_gate.db.connection import get_store\n\n'
+                       '@pytest.fixture(autouse=True)\n'
+                       'def mock_db(test_db_path):\n'
+                       '    store = TestStore(test_db_path)\n'
+                       '    with patch("modules.flow_gate.db.connection.get_store", return_value=store):\n'
+                       '        yield store\n\n'
+                       'def test_thing():\n'
+                       '    from modules.flow_gate.settings import get_all\n'
+                       '    assert get_all() == []\n')
+        ex = specify._lift_db_test_example(self.root)
+        self.assertIn("from modules.flow_gate", ex)          # correct import root
+        self.assertIn("patch(", ex)                           # the get_store patch
+        self.assertIn("get_store", ex)
+        self.assertIn("test_settings.py", ex)
+
+    def test_db_example_none_when_no_store_pattern(self):
+        self._conftest("server/tests/test_plain.py",
+                       "def test_x():\n    assert 1 == 1\n")
+        self.assertEqual(specify._lift_db_test_example(self.root), "")
 
 
 if __name__ == "__main__":

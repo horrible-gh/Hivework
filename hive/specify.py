@@ -33,6 +33,7 @@ contract stays the single source of authoring rules (no duplicated prompt here).
 """
 
 import difflib
+import glob
 import json
 import logging
 import os
@@ -939,7 +940,15 @@ def _imported_names(line: str) -> list[str]:
 
     Conservative: only the well-formed import shapes are parsed; anything ambiguous yields
     [] so the completeness check never fires on a line it did not fully understand.
+
+    ``from __future__ import ...`` is excluded: a future-statement is a compiler directive
+    whose names (``annotations`` etc.) are NEVER referenced as bindings, so treating them as
+    "imported but unused" is a guaranteed false positive — it wrongly flagged an otherwise-
+    valid create_file red test (which opens with the idiomatic future import) as incomplete
+    wiring and downgraded a good spec to needs_reinvestigation.
     """
+    if re.match(r"\s*from\s+__future__\s+import\b", line):
+        return []
     names: list[str] = []
     def _split_clause(clause: str) -> list[str]:
         out = []
@@ -1022,12 +1031,17 @@ def _incomplete_wiring_ids(spec: dict[str, Any], codebase_root: str) -> dict[str
     if not codebase_root:
         return {}
     files = _post_edit_files(spec, codebase_root)
+    # Test edits are exempt: a red test is certified by its red→green run, not by import
+    # usage, so an unused import in a test must not flag the spec as incomplete wiring.
+    test_edit_ids = {str(i) for i in (spec.get("verify") or {}).get("test_edit_ids") or []}
     incomplete: dict[str, str] = {}
     for e in spec.get("edits") or []:
         if not isinstance(e, dict):
             continue
         f = e.get("file") or ""
         if f not in files:
+            continue
+        if str(e.get("id", "")) in test_edit_ids or _is_test_path(f):
             continue
         added_text = (e.get("content") if e.get("kind", "edit") == "create_file"
                       else e.get("replacement_new")) or ""
@@ -1049,6 +1063,24 @@ def _incomplete_wiring_ids(spec: dict[str, Any], codebase_root: str) -> dict[str
                     f"(binding/call site missing)")
                 break
     return incomplete
+
+
+# Test-file path convention (mirrors apply._TEST_PATH_RE; duplicated here to avoid a
+# circular import — apply imports _incomplete_wiring_ids from this module). The wiring
+# gate exempts test edits: a red test's job is to BITE (verified by the red→green run),
+# not to wire a production call, so a stray unused import in a test (``import os``, the
+# idiomatic ``from __future__``) is cosmetic — it must never downgrade the fix.
+_TEST_PATH_RE = re.compile(
+    r"(?:^|/)(?:tests?|__tests__)/"
+    r"|(?:^|/)test_[^/]+$"
+    r"|(?:^|/)[^/]+_test\.[^./]+$"
+    r"|\.spec\.[^./]+$"
+)
+
+
+def _is_test_path(rel_path: str) -> bool:
+    """True when a path is a test file/dir by convention. Never raises."""
+    return bool(rel_path) and bool(_TEST_PATH_RE.search(rel_path.replace("\\", "/")))
 
 
 # The PRIMARY read source of a SQL statement embedded in code — the first ``FROM <table>``.
@@ -1387,6 +1419,154 @@ def _render_callee_block(contracts: list[tuple[str, dict[str, str]]]) -> str:
     for sym, c in contracts:
         parts += [f"--- {sym}  (defined in {c['file']})", "```", c["text"], "```", ""]
     return "\n".join(parts)
+
+
+# ── Test-fixture grounding (red-test isolation) ────────────────────────────────
+# A specify-authored red test must run against the target's ISOLATED test harness,
+# never the live production store/DB. Two live failures motivate this:
+#   (1) a data-dependent fix (a DB read returning ``'' AS module``) had its red test
+#       OMITTED — the author took the contract's "needs DB/app state → omit" escape
+#       when a narrow test that SEEDS the table and calls the function directly was
+#       feasible; and
+#   (2) when a red test WAS authored it called the production ``get_store()`` and
+#       wrote into the live sqlite file — unsafe to run under ``apply --verify``.
+# The fix mirrors callee-contract grounding: surface the target's existing pytest
+# fixtures (name + one-line intent, lifted from conftest.py) so the author builds the
+# red test on the real isolation fixture instead of guessing or punting. Pure-local,
+# free, deterministic, never raises; no conftest → empty block (graceful no-op).
+_FIXTURE_GROUND_MAX = 14
+_RE_PYTEST_FIXTURE = re.compile(r"^\s*@pytest\.fixture\b")
+_RE_FIXTURE_DEF = re.compile(r"^\s*def\s+([A-Za-z_]\w*)\s*\(")
+
+
+def _collect_test_fixtures(codebase_root: str) -> list[tuple[str, str]]:
+    """``(fixture_name, one-line summary)`` for pytest fixtures defined in the target's
+    ``conftest.py`` files — the isolated harness a red test should build on.
+
+    Best-effort and bounded: scans each conftest for ``@pytest.fixture`` decorators and
+    lifts the decorated def's name plus its docstring's first line. Never raises; an
+    unreadable conftest is skipped. Returns [] when the target has no conftest at all.
+    """
+    if not codebase_root or not os.path.isdir(codebase_root):
+        return []
+    out: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    try:
+        conftests = sorted(glob.glob(
+            os.path.join(codebase_root, "**", "conftest.py"), recursive=True))
+    except OSError:
+        return []
+    for cf in conftests:
+        try:
+            with open(cf, "r", encoding="utf-8", errors="replace") as fh:
+                lines = fh.read().splitlines()
+        except OSError:
+            continue
+        for i, ln in enumerate(lines):
+            if not _RE_PYTEST_FIXTURE.match(ln):
+                continue
+            # the decorated def may sit a few lines below (stacked decorators / multi-
+            # line fixture args), so look ahead a small window for the first def.
+            for j in range(i + 1, min(i + 8, len(lines))):
+                m = _RE_FIXTURE_DEF.match(lines[j])
+                if not m:
+                    continue
+                name = m.group(1)
+                if name in seen:
+                    break
+                seen.add(name)
+                summary = ""
+                for k in range(j + 1, min(j + 5, len(lines))):
+                    s = lines[k].strip()
+                    if s.startswith(('"""', "'''")):
+                        summary = s.strip("\"' ")
+                        break
+                    if s and not s.startswith(("#", ")")):
+                        break
+                out.append((name, summary))
+                break
+            if len(out) >= _FIXTURE_GROUND_MAX:
+                return out
+    return out
+
+
+def _render_fixture_block(fixtures: list[tuple[str, str]]) -> str:
+    """Render the target's pytest fixtures as a prompt section. '' when there are none."""
+    if not fixtures:
+        return ""
+    parts = [
+        "## Test fixtures (the target's ISOLATED test harness — build any red test on these)", "",
+        "These pytest fixtures already exist in the target's conftest. A red test you author "
+        "MUST run against this isolated harness and seed the rows the symptom needs. NEVER let "
+        "a red test read/write the production store/database: that mutates live data and is "
+        "unsafe to run. If the symptom is data-dependent (a DB read returning the wrong/empty "
+        "value), that is STILL a narrow, biting test — do not omit the verify block as 'needs "
+        "app state'. CRUCIAL: production code under test usually reads through a global "
+        "`get_store()`; merely requesting a raw-connection fixture and seeding it is NOT enough "
+        "— the function will still hit the REAL database unless `get_store` is pointed at the "
+        "test DB. Follow the target's own wiring pattern shown in the example below (note its "
+        "import root and how it patches `get_store`).", "",
+    ]
+    for name, summary in fixtures:
+        parts.append(f"- {name}" + (f" — {summary}" if summary else ""))
+    return "\n".join(parts)
+
+
+# A short excerpt of an existing target test that exercises store-backed code against an
+# isolated DB — the missing half of fixture grounding. The conftest fixture names alone do
+# not tell the author (1) the correct IMPORT ROOT (tests run from a cwd where the package is
+# ``modules.flow_gate``, not ``server.modules.flow_gate``) nor (2) that the production
+# ``get_store()`` must be PATCHED to the test DB or the code reads the real database anyway.
+# Both are demonstrated by a real example, so we lift one verbatim and tell the author to
+# copy the pattern. Best-effort, bounded, deterministic, never raises.
+_DBTEST_EXAMPLE_MAX_LINES = 55
+
+
+def _lift_db_test_example(codebase_root: str) -> str:
+    """An excerpt of the target test that best demonstrates wiring an isolated DB into
+    store-backed code (correct import root + patching ``get_store``). '' when none found."""
+    if not codebase_root or not os.path.isdir(codebase_root):
+        return ""
+    try:
+        candidates = glob.glob(os.path.join(codebase_root, "**", "test_*.py"), recursive=True)
+    except OSError:
+        return ""
+    best: tuple[int, str, list[str]] | None = None
+    for tf in sorted(candidates):
+        try:
+            with open(tf, "r", encoding="utf-8", errors="replace") as fh:
+                lines = fh.read().splitlines()
+        except OSError:
+            continue
+        text = "\n".join(lines)
+        if "get_store" not in text or "patch(" not in text:
+            continue
+        score = text.count("get_store") + text.count("def test")
+        if best is None or score > best[0]:
+            best = (score, os.path.relpath(tf, codebase_root), lines)
+    if best is None:
+        return ""
+    rel, lines = best[1], best[2]
+    # Import header: lines up to the first def/class/@fixture (the import root lives here).
+    header: list[str] = []
+    for ln in lines[:40]:
+        if re.match(r"^\s*(def |class |@pytest)", ln):
+            break
+        if ln.strip():
+            header.append(ln)
+    # Window around the first ``get_store`` patch, backed up to its enclosing fixture/def.
+    anchor = next((i for i, ln in enumerate(lines) if "get_store" in ln and "patch" in ln), None)
+    if anchor is None:
+        anchor = next((i for i, ln in enumerate(lines) if "get_store" in ln), 0)
+    start = anchor
+    for i in range(anchor, max(anchor - 25, -1), -1):
+        if re.match(r"^\s*(@pytest\.fixture|def )", lines[i]):
+            start = i - 1 if i > 0 and lines[i - 1].lstrip().startswith("@") else i
+            break
+    window = lines[start:start + _DBTEST_EXAMPLE_MAX_LINES]
+    excerpt = "\n".join(header[:20] + ["..."] + window)
+    return (f"## DB-test wiring example (from {rel}) — copy this import root + get_store patch\n"
+            f"```python\n{excerpt}\n```")
 
 
 def _edit_call_items(spec: dict[str, Any],
@@ -2176,6 +2356,20 @@ def run_specify(
         if cblock:
             honey_text = honey_text + "\n\n" + cblock
             logger.info("specify: callee-grounding lifted signature(s) for the author prompt")
+
+        # Test-fixture grounding: surface the target's isolated pytest fixtures so a
+        # data-dependent red test is built on the real harness (seed + call directly),
+        # never the production store — and is therefore safe to run under apply --verify.
+        fixtures = _collect_test_fixtures(codebase_root)
+        fblock = _render_fixture_block(fixtures)
+        example = _lift_db_test_example(codebase_root)
+        if example:
+            fblock = (fblock + "\n\n" + example) if fblock else example
+        if fblock:
+            honey_text = honey_text + "\n\n" + fblock
+            logger.info("specify: test-fixture grounding lifted %d fixture(s)%s for the "
+                        "author prompt", len(fixtures),
+                        " + a DB-test wiring example" if example else "")
 
     contract_text = load_contract(contract_path)
     prompt = build_specify_prompt(honey_text, contract_text, codebase_root, docs_root,
