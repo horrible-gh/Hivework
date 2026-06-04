@@ -698,6 +698,14 @@ def run_apply_command(args: argparse.Namespace) -> None:
     backup_root = cfg.apply.backup_root()
     ttl_hours = cfg.apply.backup_ttl_hours
 
+    # Runtime red→green verify (the closed loop): opt-in (--verify) and only fires when
+    # the run's codebase has a configured test_runner AND the spec carries a verify block.
+    verify = getattr(args, "verify", False)
+    runner = cfg.test_runner_for_codebase(args.codebase) if verify else None
+    if verify and runner is None:
+        logger.warning("apply: --verify set but no test_runner configured for "
+                       "codebase %r — runtime verify will be skipped", args.codebase)
+
     mode = "WRITE (apply to live code)" if args.write else "propose only"
     logger.info("=" * 60)
     logger.info("Hivework apply — edit-spec → proposal (%s)", mode)
@@ -715,9 +723,11 @@ def run_apply_command(args: argparse.Namespace) -> None:
         docs_root=args.docs,
         output_path=args.out,
         write=args.write,
-        backup_root=backup_root if args.write else None,
+        backup_root=backup_root if (args.write or verify) else None,
         ttl_hours=ttl_hours,
         partial=getattr(args, "partial", False),
+        verify=verify,
+        runner=runner,
     )
 
     logger.info("=" * 60)
@@ -1077,6 +1087,13 @@ def main() -> None:
         help="With --write on a NOT-READY proposal, apply just the individually "
              "applicable + effective edits instead of nothing — so a verified fix "
              "is not blocked by a deferred sibling. Unresolved items are reported.",
+    )
+    apply_parser.add_argument(
+        "--verify", action="store_true",
+        help="Run the spec's red test red→green against the configured test_runner "
+             "before declaring READY: apply the test edit only (must fail), then the "
+             "source fix (must pass), then restore. A fix unconfirmed by execution is "
+             "held NOT READY. No-op when the codebase has no test_runner configured.",
     )
     apply_parser.add_argument(
         "-v", "--verbose", action="store_true",

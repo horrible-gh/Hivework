@@ -657,6 +657,20 @@ def render_proposal_markdown(proposal: dict[str, Any]) -> str:
                          "--partial` to write just those.")
     lines.append("")
 
+    rv = proposal.get("runtime_verify")
+    if rv:
+        ok = rv.get("transition") in ("red_to_green",)
+        lines.append("## Runtime verify — red→green " + ("✅ CONFIRMED" if ok else "⛔ NOT confirmed"))
+        lines.append("")
+        lines.append(f"- node: `{rv.get('node', '')}`")
+        lines.append(f"- transition: `{rv.get('transition')}` — {rv.get('reason', '')}")
+        for phase in ("red", "green"):
+            run = rv.get(phase)
+            if isinstance(run, dict):
+                lines.append(f"- {phase}: `{run.get('status')}` "
+                             f"(exit {run.get('returncode')})")
+        lines.append("")
+
     if write and write.get("attempted"):
         if write.get("ok"):
             lines.append("## Write — APPLIED")
@@ -773,6 +787,8 @@ def run_apply(
     backup_root: str | None = None,
     ttl_hours: int = 168,
     partial: bool = False,
+    verify: bool = False,
+    runner: Any = None,
 ) -> dict[str, Any]:
     """Run the apply stage: edit-spec JSON + live code → proposal (and optional write).
 
@@ -825,6 +841,30 @@ def run_apply(
         logger.warning("apply: spec termination is invalid: %r", term)
 
     proposal = build_proposal(spec, root)
+
+    # Runtime red→green gate (the closed loop). build_proposal proves the anchor lands
+    # and the effectiveness review reasons ABOUT the edit; this OBSERVES the target's own
+    # test go red→green. It is opt-in (--verify) AND needs a configured runner + a
+    # spec.verify.red_test_node — otherwise it is skipped, leaving today's behaviour. A
+    # spec that ships a verify target but does NOT transition red→green is NOT ready: a
+    # fix unconfirmed by execution must not be presented as applicable.
+    if verify and runner is not None and isinstance(spec.get("verify"), dict) \
+            and spec.get("verify", {}).get("red_test_node"):
+        if not backup_root:
+            raise ValueError("verify=True requires a backup_root (the dry-run snapshot)")
+        from hive import verify as verify_mod  # lazy: verify imports apply
+        rv = verify_mod.verify_red_green(spec, root, runner, backup_root, ttl_hours)
+        proposal["runtime_verify"] = rv
+        if rv["transition"] not in verify_mod.VERIFIED_TRANSITIONS:
+            proposal["ready"] = False
+            proposal["not_ready_reasons"].append(
+                f"runtime verify did not confirm the fix: {rv['transition']} "
+                f"({rv.get('reason', '')})")
+            logger.warning("apply: runtime verify blocked READY — %s (%s)",
+                           rv["transition"], rv.get("reason", ""))
+        else:
+            logger.info("apply: runtime verify CONFIRMED red→green for node %s",
+                        rv.get("node"))
 
     if write:
         if not backup_root:
