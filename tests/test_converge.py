@@ -755,6 +755,123 @@ CONSISTENT_ON_ASSUMPTION_OUT = json.dumps({
 })
 
 
+# ── M017 lever 2: data-stamp gate ──────────────────────────────────────────────
+# A two-node path covering BOTH located files, so no peer is "dropped" (the N180 guard
+# stays inert and these tests isolate the data-stamp gate).
+_TWO_NODE_PATH = [
+    {"node": "endpoint", "file": "api/workflow_head_routes.py", "lines": "93-102",
+     "symbol": "GET /workflow/{doc_id}/head"},
+    {"node": "db_fn", "file": "db/workflow_sequences.py", "lines": "45-57",
+     "symbol": "get_effective_head"},
+]
+
+# The GAP lever 2 closes: a CONSISTENT verdict the converger itself flagged data_dependent
+# (it rests on a stored value) but ruled on an ASSUMED value — NO data_reads, so the read
+# loop never fires and nothing backs it.
+M017_DATA_DEP_NO_READS_OUT = json.dumps({
+    "converged": True,
+    "path": _TWO_NODE_PATH,
+    "attributed_defect": {"node": "db_fn", "file": "db/workflow_sequences.py",
+                          "lines": "45-57", "why": "ORDER BY mis-ranks the head"},
+    "causal_check": {
+        "verdict": "consistent", "data_dependent": True,
+        "data_state_assumptions": ["assumes M.result_doc_id is set (non-NULL)"],
+        "trace": "with result_doc_id set the CASE displaces the pending slot",
+        "need_data_state": [], "data_reads": []},
+    "missing_link": None,
+})
+
+# Data-dependent consistent that DOES name the deciding read — the loop runs it, the row
+# exists (backed), and the re-pass rules consistent on FACT → it earns its stamp.
+M017_DATA_DEP_WITH_READS_OUT = json.dumps({
+    "converged": True,
+    "path": _TWO_NODE_PATH,
+    "attributed_defect": {"node": "db_fn", "file": "db/workflow_sequences.py",
+                          "lines": "45-57", "why": "ORDER BY mis-ranks the head"},
+    "causal_check": {
+        "verdict": "consistent", "data_dependent": True,
+        "data_state_assumptions": ["M.result_doc_id set per the read below"],
+        "trace": "with result_doc_id set the CASE displaces the pending slot",
+        "need_data_state": [],
+        "data_reads": [{"table": "documents", "where": {"doc_id": "D1"},
+                        "columns": ["doc_review_status"]}]},
+    "missing_link": None,
+})
+
+# A pure code-logic consistent: NOT data_dependent, names no reads — the gate must leave
+# it alone (no stored value is in question).
+M017_PURE_CODE_OUT = json.dumps({
+    "converged": True,
+    "path": _TWO_NODE_PATH,
+    "attributed_defect": {"node": "db_fn", "file": "db/workflow_sequences.py",
+                          "lines": "45-57", "why": "off-by-one in the slice bound"},
+    "causal_check": {
+        "verdict": "consistent", "data_dependent": False,
+        "data_state_assumptions": [],
+        "trace": "the slice drops the last element regardless of stored state",
+        "need_data_state": [], "data_reads": []},
+    "missing_link": None,
+})
+
+
+class TestConvergeDataStamp(unittest.TestCase):
+    """M017 lever 2: a ``consistent`` verdict that DEPENDS on stored data must be backed by
+    a real DB read (a data-stamp), never ruled on an assumed value. Only the model call is
+    mocked; the DB read is a real temp sqlite."""
+
+    def test_data_dependent_consistent_without_read_is_demoted(self):
+        """The gap: consistent + data_dependent + NO backing read → demoted, stamped."""
+        db = _tmp_db_with_doc("approved")
+        with mock.patch.object(C, "call_worker",
+                               return_value=_wr(M017_DATA_DEP_NO_READS_OUT)):
+            res = C.run_converge(seed_text="head off-by-one for D1",
+                                 verdicts=LOCATED_VERDICTS, bundles=BUNDLES,
+                                 provider="deepinfra", model="m",
+                                 code_root="/repo", db_conn=db)
+        self.assertFalse(res.converged)                 # not a ready edit
+        self.assertTrue(res.causal_check.get("data_unstamped"))
+        self.assertFalse(res.data_state_backed)         # nothing was read
+        self.assertIn("M017 data-stamp", res.summary)
+
+    def test_data_dependent_consistent_backed_by_read_keeps_stamp(self):
+        """The earned stamp: a real read returns the row → consistent on fact survives."""
+        def fake(provider, model, prompt, cwd=None, timeout=300, **kw):
+            return _wr(M017_DATA_DEP_WITH_READS_OUT)   # same shape on both passes
+        db = _tmp_db_with_doc("approved")               # documents row D1 exists → backed
+        with mock.patch.object(C, "call_worker", side_effect=fake):
+            res = C.run_converge(seed_text="head off-by-one for D1",
+                                 verdicts=LOCATED_VERDICTS, bundles=BUNDLES,
+                                 provider="deepinfra", model="m",
+                                 code_root="/repo", db_conn=db)
+        self.assertTrue(res.data_state_backed)          # a real row backed it
+        self.assertTrue(res.converged)                  # stamped → stays converged
+        self.assertNotIn("data_unstamped", res.causal_check or {})
+
+    def test_pure_code_consistent_is_not_touched(self):
+        """A consistent ruled purely on code logic (data_dependent=False) is left alone even
+        with a DB configured and no read run."""
+        db = _tmp_db_with_doc("approved")
+        with mock.patch.object(C, "call_worker", return_value=_wr(M017_PURE_CODE_OUT)):
+            res = C.run_converge(seed_text="off-by-one slice",
+                                 verdicts=LOCATED_VERDICTS, bundles=BUNDLES,
+                                 provider="deepinfra", model="m",
+                                 code_root="/repo", db_conn=db)
+        self.assertTrue(res.converged)
+        self.assertNotIn("data_unstamped", res.causal_check or {})
+
+    def test_gate_inert_without_db_conn(self):
+        """No DB configured → nothing to read, nothing to enforce: the static verdict stands
+        (no regression vs the pre-lever-2 behaviour)."""
+        with mock.patch.object(C, "call_worker",
+                               return_value=_wr(M017_DATA_DEP_NO_READS_OUT)):
+            res = C.run_converge(seed_text="head off-by-one",
+                                 verdicts=LOCATED_VERDICTS, bundles=BUNDLES,
+                                 provider="deepinfra", model="m",
+                                 code_root="/repo", db_conn=None)
+        self.assertTrue(res.converged)
+        self.assertNotIn("data_unstamped", res.causal_check or {})
+
+
 class TestConvergeN173DbMandate(unittest.TestCase):
     """N173: when a DB is configured the converger is told so and must not fabricate
     stored values; any named read is executed and the verdict re-ruled on fact."""
@@ -1107,6 +1224,28 @@ class TestHoneyConvergeSection(unittest.TestCase):
         self.assertIn("api/workflow_head_routes.py:93-102", honey)
         self.assertIn("needs_reinvestigation", honey)
         # must NOT be presented as a ready primary edit at the data-certified node
+        self.assertNotIn("Primary edit target", honey)
+
+    def test_honey_renders_m017_data_unstamped_section(self):
+        """A demoted (data-unstamped) convergence renders as a CONFIRM-WITH-DATA target
+        routing to needs_reinvestigation — NOT a ready primary edit at the assumed node."""
+        converge = {
+            "converged": False,
+            "path": [{"node": "db_fn", "file": "db/workflow_sequences.py",
+                      "lines": "45-57", "symbol": "get_effective_head"}],
+            "attributed_defect": {"node": "db_fn", "file": "db/workflow_sequences.py",
+                                  "lines": "45-57", "why": "ORDER BY mis-ranks the head"},
+            "causal_check": {
+                "verdict": "consistent", "data_dependent": True, "data_unstamped": True,
+                "data_state_assumptions": ["assumes M.result_doc_id is set"],
+                "trace": "with result_doc_id set the CASE displaces the pending slot "
+                         "[M017 data-stamp] ..."},
+            "missing_link": None}
+        honey = render_local_honey(self._result(converge, "fix"), "head off-by-one")
+        self.assertIn("UNREAD stored value", honey)
+        self.assertIn("needs_reinvestigation", honey)
+        self.assertIn("assumed (UNREAD) data state", honey)
+        # must NOT be presented as a ready primary edit at the assumed node
         self.assertNotIn("Primary edit target", honey)
 
     def test_diagnostic_seed_says_path_is_deliverable(self):
