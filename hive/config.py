@@ -58,6 +58,21 @@ _DEFAULTS: dict[str, Any] = {
     # Cost guard-rails. allow_swarm=false makes `hive.py run` refuse to launch the
     # open-ended swarm (fan-out + reconcile) and point at the cheap investigate path.
     "safety":  {"allow_swarm": True},
+    # (M013 B3) Capped per-axis REINFORCEMENT by a few quality SCOUT agents (roles.scout)
+    # — NOT a swarm (the swarm pattern lives in judge's best-of-N vote). Distinct from the
+    # legacy open-ended swarm above. Fires ONLY on an axis the queen flagged (coverage_risk)
+    # AND whose local FIND came back empty (needs_reinforcement). Gated by its OWN switch so
+    # enabling targeted reinforcement does NOT re-open the full-swarm `run` path. Default OFF
+    # (no spend until deliberately enabled). Caps mirror the judge block: max_workers
+    # (scouts per axis — keep small; more just re-find the same files) + max_total_calls.
+    "reinforce": {"enabled": False, "max_workers": 2, "max_total_calls": 4},
+    # (M013 reaction #3) Live one-shot re-investigation of a specify
+    # needs_reinvestigation, routed by reason_code + coverage. Default OFF: the plan
+    # is always computed & logged for free, but the paid re-run (re_retrieve/
+    # re_converge → re-honey → re-specify) only fires when live=true. max_rounds is the
+    # hard ceiling on cheap re-runs; the loop also stops early when a re-run changes
+    # nothing (honey unchanged) — so it never busy-loops up to the cap for free.
+    "reinvestigation": {"live": False, "max_rounds": 2},
 }
 
 _DEFAULT_CONFIG_PATH = os.path.join(os.path.dirname(__file__), "..", "hive.config.json")
@@ -188,6 +203,41 @@ class SafetyConfig:
 
 
 @dataclass
+class ReinforceConfig:
+    """Caps for the M013 B3 targeted reinforcement by SCOUT agents (roles.scout) —
+    distinct from the legacy open-ended swarm gated by ``safety.allow_swarm``, and NOT a
+    swarm itself (the swarm pattern lives in judge's best-of-N vote).
+
+    Reinforcement fires ONLY on a ``needs_reinforcement`` axis — one the queen flagged
+    (``coverage_risk``) AND whose blind FIND returned nothing (B2). It spends, so it
+    has its OWN ``enabled`` switch (default false): turning on targeted reinforcement
+    must not silently re-open the full-swarm ``run`` path. ``max_workers`` caps the scouts
+    per axis (keep small — extra scouts just re-find the same files; quality of one scout,
+    i.e. ``roles.scout``'s model, is the real lever) and ``max_total_calls`` is the hard
+    per-run ceiling — the same one-number budget shape as ``JudgeConfig.max_total_calls``.
+    """
+    enabled: bool = False
+    max_workers: int = 2
+    max_total_calls: int = 4
+
+
+@dataclass
+class ReinvestigationConfig:
+    """Gate for the M013 reaction-#3 live re-run of a specify needs_reinvestigation.
+
+    The routing plan (``hive.reinvestigate.plan_reinvestigation``) is always computed
+    and logged for free. ``live`` gates only the PAID execution of that plan
+    (re_retrieve / re_converge → re-honey → re-specify). ``max_rounds`` is the hard
+    ceiling on cheap re-runs; the loop ALSO stops early when a re-run changes nothing
+    (the re-grounded honey is identical), so a stubborn NR can never busy-loop up to the
+    cap. Default off; default cap 2 (one re-run + one confirm) — a tuning knob raised
+    only with live A/B evidence. Default off.
+    """
+    live: bool = False
+    max_rounds: int = 2
+
+
+@dataclass
 class JudgeConfig:
     """Cost caps for the JUDGE-directed follow-up loop (M004 §4 budget).
 
@@ -224,7 +274,14 @@ class JudgeConfig:
 @dataclass
 class Config:
     queen: RoleConfig = field(default_factory=RoleConfig)
+    # The legacy blanket-fanout worker (one drone per axis, `hive run`) — a real swarm,
+    # gated off by safety.allow_swarm. Distinct from `scout` below.
     swarm: RoleConfig = field(default_factory=RoleConfig)
+    # The B3 reinforcement worker: a FEW quality agents sent to dig up the evidence a
+    # thin axis's blind grep missed — NOT a swarm (the swarm pattern lives in judge's
+    # best-of-N voting). Named `scout` so the model is the obvious reinforcement-quality
+    # tuning knob. Falls back to `swarm` when unset, so existing configs are unchanged.
+    scout: RoleConfig = field(default_factory=RoleConfig)
     assemble_role: RoleConfig = field(default_factory=RoleConfig)
     specify: RoleConfig = field(default_factory=RoleConfig)
     review: RoleConfig = field(default_factory=RoleConfig)
@@ -240,6 +297,9 @@ class Config:
     apply: ApplyConfig = field(default_factory=ApplyConfig)
     judge: JudgeConfig = field(default_factory=JudgeConfig)
     safety: SafetyConfig = field(default_factory=SafetyConfig)
+    reinforce: ReinforceConfig = field(default_factory=ReinforceConfig)
+    reinvestigation: ReinvestigationConfig = field(
+        default_factory=ReinvestigationConfig)
     commit_stage: CommitConfig = field(default_factory=CommitConfig)
     # Per-codebase read-only DB connections, keyed by a short name (e.g. "flowgate").
     # Empty by default — the converge data-state read is SKIPPED when a run's codebase
@@ -270,7 +330,7 @@ class Config:
         return None
 
     def role(self, name: str) -> RoleConfig:
-        """Return the RoleConfig for a role ('queen', 'swarm', 'assemble', 'specify', 'review', 'commit', 'judge')."""
+        """Return the RoleConfig for a role ('queen', 'swarm', 'scout', 'assemble', 'specify', 'review', 'commit', 'judge')."""
         if name == "assemble":
             return self.assemble_role
         if name == "judge":
@@ -283,8 +343,9 @@ class Config:
         """Apply a CLI --model override to all roles (preserves --model semantics)."""
         if model is None:
             return
-        for role in (self.queen, self.swarm, self.assemble_role, self.specify,
-                     self.review, self.commit, self.judge_role, self.converge_role):
+        for role in (self.queen, self.swarm, self.scout, self.assemble_role,
+                     self.specify, self.review, self.commit, self.judge_role,
+                     self.converge_role):
             role.model = model
 
 
@@ -321,6 +382,8 @@ def load_config(path: str | None = None) -> Config:
     apply_raw = merged.get("apply", {})
     judge_raw = merged.get("judge", {})
     safety_raw = merged.get("safety", {})
+    reinforce_raw = merged.get("reinforce", {})
+    reinvest_raw = merged.get("reinvestigation", {})
     commit_raw = merged.get("commit_stage", {})
     db_raw = merged.get("db_connections", {})
 
@@ -350,9 +413,14 @@ def load_config(path: str | None = None) -> Config:
                           timeout_sec=int(timeout) if timeout is not None else None,
                           retries=int(r.get("retries", 0)))
 
+    # `scout` (B3 reinforcement worker) defaults to the `swarm` role's model when the
+    # config does not name it, so an existing roles.swarm carries over unchanged.
+    swarm_role = _role("swarm")
+    scout_role = _role("scout") if "scout" in roles else swarm_role
     return Config(
         queen=_role("queen"),
-        swarm=_role("swarm"),
+        swarm=swarm_role,
+        scout=scout_role,
         assemble_role=_role("assemble"),
         specify=_role("specify"),
         review=_role("review"),
@@ -386,6 +454,15 @@ def load_config(path: str | None = None) -> Config:
         ),
         safety=SafetyConfig(
             allow_swarm=bool(safety_raw.get("allow_swarm", True)),
+        ),
+        reinforce=ReinforceConfig(
+            enabled=bool(reinforce_raw.get("enabled", False)),
+            max_workers=int(reinforce_raw.get("max_workers", 2)),
+            max_total_calls=int(reinforce_raw.get("max_total_calls", 4)),
+        ),
+        reinvestigation=ReinvestigationConfig(
+            live=bool(reinvest_raw.get("live", False)),
+            max_rounds=int(reinvest_raw.get("max_rounds", 2)),
         ),
         commit_stage=CommitConfig(
             filename_only_threshold=int(

@@ -29,11 +29,12 @@ from typing import Any
 
 from hive.converge import run_converge
 from hive.decompose import run_decompose
+from hive.fanout import ReinforceBudget, reinforce_thin_axis
 from hive.judge import run_judge_votes
-from hive.retriever import _ripgrep, retrieve
+from hive.retriever import SearchPlan, _ripgrep, retrieve, retrieve_followup
 from hive.searchplan import (
-    extract_doc_topics, extract_globs, extract_keywords, task_to_searchplan,
-    is_visibility_symptom, with_visibility_probe,
+    coverage_risk, extract_doc_topics, extract_globs, extract_keywords,
+    task_to_searchplan, is_visibility_symptom, with_visibility_probe,
 )
 
 logger = logging.getLogger("hive.investigate")
@@ -551,6 +552,41 @@ def run_investigate(
             logger.info("   glob-guard: kept=%s dropped_empty=%s dropped_overbroad=%s",
                         gv.get("kept"), gv.get("dropped_empty"),
                         gv.get("dropped_overbroad"))
+        # (B2/#5) Confirm the queen's coverage_risk self-doubt against what the FIND
+        # actually retrieved: only a flagged AND empty axis is "starved". The tag
+        # rides the verdict so converge/specify/reaction can route a retrieval gap
+        # apart from a reasoning gap — free, deterministic, no extra call.
+        coverage = _axis_coverage(coverage_risk(task) == "thin", st)
+        if coverage["flagged"] or coverage["thin"]:
+            note = ("REINFORCE (queen-flagged ∧ empty FIND)"
+                    if coverage["needs_reinforcement"]
+                    else "thin (unflagged)" if coverage["thin"]
+                    else "flagged but FIND not empty (sufficient)")
+            logger.info("   coverage: flagged=%s thin=%s → %s",
+                        coverage["flagged"], coverage["thin"], note)
+
+        # (B3) Capped scout reinforcement: ONLY for a needs_reinforcement axis (queen
+        # flagged AND FIND empty) and ONLY when cfg.reinforce.enabled. A few quality
+        # scouts (roles.scout) dig for evidence the blind grep missed; their cited files
+        # are windowed LOCALLY (free) and merged into the bundle so the judge sees them.
+        # Default off → this is a no-op and the un-reinforced path is unchanged.
+        if coverage["needs_reinforcement"] and getattr(cfg.reinforce, "enabled", False):
+            need = reinforce_thin_axis(task, sp, seed_text, code_root, cfg=cfg,
+                                       budget=reinforce_budget, ledger=ledger,
+                                       provider_kwargs=pk)
+            if need is not None:
+                fu = retrieve_followup(need, code_root, k=k)
+                if fu and (fu.get("seeds") or fu.get("call_chain")):
+                    bundle = {
+                        **bundle,
+                        "code_snippets": (list(bundle.get("code_snippets") or [])
+                                          + list(fu.get("seeds") or [])),
+                        "call_chain": (list(bundle.get("call_chain") or [])
+                                       + list(fu.get("call_chain") or [])),
+                    }
+                    logger.info("   reinforce[%s]: merged +%d snippet(s), +%d call-chain",
+                                sp.axis_id, len(fu.get("seeds") or []),
+                                len(fu.get("call_chain") or []))
 
         votes = effective_votes
         logger.info("[HIVE_STAGE] pipeline=investigate stage=3 name=judge axis=%s",
@@ -607,6 +643,9 @@ def run_investigate(
             "votes": {"n": jr.get("votes", 1), "located": jr.get("located_votes", 0)},
             "candidates": [{"file": c.file, "lines": c.lines, "reason": c.reason}
                            for c in jr.get("candidates", [])],
+            # (B2/#5) sufficiency tag: was this axis's evidence thin, and did the queen
+            # flag it? Lets the honey/reaction tell a retrieval gap from a reasoning gap.
+            "coverage": coverage,
         }
         return idx, verdict_entry, keep_bundle
 
@@ -617,6 +656,11 @@ def run_investigate(
     # ``bundles`` is kept parallel to ``verdicts`` (was discarded after judge) so the
     # ④ converge stage can pool the cross-axis call-chain hops it needs.
     slots: list[Any] = [None] * len(judged)
+    # (B3) Shared per-run ceiling on reinforcement (scout) calls — drained across axes by
+    # the thread pool. None when reinforcement is disabled, so the gate is a cheap
+    # attribute check and no budget object is allocated on the common (off) path.
+    reinforce_budget = (ReinforceBudget(cfg.reinforce.max_total_calls)
+                        if getattr(cfg.reinforce, "enabled", False) else None)
     if judged:
         logger.info("②..③ judging %d axes (max_parallel=%d)", len(judged), max_workers)
         with ThreadPoolExecutor(max_workers=max_workers) as pool:
@@ -906,6 +950,55 @@ def _render_converge_section(converge: dict[str, Any] | None,
     return out
 
 
+def _axis_coverage(flagged: bool, stats: dict[str, Any]) -> dict[str, Any]:
+    """The (flag ∧ thin) sufficiency tag for one axis (B2/#5) — free, deterministic.
+
+    ``flagged`` is the queen's coverage_risk self-doubt (searchplan.coverage_risk);
+    ``thin`` is what the local FIND ACTUALLY retrieved for the axis. The pipeline only
+    treats an axis as starved when BOTH hold (queen unsure AND evidence empty) — the
+    cheap, confirmable signal that a thin envelope existed BEFORE specify pays for it.
+    ``thin`` alone (no flag) or a flag on a well-retrieved axis are both left untouched.
+
+    The tag rides the verdict downstream so the reaction side can separate a RETRIEVAL
+    gap (thin → re-fetch may help) from a REASONING gap (sufficient → honest defer, no
+    point re-fetching): #5 closes "did the queen give enough?" with data, not a guess.
+    """
+    gv = stats.get("glob_validation", {}) or {}
+    all_globs_empty = bool(gv.get("dropped_empty")) and not gv.get("kept")
+    thin = (stats.get("snippets", 0) == 0
+            or stats.get("raw_hits", 0) == 0
+            or all_globs_empty)
+    return {
+        "flagged": bool(flagged),
+        "thin": bool(thin),
+        "sufficient": not thin,
+        "needs_reinforcement": bool(flagged) and bool(thin),
+        "raw_hits": stats.get("raw_hits", 0),
+        "snippets": stats.get("snippets", 0),
+    }
+
+
+def _coverage_phrase(coverage: dict[str, Any] | None) -> str:
+    """One honey-ready clause describing an axis's evidence sufficiency (C/#5), or "".
+
+    Renders the verdict's coverage tag into prose the specify author (and a future
+    reaction pass) reads to decide WHY an axis is unlocated: a retrieval gap (the FIND
+    came back empty → a wider re-retrieve may recover it) versus a reasoning gap (the
+    evidence WAS retrieved → re-fetching buys nothing, defer honestly). Empty when no
+    tag is present (older verdicts) so the honey is unchanged for them.
+    """
+    if not isinstance(coverage, dict):
+        return ""
+    if coverage.get("needs_reinforcement"):
+        return (" — evidence THIN (queen flagged this axis AND the local FIND came back "
+                "empty): a wider re-retrieve may recover it before deferring")
+    if coverage.get("thin"):
+        return (" — evidence thin (the local FIND came back empty): a wider re-retrieve "
+                "may recover it")
+    return (" — evidence sufficient (the FIND retrieved code here): retrieval was NOT the "
+            "gap, so defer honestly — re-fetching the same scope will not help")
+
+
 def render_local_honey(result: dict[str, Any], seed_text: str,
                        code_root: str | None = None,
                        docs_root: str | None = None) -> str:
@@ -1033,13 +1126,103 @@ def render_local_honey(result: dict[str, Any], seed_text: str,
                        "targets — the prohibition here applies only to these speculative "
                        "axis loci, not to a seed-named file.)")
             out.append("")
+        if any(v.get("coverage") for v in unlocated):
+            out.append("Each axis below carries an EVIDENCE note (C/#5): \"thin\" means the "
+                       "local FIND retrieved nothing, so a wider re-retrieve may recover it; "
+                       "\"sufficient\" means the code WAS retrieved and the axis still did not "
+                       "localise — a reasoning gap, so re-fetching the same scope will not "
+                       "help and an honest defer is correct.")
+            out.append("")
         for v in unlocated:
             vd = v.get("verdict", {})
             reason = vd.get("reason") or "not located"
-            out.append(f"- {v.get('axis_id', '?')} — {v.get('title', '')}: {reason}")
+            out.append(f"- {v.get('axis_id', '?')} — {v.get('title', '')}: {reason}"
+                       f"{_coverage_phrase(v.get('coverage'))}")
         out.append("")
 
     return "\n".join(out)
+
+
+def _rebuild_bundles(verdicts: list[dict[str, Any]], code_root: str | None,
+                     docs_root: str | None) -> list[dict[str, Any]]:
+    """Re-derive a retrieve bundle per verdict from its stored ``search_plan`` — LOCAL,
+    free. Lets a re-run feed converge the SAME evidence shape without threading the
+    original (large) bundles through the orchestrator."""
+    bundles: list[dict[str, Any]] = []
+    for v in verdicts:
+        spd = v.get("search_plan") or {}
+        sp = SearchPlan(axis_id=str(v.get("axis_id") or "?"),
+                        keywords=list(spd.get("keywords") or []),
+                        file_globs=list(spd.get("file_globs") or []),
+                        doc_topics=list(spd.get("doc_topics") or []))
+        bundles.append(retrieve(sp, code_root or ".", docs_root))
+    return bundles
+
+
+def _rerun_converge(result: dict[str, Any], seed_text: str, *, code_root: str | None,
+                    docs_root: str | None, cfg, ledger, provider_kwargs,
+                    honey_out: str | None) -> dict[str, Any] | None:
+    """Reaction #3 (ineffective/inconclusive): re-stitch on LIVE-re-grounded evidence.
+
+    Re-derives each axis's bundle from the current source (free local retrieve) and re-runs
+    ``converge`` so its causal gate rules on TODAY's code, not the first pass's compacted
+    snippets (the N177 live-grounding lever, applied at the reaction edge). Updates
+    ``result['converge']``, re-renders the local honey to ``honey_out``, and returns the
+    updated result — or ``None`` when there is nothing to re-stitch (<2 located)."""
+    verdicts = list(result.get("verdicts") or [])
+    located = [v for v in verdicts if (v.get("verdict") or {}).get("located")]
+    if len(located) < 2:
+        logger.info("reinvestigation live: <2 located verdict(s) on re-run — "
+                    "nothing to re-stitch (honest NR stands)")
+        return None
+    conv_role = cfg.role("converge")
+    db_conn = cfg.db_for_codebase(code_root)
+    bundles = _rebuild_bundles(verdicts, code_root, docs_root)
+    logger.info("reinvestigation live: re-converge %d located verdict(s) on re-grounded "
+                "evidence (%s/%s)", len(located), conv_role.provider, conv_role.model)
+    pk = dict(provider_kwargs or {})
+    cres = run_converge(
+        seed_text=seed_text, verdicts=_converge_fragments(verdicts), bundles=bundles,
+        provider=conv_role.provider, model=conv_role.model, code_root=code_root,
+        ledger=ledger, provider_kwargs=pk, k=6, max_hops=2, db_conn=db_conn)
+    result["converge"] = cres.as_dict()
+    if honey_out:
+        with open(honey_out, "w", encoding="utf-8") as f:
+            f.write(render_local_honey(result, seed_text, code_root, docs_root))
+        logger.info("reinvestigation live: re-rendered honey → %s", honey_out)
+    return result
+
+
+def rerun_reinvestigation(plan, result: dict[str, Any], *, seed_text: str,
+                          code_root: str | None, docs_root: str | None, cfg,
+                          ledger=None, provider_kwargs: dict | None = None,
+                          honey_out: str | None = None) -> dict[str, Any] | None:
+    """Execute ONE cheap re-run for a routed NR plan — gated, bounded (M013 reaction #3).
+
+    Gated by ``cfg.reinvestigation.live`` (default off): when off this is a no-op and the
+    plan stands as an honest NR (already logged for free). When on, it performs the single
+    re-entry the routing brain chose and returns an updated ``result`` (honey re-rendered
+    to ``honey_out``) for the caller to re-run specify ONCE — or ``None`` (no re-run, do not
+    re-spend on specify).
+
+    ``re_converge`` is wired (live re-grounding + re-stitch). ``re_retrieve`` re-judge is
+    intentionally NOT fired here: it needs the per-axis judge core extracted into a reusable
+    entry, and re-rendering the honey WITHOUT changed verdicts would spend a specify call for
+    nothing. So re_retrieve logs that the plan stands and returns None — no wasted spend.
+    """
+    if not getattr(cfg.reinvestigation, "live", False):
+        return None
+    # Compare on the stable action strings (avoid importing reinvestigate → no cycle risk).
+    if plan.action == "re_converge":
+        return _rerun_converge(result, seed_text, code_root=code_root, docs_root=docs_root,
+                               cfg=cfg, ledger=ledger, provider_kwargs=provider_kwargs,
+                               honey_out=honey_out)
+    if plan.action == "re_retrieve":
+        logger.info("reinvestigation live: re_retrieve re-judge not yet wired (needs the "
+                    "per-axis judge core extracted) — plan stands on axes %s, no spend",
+                    plan.axis_ids)
+        return None
+    return None
 
 
 def _write_report(result: dict[str, Any], output_path: str) -> None:

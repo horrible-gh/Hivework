@@ -217,6 +217,14 @@ make sure your axes cover BOTH trees. Then output the decomposition JSON.
      `server/modules/**/db/**/*.py`). Narrow to where the evidence lives.
    - `doc_topics`: design-doc topics/codes for design axes (e.g. `D030`,
      `head semantics`); [] for pure-code axes.
+7. Each task ALSO carries `coverage_risk` — your OWN honest confidence that the
+   blind grep above will actually find this axis's evidence. Set it to `"thin"`
+   when you are NOT sure (the symptom is vaguely worded, your keywords are few or
+   generic, or you are guessing where the code lives); otherwise `"ok"`. This is a
+   self-doubt flag, not a verdict: a downstream check confirms it against what the
+   local FIND really retrieved and only reinforces the axes you flagged AND that
+   came back empty. Flag honestly — over-flagging wastes a check, under-flagging
+   lets a thin axis slip through unreinforced.
 
 ## Output format (STRICT) — return ONLY this JSON, no prose, no markdown fence:
 
@@ -226,6 +234,7 @@ make sure your axes cover BOTH trees. Then output the decomposition JSON.
   "steps": [["A","B","C"], ["F"]],
   "tasks": [
     {"id": "A", "title": "...", "brief": "...", "depends_on": [],
+     "coverage_risk": "ok" | "thin",
      "search_plan": {"keywords": ["..."], "file_globs": ["..."], "doc_topics": ["..."]}}
   ]
 }

@@ -12,10 +12,13 @@ Uses subprocess + concurrent.futures for parallel execution.
 import os
 import subprocess
 import logging
+import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any
 
+from hive.parse import extract_first_json
 from hive.providers import call_worker
+from hive.retriever import FollowupNeed
 
 logger = logging.getLogger("hive.fanout")
 
@@ -194,3 +197,135 @@ def run_fanout(
 
     logger.info("Fan-out complete: %d combs saved", len(comb_files))
     return comb_files
+
+
+# ── M013 B3: targeted, capped REINFORCEMENT (scouts, NOT a swarm) ──────────────
+# Distinct from the open-ended fan-out above (a real swarm): reinforcement fires ONLY on
+# an axis the queen flagged (coverage_risk) AND whose blind local FIND returned nothing
+# (needs_reinforcement, B2). A FEW quality SCOUT agents (roles.scout, 120b) dig for the
+# evidence the blind grep missed; we lift the file:lines they cite and hand them back as a
+# FollowupNeed the caller windows LOCALLY (free) into the bundle before judge. This is the
+# opposite of a swarm: more scouts on one thin axis just re-find the same files (the swarm
+# pattern — many cheap independent agents averaged — lives in judge's best-of-N vote, not
+# here). Gated by cfg.reinforce.enabled (default off) and bounded by a shared run budget.
+
+
+class ReinforceBudget:
+    """Thread-safe ceiling on total reinforcement (scout) calls per investigate run.
+
+    Scouts run inside a thread pool, so the per-run ``max_total_calls`` cap is enforced
+    with a lock: each axis ``take(n)``s as many scout slots as remain (≤ its own
+    ``max_workers`` request). Once drained, further axes get 0 and skip reinforcement —
+    the hard one-number budget shape mirrors ``JudgeConfig.max_total_calls``.
+    """
+
+    def __init__(self, total: int):
+        self._remaining = max(0, int(total))
+        self._lock = threading.Lock()
+
+    def take(self, want: int) -> int:
+        want = max(0, int(want))
+        with self._lock:
+            granted = min(want, self._remaining)
+            self._remaining -= granted
+            return granted
+
+    @property
+    def remaining(self) -> int:
+        with self._lock:
+            return self._remaining
+
+
+def _extract_comb_evidence(comb_stdout: str) -> tuple[list[str], list[str]]:
+    """Pull cited (file paths, root-cause symbols) out of one comb JSON. Never raises.
+
+    A scout's value on a thin axis is the FILES it located that the blind grep missed;
+    we feed those back as a re-search scope. ``root_cause_signal`` (``file:line``) and
+    ``findings[].evidence[].file`` are the cited paths; the basename (sans extension) of a
+    root-cause file is offered as a symbol seed. A malformed comb yields ([], [])."""
+    try:
+        obj = extract_first_json(comb_stdout or "")
+    except (ValueError, TypeError):
+        return [], []
+    if not isinstance(obj, dict):
+        return [], []
+    files: list[str] = []
+    symbols: list[str] = []
+
+    def _add_file(f: Any) -> None:
+        f = str(f or "").strip()
+        if f and f not in files:
+            files.append(f)
+
+    sig = str(obj.get("root_cause_signal") or "").strip()
+    if sig:
+        _add_file(sig.split(":", 1)[0])
+    for finding in obj.get("findings") or []:
+        if not isinstance(finding, dict):
+            continue
+        for ev in finding.get("evidence") or []:
+            if isinstance(ev, dict):
+                _add_file(ev.get("file"))
+    return files, symbols
+
+
+def reinforce_thin_axis(task: dict[str, Any], sp, seed_text: str, code_root: str, *,
+                        cfg, budget: "ReinforceBudget | None",
+                        ledger=None, provider_kwargs: dict | None = None):
+    """Capped scout reinforcement for ONE ``needs_reinforcement`` axis (B3).
+
+    Returns a :class:`hive.retriever.FollowupNeed` (scope = the files the scouts cited,
+    grepped by the axis's own keywords) for the caller to window LOCALLY into the bundle
+    before judge — or ``None`` when reinforcement is disabled, out of budget, or the
+    scouts cited nothing. Never raises: a flaky/empty scout degrades to no reinforcement,
+    so an enabled-but-unlucky run is no worse than the un-reinforced path.
+    """
+    if not getattr(cfg.reinforce, "enabled", False):
+        return None
+    axis_id = sp.axis_id
+    want = max(1, int(cfg.reinforce.max_workers))
+    granted = budget.take(want) if budget is not None else 0
+    if granted <= 0:
+        logger.info("   reinforce[%s]: skipped (budget exhausted)", axis_id)
+        return None
+
+    role = cfg.role("scout")
+    pk = dict(provider_kwargs or {})
+    prompt = build_comb_prompt(load_comb_contract(None, code_root), task, seed_text)
+    logger.info("   reinforce[%s]: %d scout(s) (%s/%s) on thin axis",
+                axis_id, granted, role.provider, role.model)
+
+    def _one(i: int) -> str:
+        try:
+            wr = call_worker(role.provider, role.model, prompt, cwd=code_root,
+                             timeout=600, **pk)
+        except subprocess.SubprocessError:
+            return ""
+        if ledger is not None:
+            ledger.record_call("scout", f"{axis_id}#reinforce{i}", role.provider,
+                               role.model, prompt=prompt, output=wr.stdout,
+                               latency_s=wr.latency_s, ok=wr.exit_code == 0,
+                               err=wr.stderr[:200] if wr.exit_code != 0 else "",
+                               real_tokens=wr.real_tokens)
+        return wr.stdout if wr.exit_code == 0 else ""
+
+    if granted == 1:
+        outs = [_one(0)]
+    else:
+        with ThreadPoolExecutor(max_workers=granted) as pool:
+            outs = list(pool.map(_one, range(granted)))
+
+    files: list[str] = []
+    for out in outs:
+        cited, _syms = _extract_comb_evidence(out)
+        for f in cited:
+            if f not in files:
+                files.append(f)
+    if not files:
+        logger.info("   reinforce[%s]: scouts cited no new files — no enrichment", axis_id)
+        return None
+    logger.info("   reinforce[%s]: scouts cited %d file(s) → local re-window", axis_id,
+                len(files))
+    # Scope the local re-search to the cited files, grepped by the axis's own keywords.
+    return FollowupNeed(axis_id=axis_id, symbols=[], greps=list(sp.keywords),
+                        file_globs=files)

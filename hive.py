@@ -26,11 +26,13 @@ from hive.conflict_scan import scan_conflicts
 from hive.reconcile import run_reconcile_loop
 from hive.assemble import run_assemble
 from hive.specify import run_specify
+from hive.reinvestigate import run_reinvestigation_loop
 from hive.apply import run_apply
 from hive.commit import run_propose, run_commit, render_commit_summary_lines
 from hive.investigate import (
     format_caller_context,
     render_local_honey,
+    rerun_reinvestigation,
     run_investigate,
     seed_edit_targets,
 )
@@ -563,17 +565,40 @@ def run_investigate_command(args: argparse.Namespace) -> None:
             specify_kwargs = dict(author_retries=specify_role.retries)
             if specify_role.timeout_sec is not None:
                 specify_kwargs["author_timeout"] = specify_role.timeout_sec
-            spec = run_specify(
-                honey_path=honey_path, codebase_root=args.codebase,
-                docs_root=args.docs,
-                output_path=spec_out, contract_path=args.contract,
-                model=specify_role.model, provider=specify_role.provider,
-                review_model=review_role.model, review_provider=review_role.provider,
-                ledger=ldg2, provider_kwargs=provider_kwargs, **specify_kwargs,
-            )
-            logger.info("Edit-spec: %s (%d edits, %d deferred, termination=%s)",
-                        spec_out, len(spec.get("edits") or []),
-                        len(spec.get("deferred") or []), spec.get("termination", "?"))
+
+            def _respecify():
+                spec = run_specify(
+                    honey_path=honey_path, codebase_root=args.codebase,
+                    docs_root=args.docs, output_path=spec_out,
+                    contract_path=args.contract, model=specify_role.model,
+                    provider=specify_role.provider, review_model=review_role.model,
+                    review_provider=review_role.provider, ledger=ldg2,
+                    provider_kwargs=provider_kwargs, **specify_kwargs)
+                logger.info("Edit-spec: %s (%d edits, %d deferred, termination=%s)",
+                            spec_out, len(spec.get("edits") or []),
+                            len(spec.get("deferred") or []),
+                            spec.get("termination", "?"))
+                return spec
+
+            def _read_honey():
+                try:
+                    with open(honey_path, encoding="utf-8") as f:
+                        return f.read()
+                except OSError:
+                    return ""
+
+            spec = _respecify()
+            # Reaction #3: route an NR to the cheapest re-entry instead of dead-ending.
+            # The plan is always logged for free; the live re-run loop (gated by
+            # cfg.reinvestigation.live, capped by max_rounds, with an honest no-change
+            # early stop) re-grounds → re-specifies up to the cap.
+            spec, result = run_reinvestigation_loop(
+                spec, result, cfg=cfg,
+                rerun=lambda pl, res: rerun_reinvestigation(
+                    pl, res, seed_text=seed_text, code_root=args.codebase,
+                    docs_root=args.docs, cfg=cfg, ledger=ldg2,
+                    provider_kwargs=provider_kwargs, honey_out=honey_path),
+                respecify=_respecify, read_honey=_read_honey)
         except Exception as e:
             # Partial-save: the honey (the whole investigate stage's output) is
             # already on disk, so specify can be RESUMED from it without re-running

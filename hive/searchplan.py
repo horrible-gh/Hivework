@@ -234,6 +234,27 @@ def with_visibility_probe(plan: SearchPlan) -> SearchPlan:
                       file_globs=plan.file_globs, doc_topics=plan.doc_topics)
 
 
+# Queen self-doubt synonyms → the canonical "thin" flag (B1). Anything else
+# (incl. absent/empty/"ok"/"high") normalises to "ok": coverage_risk is opt-IN, so a
+# queen that never learned the field, or a flaky value, defaults to NOT flagged.
+_THIN_RISK = frozenset({"thin", "high", "risky", "low", "weak", "uncertain", "true"})
+
+
+def coverage_risk(task: dict[str, Any]) -> str:
+    """Normalise a decompose task's ``coverage_risk`` self-doubt flag → "thin"|"ok".
+
+    Defensive: the queen contract (B1) asks for ``"thin"``/``"ok"`` but the field is
+    free-form model output, so a bool ``true``, a synonym ("high", "risky"), or a
+    missing field are all coerced rather than trusted. Only an affirmative thinness
+    signal yields ``"thin"``; everything else (incl. absent) is ``"ok"``. This is the
+    single parse point — investigate reads the normalised value, never the raw field.
+    """
+    raw = task.get("coverage_risk")
+    if isinstance(raw, bool):
+        return "thin" if raw else "ok"
+    return "thin" if str(raw or "").strip().lower() in _THIN_RISK else "ok"
+
+
 def task_to_searchplan(task: dict[str, Any], *,
                        default_globs: list[str] | None = None,
                        max_keywords: int = 14) -> SearchPlan:

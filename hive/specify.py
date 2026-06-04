@@ -86,6 +86,76 @@ _DECISIVE_CONFIDENCE = {"high", "medium"}
 # so their presence must not block applying an independently-verified edit.
 _OPTIONAL_DEFERRED_REASONS = {"policy_direction", "not_expressible_as_edit", "multi_file_design"}
 
+# ── Structured reinvestigation reason codes (Step A) ───────────────────────────
+# Every site that lands a spec in needs_reinvestigation stamps a MACHINE-READABLE
+# reason code into ``spec["reinvestigation"]`` so the reactive re-investigation can
+# route by CAUSE (which hole) instead of re-parsing the prose ``notes``. The LAST
+# gate to fire wins — the structured field is overwritten, so it is the single
+# source of truth for which gate had final say (the prose notes still accumulate
+# the full trail). Each code maps to the targeted action the bridge should take:
+#   stale_anchor          → re-anchor against live source (NOT a re-investigation)
+#   anchor_not_grounded   → targeted re-retrieve of the missing grounding
+#   ineffective           → exclude the ruled-out node, re-converge
+#   inconclusive          → re-review / re-converge (effectiveness unconfirmed)
+#   seed_target_uncovered → re-author the edit for the dropped seed target
+#   legacy_coerce         → a retired needs_pm coerced here (no real gap)
+#   author_declared       → the author itself emitted NR (read its own detail)
+RI_STALE_ANCHOR = "stale_anchor"
+RI_ANCHOR_NOT_GROUNDED = "anchor_not_grounded"
+RI_INEFFECTIVE = "ineffective"
+RI_INCONCLUSIVE = "inconclusive"
+RI_SEED_TARGET_UNCOVERED = "seed_target_uncovered"
+RI_LEGACY_COERCE = "legacy_coerce"
+RI_AUTHOR_DECLARED = "author_declared"
+
+
+def _append_note(spec: dict[str, Any], note: str) -> None:
+    """Append ``note`` to ``spec['notes']`` (space-joined), preserving prior trail."""
+    prev = str(spec.get("notes", "")).strip()
+    spec["notes"] = f"{prev} {note}".strip() if prev else note
+
+
+def _set_reinvestigation(spec: dict[str, Any], *, reason_code: str, gate: str,
+                         note: str, detail: str | None = None) -> dict[str, Any]:
+    """Land ``spec`` in needs_reinvestigation with a structured, routable reason.
+
+    Sets the canonical termination, stamps ``spec['reinvestigation']`` (last writer
+    wins → the gate with final say) and appends ``note`` to the prose trail. This is
+    the ONE place termination becomes needs_reinvestigation inside the gates, so the
+    reactive bridge always finds a machine-readable cause, never just prose.
+    """
+    spec["termination"] = "needs_reinvestigation"
+    spec["reinvestigation"] = {
+        "reason_code": reason_code,
+        "gate": gate,
+        "detail": (detail if detail is not None else note),
+    }
+    _append_note(spec, note)
+    return spec
+
+
+def _ensure_reinvestigation_reason(spec: dict[str, Any]) -> dict[str, Any]:
+    """Stamp an author-declared reason when NR was emitted by the author, not a gate.
+
+    Runs last in ``run_specify``. A gate that downgrades to needs_reinvestigation
+    always stamps ``spec['reinvestigation']``; if the spec is in that terminal state
+    WITHOUT the structured field, the author worker emitted it directly. We record
+    ``author_declared`` (carrying the author's own narrative) so the reactive bridge
+    never meets a needs_reinvestigation with no routable cause. A non-NR spec keeps
+    no stray reason field.
+    """
+    if spec.get("termination") != "needs_reinvestigation":
+        spec.pop("reinvestigation", None)
+        return spec
+    if not isinstance(spec.get("reinvestigation"), dict):
+        spec["reinvestigation"] = {
+            "reason_code": RI_AUTHOR_DECLARED,
+            "gate": "author",
+            "detail": str(spec.get("notes", "")).strip()[:300] or "author emitted "
+            "needs_reinvestigation",
+        }
+    return spec
+
 
 def load_contract(contract_path: str | None = None) -> str:
     """Load the edit-spec authoring contract (the specify author's role prompt)."""
@@ -484,6 +554,10 @@ def _normalize_spec(spec: dict[str, Any]) -> dict[str, Any]:
     if spec.get("termination") == "needs_pm":
         logger.info("specify: coercing retired termination needs_pm -> needs_reinvestigation")
         spec["termination"] = "needs_reinvestigation"
+        spec["reinvestigation"] = {
+            "reason_code": RI_LEGACY_COERCE, "gate": "normalize",
+            "detail": "retired needs_pm coerced to needs_reinvestigation",
+        }
 
     gate = spec.get("gate")
     if not isinstance(gate, dict):
@@ -503,6 +577,10 @@ def _normalize_spec(spec: dict[str, Any]) -> dict[str, Any]:
         logger.warning("specify: edits %s are stale/not_found but termination=ready_to_apply"
                        " — overriding to needs_reinvestigation", unverified)
         spec["termination"] = "needs_reinvestigation"
+        spec["reinvestigation"] = {
+            "reason_code": RI_STALE_ANCHOR, "gate": "normalize",
+            "detail": f"stale/not_found anchor(s): {unverified}",
+        }
     return spec
 
 
@@ -966,30 +1044,29 @@ def _apply_effectiveness_gate(
                            "VERIFIED edits in a cross-file wiring — holding as "
                            "inconclusive -> %s (not asserting the fix is wrong)",
                            sorted(review_flagged), _INCONCLUSIVE_TERMINATION)
-            spec["termination"] = _INCONCLUSIVE_TERMINATION
             note = ("effectiveness gate: review judged " + ", ".join(sorted(review_flagged))
                     + " ineffective in isolation, but they are verified edits in a "
                     "cross-file wiring — re-investigating rather than asserting the fix "
                     "is broken")
+            reason_code = RI_INCONCLUSIVE
         else:
             logger.warning("specify: edits %s do not change the reported behavior but "
                            "termination=ready_to_apply — overriding to %s",
                            sorted(ineffective), _INEFFECTIVE_TERMINATION)
-            spec["termination"] = _INEFFECTIVE_TERMINATION
             note = "effectiveness gate: " + "; ".join(
                 f"{k} {v}" for k, v in sorted(ineffective.items()))
+            reason_code = RI_INEFFECTIVE
     elif inconclusive:
         logger.warning("specify: effectiveness review inconclusive — downgrading "
                        "ready_to_apply to %s (re-investigate)", _INCONCLUSIVE_TERMINATION)
-        spec["termination"] = _INCONCLUSIVE_TERMINATION
         note = ("effectiveness gate: review inconclusive — re-investigating to confirm "
                 "the edits change the reported behavior before presenting as ready")
+        reason_code = RI_INCONCLUSIVE
     else:
         return spec
 
-    prev = str(spec.get("notes", "")).strip()
-    spec["notes"] = f"{prev} {note}".strip() if prev else note
-    return spec
+    return _set_reinvestigation(spec, reason_code=reason_code, gate="effectiveness",
+                                note=note)
 
 
 def _apply_anchor_not_grounded_gate(spec: dict[str, Any]) -> dict[str, Any]:
@@ -1034,11 +1111,10 @@ def _apply_anchor_not_grounded_gate(spec: dict[str, Any]) -> dict[str, Any]:
         "the same anchor)", contradictory)
     spec["edits"] = kept
     if spec.get("termination") == "ready_to_apply":
-        spec["termination"] = "needs_reinvestigation"
         note = ("anchor-not-grounded gate: edits %s removed — file also in deferred "
                 "as anchor_not_grounded (contradictory emit)" % contradictory)
-        prev = str(spec.get("notes", "")).strip()
-        spec["notes"] = f"{prev} {note}".strip() if prev else note
+        _set_reinvestigation(spec, reason_code=RI_ANCHOR_NOT_GROUNDED,
+                             gate="anchor_not_grounded", note=note)
     return spec
 
 
@@ -1093,11 +1169,12 @@ def _apply_decisiveness_gate(spec: dict[str, Any]) -> dict[str, Any]:
             return spec
 
     spec["termination"] = "ready_to_apply"
+    # No longer reinvestigating — drop any structured reason a downstream gate stamped.
+    spec.pop("reinvestigation", None)
     note = ("decisiveness gate: promoted needs_reinvestigation -> ready_to_apply — every "
             "edit is verified/effective and confident; deferred items remain surfaced as "
             "optional directions")
-    prev = str(spec.get("notes", "")).strip()
-    spec["notes"] = f"{prev} {note}".strip() if prev else note
+    _append_note(spec, note)
     logger.info("specify: decisiveness gate promoted needs_reinvestigation -> ready_to_apply "
                 "(%d verified/effective edit(s), %d optional deferred)",
                 len(edits), len(deferred))
@@ -1181,11 +1258,11 @@ def _apply_seed_coverage_gate(spec: dict[str, Any], honey_text: str) -> dict[str
         logger.warning("specify: seed-named edit target(s) not authored %s — "
                        "downgrading ready_to_apply to needs_reinvestigation (a user-"
                        "specified edit must not be silently dropped)", missing)
-        spec["termination"] = "needs_reinvestigation"
         note = ("seed-coverage gate: seed-specified target(s) not authored — "
                 + "; ".join(f"{t} [{reasons[t]}]" for t in missing))
-        prev = str(spec.get("notes", "")).strip()
-        spec["notes"] = f"{prev} {note}".strip() if prev else note
+        _set_reinvestigation(spec, reason_code=RI_SEED_TARGET_UNCOVERED,
+                             gate="seed_coverage", note=note,
+                             detail="; ".join(missing))
     return spec
 
 
@@ -1338,6 +1415,11 @@ def run_specify(
     # an explicit edit target must become an edit, or a ready_to_apply spec is
     # downgraded to needs_reinvestigation with the dropped target(s) reported (Defect 2 / T892).
     spec = _apply_seed_coverage_gate(spec, honey_text)
+
+    # Step A finalizer: if the spec lands in needs_reinvestigation but NO gate stamped a
+    # structured reason, the AUTHOR itself emitted it — record that so the reactive bridge
+    # always finds a routable cause (it reads the author's own narrative from notes/detail).
+    spec = _ensure_reinvestigation_reason(spec)
 
     problems = _validate_spec(spec)
     if problems:
