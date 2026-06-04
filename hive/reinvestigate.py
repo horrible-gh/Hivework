@@ -8,11 +8,12 @@ reads the STRUCTURED reason the gates stamped (``spec['reinvestigation']`` — S
 and the per-axis coverage tag (``verdict['coverage']`` — B2/#5) and decides the
 CHEAPEST re-entry that could add NEW evidence:
 
-    reason_code                                   → action
+    reason_code                                          → action
     ───────────────────────────────────────────────────────────────────────
-    seed_target_uncovered / anchor_not_grounded   → re_retrieve  (narrow, thin axes)
-    ineffective / inconclusive                    → re_converge  (re-stitch, node out)
-    stale_anchor / legacy_coerce / author_declared → terminate   (no new evidence)
+    seed_target_uncovered / anchor_not_grounded /        → re_retrieve  (narrow, thin axes)
+        deferred_root_cause
+    ineffective / inconclusive                           → re_converge  (re-stitch, node out)
+    stale_anchor / legacy_coerce / author_declared       → terminate   (no new evidence)
 
 The honesty gate (M013 §3 #3 / #5): a re-run is proposed ONLY when the coverage tag
 says new evidence is REACHABLE — an axis came back thin, so a wider re-fetch may
@@ -33,6 +34,7 @@ from typing import Any
 
 from hive.specify import (
     RI_ANCHOR_NOT_GROUNDED,
+    RI_DEFERRED_ROOT_CAUSE,
     RI_INCONCLUSIVE,
     RI_INEFFECTIVE,
     RI_SEED_TARGET_UNCOVERED,
@@ -46,7 +48,10 @@ ACTION_TERMINATE = "terminate"
 
 # A reason whose gap is MISSING/UNGROUNDED evidence — a narrow re-retrieve of the
 # starved axis can recover it (only worth firing where an axis actually came back thin).
-_RETRIEVE_REASONS = frozenset({RI_SEED_TARGET_UNCOVERED, RI_ANCHOR_NOT_GROUNDED})
+# deferred_root_cause joins these: the punted substantive fix's axis was never grounded
+# as an edit, so re-fetching that thin axis is the cheapest path to the missing evidence.
+_RETRIEVE_REASONS = frozenset(
+    {RI_SEED_TARGET_UNCOVERED, RI_ANCHOR_NOT_GROUNDED, RI_DEFERRED_ROOT_CAUSE})
 # A reason whose gap is a causal/effectiveness CONTRADICTION — the evidence is present
 # but the stitch was wrong; re-converge with the refuted node excluded (M013 §2 table).
 _CONVERGE_REASONS = frozenset({RI_INEFFECTIVE, RI_INCONCLUSIVE})

@@ -15,7 +15,8 @@ from hive.reinvestigate import (
     ACTION_RE_RETRIEVE, ACTION_RE_CONVERGE, ACTION_TERMINATE,
 )
 from hive.specify import (
-    RI_ANCHOR_NOT_GROUNDED, RI_AUTHOR_DECLARED, RI_INCONCLUSIVE, RI_INEFFECTIVE,
+    RI_ANCHOR_NOT_GROUNDED, RI_AUTHOR_DECLARED, RI_DEFERRED_ROOT_CAUSE,
+    RI_INCONCLUSIVE, RI_INEFFECTIVE,
     RI_LEGACY_COERCE, RI_SEED_TARGET_UNCOVERED, RI_STALE_ANCHOR,
 )
 
@@ -50,6 +51,18 @@ class TestRetrieveRouting(unittest.TestCase):
                                     [_verdict("FE", thin=True)])
         self.assertEqual(plan.action, ACTION_RE_RETRIEVE)
         self.assertEqual(plan.axis_ids, ["FE"])
+
+    def test_deferred_root_cause_with_thin_axis_re_retrieves(self):
+        # N176: a punted substantive fix routes like a missing-evidence gap.
+        plan = plan_reinvestigation(_nr_spec(RI_DEFERRED_ROOT_CAUSE),
+                                    [_verdict("BE", thin=True), _verdict("FE", thin=False)])
+        self.assertEqual(plan.action, ACTION_RE_RETRIEVE)
+        self.assertEqual(plan.axis_ids, ["BE"])
+
+    def test_deferred_root_cause_all_sufficient_terminates(self):
+        plan = plan_reinvestigation(_nr_spec(RI_DEFERRED_ROOT_CAUSE),
+                                    [_verdict("BE", thin=False)])
+        self.assertEqual(plan.action, ACTION_TERMINATE)
 
     def test_uncovered_but_all_sufficient_terminates_honestly(self):
         # Honesty gate: no thin axis → re-fetch buys nothing → terminate, not loop.
