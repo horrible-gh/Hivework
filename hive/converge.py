@@ -359,12 +359,15 @@ def build_converge_prompt(seed_text: str, located: list[dict[str, Any]],
             "\"the head doc is approved\" for a value you cannot see in the code evidence). "
             "Inventing a stored value is a contract violation.\n"
             "- If your cause→symptom check depends on ANY stored row/field value not visible "
-            "in the code evidence, you MUST set causal_check.verdict = \"undecidable\" and "
+            "in the code evidence, you MUST set causal_check.data_dependent = true, set "
+            "causal_check.verdict = \"undecidable\" on THIS pass, and "
             "emit causal_check.data_reads naming the exact table, the row selector "
             "(column=value taken from the scenario, e.g. the document id / group key), and "
             "the deciding column(s). Do NOT rule \"consistent\" or \"contradicted\" on an "
             "unread stored value. The pipeline will run your reads against the live DB and "
-            "ask you again with the ACTUAL rows, where you rule on fact.\n"
+            "ask you again with the ACTUAL rows, where you rule on fact (KEEP "
+            "data_dependent = true then). A \"consistent\" verdict flagged data_dependent "
+            "but with NO data_reads — a guess about a stored value — is REJECTED.\n"
             "- Assumptions taken straight from the scenario text (e.g. \"the seed states R is "
             "approved\") are fine; assumptions about UNSEEN stored values are not — read them.\n")
 
@@ -501,6 +504,18 @@ fragment says the consumer reads a different key, adding rows / a UNION upstream
 the symptom fully intact. Do NOT let a ``data_reads`` result that merely proves rows \
 EXIST stand in for a render-layer cause→symptom check, and do NOT rule "consistent" on a \
 render/binding symptom from a DB read alone.
+   - DATA-DEPENDENCE FLAG — set causal_check.data_dependent = true WHENEVER the \
+correctness of your ruling rests on a STORED row/field value (which row is selected, the \
+status/id a field holds, whether a row exists) that is NOT written in the code evidence \
+and NOT explicitly stated in the seed. When it is true you MUST also emit \
+causal_check.data_reads naming the exact rows that decide it — the pipeline READS those \
+rows from the live DB and re-asks you to rule on the REAL values, so your final \
+consistent/contradicted is grounded on fact. A consistent (or contradicted) verdict that \
+is data_dependent but carries NO data_reads — i.e. you ruled on an ASSUMED stored value \
+without reading it — is INCOMPLETE and will be REJECTED (not trusted as a fix). Keep \
+data_dependent = true even after you rule on the rows we returned. Set data_dependent = \
+false ONLY when your ruling follows purely from the code logic plus seed-stated facts, \
+with no unread stored value involved.
    - REFUTE BEFORE YOU DROP — when you leave a located fragment OFF the path, that is a \
 claim it is a RED HERRING. If that fragment names a DISTINCT mechanism that could \
 INDEPENDENTLY produce the reported symptom (a different file/key/branch, not a \
@@ -553,7 +568,7 @@ refutation into the next, better-aimed search instead of a rejection.
   ],
   "attributed_defect": {{ "node": "<which node above>", "file": "<repo-relative>", "lines": "<start-end>", "why": "<one line: the wrong behaviour here>" }},
   "additional_defects": [ {{ "node": "endpoint|handler|db_fn|sql_key|fe|other", "file": "<repo-relative>", "lines": "<start-end>", "why": "<the SEPARATE wrong behaviour at this INDEPENDENT locus>" }} ],
-  "causal_check": {{ "verdict": "consistent|contradicted|undecidable", "data_state_assumptions": ["<the row/field values the scenario forces>"], "trace": "<what the attributed code outputs under those assumptions, and whether it reproduces the symptom>", "need_data_state": ["<when undecidable: the exact stored row state / fixture to confirm>"], "data_reads": [ {{ "id": "<short name for chaining, optional>", "table": "<table name from the evidence>", "where": {{ "<key column>": "<literal row selector OR {{\\"from\\": \\"<prior read id>\\", \\"column\\": \\"<column to carry over>\\"}}>" }}, "columns": ["<column(s) whose value decides the verdict>"] }} ] }},
+  "causal_check": {{ "verdict": "consistent|contradicted|undecidable", "data_dependent": false, "data_state_assumptions": ["<the row/field values the scenario forces>"], "trace": "<what the attributed code outputs under those assumptions, and whether it reproduces the symptom>", "need_data_state": ["<when undecidable: the exact stored row state / fixture to confirm>"], "data_reads": [ {{ "id": "<short name for chaining, optional>", "table": "<table name from the evidence>", "where": {{ "<key column>": "<literal row selector OR {{\\"from\\": \\"<prior read id>\\", \\"column\\": \\"<column to carry over>\\"}}>" }}, "columns": ["<column(s) whose value decides the verdict>"] }} ] }},
   "missing_link": null
 }}
 
@@ -599,6 +614,11 @@ def _coerce_causal(d: Any) -> dict[str, Any] | None:
         verdict = "unverified"
     return {
         "verdict": verdict,
+        # M017 data-stamp: the converger's own flag that this ruling's correctness rests
+        # on a STORED row/field value not visible in the code and not stated in the seed.
+        # When true the verdict must be BACKED by a real DB read (data_reads we execute);
+        # the data-stamp gate demotes a ``consistent`` that is data_dependent yet unread.
+        "data_dependent": bool(d.get("data_dependent", False)),
         "data_state_assumptions": [str(x) for x in (d.get("data_state_assumptions") or [])],
         "trace": str(d.get("trace", "") or ""),
         "need_data_state": [str(x) for x in (d.get("need_data_state") or [])],
@@ -716,7 +736,8 @@ def _result_from(parsed: dict[str, Any] | None,
     # (contradicted) or data-state confirmation (undecidable / unverified).
     if converged and attributed is not None:
         if causal is None:
-            causal = {"verdict": "unverified", "data_state_assumptions": [],
+            causal = {"verdict": "unverified", "data_dependent": False,
+                      "data_state_assumptions": [],
                       "trace": "converger did not perform the cause→symptom check",
                       "need_data_state": []}
             converged = False
@@ -1049,6 +1070,57 @@ def _dropped_peer_guard(res: ConvergeResult, located: list[dict[str, Any]],
     return res
 
 
+def _data_stamp_guard(res: ConvergeResult, db_available: bool,
+                      data_backed: bool) -> ConvergeResult:
+    """M017 lever 2: a ``consistent`` verdict that DEPENDS on stored data must be STAMPED
+    by a real DB read, never ruled on an ASSUMED value.
+
+    The gap this closes: converge is tool-OFF, so when a symptom hinges on a stored
+    row/field value (which row is selected, a status a field holds, whether a row exists)
+    the converger can reason "code looks consistent" and rule ``consistent`` WITHOUT ever
+    reading the DB — no ``data_reads`` named, so the existing read-loop never fires and the
+    verdict ships on an assumption. The data-read machinery already turns a
+    consistent-WITH-data_reads verdict into a fact-backed one (``data_backed``); this guard
+    is the BACKSTOP for the model that flags its ruling data_dependent yet fails to back it
+    with a read we could actually run.
+
+    Fires ONLY when: the verdict is ``consistent`` AND a read-only DB IS configured
+    (db_available) AND the converger itself flagged the ruling ``data_dependent`` AND NO
+    live read backed it (``data_backed`` is False — either it named no reads, or the reads
+    came back empty / failed). Then it is an UNSTAMPED assumption: demote to not-converged
+    and mark ``data_unstamped`` so the honey routes it back to name + read the deciding rows
+    (the read IS available — this is recoverable, not a runtime punt).
+
+    DELIBERATELY TIGHT (the N177 over-fire lesson): a consistent verdict NOT flagged
+    data_dependent (a pure code-logic ruling) is untouched; a data_dependent verdict that
+    WAS backed by a real read is untouched (it earned its stamp). Worst-case false fire
+    costs one extra reinvestigation pass, never a wrong edit (fail toward re-examine).
+    """
+    if not (res.converged and db_available):
+        return res
+    cc = res.causal_check or {}
+    if cc.get("verdict") != "consistent" or not cc.get("data_dependent"):
+        return res
+    if data_backed:
+        return res  # a real read returned rows that back the verdict → stamped, keep it
+    ad = res.attributed_defect or {}
+    res.converged = False
+    res.causal_check = {
+        **cc, "data_unstamped": True,
+        "trace": (cc.get("trace") or "")
+        + " [M017 data-stamp] verdict is data_dependent (rests on a stored value) but NO "
+          "live DB read backed it — ruled on an ASSUMED value; a read-only DB IS "
+          "configured, so route back to name and READ the deciding row, then re-rule on "
+          "fact."}
+    res.summary = (
+        f"not converged: data-dependent consistent at "
+        f"{ad.get('file', '')}:{ad.get('lines', '')} not backed by a live DB read "
+        f"(M017 data-stamp)")
+    logger.info("converge: M017 data-stamp guard demoted — data-dependent consistent at "
+                "%s:%s had no backing read", ad.get("file", ""), ad.get("lines", ""))
+    return res
+
+
 def run_converge(*, seed_text: str, verdicts: list[dict[str, Any]],
                  bundles: list[dict[str, Any]], provider: str, model: str,
                  code_root: str | None = None, ledger=None,
@@ -1220,6 +1292,14 @@ def run_converge(*, seed_text: str, verdicts: list[dict[str, Any]],
     # FINAL result (after any data-read / missing-link re-pass); demotes to not-converged
     # and stamps the peer so the honey routes it to reinvestigation. Tight by design.
     res = _dropped_peer_guard(res, located, data_backed)
+
+    # ── Data-stamp gate (M017 lever 2): a ``consistent`` verdict the converger flagged
+    # ``data_dependent`` must be BACKED by a real DB read, never ruled on an assumed stored
+    # value. Runs on the FINAL result; demotes an unstamped data-dependent consistent to
+    # not-converged and marks ``data_unstamped`` so the honey routes it back to read the
+    # deciding row. No-op when no DB is configured, when the ruling is pure code-logic
+    # (not data_dependent), or when a real read already backed it. Tight by design.
+    res = _data_stamp_guard(res, db_available, data_backed)
 
     # Carry the live-DB read onto whichever result we return so the honey can PASTE the
     # real rows (or honestly report that the read was attempted but returned nothing).

@@ -944,6 +944,43 @@ def _render_converge_section(converge: dict[str, Any] | None,
         out += _render_data_state_lines(converge)
         return out
 
+    # ── Data-stamp gate (M017 lever 2): converge attributed a defect and ruled its
+    # cause→symptom check ``consistent``, but FLAGGED it data_dependent (the ruling rests
+    # on a stored row/field value) while NO live DB read backed it — it ruled on an
+    # ASSUMED value. A read-only DB IS configured, so this is recoverable: route back to
+    # name and READ the deciding row, then re-rule on fact. NOT a ready edit target.
+    if cc.get("data_unstamped") and ad:
+        loc = f"{ad.get('file', '')}:{ad.get('lines', '')}".strip(":")
+        out += [
+            "## Convergence ruled CONSISTENT on an UNREAD stored value — confirm with data",
+            "",
+            f"The converge stage attributed the defect to `{loc}` ({ad.get('node', '?')}) "
+            f"and ruled its cause→symptom check **consistent**, but flagged the ruling as "
+            f"**data-dependent** — its correctness rests on a STORED row/field value (which "
+            f"row is selected, a status/id a field holds, whether a row exists) — while "
+            f"**no live DB read backed it**. The verdict was ruled on an ASSUMED value, not "
+            f"a confirmed one. A read-only database IS configured for this codebase, so the "
+            f"deciding row CAN be read. **Do NOT author a ready edit at `{loc}` on the "
+            f"strength of this unconfirmed convergence.**",
+            "",
+        ]
+        for a in cc.get("data_state_assumptions") or []:
+            out.append(f"- assumed (UNREAD) data state: {a}")
+        if cc.get("trace"):
+            out.append(f"- causal trace: {cc['trace']}")
+        out.append("")
+        out += _render_data_state_lines(converge)
+        out += [
+            "> Return **needs_reinvestigation** so the converge stage NAMES the exact rows "
+            "that decide this verdict (table + row selector from the scenario key + the "
+            "deciding column) and READS them from the live DB — then re-rules consistent or "
+            "contradicted on the REAL values. Do NOT ship the fix on the assumed value, and "
+            "do NOT defer it as needs_runtime: the data IS readable here. If the seed names "
+            "concrete edit targets (see below), author those.",
+            "",
+        ]
+        return out
+
     # ── Causal failure (N170): the converger reached a node on the executed path
     # but the cause→symptom check did NOT confirm it produces the symptom. This is
     # NOT a primary edit target — emitting it as one is exactly the N170 defect
