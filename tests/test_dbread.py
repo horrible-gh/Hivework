@@ -9,7 +9,7 @@ import json, os, sqlite3, sys, tempfile, unittest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from hive.config import load_config, DbConnection
-from hive.dbread import read_rows, probe, list_schema, DbReadError
+from hive.dbread import read_rows, probe, list_schema, count_rows, DbReadError
 
 
 def _make_sqlite(path: str) -> None:
@@ -59,6 +59,13 @@ class TestSqliteRead(unittest.TestCase):
 
     def test_probe_ok(self):
         self.assertTrue(probe(self.conn))
+
+    def test_count_rows(self):
+        self.assertEqual(count_rows(self.conn, "documents"), 3)
+
+    def test_count_rows_bad_table_raises(self):
+        with self.assertRaises(DbReadError):
+            count_rows(self.conn, "no-such; DROP")
 
     def test_where_list_renders_in_clause(self):
         # a multi-value selector → col IN (?, ?) — used by chained reads that resolve

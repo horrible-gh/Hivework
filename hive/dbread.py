@@ -239,6 +239,35 @@ def read_rows(conn: DbConnection, table: str, *, columns: list[str] | None = Non
     return ReadResult(rows=rows, sql=rendered, params=params)
 
 
+def count_rows(conn: DbConnection, table: str) -> int:
+    """Return ``COUNT(*)`` for one table, read-only. Raises ``DbReadError`` on failure.
+
+    Used by specify's data-source grounding gate to compare the row coverage of the
+    table an edit's SQL read switches AWAY from vs the one it switches TO — a swap to
+    an empty / sparser table is a likely regression (N176: an edit moved the modules
+    read from ``groups`` to ``project_modules``, which the live DB shows is near-empty).
+    NEUTRAL: validates+delimits the identifier exactly like :func:`read_rows`, then runs
+    one aggregate SELECT with no caller-specific knowledge.
+    """
+    kind = (conn.kind or "sqlite").strip().lower()
+    quote_char = "`" if kind in _MYSQL_KINDS else '"'
+    tbl = _quote_ident(table, "table", quote_char)
+    sql = f"SELECT COUNT(*) AS n FROM {tbl}"
+    logger.info("dbread: %s on %s", sql, kind)
+    if kind == "sqlite":
+        rows = _read_sqlite(conn, sql, [])
+    elif kind in _MYSQL_KINDS:
+        rows = _read_mysql(conn, sql, [])
+    elif kind in _PG_KINDS:
+        rows = _read_postgres(conn, sql, [])
+    else:
+        raise DbReadError(f"unknown db kind: {conn.kind!r} (use sqlite|mysql|mariadb|postgres)")
+    if not rows:
+        return 0
+    val = rows[0].get("n")
+    return int(val) if val is not None else 0
+
+
 def _schema_sqlite(conn: DbConnection) -> dict[str, list[str]]:
     tables = _read_sqlite(
         conn,
