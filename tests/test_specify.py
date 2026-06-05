@@ -1868,6 +1868,28 @@ class TestFixtureGrounding(unittest.TestCase):
                        "def test_x():\n    assert 1 == 1\n")
         self.assertEqual(specify._lift_db_test_example(self.root), "")
 
+    def test_db_example_prefers_string_target_patch_over_monkeypatch(self):
+        # A big integration file that wires get_store via the error-prone
+        # monkeypatch.setattr(alias, ...) style must NOT win just because it has many
+        # `def test`s — even one string-target `patch("...get_store", ...)` file beats it.
+        monkey = "from unittest.mock import patch\n"
+        monkey += "import modules.flow_gate.db.groups as db_g\n\n"
+        for i in range(30):
+            monkey += (f"def test_case_{i}(monkeypatch):\n"
+                       "    monkeypatch.setattr(db_g, 'get_store', lambda: store)\n"
+                       "    assert True\n\n")
+        self._conftest("server/tests/test_big_monkey.py", monkey)
+        self._conftest("server/tests/test_clean.py",
+                       'from unittest.mock import patch\n'
+                       'from modules.flow_gate.db.connection import get_store\n\n'
+                       'def test_one():\n'
+                       '    with patch("modules.flow_gate.db.connection.get_store", '
+                       'return_value=store):\n'
+                       '        assert True\n')
+        ex = specify._lift_db_test_example(self.root)
+        self.assertIn("test_clean.py", ex)
+        self.assertNotIn("test_big_monkey.py", ex)
+
 
 if __name__ == "__main__":
     unittest.main()

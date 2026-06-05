@@ -1437,6 +1437,11 @@ def _render_callee_block(contracts: list[tuple[str, dict[str, str]]]) -> str:
 _FIXTURE_GROUND_MAX = 14
 _RE_PYTEST_FIXTURE = re.compile(r"^\s*@pytest\.fixture\b")
 _RE_FIXTURE_DEF = re.compile(r"^\s*def\s+([A-Za-z_]\w*)\s*\(")
+# A patch() whose TARGET is a get_store binding given as a string path, e.g.
+# patch("modules.flow_gate.db.connection.get_store", ...). This is the robust wiring
+# the author must copy; a file that only mentions get_store and patch() separately
+# (monkeypatch.setattr on a guessed module alias) teaches the error-prone style.
+_RE_PATCH_GET_STORE = re.compile(r"""patch\(\s*['"][^'"]*get_store""")
 
 
 def _collect_test_fixtures(codebase_root: str) -> list[tuple[str, str]]:
@@ -1504,8 +1509,13 @@ def _render_fixture_block(fixtures: list[tuple[str, str]]) -> str:
         "app state'. CRUCIAL: production code under test usually reads through a global "
         "`get_store()`; merely requesting a raw-connection fixture and seeding it is NOT enough "
         "— the function will still hit the REAL database unless `get_store` is pointed at the "
-        "test DB. Follow the target's own wiring pattern shown in the example below (note its "
-        "import root and how it patches `get_store`).", "",
+        "test DB. Use the STRING-TARGET form `patch(\"<module.path>.get_store\", "
+        "return_value=store)` (a context manager / decorator), exactly as the example below "
+        "shows. Do NOT use `monkeypatch.setattr(<some_module>, \"get_store\", ...)` on a module "
+        "alias you guessed at — that is brittle and is the usual cause of a red test that never "
+        "actually bites. When the symptom surfaces through a HIGH-LEVEL function, patch "
+        "`get_store` in the module where THAT function reads it (follow the example's import "
+        "root and patch target).", "",
     ]
     for name, summary in fixtures:
         parts.append(f"- {name}" + (f" — {summary}" if summary else ""))
@@ -1539,9 +1549,17 @@ def _lift_db_test_example(codebase_root: str) -> str:
         except OSError:
             continue
         text = "\n".join(lines)
-        if "get_store" not in text or "patch(" not in text:
+        # Only files that DEMONSTRATE the robust wiring win — a string-target patch of
+        # get_store. A file that merely mentions get_store and patch() separately teaches
+        # the error-prone monkeypatch.setattr(<guessed alias>, ...) style the author then
+        # botches, so it is excluded outright (count == 0 -> skip), never just out-scored
+        # by a big integration file's def-test count.
+        targeted = len(_RE_PATCH_GET_STORE.findall(text))
+        if targeted == 0:
             continue
-        score = text.count("get_store") + text.count("def test")
+        # Rank by how densely the file shows the pattern; def-test count is only a faint
+        # tiebreak so it can never flip the winner to a less-demonstrating file.
+        score = targeted * 100 + text.count("def test")
         if best is None or score > best[0]:
             best = (score, os.path.relpath(tf, codebase_root), lines)
     if best is None:
