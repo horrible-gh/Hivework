@@ -102,7 +102,7 @@ def run_pipeline(args: argparse.Namespace) -> None:
     """Execute the full 6-stage pipeline."""
     start_time = time.time()
     logger = logging.getLogger("hive")
-    cfg = load_config()
+    cfg = load_config(profile=getattr(args, "profile", None))
     cfg.apply_cli_model(args.model)
 
     # ── Cost guard-rail (safety.allow_swarm): refuse the open-ended swarm before
@@ -454,7 +454,7 @@ def run_investigate_command(args: argparse.Namespace) -> None:
     ≤ ``judge.max_axes`` axes (all from hive.config.json).
     """
     logger = logging.getLogger("hive")
-    cfg = load_config()
+    cfg = load_config(profile=getattr(args, "profile", None))
     cfg.apply_cli_model(args.model)
 
     provider_kwargs = build_provider_kwargs(cfg)
@@ -600,7 +600,7 @@ def run_reconverge_command(args: argparse.Namespace) -> None:
     non-determinism between runs. Propose-only; writes nothing to the target codebase.
     """
     logger = logging.getLogger("hive")
-    cfg = load_config()
+    cfg = load_config(profile=getattr(args, "profile", None))
     cfg.apply_cli_model(args.model)
     provider_kwargs = build_provider_kwargs(cfg)
 
@@ -679,7 +679,7 @@ def run_specify_command(args: argparse.Namespace) -> None:
     the target codebase.
     """
     logger = logging.getLogger("hive")
-    cfg = load_config()
+    cfg = load_config(profile=getattr(args, "profile", None))
     cfg.apply_cli_model(args.model)
 
     provider_kwargs = build_provider_kwargs(cfg)
@@ -749,7 +749,7 @@ def run_apply_command(args: argparse.Namespace) -> None:
     (all-or-nothing, with rollback). A non-ready proposal is never written.
     """
     logger = logging.getLogger("hive")
-    cfg = load_config()
+    cfg = load_config(profile=getattr(args, "profile", None))
     backup_root = cfg.apply.backup_root()
     ttl_hours = cfg.apply.backup_ttl_hours
 
@@ -825,7 +825,7 @@ def run_commit_plan_command(args: argparse.Namespace) -> None:
     nothing is committed. The output plan JSON is the SSOT consumed by ``commit``.
     """
     logger = logging.getLogger("hive")
-    cfg = load_config()
+    cfg = load_config(profile=getattr(args, "profile", None))
     cfg.apply_cli_model(args.model)
 
     provider_kwargs = build_provider_kwargs(cfg)
@@ -924,7 +924,7 @@ def run_commit_command(args: argparse.Namespace) -> None:
 def run_restore_command(args: argparse.Namespace) -> None:
     """Restore a backup bundle, undoing an earlier ``apply --write``."""
     logger = logging.getLogger("hive")
-    cfg = load_config()
+    cfg = load_config(profile=getattr(args, "profile", None))
     backup_root = cfg.apply.backup_root()
 
     bundle = args.bundle
@@ -955,6 +955,12 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         prog="hive",
         description="Hivework full-loop orchestrator — automated investigation pipeline",
+    )
+    # Global profile selector — picks config/hive.config.<profile>.json (default:
+    # 'default'). Goes before the sub-command: `hive --profile small investigate ...`.
+    parser.add_argument(
+        "--profile", default=None,
+        help="Config profile under config/ (default: 'default').",
     )
     subparsers = parser.add_subparsers(dest="command", help="Sub-commands")
 

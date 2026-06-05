@@ -47,8 +47,22 @@ def _force_utf8_io() -> None:
 _force_utf8_io()
 
 REPO = os.path.dirname(os.path.abspath(__file__))
-CONFIG = os.path.join(REPO, "hive.config.json")
-CONFIG_EXAMPLE = os.path.join(REPO, "hive.config.example.json")
+# Config files live under config/ as one complete file per profile. Stage 1 ships the
+# 'default' profile; setup writes/reads it here. (Generating the small/medium/large
+# profiles is stage 2.)
+CONFIG_DIR = os.path.join(REPO, "config")
+CONFIG = os.path.join(CONFIG_DIR, "hive.config.default.json")
+CONFIG_EXAMPLE = os.path.join(CONFIG_DIR, "hive.config.example.json")
+
+
+def _openai_block(data: dict) -> dict:
+    """The openai endpoint block, tolerant of layout: grouped providers.openai wins,
+    else the legacy top-level openai. Returns {} when absent."""
+    prov = data.get("providers")
+    if isinstance(prov, dict) and isinstance(prov.get("openai"), dict):
+        return prov["openai"]
+    oa = data.get("openai")
+    return oa if isinstance(oa, dict) else {}
 
 
 class GoBack(Exception):
@@ -311,7 +325,11 @@ def patch_config_endpoint(base_url: str, api_key_env: str) -> None:
         warn(f"Could not patch config endpoint ({e}); set the openai block by hand.")
         return
     data.pop("_openai_presets", None)
-    data["openai"] = {"base_url": base_url, "api_key_env": api_key_env}
+    block = {"base_url": base_url, "api_key_env": api_key_env}
+    if isinstance(data.get("providers"), dict):
+        data["providers"]["openai"] = block      # grouped layout (current)
+    else:
+        data["openai"] = block                   # legacy flat layout
     with open(CONFIG, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2)
         f.write("\n")
@@ -510,7 +528,7 @@ def detect_providers() -> dict[str, tuple[bool, str]]:
         reason = "CLI NOT on PATH" + (", but token set" if cop_tok else "")
     out["copilot"] = (bool(cop_cli) or cop_tok, reason)
 
-    api_env = ((_load_config_data() or {}).get("openai") or {}).get(
+    api_env = _openai_block(_load_config_data() or {}).get(
         "api_key_env", "DEEPINFRA_TOKEN")
     http_tok = bool(keys.get(api_env))
     out["openai"] = (http_tok, f"key ${api_env} {'set' if http_tok else 'NOT set'}")
@@ -606,7 +624,7 @@ def show_status() -> None:
         for name, _desc in _ROLES:
             r = roles.get(name, {})
             info(f"    {name:9s} {str(r.get('provider','-')):9s} {r.get('model','-')}")
-        oa = data.get("openai", {})
+        oa = _openai_block(data)
         if oa:
             info(f"    endpoint  {oa.get('base_url','-')}  (key ${oa.get('api_key_env','-')})")
     else:
