@@ -1587,5 +1587,208 @@ class TestPremiseRefutedGuard(unittest.TestCase):
         self.assertNotIn("data_premise_refuted", out.causal_check)
 
 
+# ── M020 follow-up: per-locus SPLIT elimination converge ────────────────────────
+def _focal_file(prompt: str) -> str | None:
+    """Extract the FOCAL locus's file from a per-locus split prompt (None if holistic)."""
+    marker = "[FOCAL LOCUS — rule on THIS one]\n"
+    i = prompt.find(marker)
+    if i < 0:
+        return None
+    return prompt[i + len(marker):].split(":", 1)[0].strip()
+
+
+def _locus_out(verdict, data_dependent=False, why="x", reads=None, trace="t") -> str:
+    return json.dumps({"verdict": verdict, "data_dependent": data_dependent,
+                       "why": why, "trace": trace, "data_reads": reads or []})
+
+
+def _is_holistic(prompt: str) -> bool:
+    return "STITCH those fragments" in prompt
+
+
+# A render-vs-data pair (the M035 shape): a backend SQL/ordering locus that the live data
+# refutes, plus a front-end render locus that actually carries the bug.
+SPLIT_VERDICTS = [
+    _verdict("SQL", True, "db/workflow_sequences.py", "45-57",
+             "ORDER BY may put a stale row first"),
+    _verdict("FE", True, "client/src/workflow_view.ts", "160-170",
+             "active step painted highlight (yellow) not current (blue)"),
+]
+SPLIT_BUNDLES = [
+    {"axis_id": "SQL",
+     "code_snippets": [{"file": "db/workflow_sequences.py", "lines": "45-57",
+                        "text": "ORDER BY CASE WHEN result_doc_id IS NOT NULL ..."}],
+     "call_chain": []},
+    {"axis_id": "FE",
+     "code_snippets": [{"file": "client/src/workflow_view.ts", "lines": "160-170",
+                        "text": "head -> 'highlight'"}],
+     "call_chain": []},
+]
+
+
+class TestSplitConverge(unittest.TestCase):
+    """M020 follow-up: split the holistic stitch into one narrow cause→symptom question
+    per located locus, then COMBINE by deterministic elimination. Adopts a result only on
+    a clean elimination (exactly one survivor); anything else falls back to holistic."""
+
+    def test_clean_elimination_attributes_lone_survivor(self):
+        """Exactly one locus rules consistent → it is attributed; no holistic call."""
+        def fake(provider, model, prompt, cwd=None, timeout=300, **kw):
+            ff = _focal_file(prompt)
+            if ff == "db/workflow_sequences.py":
+                return _wr(_locus_out("contradicted", why="data shows expected row"))
+            if ff == "client/src/workflow_view.ts":
+                return _wr(_locus_out("consistent", why="paints highlight not current"))
+            return _wr(CONVERGED_OUT)  # holistic — must NOT be reached
+
+        with mock.patch.object(C, "call_worker", side_effect=fake):
+            res = C.run_converge(seed_text="active step is yellow; should be blue",
+                                 verdicts=SPLIT_VERDICTS, bundles=SPLIT_BUNDLES,
+                                 provider="deepinfra", model="m", split_enabled=True)
+        self.assertTrue(res.converged)
+        self.assertEqual(res.attributed_defect["file"], "client/src/workflow_view.ts")
+        self.assertIn("split elimination", res.summary)
+        # the trace records HOW the competing locus was eliminated (auditable)
+        self.assertIn("eliminated competing loci", res.causal_check["trace"])
+        self.assertIn("db/workflow_sequences.py", res.causal_check["trace"])
+
+    def test_no_survivor_falls_back_to_holistic(self):
+        """Zero loci consistent → split abstains → holistic converge runs instead."""
+        saw_holistic = []
+
+        def fake(provider, model, prompt, cwd=None, timeout=300, **kw):
+            if _is_holistic(prompt):
+                saw_holistic.append(prompt)
+                return _wr(CONVERGED_OUT)
+            return _wr(_locus_out("contradicted"))
+
+        with mock.patch.object(C, "call_worker", side_effect=fake):
+            res = C.run_converge(seed_text="s", verdicts=SPLIT_VERDICTS,
+                                 bundles=SPLIT_BUNDLES, provider="deepinfra", model="m",
+                                 split_enabled=True)
+        self.assertTrue(saw_holistic, "holistic converge should run on a split abstain")
+        # holistic CONVERGED_OUT attributes to db/workflow_sequences.py
+        self.assertTrue(res.converged)
+        self.assertEqual(res.attributed_defect["file"], "db/workflow_sequences.py")
+
+    def test_multiple_survivors_falls_back_to_holistic(self):
+        """≥2 loci consistent → ambiguous → abstain → holistic runs."""
+        saw_holistic = []
+
+        def fake(provider, model, prompt, cwd=None, timeout=300, **kw):
+            if _is_holistic(prompt):
+                saw_holistic.append(prompt)
+                return _wr(CONVERGED_OUT)
+            return _wr(_locus_out("consistent"))  # both survive
+
+        with mock.patch.object(C, "call_worker", side_effect=fake):
+            C.run_converge(seed_text="s", verdicts=SPLIT_VERDICTS,
+                           bundles=SPLIT_BUNDLES, provider="deepinfra", model="m",
+                           split_enabled=True)
+        self.assertTrue(saw_holistic, "ambiguous split must fall back to holistic")
+
+    def test_over_cap_abstains_without_locus_calls(self):
+        """More located loci than max_loci → cannot soundly eliminate → abstain WITHOUT
+        spending per-locus calls (cheaper) and run holistic."""
+        calls = {"locus": 0, "holistic": 0}
+
+        def fake(provider, model, prompt, cwd=None, timeout=300, **kw):
+            if _is_holistic(prompt):
+                calls["holistic"] += 1
+                return _wr(CONVERGED_OUT)
+            calls["locus"] += 1
+            return _wr(_locus_out("consistent"))
+
+        with mock.patch.object(C, "call_worker", side_effect=fake):
+            C.run_converge(seed_text="s", verdicts=SPLIT_VERDICTS,
+                           bundles=SPLIT_BUNDLES, provider="deepinfra", model="m",
+                           split_enabled=True, split_max_loci=1)
+        self.assertEqual(calls["locus"], 0, "no per-locus calls when over the cap")
+        self.assertEqual(calls["holistic"], 1)
+
+    def test_disabled_never_calls_locus(self):
+        """split_enabled defaults False → only the holistic converge prompt is used."""
+        focal_seen = []
+
+        def fake(provider, model, prompt, cwd=None, timeout=300, **kw):
+            if _focal_file(prompt):
+                focal_seen.append(prompt)
+            return _wr(CONVERGED_OUT)
+
+        with mock.patch.object(C, "call_worker", side_effect=fake):
+            C.run_converge(seed_text="s", verdicts=SPLIT_VERDICTS,
+                           bundles=SPLIT_BUNDLES, provider="deepinfra", model="m")
+        self.assertEqual(focal_seen, [])
+
+    def test_custom_split_model_is_used(self):
+        """split_provider/model override the per-locus calls (scout-style model knob)."""
+        seen = []
+
+        def fake(provider, model, prompt, cwd=None, timeout=300, **kw):
+            if _focal_file(prompt):
+                seen.append((provider, model))
+            return _wr(_locus_out("contradicted"))  # abstain → holistic
+
+        with mock.patch.object(C, "call_worker", side_effect=fake):
+            C.run_converge(seed_text="s", verdicts=SPLIT_VERDICTS,
+                           bundles=SPLIT_BUNDLES, provider="deepinfra", model="big",
+                           split_enabled=True, split_provider="openai",
+                           split_model="cheap-120b")
+        self.assertTrue(seen)
+        self.assertTrue(all(p == ("openai", "cheap-120b") for p in seen))
+
+    def test_premise_refuted_inline_makes_data_locus_lose(self):
+        """The M035 end-to-end shape: the SQL locus rules consistent on a stored value but
+        its read chain BREAKS (the rows are absent in the live DB) → inline premise-refuted
+        flips it to contradicted; the FE render locus survives → defect attributed to FE."""
+        chain_reads = [
+            {"id": "p", "table": "documents", "where": {"doc_id": "NOPE"},
+             "columns": ["doc_id"]},
+            {"id": "c", "table": "documents",
+             "where": {"doc_id": {"from": "p", "column": "doc_id"}},
+             "columns": ["doc_review_status"]},
+        ]
+
+        def fake(provider, model, prompt, cwd=None, timeout=300, **kw):
+            ff = _focal_file(prompt)
+            if ff == "db/workflow_sequences.py":
+                # claims consistent on a stored value, naming a chain-breaking read; even
+                # on the re-ask it (wrongly) insists consistent — the inline guard demotes it
+                return _wr(_locus_out("consistent", data_dependent=True,
+                                      reads=chain_reads, why="stale row puts M first"))
+            if ff == "client/src/workflow_view.ts":
+                return _wr(_locus_out("consistent", why="paints highlight not current"))
+            return _wr(CONVERGED_OUT)  # holistic must NOT be reached
+
+        db = _tmp_db_with_doc("approved")  # has only D1 → 'NOPE' parent read matches nothing
+        with mock.patch.object(C, "call_worker", side_effect=fake):
+            res = C.run_converge(seed_text="active step yellow; should be blue",
+                                 verdicts=SPLIT_VERDICTS, bundles=SPLIT_BUNDLES,
+                                 provider="deepinfra", model="m",
+                                 code_root="/repo", db_conn=db, split_enabled=True)
+        self.assertTrue(res.converged)
+        self.assertEqual(res.attributed_defect["file"], "client/src/workflow_view.ts")
+
+    def test_split_result_carries_through_guards_unharmed(self):
+        """A clean code-logic survivor (not data_dependent) must survive the trailing
+        dropped-peer / data-stamp guards (they must not demote a sound split result)."""
+        def fake(provider, model, prompt, cwd=None, timeout=300, **kw):
+            ff = _focal_file(prompt)
+            if ff == "db/workflow_sequences.py":
+                return _wr(_locus_out("contradicted"))
+            if ff == "client/src/workflow_view.ts":
+                return _wr(_locus_out("consistent", data_dependent=False))
+            return _wr(CONVERGED_OUT)
+
+        db = _tmp_db_with_doc("approved")
+        with mock.patch.object(C, "call_worker", side_effect=fake):
+            res = C.run_converge(seed_text="s", verdicts=SPLIT_VERDICTS,
+                                 bundles=SPLIT_BUNDLES, provider="deepinfra", model="m",
+                                 db_conn=db, split_enabled=True)
+        self.assertTrue(res.converged)
+        self.assertNotIn("data_unstamped", res.causal_check)
+        self.assertNotIn("dropped_peer", res.causal_check)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -706,11 +706,14 @@ def run_investigate(
         # the wider candidate net. The ≥2 gate above stays on AXES located (not
         # fragment count), so a single noisy axis splitting into two files does not
         # by itself trigger converge.
+        split_cfg = cfg.converge_split
         cres = run_converge(
             seed_text=seed_text, verdicts=_converge_fragments(verdicts),
             bundles=bundles,
             provider=conv_role.provider, model=conv_role.model, code_root=code_root,
-            ledger=ledger, provider_kwargs=pk, k=k, max_hops=2, db_conn=db_conn)
+            ledger=ledger, provider_kwargs=pk, k=k, max_hops=2, db_conn=db_conn,
+            split_enabled=split_cfg.enabled, split_max_loci=split_cfg.max_loci,
+            split_provider=split_cfg.provider, split_model=split_cfg.model)
         converge_dict = cres.as_dict()
         cc = cres.causal_check or {}
         if cres.converged and cres.attributed_defect:

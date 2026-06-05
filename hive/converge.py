@@ -1192,12 +1192,348 @@ def _data_stamp_guard(res: ConvergeResult, db_available: bool,
     return res
 
 
+# ── Per-locus SPLIT converge (M020 follow-up) ───────────────────────────────────
+# The holistic converge asks ONE weak single-shot to do the whole stitch AND pick the
+# guilty node among several competing located loci — so it wanders run to run. The split
+# pass asks a NARROW, low-variance question per locus ("does THIS locus's live code
+# produce the symptom?") and COMBINES the answers by deterministic elimination. The hard
+# combine (which one is the cause) is then free CODE, not a model judgment, so the wobble
+# at the stitch point is gone. Adopts a result ONLY on a clean elimination (exactly one
+# survivor); anything else falls back to the holistic path — precision layer, never a new
+# failure mode (see ConvergeSplitConfig).
+_LOCUS_DATA_ROUNDS = 1   # per-locus: one initial call + at most ONE data re-ask (bounded
+                         # tighter than the holistic _MAX_DATA_ROUNDS — the narrow question
+                         # needs the deciding row once, not an iterative hunt).
+
+
+def build_locus_prompt(seed_text: str, focal: dict[str, Any],
+                       others: list[dict[str, Any]], windows: list[dict[str, Any]],
+                       focal_code: str = "", data_state_block: str = "",
+                       db_available: bool = False, db_schema: str = "") -> str:
+    """Build the NARROW single-locus prompt: does THIS one locus produce the symptom?
+
+    Unlike the holistic converge prompt (order the whole path + pick one of N), this asks
+    a yes/no causal question about ONE located fragment. The other located loci are listed
+    as CONTEXT ONLY — the model must rule on the focal locus alone. Low variance by design,
+    so a cheaper model is reliable; the elimination across loci happens in CODE afterwards.
+    """
+    vd = focal.get("verdict") or {}
+    focal_line = (f"{vd.get('file', '')}:{vd.get('lines', '')} — "
+                  f"{_trunc(vd.get('reason', ''), _REASON_CHARS)}")
+
+    other_lines = []
+    for v in others:
+        ovd = v.get("verdict") or {}
+        other_lines.append(f"- {ovd.get('file', '')}:{ovd.get('lines', '')} "
+                           f"— {_trunc(ovd.get('reason', ''), _REASON_CHARS)}")
+    others_block = ("\n[Other suspected loci — CONTEXT ONLY, do NOT rule on these]\n"
+                    + "\n".join(other_lines) + "\n") if other_lines else ""
+
+    code_block = ""
+    if focal_code.strip():
+        code_block = ("\n[Focal locus — ACTUAL current source read live; rule on THIS "
+                      "text, not on a snippet]\n" + focal_code.strip() + "\n")
+
+    ev_lines = []
+    for w in windows:
+        via = f" via={w['via']}" if w.get("via") else ""
+        ev_lines.append(f"--- {w.get('file')}:{w.get('lines')}{via}")
+        ev_lines.append(_trunc(w.get("text", ""), _EVIDENCE_CHARS))
+    evidence = "\n".join(ev_lines) or "(no extra evidence)"
+
+    confirmed_block = ""
+    if data_state_block.strip():
+        confirmed_block = (
+            "\n[Confirmed data state — ACTUAL rows read from the live DB; FACT, not "
+            "assumptions. Rule consistent/contradicted against THESE values; do NOT return "
+            "undecidable for a field shown here. If the deciding row is plainly ABSENT here "
+            "(the rows you needed do not exist), the suspected stored value is not present, "
+            "so this locus's code already yields the EXPECTED output → rule contradicted.]\n"
+            + data_state_block.strip() + "\n")
+
+    db_avail_block = ""
+    if db_available and not confirmed_block:
+        db_avail_block = (
+            "\n[LIVE DATABASE AVAILABLE] A read-only DB connection IS configured. If your "
+            "ruling depends on ANY stored row/field value not visible in the code, you MUST "
+            "set data_dependent=true, verdict=\"undecidable\" on THIS pass, and emit "
+            "data_reads naming the exact table, row selector (a business key from the "
+            "scenario), and deciding column(s). NEVER invent a stored value to rule.\n")
+
+    schema_block = ""
+    if db_available and db_schema.strip():
+        schema_block = ("\n[DB SCHEMA — use ONLY these table/column names in data_reads]\n"
+                        + db_schema.strip() + "\n")
+
+    return f"""[Role] You are checking ONE suspected defect locus for a Hivework \
+investigation. Several independent judges each localised a fragment that MIGHT be the \
+cause of the reported symptom. Your job is NOT to stitch them — it is to rule on a \
+SINGLE locus: does the code at the FOCAL LOCUS below actually PRODUCE the reported \
+symptom for this scenario?
+
+[Constraints] You have NO tools. Rule ONLY on the FOCAL LOCUS. The other loci are listed \
+for context so you understand the competing hypotheses, but you must NOT decide which one \
+is guilty — that is combined later. Reachability is not enough: a locus can be on the \
+executed path yet not be what produces the symptom.
+
+[Seed is ground truth — do NOT invert it] If the scenario DECLARES an observed value \
+WRONG and states the CORRECT one, the CORRECT value is ground truth: the defect is that \
+the code emits the WRONG value. Never write reasoning that re-crowns the seed-negated \
+value as the intended output.
+
+[Symptom domain] Match the evidence to the symptom KIND. A live-DB / stored-value read \
+can only certify a STORED-VALUE symptom (which row is selected, a status/id a field \
+holds). It can NEVER certify a RENDER / SHAPE / BINDING symptom (an element empty on \
+screen, a response key the FE reads under a different name, a colour/class). For those \
+the deciding fact lives in CODE — trace the producer's emitted field/key to the \
+consumer's read of it. Do not rule "consistent" on a render symptom from a DB read alone.
+
+[Reported scenario / seed]
+{_trunc(seed_text, 2000)}
+{confirmed_block}{db_avail_block}{schema_block}
+[FOCAL LOCUS — rule on THIS one]
+{focal_line}
+{code_block}{others_block}
+[Pooled evidence windows (context)]
+{evidence}
+
+[What to produce] Rule whether the FOCAL LOCUS's code produces the reported symptom:
+  - It DOES, under the data state the scenario forces → verdict = "consistent" (this \
+locus is a cause).
+  - It provably CANNOT (e.g. the live data shows it already yields the expected output, \
+or the live source does not exhibit the claimed mechanism) → verdict = "contradicted".
+  - The outcome DEPENDS on a stored row/field value you cannot read here → verdict = \
+"undecidable"; set data_dependent=true and emit data_reads (exact table, row selector \
+from the scenario, deciding columns) so the pipeline reads it and re-asks you on fact.
+Set data_dependent=true WHENEVER your ruling rests on an unread stored value; false only \
+when it follows purely from the code logic plus seed-stated facts.
+
+[Output contract] Output ONLY this JSON object. No prose outside it.
+{{
+  "verdict": "consistent|contradicted|undecidable",
+  "data_dependent": false,
+  "why": "<one line: the wrong (or correct) behaviour at this locus>",
+  "trace": "<what this locus's code outputs under the data state, and whether it reproduces the symptom>",
+  "data_reads": [ {{ "id": "<short name, optional>", "table": "<table>", "where": {{ "<col>": "<literal OR {{\\"from\\": \\"<prior id>\\", \\"column\\": \\"<col>\\"}}>" }}, "columns": ["<deciding column(s)>"] }} ]
+}}
+"""
+
+
+def _eval_locus_once(seed_text: str, focal: dict[str, Any],
+                     others: list[dict[str, Any]], windows: list[dict[str, Any]],
+                     focal_code: str, provider: str, model: str, pk: dict[str, Any],
+                     ledger, timeout: int, data_state_block: str,
+                     db_available: bool, db_schema: str) -> dict[str, Any] | None:
+    """One narrow per-locus model call (with a JSON-only reparse). Never raises.
+
+    Returns the parsed object (verdict / data_dependent / why / trace / data_reads) via
+    :func:`_coerce_causal` plus the raw ``why``, or None when nothing parseable came back.
+    """
+    prompt = build_locus_prompt(seed_text, focal, others, windows, focal_code,
+                                data_state_block, db_available, db_schema)
+    attempt_prompt = prompt
+    parsed: dict[str, Any] | None = None
+    for attempt in range(2):
+        call_id = ledger.begin_call("converge", "converge-locus", provider, model,
+                                    attempt_prompt) if ledger is not None else None
+        try:
+            wr = call_worker(provider, model, attempt_prompt, cwd=None,
+                             timeout=timeout, **pk)
+        except Exception as e:
+            logger.warning("converge: locus worker failed: %s", e)
+            if ledger is not None:
+                ledger.finish_call(call_id, output="", latency_s=0.0, ok=False,
+                                   err=str(e)[:200])
+            return None
+        if ledger is not None:
+            ledger.finish_call(call_id, output=wr.stdout, latency_s=wr.latency_s,
+                               ok=wr.exit_code == 0,
+                               err=wr.stderr[:200] if wr.exit_code != 0 else "",
+                               real_tokens=wr.real_tokens)
+        try:
+            parsed = extract_first_json(wr.stdout)
+            break
+        except ValueError:
+            if attempt == 0:
+                attempt_prompt = prompt + _JSON_ONLY_REMINDER
+            else:
+                logger.warning("converge: locus — no parseable JSON after retry")
+    if not isinstance(parsed, dict):
+        return None
+    causal = _coerce_causal(parsed) or {"verdict": "unverified"}
+    causal["why"] = str(parsed.get("why", "") or "")
+    return causal
+
+
+def _eval_locus(seed_text: str, focal: dict[str, Any], others: list[dict[str, Any]],
+                windows: list[dict[str, Any]], code_root: str | None,
+                provider: str, model: str, pk: dict[str, Any], ledger, timeout: int,
+                db_conn, schema_map: dict[str, list[str]], db_schema: str,
+                db_available: bool) -> dict[str, Any]:
+    """Evaluate ONE located locus end to end: does its code produce the symptom?
+
+    One narrow model call; if the model says the ruling is data_dependent and names
+    ``data_reads`` and a DB is configured, run those reads ONCE (deterministic glue) and
+    re-ask the locus on the real rows. Applies the premise-refuted rule INLINE: a
+    ``consistent`` data-dependent ruling whose read chain broke (the rows it needs are
+    ABSENT) is flipped to ``contradicted`` — the locus rests on rows the live DB proves
+    do not exist. Returns a verdict dict; never raises (a failed call → ``unverified``).
+    """
+    vd = focal.get("verdict") or {}
+    tag = f"{vd.get('file', '')}:{vd.get('lines', '')}"
+    focal_code = _lift_live_code([focal], code_root)
+
+    causal = _eval_locus_once(seed_text, focal, others, windows, focal_code,
+                              provider, model, pk, ledger, timeout, "",
+                              db_available, db_schema)
+    if causal is None:
+        return {"focal": focal, "verdict": "unverified", "data_dependent": False,
+                "data_backed": False, "chain_broke": False, "why": "", "trace": "",
+                "data_block": "", "attempted": False}
+
+    data_block = ""
+    data_backed = False
+    chain_broke = False
+    data_attempted = False
+    reads = causal.get("data_reads") or []
+    if db_conn is not None and reads and causal.get("data_dependent"):
+        data_attempted = True
+        block, backed, broke = _run_data_reads(reads, db_conn, schema_map)
+        data_block = block
+        data_backed = backed
+        chain_broke = broke
+        logger.info("converge: locus %s data read → rows=%s chain_broke=%s",
+                    tag, backed, broke)
+        # Re-ask this locus ONCE on the real rows (bounded — _LOCUS_DATA_ROUNDS).
+        causal2 = _eval_locus_once(seed_text, focal, others, windows, focal_code,
+                                   provider, model, pk, ledger, timeout, block,
+                                   db_available, db_schema)
+        if causal2 is not None:
+            causal = causal2
+
+    verdict = causal.get("verdict", "unverified")
+    data_dependent = bool(causal.get("data_dependent"))
+    # Premise-refuted INLINE: a consistent data-dependent ruling whose read chain broke
+    # rests on rows the live DB proves absent → the locus already yields the expected
+    # output, so it is NOT the cause. Flip to contradicted (downgrade-only).
+    if verdict == "consistent" and data_dependent and chain_broke:
+        logger.info("converge: locus %s premise-refuted (consistent but read chain broke) "
+                    "→ contradicted", tag)
+        verdict = "contradicted"
+    # A consistent data-dependent ruling that was NEVER backed by a real read (no rows /
+    # not attempted) is an unstamped assumption — not trustworthy as a survivor. Demote it
+    # so it cannot win the elimination on a guess (mirrors the holistic data-stamp guard).
+    elif verdict == "consistent" and data_dependent and not data_backed:
+        logger.info("converge: locus %s consistent but data-dependent and unbacked "
+                    "→ undecidable", tag)
+        verdict = "undecidable"
+
+    return {"focal": focal, "verdict": verdict, "data_dependent": data_dependent,
+            "data_backed": data_backed, "chain_broke": chain_broke,
+            "why": str(causal.get("why", "") or ""),
+            "trace": str(causal.get("trace", "") or ""),
+            "data_block": data_block, "attempted": data_attempted}
+
+
+def _split_converge(seed_text: str, located: list[dict[str, Any]],
+                    windows: list[dict[str, Any]], known: set[str],
+                    code_root: str | None, max_loci: int,
+                    provider: str, model: str, pk: dict[str, Any], ledger, timeout: int,
+                    db_conn, schema_map: dict[str, list[str]], db_schema: str,
+                    db_available: bool) -> ConvergeResult | None:
+    """Per-locus elimination converge. Returns a ConvergeResult on a CLEAN elimination
+    (exactly one located locus survives its cause→symptom check), else None (fall back).
+
+    Sound-or-abstain by construction: when MORE than ``max_loci`` loci located, a subset
+    evaluation cannot honestly claim "only one survives", so it abstains (None) and the
+    caller runs the holistic path — which for a big set is also CHEAPER than N calls. With
+    zero or several survivors it likewise abstains: a single clear winner is the only thing
+    it will commit to, so it can never manufacture a worse answer than the holistic path.
+    """
+    if not (2 <= len(located) <= max_loci):
+        logger.info("converge: split abstains — %d located locus(es) outside [2, %d]",
+                    len(located), max_loci)
+        return None
+
+    results = []
+    for i, focal in enumerate(located):
+        others = [v for j, v in enumerate(located) if j != i]
+        results.append(_eval_locus(seed_text, focal, others, windows, code_root,
+                                   provider, model, pk, ledger, timeout, db_conn,
+                                   schema_map, db_schema, db_available))
+
+    survivors = [r for r in results if r["verdict"] == "consistent"]
+    eliminated = [r for r in results if r["verdict"] != "consistent"]
+    logger.info("converge: split evaluated %d loci → %d survivor(s) "
+                "(consistent), %d eliminated", len(results), len(survivors),
+                len(eliminated))
+
+    if len(survivors) != 1:
+        logger.info("converge: split inconclusive (%d survivors) — fall back to holistic",
+                    len(survivors))
+        return None
+
+    win = survivors[0]
+    vd = win["focal"].get("verdict") or {}
+    attributed = {
+        "node": "other",
+        "file": vd.get("file", ""),
+        "lines": vd.get("lines", ""),
+        "why": win["why"] or _trunc(vd.get("reason", ""), _REASON_CHARS),
+    }
+    af = attributed["file"]
+    if af and not any(_aligns(af, kf) for kf in known):
+        attributed["ungrounded"] = True
+
+    # Record HOW each competing locus was eliminated, in the trace — auditable, and it
+    # also names the dropped peers so the holistic dropped-peer guard (which runs next on
+    # this result) sees they were addressed, not silently dropped.
+    elim_notes = []
+    for r in eliminated:
+        evd = r["focal"].get("verdict") or {}
+        elim_notes.append(f"{evd.get('file', '')}:{evd.get('lines', '')}"
+                          f" ({r['verdict']}: {_trunc(r['why'] or r['trace'], 120)})")
+    trace = (win["trace"] or "")
+    if elim_notes:
+        trace += " [split elimination] eliminated competing loci: " + "; ".join(elim_notes)
+
+    causal = {
+        "verdict": "consistent",
+        "data_dependent": win["data_dependent"],
+        "data_state_assumptions": [],
+        "trace": trace,
+        "need_data_state": [],
+        "data_reads": [],
+    }
+    res = ConvergeResult(
+        converged=True,
+        path=[{"node": attributed["node"], "file": attributed["file"],
+               "lines": attributed["lines"], "symbol": vd.get("symbol", "") or ""}],
+        attributed_defect=attributed,
+        additional_defects=[],
+        missing_link=None,
+        causal_check=causal,
+        summary=(f"converged via split elimination: 1 of {len(results)} located loci "
+                 f"survived its cause→symptom check → defect at "
+                 f"{attributed['file']}:{attributed['lines']}"),
+        raw={"split": True, "survivors": 1, "evaluated": len(results)},
+    )
+    # Carry the winner's live-DB read (if any) so the honey can paste real rows.
+    if win["attempted"]:
+        res.data_state_attempted = True
+        res.data_state_block = win["data_block"]
+        res.data_state_backed = win["data_backed"]
+    return res
+
+
 def run_converge(*, seed_text: str, verdicts: list[dict[str, Any]],
                  bundles: list[dict[str, Any]], provider: str, model: str,
                  code_root: str | None = None, ledger=None,
                  provider_kwargs: dict | None = None, timeout: int = 180,
                  min_located: int = 2, max_calls: int = 2,
-                 k: int = 6, max_hops: int = 2, db_conn=None) -> ConvergeResult:
+                 k: int = 6, max_hops: int = 2, db_conn=None,
+                 split_enabled: bool = False, split_max_loci: int = 4,
+                 split_provider: str = "", split_model: str = "") -> ConvergeResult:
     """Stitch the per-axis verdicts into one path. Tool-OFF; never raises.
 
     Budget (mirrors judge's retrieve→re-judge): ONE converge call, plus — ONLY when
@@ -1238,10 +1574,31 @@ def run_converge(*, seed_text: str, verdicts: list[dict[str, Any]],
     # NR174) and the pre-execution read guard (reject hallucinated table/columns).
     schema_map = _introspect_schema(db_conn)
     db_schema = _render_schema_block(schema_map)
-    res = _converge_once(seed_text, located, unlocated, windows, known,
-                         provider, model, pk, ledger, timeout,
-                         db_available=db_available, db_schema=db_schema,
-                         code_state_block=code_state_block)
+
+    # ── Per-locus SPLIT pass (M020, opt-in): ask one narrow cause→symptom question per
+    # located locus and combine by deterministic elimination. On a CLEAN elimination
+    # (exactly one survivor) it returns the converged result and we skip the holistic
+    # stitch entirely (its data loop / missing-link re-pass below no-op for a split result
+    # — empty data_reads, converged, no missing_link). On anything ambiguous it returns
+    # None and we fall back to the holistic converge unchanged. Precision layer, not a new
+    # failure mode (see ConvergeSplitConfig / _split_converge).
+    split_res = None
+    if split_enabled:
+        sprov = split_provider or provider
+        smodel = split_model or model
+        logger.info("converge: split pass (%s/%s, max_loci=%d) over %d located locus(es)",
+                    sprov, smodel, split_max_loci, len(located))
+        split_res = _split_converge(seed_text, located, windows, known, code_root,
+                                    split_max_loci, sprov, smodel, pk, ledger, timeout,
+                                    db_conn, schema_map, db_schema, db_available)
+
+    if split_res is not None:
+        res = split_res
+    else:
+        res = _converge_once(seed_text, located, unlocated, windows, known,
+                             provider, model, pk, ledger, timeout,
+                             db_available=db_available, db_schema=db_schema,
+                             code_state_block=code_state_block)
     logger.info("converge: %s", res.summary)
 
     # ── Data-state read (N172/N173): the verdict hinges on a STORED row value static
@@ -1362,6 +1719,18 @@ def run_converge(*, seed_text: str, verdicts: list[dict[str, Any]],
                 # first result, which at least named the missing link for the author.
                 if res2.converged:
                     res = res2
+
+    # When the split pass produced this result, the holistic data loop above no-op'd, so
+    # the local data_* vars are still their False defaults. Reflect the WINNER's actual
+    # read state (captured per-locus inside the split) so the trailing guards see the truth
+    # — in particular the data-stamp guard must NOT demote a data-dependent split verdict
+    # that WAS backed by a real read. The premise-refutation was already applied per-locus,
+    # so data_chain_broke stays False (do not double-fire the premise-refuted guard).
+    if split_res is not None:
+        data_backed = res.data_state_backed
+        data_attempted = res.data_state_attempted
+        data_block = res.data_state_block
+        data_chain_broke = False
 
     # ── Dropped-peer domain guard (N180): a ``consistent`` certified on a live DB read
     # must not stay converged while a DISTINCT-locus located peer was dropped without

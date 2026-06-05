@@ -632,10 +632,13 @@ def run_reconverge_command(args: argparse.Namespace) -> None:
                   model_queen=conv_role.model, model_swarm=conv_role.model)
     try:
         bundles = _rebuild_bundles(verdicts, args.codebase, args.docs)
+        split_cfg = cfg.converge_split
         cres = run_converge(
             seed_text=seed_text, verdicts=_converge_fragments(verdicts), bundles=bundles,
             provider=conv_role.provider, model=conv_role.model, code_root=args.codebase,
-            ledger=ldg, provider_kwargs=provider_kwargs, k=6, max_hops=2, db_conn=db_conn)
+            ledger=ldg, provider_kwargs=provider_kwargs, k=6, max_hops=2, db_conn=db_conn,
+            split_enabled=split_cfg.enabled, split_max_loci=split_cfg.max_loci,
+            split_provider=split_cfg.provider, split_model=split_cfg.model)
         ldg.finish_run(status="done")
     except Exception:
         ldg.finish_run(status="failed")
