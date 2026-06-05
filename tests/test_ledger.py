@@ -235,15 +235,38 @@ class TestLedgerBeginFinishCall(unittest.TestCase):
                                       prompt="x" * 40)
         self.assertIsNotNone(call_id)
 
-    def test_begin_row_is_running_with_started_at(self):
+    def test_begin_row_is_wait_with_started_at(self):
+        # The row starts at 'wait' (registered, not yet executing) — it only
+        # becomes 'running' once the handler owns its slot (mark_running). This is
+        # what stops a codex call parked on the serialization lock from showing a
+        # false 'running'.
         call_id = self.ldg.begin_call("queen", "decompose", "copilot", "gpt-5-mini",
                                       prompt="x" * 40)
         status, started_at, in_chars, out_chars, est, ok, err = self._row(call_id)
-        self.assertEqual(status, "running")
+        self.assertEqual(status, "wait")
         self.assertTrue(started_at)            # ISO timestamp present
         self.assertEqual(in_chars, 40)         # fixed at begin
         self.assertIsNone(out_chars)           # not yet known
         self.assertIsNone(ok)
+
+    def test_mark_running_flips_wait_to_running(self):
+        call_id = self.ldg.begin_call("specify", "specify", "codex", "gpt-5.4-mini",
+                                      prompt="x" * 40)
+        self.assertEqual(self._row(call_id)[0], "wait")
+        self.ldg.mark_running(call_id)
+        self.assertEqual(self._row(call_id)[0], "running")
+
+    def test_mark_running_does_not_clobber_finished(self):
+        # A late/lost wakeup must never resurrect a completed row back to running.
+        call_id = self.ldg.begin_call("specify", "specify", "codex", "gpt-5.4-mini",
+                                      prompt="x" * 40)
+        self.ldg.finish_call(call_id, output="o" * 10, latency_s=1.0)
+        self.assertEqual(self._row(call_id)[0], "done")
+        self.ldg.mark_running(call_id)         # arrives after finish — must be a no-op
+        self.assertEqual(self._row(call_id)[0], "done")
+
+    def test_mark_running_none_id_noop(self):
+        self.ldg.mark_running(None)            # ledger unavailable / begin failed
 
     def test_finish_call_marks_done(self):
         call_id = self.ldg.begin_call("converge", "converge", "copilot", "gpt-5-mini",

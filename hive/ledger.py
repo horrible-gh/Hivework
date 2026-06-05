@@ -123,7 +123,7 @@ class Ledger:
 
     def begin_call(self, stage: str, axis_id: str, provider: str, model: str,
                    prompt: str, comb_path: str = "") -> int | None:
-        """Insert a worker_calls row at call start with status='running'.
+        """Insert a worker_calls row at call start with status='wait'.
 
         Returns the new row id (pass it to ``finish_call``) or None when the
         ledger is unavailable. Recording the row BEFORE the (possibly multi-minute)
@@ -131,6 +131,14 @@ class Ledger:
         survives even if the call later times out (see finish_call in except paths).
         ``in_chars`` and ``started_at`` are fixed here; out_chars/latency/ok land
         at finish.
+
+        Status starts at 'wait', NOT 'running': between begin_call and the worker
+        actually executing there can be a real blocking gap — a provider may queue
+        behind a serialization lock (the codex cross-process mutex). Marking it
+        'running' here would label every queued codex call 'running' when only one
+        is truly executing and the rest are parked on the lock. The handler calls
+        ``mark_running`` the instant it owns the slot, so 'wait' vs 'running'
+        reflects reality.
         """
         if self._conn is None or self._run_id is None:
             return None
@@ -145,7 +153,7 @@ class Ledger:
                     "  in_chars, comb_path, status, started_at)"
                     " VALUES (?,?,?,?,?,?,?,?,?)",
                     (self._run_id, stage, axis_id, provider, model,
-                     in_chars, comb_path, "running", started_at))
+                     in_chars, comb_path, "wait", started_at))
                 self._conn.commit()
                 call_id = cur.lastrowid
                 self._pending[call_id] = {"in_chars": in_chars, "est_prompt": est_prompt}
@@ -153,6 +161,27 @@ class Ledger:
         except Exception as e:
             logger.warning("Ledger: begin_call failed: %s", e)
             return None
+
+    def mark_running(self, call_id: int | None) -> None:
+        """Flip a 'wait' row to 'running' once the worker truly starts executing.
+
+        The provider handler calls this the instant it owns its slot and begins
+        the subprocess/HTTP call — for codex, AFTER acquiring the cross-process
+        serialization lock — so the ledger separates "queued behind the lock"
+        ('wait') from "actually running" ('running'). Only a still-'wait' row is
+        flipped (never clobbers a finished/failed row, and a lost wakeup can't
+        resurrect a done row); a None call_id no-ops. Non-fatal.
+        """
+        if self._conn is None or call_id is None:
+            return
+        try:
+            with self._lock:
+                self._conn.execute(
+                    "UPDATE worker_calls SET status='running'"
+                    " WHERE id=? AND status='wait'", (call_id,))
+                self._conn.commit()
+        except Exception as e:
+            logger.warning("Ledger: mark_running failed: %s", e)
 
     def finish_call(self, call_id: int | None, output: str, latency_s: float,
                     ok: bool = True, err: str = "",
@@ -271,6 +300,7 @@ class NullLedger:
     """No-op ledger used when ledger.enabled=False or open fails."""
     def start_run(self, *a, **kw): pass
     def begin_call(self, *a, **kw): return None
+    def mark_running(self, *a, **kw): pass
     def finish_call(self, *a, **kw): pass
     def record_call(self, *a, **kw): pass
     def record_local(self, *a, **kw): pass
