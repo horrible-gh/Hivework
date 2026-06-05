@@ -295,8 +295,11 @@ def _http_binding_bridges(located: list[dict[str, Any]],
     Reuses the retriever's deterministic binding machinery on the union of the evidence
     windows + the located fragments' in-scope files. Never raises; a resolver/import
     failure degrades silently to "" (the snippet-only path, exactly as before).
+
+    Set ``HIVE_NO_HTTP_BRIDGE=1`` to disable (A/B isolation / kill-switch) — the stage
+    then behaves exactly as it did before this grounding was added.
     """
-    if not code_root:
+    if not code_root or os.environ.get("HIVE_NO_HTTP_BRIDGE"):
         return ""
     try:
         from hive.retriever import _read_text, _resolve_http_bindings

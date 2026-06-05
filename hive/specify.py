@@ -2114,7 +2114,10 @@ def _apply_deferred_substance_gate(spec: dict[str, Any],
         return spec
 
     # Converge-certified escape: single-locus convergence + an edit on the certified locus.
-    if not _converge_target_loci(honey_text):  # single-locus only (multi has its own gate)
+    # Set HIVE_NO_DEFERRED_ESCAPE=1 to disable (A/B isolation / kill-switch) — the gate
+    # then fires the blanket downgrade exactly as it did before the N182 escape.
+    if (not os.environ.get("HIVE_NO_DEFERRED_ESCAPE")
+            and not _converge_target_loci(honey_text)):  # single-locus only (multi has its own gate)
         certified = _converge_certified_locus(honey_text)
         if certified:
             edits = [e for e in (spec.get("edits") or []) if isinstance(e, dict)]
