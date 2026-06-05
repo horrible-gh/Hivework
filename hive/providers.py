@@ -115,7 +115,8 @@ def _run_capture(cmd, *, input=None, cwd=None, timeout=None, env=None) -> subpro
 
 
 def _call_copilot(model, prompt, cwd, timeout, exe=None, allow_flag="--allow-all",
-                  available_tools=None, copilot_token=None, **_ignored) -> WorkerResult:
+                  available_tools=None, copilot_token=None, on_start=None,
+                  **_ignored) -> WorkerResult:
     """Call the copilot CLI. Prompt sent via stdin (never -p) to avoid cp932 truncation.
 
     ``available_tools``: when not None, restrict the model to exactly this tool
@@ -148,6 +149,8 @@ def _call_copilot(model, prompt, cwd, timeout, exe=None, allow_flag="--allow-all
                        "a token account")
     logger.debug("call_worker copilot: model=%s cwd=%s timeout=%d token=%s",
                  model, cwd, timeout, "pinned" if copilot_token else "ambient")
+    if on_start is not None:
+        on_start()  # copilot never queues → wait→running flips immediately
     t0 = time.monotonic()
     result = _run_capture(cmd, input=prompt, cwd=cwd, timeout=timeout, env=env)
     latency_s = time.monotonic() - t0
@@ -174,7 +177,8 @@ def _call_openai_compatible(model, prompt, cwd=None, timeout=120, *, system=None
                             reasoning_effort=None,
                             api_key_env="DEEPINFRA_TOKEN",
                             base_url="https://api.deepinfra.com/v1/openai",
-                            available_tools=None, **_ignored) -> WorkerResult:
+                            available_tools=None, on_start=None,
+                            **_ignored) -> WorkerResult:
     """Call any OpenAI-compatible chat endpoint (DeepInfra, OpenAI, vLLM, …).
 
     This is the generic HTTP handler behind both the ``openai`` and ``deepinfra``
@@ -235,6 +239,8 @@ def _call_openai_compatible(model, prompt, cwd=None, timeout=120, *, system=None
     logger.debug("call_worker openai: model=%s base_url=%s timeout=%d tools=%s",
                  model, base_url, timeout, tool_names or "none")
     client = OpenAI(api_key=api_key, base_url=base_url, timeout=timeout)
+    if on_start is not None:
+        on_start()  # HTTP provider never queues → wait→running flips immediately
     t0 = time.monotonic()
     try:
         if tool_names:
@@ -330,7 +336,7 @@ def _codex_serial_lock(acquire_timeout=None, poll=1.0):
 
 
 def _call_codex(model, prompt, cwd=None, timeout=300, *, sandbox="read-only",
-                codex_exe=None, **_ignored) -> WorkerResult:
+                codex_exe=None, on_start=None, **_ignored) -> WorkerResult:
     """Call the Codex CLI in non-interactive ``codex exec`` mode (tool-ON agentic).
 
     The OpenAI-equivalent of the copilot worker: an agentic CLI that reads/explores
@@ -371,6 +377,10 @@ def _call_codex(model, prompt, cwd=None, timeout=300, *, sandbox="read-only",
         # Cross-process serialization: only one codex subprocess runs at a time.
         # t0 is set INSIDE the lock so latency reflects codex time, not queue wait.
         with _codex_serial_lock():
+            # We now OWN the codex slot — flip the ledger row wait→running here, so
+            # a call parked on the lock reads 'wait' (queued), not a false 'running'.
+            if on_start is not None:
+                on_start()
             t0 = time.monotonic()
             result = _run_capture(cmd, input=prompt, cwd=cwd, timeout=timeout)
             latency_s = time.monotonic() - t0
@@ -416,11 +426,18 @@ _REGISTRY: dict = {
 }
 
 
-def call_worker(provider, model, prompt, cwd=None, timeout=300, **provider_kwargs) -> WorkerResult:
+def call_worker(provider, model, prompt, cwd=None, timeout=300, on_start=None,
+                **provider_kwargs) -> WorkerResult:
     """Dispatch a worker call to the named provider.
 
     Raises NotImplementedError for unknown providers.
     To add a provider: register a handler in _REGISTRY above.
+
+    ``on_start``: optional zero-arg callback the handler fires the instant it
+    begins ACTUALLY executing — for codex, after acquiring the cross-process
+    serialization lock; for the others, immediately (they never queue). The
+    ledger passes ``mark_running(call_id)`` here so a row blocked on the codex
+    mutex reads 'wait', not a false 'running'. Safe to omit.
     """
     handler = _REGISTRY.get(provider)
     if handler is None:
@@ -429,4 +446,5 @@ def call_worker(provider, model, prompt, cwd=None, timeout=300, **provider_kwarg
             f"Available: {list(_REGISTRY)}. "
             "To add one, register a handler in hive/providers.py _REGISTRY."
         )
-    return handler(model=model, prompt=prompt, cwd=cwd, timeout=timeout, **provider_kwargs)
+    return handler(model=model, prompt=prompt, cwd=cwd, timeout=timeout,
+                   on_start=on_start, **provider_kwargs)

@@ -365,6 +365,44 @@ class TestCodexSerialLock(unittest.TestCase):
         with providers._codex_serial_lock(acquire_timeout=1):
             pass
 
+    def test_on_start_fires_inside_the_lock(self):
+        # on_start (the ledger's mark_running) must run AFTER the codex slot is
+        # owned — i.e. while the lock is HELD — so a call still queued on the lock
+        # reads 'wait', not a false 'running'. Probe by trying a reentrant acquire
+        # from inside on_start: it must find the lock busy.
+        seen = {}
+
+        def on_start():
+            seen["called"] = seen.get("called", 0) + 1
+            try:
+                with providers._codex_serial_lock(acquire_timeout=0):
+                    seen["lock_free_when_marked"] = True
+            except (TimeoutError, OSError):
+                seen["lock_held_when_marked"] = True
+
+        with mock.patch.object(providers.shutil, "which", return_value="codex.cmd"), \
+             mock.patch.object(providers, "_run_capture",
+                               return_value=_make_proc(0, "{}", "")):
+            providers.call_worker("codex", "gpt-5-codex", "do X", cwd="/x",
+                                  timeout=5, on_start=on_start)
+
+        self.assertEqual(seen.get("called"), 1)
+        self.assertTrue(seen.get("lock_held_when_marked"),
+                        "on_start must fire while the codex lock is held")
+        self.assertNotIn("lock_free_when_marked", seen)
+
+    def test_copilot_on_start_fires_before_run(self):
+        # Non-queuing providers flip wait→running immediately: on_start must fire
+        # exactly once, before the subprocess result is returned.
+        order = []
+        with mock.patch.object(providers.shutil, "which", return_value="copilot.cmd"), \
+             mock.patch.object(providers, "_run_capture",
+                               side_effect=lambda *a, **k: (order.append("run"),
+                                                            _make_proc(0, "out", ""))[1]):
+            providers.call_worker("copilot", "gpt-5-mini", "p", cwd="/x", timeout=5,
+                                  on_start=lambda: order.append("start"))
+        self.assertEqual(order, ["start", "run"])
+
     def test_disabled_by_env(self):
         with mock.patch.dict(os.environ, {"HIVE_CODEX_NO_LOCK": "1"}):
             with providers._codex_serial_lock(acquire_timeout=0):
