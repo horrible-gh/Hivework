@@ -926,7 +926,8 @@ def _validate_read(spec: dict[str, Any], schema: dict[str, list[str]]) -> str:
 
 
 def _run_data_reads(data_reads: list[dict[str, Any]], db_conn,
-                    schema: dict[str, list[str]] | None = None
+                    schema: dict[str, list[str]] | None = None,
+                    ledger=None, axis_id: str = "converge"
                     ) -> tuple[str, bool, bool]:
     """Run the converger's ``data_reads`` against the live DB; return
     (block, any_rows, chain_broke).
@@ -954,6 +955,8 @@ def _run_data_reads(data_reads: list[dict[str, Any]], db_conn,
     except Exception as e:  # pragma: no cover - import guard
         logger.warning("converge: dbread unavailable (%s) — skipping data read", e)
         return "", False, False
+    import time as _time
+    _t0 = _time.monotonic()
     lines: list[str] = []
     any_rows = False
     chain_broke = False
@@ -1004,7 +1007,16 @@ def _run_data_reads(data_reads: list[dict[str, Any]], db_conn,
             lines.append(f"  -> (NOTE: returned {_DATA_READ_LIMIT} rows = the read cap; "
                          f"the set may be TRUNCATED — do not draw an ordering/'which row "
                          f"wins' conclusion from a possibly-incomplete set)")
-    return "\n".join(lines), any_rows, chain_broke
+    block = "\n".join(lines)
+    # Register this LOCAL (free, deterministic) live-DB read in the ledger so the
+    # ★ undecidable → DB read ★ step shows up in the configured DB, not just model
+    # calls. provider='local', mechanism='sqlite'; cost aggregate stays untouched.
+    if ledger is not None:
+        ledger.record_local(
+            stage="db_read", axis_id=axis_id, mechanism="sqlite",
+            detail=f"reads={len(data_reads)} rows={any_rows} chain_broke={chain_broke}",
+            out_chars=len(block), latency_s=_time.monotonic() - _t0)
+    return block, any_rows, chain_broke
 
 
 def _fetch_data_state(data_reads: list[dict[str, Any]], db_conn) -> str:
@@ -1398,7 +1410,8 @@ def _eval_locus(seed_text: str, focal: dict[str, Any], others: list[dict[str, An
     reads = causal.get("data_reads") or []
     if db_conn is not None and reads and causal.get("data_dependent"):
         data_attempted = True
-        block, backed, broke = _run_data_reads(reads, db_conn, schema_map)
+        block, backed, broke = _run_data_reads(reads, db_conn, schema_map,
+                                               ledger=ledger, axis_id=tag or "converge")
         data_block = block
         data_backed = backed
         chain_broke = broke
@@ -1638,7 +1651,8 @@ def run_converge(*, seed_text: str, verdicts: list[dict[str, Any]],
         seen_sigs.add(sig)
         data_attempted = True
         rounds += 1
-        block, backed, chain_broke = _run_data_reads(pending, db_conn, schema_map)
+        block, backed, chain_broke = _run_data_reads(pending, db_conn, schema_map,
+                                                     ledger=ledger, axis_id="converge")
         block_parts.append(block)
         data_backed = data_backed or backed
         logger.info("converge: data read round %d → %d row-set(s), rows=%s, chain_broke=%s",

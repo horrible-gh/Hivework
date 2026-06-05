@@ -534,6 +534,11 @@ def run_investigate_command(args: argparse.Namespace) -> None:
                     specify_role.provider, specify_role.model)
         logger.info("─" * 60)
         ldg2 = open_ledger(cfg.ledger.enabled, cfg.ledger.db_path)
+        # Without start_run the ledger's _run_id stays None, so begin_call no-ops
+        # and the chained specify worker calls leave NO rows. Start a run here so
+        # the post-converge worker shows up in the configured ledger DB.
+        ldg2.start_run(seed=args.seed, codebase=args.codebase,
+                       model_queen=specify_role.model, model_swarm=specify_role.model)
         try:
             review_role = cfg.role("review")
             specify_kwargs = dict(author_retries=specify_role.retries)
@@ -585,6 +590,9 @@ def run_investigate_command(args: argparse.Namespace) -> None:
             logger.error("Chained specify failed (verdicts + honey intact at %s): %s",
                          honey_path, e)
             logger.error("Resume specify WITHOUT re-investigating: %s", resume_path)
+            ldg2.finish_run(honey_path=honey_path, status="failed")
+        else:
+            ldg2.finish_run(honey_path=honey_path, status="done")
         finally:
             ldg2.close()
 

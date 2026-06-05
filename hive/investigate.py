@@ -24,6 +24,7 @@ import json
 import logging
 import os
 import re
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any
 
@@ -550,11 +551,22 @@ def run_investigate(
                     sp.axis_id)
         logger.info("② retrieve [%s] keywords=%d globs=%d (local, free)",
                     sp.axis_id, len(sp.keywords), len(sp.file_globs))
+        _retr_t0 = time.monotonic()
         bundle = retrieve(sp, code_root, docs_root, k=k,
                           top_files=top_files, blame_files=blame_files)
+        _retr_dt = time.monotonic() - _retr_t0
         st = bundle.get("stats", {})
         logger.info("   FIND: %s hits → %s snippets, %s call-chain",
                     st.get("raw_hits"), st.get("snippets"), st.get("call_chain"))
+        # Register this LOCAL (free, deterministic) retrieve in the ledger so stage ②
+        # shows up in the configured DB alongside the billed model calls (provider=
+        # 'local', mechanism='ripgrep'; cost aggregate untouched).
+        if ledger is not None:
+            ledger.record_local(
+                stage="retrieve", axis_id=sp.axis_id, mechanism="ripgrep",
+                detail=f"hits={st.get('raw_hits')} snippets={st.get('snippets')} "
+                       f"call_chain={st.get('call_chain')}",
+                latency_s=_retr_dt)
         gv = st.get("glob_validation", {})
         if gv.get("dropped_empty") or gv.get("dropped_overbroad"):
             logger.info("   glob-guard: kept=%s dropped_empty=%s dropped_overbroad=%s",
