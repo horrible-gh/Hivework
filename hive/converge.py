@@ -157,6 +157,13 @@ def _aligns(a: str, b: str) -> bool:
     return bool(a) and bool(b) and (a == b or a.endswith("/" + b) or b.endswith("/" + a))
 
 
+_FE_EXTS = (".vue", ".jsx", ".tsx", ".svelte", ".ts", ".js", ".mjs", ".cjs")
+
+
+def _is_fe_file(path: str) -> bool:
+    return _norm(path).endswith(_FE_EXTS)
+
+
 def _located(verdicts: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return [v for v in verdicts if (v.get("verdict") or {}).get("located")]
 
@@ -1302,6 +1309,320 @@ def _data_stamp_guard(res: ConvergeResult, db_available: bool,
     return res
 
 
+# ── HTTP-bound datasource provenance (M036 module-selector off-path) ───────────
+# Field-provenance handles snake_case response fields that the FE reads directly, but it
+# deliberately ignores short bare fields like ``module``. The module-selector miss is the
+# sibling shape: a FE collection variable (``currentModules``) is gated on non-empty,
+# populated from an HTTP endpoint (``/api/v1/projects``), and the endpoint's datasource
+# hardcodes the relevant field empty (``'' AS module``). The retriever already grounds the
+# executed HTTP path; this guard makes converge respect that path when a lexically-similar
+# route (``list_modules``) is an off-path decoy.
+_HTTP_DS_URL_RE = re.compile(
+    r"""(?P<callee>[A-Za-z_$][\w.$]*)\s*(?:<[^>(){}]*>)?\s*\(\s*[`'"]\s*(?P<path>/[A-Za-z0-9_./:{}-]*)""")
+_HTTP_DS_BINDING_RE = re.compile(r"client\s+(?P<url>/[A-Za-z0-9_./:{}-]+)")
+_HTTP_DS_CALL_RE = re.compile(r"(?:\.|\b)([A-Za-z_][A-Za-z0-9_]{2,})\s*\(")
+_HTTP_DS_DEF_RE = re.compile(r"\b(?:async\s+def|def)\s+([A-Za-z_][A-Za-z0-9_]*)\b")
+_HTTP_DS_SKIP = {
+    "array", "bool", "dict", "enumerate", "get", "isinstance", "jsonresponse", "len",
+    "list", "open", "range", "return", "set", "sorted", "str", "tuple",
+}
+# Property accesses on an assignment RHS: ``.field`` / ``?.field`` / ``["field"]`` /
+# ``['field']``. Matching EVERY access (not just the first dotted token) keeps this
+# codebase-agnostic — ``res.modules``, ``resp.data.modules`` and ``payload["modules"]`` all
+# surface the field rather than a wrapper object.
+_HTTP_DS_PROP_RE = re.compile(
+    r"""(?:\?\.|\.)\s*([A-Za-z_][A-Za-z0-9_]*)\b|\[\s*['"]([A-Za-z_][A-Za-z0-9_]*)['"]\s*\]""")
+
+
+def _field_stems(field: str) -> set[str]:
+    """A field token plus its singular form — the FE payload property is usually plural while
+    the DB row field is singular (``modules`` → ``module``; ``categories`` → ``category``)."""
+    stems = {field}
+    if field.endswith("ies") and len(field) > 3:
+        stems.add(field[:-3] + "y")
+    if field.endswith("s") and len(field) > 1:
+        stems.add(field[:-1])
+    return stems
+
+
+def _camel_tail(name: str) -> str:
+    """Last camelCase/snake_case segment, lowercased: a gated variable usually names the
+    collection it holds (``currentModules`` → ``modules``, ``allowed_projects`` → ``projects``).
+    A fallback field source when the assignment RHS is indirect (``x = someLocal``)."""
+    parts = re.findall(r"[A-Z]?[a-z0-9]+|[A-Z]+(?![a-z])", name)
+    return parts[-1].lower() if parts else ""
+
+
+def _http_ds_fe_edges(windows: list[dict[str, Any]],
+                      code_root: str | None = None) -> list[dict[str, Any]]:
+    """Extract FE gated collection variables and the response field/URL that feeds them.
+
+    Tight, structural signal only: a FE file must show a non-empty length gate for a local
+    collection variable AND contain an HTTP URL literal. Candidate response fields come from
+    the variable's assignments (any property access on the RHS, codebase-agnostic) or, as a
+    fallback, the variable's own name tail. No seed text parsing; no invented field names.
+    """
+    by_file: dict[str, str] = {}
+    for w in windows or []:
+        f = w.get("file", "")
+        if not _is_fe_file(f):
+            continue
+        by_file[f] = by_file.get(f, "") + "\n" + (w.get("text") or "")
+    if code_root:
+        # The gate, fetch, and assignment often sit in three small windows with gaps
+        # between them. Read only FE files already present in evidence, mirroring the
+        # HTTP bridge's in-scope full-file grounding.
+        for f in list(by_file):
+            rel = (f or "").replace("\\", "/")
+            abspath = os.path.join(code_root, rel)
+            try:
+                with open(abspath, "r", encoding="utf-8", errors="replace") as fh:
+                    live = fh.read()
+            except OSError:
+                continue
+            if live:
+                by_file[f] = by_file[f] + "\n" + live
+
+    edges: list[dict[str, Any]] = []
+    for f, text in by_file.items():
+        gates = set()
+        for pat in (
+            r"""v-if\s*=\s*["'][^"']*\b([A-Za-z_$][\w$]*)\s*(?:\.value)?\.length\s*>\s*0""",
+            r"""\bif\s*\(\s*([A-Za-z_$][\w$]*)\s*(?:\.value)?\.length\s*>\s*0""",
+        ):
+            gates.update(m.group(1) for m in re.finditer(pat, text))
+        if not gates:
+            continue
+        urls = sorted({m.group("path").rstrip("/")
+                       for m in _HTTP_DS_URL_RE.finditer(text)})
+        if not urls:
+            continue
+        for var in sorted(gates):
+            # Candidate response fields, codebase-agnostic: every property access on the RHS
+            # of any assignment to the gated var — ``res.modules``, ``resp.data.modules``,
+            # ``payload["modules"]``, ``x?.modules ?? []`` all surface the field rather than a
+            # wrapper. Fall back to the variable's own name tail (``currentModules`` →
+            # ``modules``) when the RHS is indirect (``x = someLocal``). FE payload is plural,
+            # the DB row often singular, so each candidate carries its singular stem too. A
+            # wrong candidate is harmless: the guard fires only when a LOCATED datasource
+            # literally hardcodes one of these empty, so extra fields simply never match.
+            fields: list[str] = []
+            for am in re.finditer(
+                    rf"""\b{re.escape(var)}\b\s*(?:\.value)?\s*=\s*(?P<rhs>[^;\n]+)""", text):
+                for pm in _HTTP_DS_PROP_RE.finditer(am.group("rhs")):
+                    fields.append(pm.group(1) or pm.group(2))
+            tail = _camel_tail(var)
+            if tail:
+                fields.append(tail)
+            fields = [x for x in fields if x]
+            if not fields:
+                continue
+            stems: set[str] = set()
+            for fld in fields:
+                stems |= _field_stems(fld)
+            edges.append({"file": f, "var": var, "field": fields[0],
+                          "stems": stems, "urls": urls})
+    return edges
+
+
+def _http_ds_binding_url(w: dict[str, Any]) -> str:
+    text = w.get("text") or ""
+    m = _HTTP_DS_BINDING_RE.search(text)
+    if m:
+        return m.group("url").rstrip("/")
+    return str(w.get("url") or "").rstrip("/")
+
+
+def _http_ds_def_name(w: dict[str, Any]) -> str:
+    sym = str(w.get("symbol") or "")
+    if sym:
+        return sym
+    m = _HTTP_DS_DEF_RE.search(w.get("text") or "")
+    return m.group(1) if m else ""
+
+
+def _http_ds_calls(text: str) -> set[str]:
+    out = set()
+    for m in _HTTP_DS_CALL_RE.finditer(text or ""):
+        name = m.group(1)
+        if name.lower() not in _HTTP_DS_SKIP:
+            out.add(name)
+    return out
+
+
+def _http_ds_reachable(binding: dict[str, Any],
+                       windows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Reachability-lite from a resolved HTTP handler through same-name def windows."""
+    by_def: dict[str, list[dict[str, Any]]] = {}
+    for w in windows or []:
+        name = _http_ds_def_name(w)
+        if name:
+            by_def.setdefault(name, []).append(w)
+
+    out: list[dict[str, Any]] = [binding]
+    seen_win = {(_norm(binding.get("file", "")), str(binding.get("lines", "")))}
+    seen_sym: set[str] = set()
+    queue = list(_http_ds_calls(binding.get("text") or ""))
+    while queue and len(seen_sym) < 64:
+        sym = queue.pop(0)
+        if sym in seen_sym:
+            continue
+        seen_sym.add(sym)
+        for w in by_def.get(sym, []):
+            key = (_norm(w.get("file", "")), str(w.get("lines", "")))
+            if key in seen_win:
+                continue
+            seen_win.add(key)
+            out.append(w)
+            for nxt in sorted(_http_ds_calls(w.get("text") or "")):
+                if nxt not in seen_sym:
+                    queue.append(nxt)
+    return out
+
+
+def _http_ds_empty_field(text: str, stems: set[str]) -> str | None:
+    """Return the field whose datasource evidence hardcodes/omits it as empty."""
+    for field in sorted(stems, key=lambda x: (len(x), x)):
+        q = re.escape(field)
+        if re.search(rf"""(?i)(?:''|"")\s+AS\s+{q}\b""", text or ""):
+            return field
+        if re.search(rf"""(?i)['"]{q}['"]\s*:\s*(?:''|""|\[\s*\])""", text or ""):
+            return field
+        if re.search(rf"""(?i)\b{q}\b\s*=\s*(?:''|""|\[\s*\])""", text or ""):
+            return field
+    return None
+
+
+def _http_datasource_provenance_guard(res: ConvergeResult,
+                                      located: list[dict[str, Any]],
+                                      windows: list[dict[str, Any]],
+                                      code_root: str | None = None) -> ConvergeResult:
+    """Re-point off-path HTTP decoys to the datasource that empties a gated FE field.
+
+    Fires only when all grounding lines up:
+      • FE evidence shows a collection variable gated by ``length > 0`` and assigned from
+        a response field (e.g. ``currentModules`` ← ``modules``);
+      • a real HTTP binding resolves the FE URL to a backend handler;
+      • following real call-chain windows from that handler reaches a non-FE window that
+        hardcodes the field empty (``'' AS module`` / empty collection);
+      • that datasource file is already a located candidate.
+
+    No located datasource → no-op. Ambiguous/no structural FE signal → no-op. Disabled by
+    ``HIVE_NO_HTTP_DATASOURCE_PROVENANCE``. This is a re-point/confirm guard only; it
+    never invents an edit target.
+    """
+    if os.environ.get("HIVE_NO_HTTP_DATASOURCE_PROVENANCE"):
+        return res
+    edges = _http_ds_fe_edges(windows, code_root)
+    if not edges:
+        return res
+    bindings = [w for w in windows if w.get("via") == "http-binding"]
+    if not bindings:
+        return res
+
+    located_by_file: dict[str, dict[str, Any]] = {}
+    for v in located or []:
+        f = _norm((v.get("verdict") or {}).get("file", ""))
+        if f:
+            located_by_file[f] = v
+
+    targets: list[dict[str, Any]] = []
+    for edge in edges:
+        edge_urls = {u.rstrip("/") for u in edge.get("urls", [])}
+        for b in bindings:
+            if _http_ds_binding_url(b) not in edge_urls:
+                continue
+            reachable = _http_ds_reachable(b, windows)
+            reachable_files = {_norm(w.get("file", "")) for w in reachable}
+            for w in reachable:
+                f = _norm(w.get("file", ""))
+                if not f or _is_fe_file(f):
+                    continue
+                empty_field = _http_ds_empty_field(w.get("text") or "",
+                                                   set(edge.get("stems") or []))
+                if not empty_field:
+                    continue
+                lv = next((v for lf, v in located_by_file.items() if _aligns(f, lf)), None)
+                if not lv:
+                    continue
+                targets.append({"edge": edge, "binding": b, "window": w,
+                                "located": lv, "field": empty_field,
+                                "reachable_files": reachable_files})
+    if not targets:
+        return res
+
+    # Prefer the deepest reachable constant site (a datasource) over wrappers with the
+    # same name, then stable-sort by file. In the M036 chain this picks store.py over
+    # db.py/process_service.py and ignores off-path list_modules.
+    targets.sort(key=lambda t: (
+        0 if _http_ds_empty_field(t["window"].get("text") or "", {t["field"]}) else 1,
+        _norm((t["located"].get("verdict") or {}).get("file", "")),
+    ))
+    target = targets[0]
+    tvd = target["located"].get("verdict") or {}
+    tf = _norm(tvd.get("file", ""))
+    ad = res.attributed_defect or {}
+    cf = _norm(ad.get("file", ""))
+    if not cf:
+        return res
+
+    if _aligns(cf, tf):
+        if not res.converged:
+            res.converged = True
+            cc = dict(res.causal_check or {})
+            cc["http_datasource_provenance_confirmed"] = {
+                "file": ad.get("file", ""), "lines": ad.get("lines", ""),
+                "field": target["field"], "url": _http_ds_binding_url(target["binding"]),
+                "var": target["edge"].get("var", ""),
+            }
+            cc["trace"] = (cc.get("trace") or "") + (
+                f" [http-datasource-provenance] attribution {ad.get('file', '')}:"
+                f"{ad.get('lines', '')} is the HTTP-bound datasource that hardcodes "
+                f"{target['field']} empty for gated FE variable {target['edge'].get('var', '')}.")
+            res.causal_check = cc
+            res.summary = (
+                f"converged (HTTP datasource provenance): defect at {ad.get('file', '')}:"
+                f"{ad.get('lines', '')} empties the field feeding the gated FE variable")
+        return res
+
+    old = {"file": ad.get("file", ""), "lines": ad.get("lines", "")}
+    res.attributed_defect = {
+        "node": "http-bound-datasource",
+        "file": tvd.get("file", ""),
+        "lines": tvd.get("lines", ""),
+        "why": (f"the FE gates {target['edge'].get('var', '')} on non-empty values from "
+                f"{_http_ds_binding_url(target['binding'])}, and this HTTP-bound datasource "
+                f"hardcodes {target['field']} empty; the prior attribution "
+                f"{old['file']}:{old['lines']} is not the datasource producing that empty "
+                f"field for the executed endpoint"),
+    }
+    cc = dict(res.causal_check or {})
+    cc["http_datasource_provenance_repointed"] = {
+        "from": old,
+        "to": {"file": tvd.get("file", ""), "lines": tvd.get("lines", "")},
+        "field": target["field"],
+        "url": _http_ds_binding_url(target["binding"]),
+        "var": target["edge"].get("var", ""),
+    }
+    cc["trace"] = (cc.get("trace") or "") + (
+        f" [http-datasource-provenance] FE variable {target['edge'].get('var', '')} is "
+        f"gated on non-empty data and is filled from {_http_ds_binding_url(target['binding'])}; "
+        f"the resolved HTTP path reaches {tvd.get('file', '')}:{tvd.get('lines', '')}, "
+        f"which hardcodes {target['field']} empty. Re-pointed from {old['file']}:"
+        f"{old['lines']} to the executed datasource and refuted the off-path/non-datasource "
+        f"attribution.")
+    res.causal_check = cc
+    res.converged = True
+    res.summary = (
+        f"converged (HTTP datasource re-point): defect at {tvd.get('file', '')}:"
+        f"{tvd.get('lines', '')} empties {target['field']} for the endpoint feeding "
+        f"{target['edge'].get('var', '')} (was mis-attributed to {old['file']}:"
+        f"{old['lines']})")
+    logger.info("converge: HTTP datasource guard re-pointed attribution %s:%s → %s:%s",
+                old["file"], old["lines"], tvd.get("file", ""), tvd.get("lines", ""))
+    return res
+
+
 def _field_provenance_guard(res: ConvergeResult,
                             located: list[dict[str, Any]],
                             fp_windows: list[dict[str, Any]]) -> ConvergeResult:
@@ -2013,6 +2334,17 @@ def run_converge(*, seed_text: str, verdicts: list[dict[str, Any]],
     # deciding row. No-op when no DB is configured, when the ruling is pure code-logic
     # (not data_dependent), or when a real read already backed it. Tight by design.
     res = _data_stamp_guard(res, db_available, data_backed)
+
+    # ── HTTP-bound datasource re-point (M036 module-selector off-path): when a gated FE
+    # collection is filled from an endpoint and that endpoint's datasource hardcodes the
+    # relevant field empty (``currentModules`` ← ``/api/v1/projects`` ← ``'' AS module``),
+    # re-point away from off-path list-style decoys to the datasource. Runs before the
+    # snake_case field-provenance guard; if both somehow apply, field-provenance remains
+    # the final arbiter for richer response-field symptoms.
+    http_ds_windows = [s for b in (bundles or [])
+                       for s in ((b.get("code_snippets") or []) + (b.get("call_chain") or []))
+                       if isinstance(s, dict)]
+    res = _http_datasource_provenance_guard(res, located, http_ds_windows, code_root)
 
     # ── Field-provenance re-point (M035 §4 head case): when the symptom is a wrong value
     # in an FE-bound response field, field-producer grounding knows the code that FILLS

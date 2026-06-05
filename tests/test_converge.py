@@ -1783,6 +1783,140 @@ class TestFieldProvenanceGuard(unittest.TestCase):
             del os.environ["HIVE_NO_FIELD_PROVENANCE"]
 
 
+class TestHttpDatasourceProvenanceGuard(unittest.TestCase):
+    """M036: a gated FE collection is filled through a real HTTP endpoint whose
+    datasource hardcodes the field empty. Re-point off-path list_modules decoys to the
+    endpoint datasource, using only resolved HTTP/call-chain evidence."""
+
+    FE = "client/src/main/components/NewRequirementModal.vue"
+    ROUTE = "server/modules/flow_gate/api/v1/legacy_misc_routes.py"
+    SVC = "server/modules/flow_gate/process_service.py"
+    DB = "server/modules/flow_gate/db.py"
+    STORE = "server/modules/flow_gate/store.py"
+    DECOY = "server/modules/flow_gate/api/v1/list_routes.py"
+
+    def _windows(self):
+        return [
+            {"file": self.FE, "lines": "35-43", "text":
+             '<div v-if="currentModules.length > 0" class="form-group">\n'
+             '<option v-for="m in currentModules" :key="m.id" :value="m.id">'},
+            {"file": self.FE, "lines": "239-306", "text":
+             "const res = await getRequest<unknown>('/api/v1/projects')\n"
+             "currentModules.value = selectedProject?.modules ?? []\n"},
+            {"file": self.ROUTE, "lines": "82-87", "via": "http-binding", "text":
+             "# RESOLVED BINDING (hive): GET /api/v1/projects <- client /api/v1/projects\n"
+             "async def api_projects():\n"
+             "    projects = process_service.get_projects_with_modules()\n"
+             "    return {'projects': projects}\n"},
+            {"file": self.SVC, "lines": "2090-2106", "via": "call-chain",
+             "symbol": "get_projects_with_modules", "text":
+             "def get_projects_with_modules() -> list[dict]:\n"
+             "    allowed = db.get_allowed_projects()\n"
+             "    for row in allowed:\n"
+             "        m = (row.get('module') or '').strip()\n"
+             "        if m:\n"
+             "            project_map[p].append(m)\n"},
+            {"file": self.DB, "lines": "218-221", "via": "call-chain",
+             "symbol": "get_allowed_projects", "text":
+             "def get_allowed_projects() -> list[dict]:\n"
+             "    return _store.get_allowed_projects()\n"},
+            {"file": self.STORE, "lines": "1021-1035", "via": "call-chain",
+             "symbol": "get_allowed_projects", "text":
+             "def get_allowed_projects(self) -> List[Dict[str, Any]]:\n"
+             "    return conn.execute(\"SELECT project_id AS project, project_name, '' AS module\"\n"
+             "                        \" FROM projects WHERE is_active = 1\").fetchall()\n"},
+            {"file": self.DECOY, "lines": "101-144", "via": "call-chain",
+             "symbol": "list_modules", "text":
+             "def list_modules(request, p):\n"
+             "    rows = store._fetch_all('SELECT DISTINCT module FROM groups WHERE project_id = ?', [p])\n"},
+        ]
+
+    def _located(self, *files):
+        return [{"axis_id": f"AX{i}", "verdict": {"located": True, "file": f,
+                 "lines": "1021-1035" if f == self.STORE else "101-144",
+                 "reason": "r"}}
+                for i, f in enumerate(files)]
+
+    def _res_attr(self, file, lines="101-144", converged=True):
+        return C.ConvergeResult(
+            converged=converged,
+            attributed_defect={"node": "n", "file": file, "lines": lines},
+            causal_check={"verdict": "consistent", "data_dependent": False,
+                          "trace": "seed-anchored on list_modules"})
+
+    def test_repoints_list_modules_decoy_to_endpoint_datasource(self):
+        res = self._res_attr(self.DECOY)
+        out = C._http_datasource_provenance_guard(
+            res, self._located(self.DECOY, self.STORE), self._windows())
+        self.assertEqual(C._norm(out.attributed_defect["file"]), C._norm(self.STORE))
+        self.assertTrue(out.converged)
+        self.assertIn("http_datasource_provenance_repointed", out.causal_check)
+        self.assertEqual(out.causal_check["http_datasource_provenance_repointed"]["field"],
+                         "module")
+        self.assertEqual(out.causal_check["http_datasource_provenance_repointed"]["url"],
+                         "/api/v1/projects")
+
+    def test_noop_when_datasource_not_located(self):
+        res = self._res_attr(self.DECOY)
+        out = C._http_datasource_provenance_guard(
+            res, self._located(self.DECOY), self._windows())
+        self.assertEqual(C._norm(out.attributed_defect["file"]), C._norm(self.DECOY))
+        self.assertNotIn("http_datasource_provenance_repointed", out.causal_check)
+
+    def test_noop_when_already_at_datasource(self):
+        res = self._res_attr(self.STORE, lines="1021-1035")
+        out = C._http_datasource_provenance_guard(
+            res, self._located(self.DECOY, self.STORE), self._windows())
+        self.assertEqual(C._norm(out.attributed_defect["file"]), C._norm(self.STORE))
+        self.assertNotIn("http_datasource_provenance_repointed", out.causal_check)
+
+    def test_confirms_demoted_datasource_attribution(self):
+        res = self._res_attr(self.STORE, lines="1021-1035", converged=False)
+        out = C._http_datasource_provenance_guard(
+            res, self._located(self.DECOY, self.STORE), self._windows())
+        self.assertTrue(out.converged)
+        self.assertIn("http_datasource_provenance_confirmed", out.causal_check)
+
+    def test_kill_switch_disables(self):
+        os.environ["HIVE_NO_HTTP_DATASOURCE_PROVENANCE"] = "1"
+        try:
+            res = self._res_attr(self.DECOY)
+            out = C._http_datasource_provenance_guard(
+                res, self._located(self.DECOY, self.STORE), self._windows())
+            self.assertEqual(C._norm(out.attributed_defect["file"]), C._norm(self.DECOY))
+        finally:
+            del os.environ["HIVE_NO_HTTP_DATASOURCE_PROVENANCE"]
+
+    def _windows_fe(self, fe_assign: str):
+        """Backend chain from _windows(), but with a custom FE assignment line so the edge
+        extractor is exercised on shapes other than FlowGate's ``?.field ?? []`` (generality:
+        Hive is a general engine, not a FlowGate-specific one)."""
+        ws = self._windows()
+        ws[1] = {"file": self.FE, "lines": "239-306", "text":
+                 "const res = await getRequest('/api/v1/projects')\n" + fe_assign + "\n"}
+        return ws
+
+    def test_generalizes_to_chained_property_access(self):
+        # Old regex grabbed the FIRST dotted token (``data``) and required a trailing ``[]``;
+        # this shape (chained access, no ``[]``) must still resolve the real field ``modules``.
+        out = C._http_datasource_provenance_guard(
+            self._res_attr(self.DECOY), self._located(self.DECOY, self.STORE),
+            self._windows_fe("currentModules.value = res.data.modules"))
+        self.assertEqual(C._norm(out.attributed_defect["file"]), C._norm(self.STORE))
+        self.assertEqual(out.causal_check["http_datasource_provenance_repointed"]["field"],
+                         "module")
+
+    def test_generalizes_via_variable_name_fallback(self):
+        # No property access on the RHS at all (indirect local); the gated variable's own name
+        # tail (``currentModules`` → ``modules`` → ``module``) carries the field.
+        out = C._http_datasource_provenance_guard(
+            self._res_attr(self.DECOY), self._located(self.DECOY, self.STORE),
+            self._windows_fe("currentModules.value = mapped"))
+        self.assertEqual(C._norm(out.attributed_defect["file"]), C._norm(self.STORE))
+        self.assertEqual(out.causal_check["http_datasource_provenance_repointed"]["field"],
+                         "module")
+
+
 # ── M020 follow-up: per-locus SPLIT elimination converge ────────────────────────
 def _focal_file(prompt: str) -> str | None:
     """Extract the FOCAL locus's file from a per-locus split prompt (None if holistic)."""
