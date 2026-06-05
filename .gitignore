@@ -3,6 +3,7 @@
 config/hive.config.*.json
 !config/hive.config.example.json
 /state/
+/memory/
 
 # Claude / local
 /.claude/
