@@ -1669,6 +1669,120 @@ class TestPremiseRefutedGuard(unittest.TestCase):
         self.assertNotIn("data_premise_refuted", out.causal_check)
 
 
+class TestFieldProvenanceGuard(unittest.TestCase):
+    """M035 §4 head case: re-point a mis-attribution to the code that PRODUCES the
+    FE-bound response field the symptom is about (field-producer provenance)."""
+
+    DOCS = "server/modules/flow_gate/documents/routers/documents.py"
+    DECOY = "server/sql/queries/queries.json"
+
+    def _windows(self, producer_file=None, text="out[\"workflow_head_type\"] = head_type"):
+        # one field-producer evidence window for the head field
+        return [{"file": producer_file or self.DOCS, "lines": "378-394",
+                 "via": "field-producer", "field": "workflow_head_type", "text": text}]
+
+    def _located(self, *files):
+        return [{"axis_id": f"AX{i}", "verdict": {"located": True, "file": f,
+                 "lines": "378-394" if f == self.DOCS else "129-129", "reason": "r"}}
+                for i, f in enumerate(files)]
+
+    def _res_attr(self, file, lines="129-129", converged=True):
+        return C.ConvergeResult(
+            converged=converged,
+            attributed_defect={"node": "n", "file": file, "lines": lines},
+            causal_check={"verdict": "consistent", "data_dependent": True,
+                          "trace": "data-certified on a sql read"})
+
+    def test_repoints_decoy_to_producer(self):
+        # converge attributed the seed-anchored decoy; the producer is a located peer.
+        res = self._res_attr(self.DECOY)
+        out = C._field_provenance_guard(
+            res, self._located(self.DECOY, self.DOCS), self._windows())
+        self.assertEqual(C._norm(out.attributed_defect["file"]), C._norm(self.DOCS))
+        self.assertTrue(out.converged)
+        self.assertIn("field_provenance_repointed", out.causal_check)
+        self.assertIn("workflow_head_type",
+                      out.causal_check["field_provenance_repointed"]["fields"])
+
+    def test_overrides_a_demotion(self):
+        # the structural fact outranks an upstream guard's converged=False demotion.
+        res = self._res_attr(self.DECOY, converged=False)
+        out = C._field_provenance_guard(
+            res, self._located(self.DECOY, self.DOCS), self._windows())
+        self.assertTrue(out.converged)
+        self.assertEqual(C._norm(out.attributed_defect["file"]), C._norm(self.DOCS))
+
+    def test_noop_when_already_at_producer(self):
+        res = self._res_attr(self.DOCS, lines="378-394")
+        out = C._field_provenance_guard(
+            res, self._located(self.DECOY, self.DOCS), self._windows())
+        self.assertEqual(C._norm(out.attributed_defect["file"]), C._norm(self.DOCS))
+        self.assertNotIn("field_provenance_repointed", out.causal_check)
+
+    def test_confirms_producer_restores_demoted_convergence(self):
+        # attribution is ALREADY the producer but an upstream guard demoted it over an
+        # unrelated peer → assert convergence on the grounded producer (job 2).
+        res = self._res_attr(self.DOCS, lines="378-394", converged=False)
+        out = C._field_provenance_guard(
+            res, self._located(self.DECOY, self.DOCS), self._windows())
+        self.assertTrue(out.converged)
+        self.assertEqual(C._norm(out.attributed_defect["file"]), C._norm(self.DOCS))
+        self.assertIn("field_provenance_confirmed", out.causal_check)
+        self.assertNotIn("field_provenance_repointed", out.causal_check)
+
+    def test_picks_field_rich_producer_not_incidental_one(self):
+        # regression for the m035 misfire: a second, UNRELATED single-field producer
+        # (pipeline_service fills `in_progress`) must NOT win over the symptom's
+        # field-rich producer (documents.py fills the whole workflow_head_* family).
+        PIPE = "server/modules/flow_gate/workflow/pipeline_service.py"
+        fp = [
+            {"file": self.DOCS, "lines": "378-394", "via": "field-producer",
+             "field": "workflow_head_type", "text": 'out["workflow_head_type"] = h'},
+            {"file": self.DOCS, "lines": "354-370", "via": "field-producer",
+             "field": "workflow_head_status", "text": 'out["workflow_head_status"] = s'},
+            {"file": PIPE, "lines": "288-304", "via": "field-producer",
+             "field": "in_progress", "text": 'out["in_progress"] = x'},
+        ]
+        # converge correctly attributed the field-rich producer; guard must leave it.
+        res = self._res_attr(self.DOCS, lines="375-397", converged=False)
+        out = C._field_provenance_guard(
+            res, self._located(self.DECOY, self.DOCS, PIPE), fp)
+        self.assertEqual(C._norm(out.attributed_defect["file"]), C._norm(self.DOCS))
+        self.assertTrue(out.converged)
+
+    def test_noop_when_producer_not_located(self):
+        # never invent a target: the producer must be a judge-located candidate.
+        res = self._res_attr(self.DECOY)
+        out = C._field_provenance_guard(res, self._located(self.DECOY), self._windows())
+        self.assertEqual(C._norm(out.attributed_defect["file"]), C._norm(self.DECOY))
+
+    def test_noop_when_no_field_producer_evidence(self):
+        res = self._res_attr(self.DECOY)
+        out = C._field_provenance_guard(res, self._located(self.DECOY, self.DOCS), [])
+        self.assertEqual(C._norm(out.attributed_defect["file"]), C._norm(self.DECOY))
+
+    def test_silent_when_decoy_on_producer_path(self):
+        # the "bug is downstream of the producer" case: the producer READS the attributed
+        # file (its stem appears in the producer window) → leave the attribution alone.
+        store = "server/db/store.py"
+        res = self._res_attr(store, lines="40-44")
+        windows = self._windows(text="rows = store.get_modules()  # see store.py\n"
+                                     "out[\"workflow_head_type\"] = head_type")
+        out = C._field_provenance_guard(
+            res, self._located(store, self.DOCS), windows)
+        self.assertEqual(C._norm(out.attributed_defect["file"]), C._norm(store))
+
+    def test_kill_switch_disables(self):
+        os.environ["HIVE_NO_FIELD_PROVENANCE"] = "1"
+        try:
+            res = self._res_attr(self.DECOY)
+            out = C._field_provenance_guard(
+                res, self._located(self.DECOY, self.DOCS), self._windows())
+            self.assertEqual(C._norm(out.attributed_defect["file"]), C._norm(self.DECOY))
+        finally:
+            del os.environ["HIVE_NO_FIELD_PROVENANCE"]
+
+
 # ── M020 follow-up: per-locus SPLIT elimination converge ────────────────────────
 def _focal_file(prompt: str) -> str | None:
     """Extract the FOCAL locus's file from a per-locus split prompt (None if holistic)."""

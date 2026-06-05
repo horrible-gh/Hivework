@@ -1302,6 +1302,136 @@ def _data_stamp_guard(res: ConvergeResult, db_available: bool,
     return res
 
 
+def _field_provenance_guard(res: ConvergeResult,
+                            located: list[dict[str, Any]],
+                            fp_windows: list[dict[str, Any]]) -> ConvergeResult:
+    """Anchor the attribution to the code that PRODUCES the FE-bound field the symptom is
+    about (field-producer provenance).
+
+    The gap this closes (head off-by-one, M035 §4): the symptom is a wrong value in a
+    response field the FE reads (``workflow_head_type``). field-producer grounding (the
+    retriever ``via=field-producer`` windows) deterministically locates the code that
+    FILLS that field (``out["workflow_head_type"] = …`` in documents.py, right at the
+    ``NON_HEAD_TYPES`` bug). But a weak single-shot converger anchored on the seed and
+    "data-certified" by an INCIDENTAL SQL read attributed the defect to a sibling query
+    merely NAMED for the concept (``get_effective_head``) that the FE never reads, OR a
+    correct producer attribution got demoted by a domain guard over an unrelated peer.
+    Data existence ≠ causal link (the N170/N180 lesson). This guard uses the STRUCTURAL
+    fact — "field F is produced HERE" — to anchor the attribution, NOT any seed
+    natural-language parsing (the N177 over-fire trap).
+
+    The producer of interest P is the LOCATED candidate filling the MOST FE-bound fields
+    (the judge already vetted it as a defect site, and field-count picks the symptom's
+    field-rich producer over an incidental single-field one — e.g. documents.py's whole
+    ``workflow_head_*`` family over pipeline_service's lone ``in_progress``). Then:
+      • attribution already AT P → ASSERT converged (restore a demotion: the grounded
+        producer of the symptom field outranks a consistency dropped over an unrelated
+        peer);
+      • attribution at a DIFFERENT file that produces none of P's fields AND is not on
+        P's production path → RE-POINT to P;
+      • attribution at some other producer, or on P's path (the legitimate "bug is
+        downstream of the producer" case) → left untouched.
+
+    Disabled by ``HIVE_NO_FIELD_PROVENANCE``. Short fields (<8 chars, e.g. ``module``)
+    are never harvested by field-producer, so field-poor symptoms never reach this guard.
+    Operates on the FULL (uncapped) field-producer evidence — the pooled ``windows`` cap
+    can drop the symptom producer, so the caller passes facts straight from the bundles.
+    """
+    if os.environ.get("HIVE_NO_FIELD_PROVENANCE"):
+        return res
+    prod_fields: dict[str, set[str]] = {}
+    prod_text: dict[str, str] = {}
+    for w in fp_windows or []:
+        if w.get("via") != "field-producer":
+            continue
+        f = _norm(w.get("file", ""))
+        if not f:
+            continue
+        prod_fields.setdefault(f, set()).add(str(w.get("field", "")))
+        prod_text[f] = prod_text.get(f, "") + "\n" + (w.get("text") or "")
+    if not prod_fields:
+        return res
+    # P = located producer filling the MOST FE-bound fields (vetted + symptom-rich).
+    prod_located = [v for v in located
+                    if _norm((v.get("verdict") or {}).get("file", "")) in prod_fields]
+    if not prod_located:
+        return res
+
+    def _rank(v: dict[str, Any]) -> tuple[int, str]:
+        f = _norm((v.get("verdict") or {}).get("file", ""))
+        return (-len(prod_fields.get(f, set())), f)
+
+    target = sorted(prod_located, key=_rank)[0]
+    tvd = target.get("verdict") or {}
+    tf = _norm(tvd.get("file", ""))
+    fields = sorted(prod_fields.get(tf, set()))
+    ad = res.attributed_defect or {}
+    c = _norm(ad.get("file", ""))
+    if not c:
+        return res
+
+    # (job 2) attribution already AT the symptom field's producer → assert convergence.
+    if _aligns(c, tf):
+        if not res.converged:
+            res.converged = True
+            cc = dict(res.causal_check or {})
+            cc["field_provenance_confirmed"] = {"file": ad.get("file", ""),
+                                                "lines": ad.get("lines", ""), "fields": fields}
+            cc["trace"] = (cc.get("trace") or "") + (
+                f" [field-provenance] attribution {ad.get('file', '')}:{ad.get('lines', '')} "
+                f"is the producer of the FE-bound symptom field(s) {', '.join(fields)} — "
+                f"convergence asserted over a demotion on an unrelated peer.")
+            res.causal_check = cc
+            res.summary = (
+                f"converged (field-provenance): defect at {ad.get('file', '')}:"
+                f"{ad.get('lines', '')} produces the FE-bound field the symptom is about")
+            logger.info("converge: field-provenance guard confirmed producer attribution "
+                        "%s:%s (converged)", ad.get("file", ""), ad.get("lines", ""))
+        return res
+
+    # attribution is elsewhere:
+    if c in prod_fields:
+        return res  # a DIFFERENT field's producer — do not arbitrate producer-vs-producer
+    # reachability-lite: if C is what P READS (C on P's production path), C may be the real
+    # upstream cause → stay silent. Proxy: C's file stem in P's producer text, or both on
+    # the converged path.
+    c_stem = c.rsplit("/", 1)[-1].rsplit(".", 1)[0]
+    if c_stem and c_stem in prod_text.get(tf, "").lower():
+        return res
+    path_files = {_norm(n.get("file", "")) for n in (res.path or [])}
+    if c in path_files and tf in path_files:
+        return res
+
+    # (job 1) RE-POINT a disconnected decoy to the field's real producer.
+    old = {"file": ad.get("file", ""), "lines": ad.get("lines", "")}
+    res.attributed_defect = {
+        "node": "field-producer",
+        "file": tvd.get("file", ""),
+        "lines": tvd.get("lines", ""),
+        "why": (f"fills the FE-bound response field(s) {', '.join(fields)} the symptom is "
+                f"about; the prior attribution {old['file']}:{old['lines']} neither produces "
+                f"that field nor lies on its production path"),
+    }
+    cc = dict(res.causal_check or {})
+    cc["field_provenance_repointed"] = {
+        "from": old, "to": {"file": tvd.get("file", ""), "lines": tvd.get("lines", "")},
+        "fields": fields}
+    cc["trace"] = (cc.get("trace") or "") + (
+        f" [field-provenance] the symptom is a wrong FE-bound field value; that field is "
+        f"PRODUCED at {tvd.get('file', '')}:{tvd.get('lines', '')} (field-producer "
+        f"grounding), while {old['file']}:{old['lines']} does not produce it and is not on "
+        f"its production path — re-pointed attribution to the producer.")
+    res.causal_check = cc
+    res.converged = True
+    res.summary = (
+        f"converged (field-provenance re-point): defect at {tvd.get('file', '')}:"
+        f"{tvd.get('lines', '')} produces the FE-bound field the symptom is about "
+        f"(was mis-attributed to {old['file']}:{old['lines']})")
+    logger.info("converge: field-provenance guard re-pointed attribution %s:%s → %s:%s",
+                old["file"], old["lines"], tvd.get("file", ""), tvd.get("lines", ""))
+    return res
+
+
 # ── Per-locus SPLIT converge (M020 follow-up) ───────────────────────────────────
 # The holistic converge asks ONE weak single-shot to do the whole stitch AND pick the
 # guilty node among several competing located loci — so it wanders run to run. The split
@@ -1883,6 +2013,20 @@ def run_converge(*, seed_text: str, verdicts: list[dict[str, Any]],
     # deciding row. No-op when no DB is configured, when the ruling is pure code-logic
     # (not data_dependent), or when a real read already backed it. Tight by design.
     res = _data_stamp_guard(res, db_available, data_backed)
+
+    # ── Field-provenance re-point (M035 §4 head case): when the symptom is a wrong value
+    # in an FE-bound response field, field-producer grounding knows the code that FILLS
+    # that field. If converge attributed to a different locus that does NOT produce the
+    # field and is not on its production path (a lexically-similar, data-"certified"
+    # decoy), re-point the attribution to the real producer. Runs LAST and may OVERRIDE a
+    # demotion above: the structural "field is produced here" fact outranks a consistency
+    # certified on an incidental read of rows the symptom field never came from (the very
+    # N170/N180 failure mode). Structural, not seed-NL parsing (N177-safe); off via
+    # HIVE_NO_FIELD_PROVENANCE.
+    fp_windows = [s for b in (bundles or [])
+                  for s in ((b.get("code_snippets") or []) + (b.get("call_chain") or []))
+                  if isinstance(s, dict) and s.get("via") == "field-producer"]
+    res = _field_provenance_guard(res, located, fp_windows)
 
     # Carry the live-DB read onto whichever result we return so the honey can PASTE the
     # real rows (or honestly report that the read was attempted but returned nothing).
