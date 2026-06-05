@@ -408,6 +408,56 @@ class TestLedgerRecording(unittest.TestCase):
         self.assertEqual(led.begin_call.call_args_list[0].args[0], "judge")
 
 
+class TestFieldProducerNote(unittest.TestCase):
+    """The field-producer directive nudges the judge off its render-side default to the
+    server code that PRODUCES a wrong FE-bound field value (m035 head case)."""
+
+    def _bundle_with_fp(self):
+        return {"axis_id": "FE_STRIP_HEAD",
+                "code_snippets": [{"file": "client/DocHeader.vue", "lines": "1-4",
+                                   "text": "doc.value?.workflow_head_type"}],
+                "call_chain": [
+                    {"file": "server/documents.py", "lines": "378-394",
+                     "via": "field-producer", "field": "workflow_head_type",
+                     "text": 'out["workflow_head_type"] = head_type'},
+                    {"file": "server/documents.py", "lines": "354-370",
+                     "via": "field-producer", "field": "workflow_head_status",
+                     "text": 'out["workflow_head_status"] = s'}],
+                "call_sites": [], "git_history": [], "design_excerpts": []}
+
+    def test_note_names_producer_and_fields(self):
+        note = J._field_producer_note(self._bundle_with_fp())
+        self.assertIn("server/documents.py", note)
+        self.assertIn("workflow_head_type", note)
+        self.assertIn("workflow_head_status", note)
+        self.assertIn("PRODUCES", note.upper().replace("PRODUCED", "PRODUCES"))
+
+    def test_note_empty_without_field_producer_evidence(self):
+        self.assertEqual(J._field_producer_note(PLAN_BUNDLE), "")
+
+    def test_prompt_carries_note_when_evidence_present(self):
+        with mock.patch.object(J, "call_worker",
+                               return_value=_wr(VERDICT_NO_NEED)) as cw, \
+             mock.patch.object(J, "retrieve_followup"):
+            J.run_judge(plan_bundle=self._bundle_with_fp(), symptom="wrong head value",
+                        axis_globs=["g"], code_root="/x", provider="deepinfra", model="m",
+                        judge_cfg=JudgeConfig(max_calls_per_axis=1))
+        prompt = cw.call_args_list[0].args[2]
+        self.assertIn("Field-producer grounding", prompt)
+        self.assertIn("server/documents.py", prompt)
+        self.assertIn("Do not default to the render side", prompt)
+
+    def test_prompt_omits_note_for_fe_only_symptom(self):
+        with mock.patch.object(J, "call_worker",
+                               return_value=_wr(VERDICT_NO_NEED)) as cw, \
+             mock.patch.object(J, "retrieve_followup"):
+            J.run_judge(plan_bundle=PLAN_BUNDLE, symptom="s", axis_globs=["g"],
+                        code_root="/x", provider="deepinfra", model="m",
+                        judge_cfg=JudgeConfig(max_calls_per_axis=1))
+        prompt = cw.call_args_list[0].args[2]
+        self.assertNotIn("Field-producer grounding", prompt)
+
+
 class TestSummarizeBundle(unittest.TestCase):
     """Bundle rendering is compact and truncates long windows."""
 

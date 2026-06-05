@@ -154,6 +154,49 @@ def summarize_bundle(bundle: dict[str, Any], *, include_call_sites: bool = True)
     return "\n".join(parts)
 
 
+def _field_producer_note(bundle: dict[str, Any]) -> str:
+    """A directive naming the backend code that PRODUCES the FE-bound fields in scope.
+
+    field-producer grounding (retriever ``via=field-producer`` windows) resolves a
+    snake_case response field the FE reads back to the server code that FILLS it. The
+    judge — like the converger — defaults to the SYMPTOM side: for "the screen shows the
+    wrong X" it localises the FE component that RENDERS X (observed: m035 head case, 37/40
+    votes landed on MainPanel.vue, only 1/40 on the real producer documents.py). But a
+    wrong VALUE in a response field is produced by the server code that computes that
+    field, not by the FE that displays the value it was handed. This block puts that
+    structural fact in front of the judge and names the concrete producer so it rules
+    there. Empty when the bundle carries no field-producer evidence (no behaviour change
+    for symptoms that are genuinely FE-only). Structural, not seed parsing (N177-safe).
+    Computed from the full bundle dict, so a snippet-cap truncation cannot drop it.
+    """
+    snips = (bundle.get("code_snippets") or []) + (bundle.get("call_chain") or [])
+    by_file: dict[str, set[str]] = {}
+    for s in snips:
+        if s.get("via") != "field-producer":
+            continue
+        f = s.get("file") or ""
+        if not f:
+            continue
+        by_file.setdefault(f, set()).add(str(s.get("field", "")))
+    if not by_file:
+        return ""
+    lines = []
+    for f, fields in sorted(by_file.items(), key=lambda kv: (-len(kv[1]), kv[0])):
+        fl = ", ".join(sorted(x for x in fields if x))
+        lines.append(f"  - response field(s) [{fl}] are PRODUCED in {f}")
+    listing = "\n".join(lines)
+    return f"""
+[Field-producer grounding] The bundle resolved where the FE-bound response field(s) the \
+front-end reads are FILLED on the server:
+{listing}
+A WRONG VALUE in a response field is caused by the server code that PRODUCES/COMPUTES that \
+field — NOT by the front-end component that merely renders the value it receives. If the \
+symptom is a wrong value of one of these fields, localise the PRODUCER above; treat the FE \
+render site as the cause ONLY if the evidence shows the front-end transforms an \
+already-correct value incorrectly. Do not default to the render side.
+"""
+
+
 def _verdict_contract(want_need: bool) -> str:
     need_block = (
         ',\n  "need": { "symbols": ["<callee/def names to resolve>"], '
@@ -177,7 +220,7 @@ def _verdict_contract(want_need: bool) -> str:
 
 def build_judge_prompt(axis_id: str, symptom: str, bundle_text: str,
                        *, want_need: bool, code_root: str = "",
-                       seed_axis: bool = False) -> str:
+                       seed_axis: bool = False, field_producer_note: str = "") -> str:
     """Build the JUDGE prompt for one axis. ``want_need`` enables follow-up asks.
 
     The judge rules on the SUPPLIED bundle — it has no tools and must not try to
@@ -214,7 +257,7 @@ You may NOT decline to rule. A brief phrased as a question ("does X call the wro
 key?", "is the ORDER BY wrong?") still demands a confirm/refute answer about the \
 symptom — do NOT dismiss it as "merely an informational/lookup request", "not itself \
 a code defect", or "no source-line change needed" to sidestep judging. "located=false" \
-must mean "refuted, because <evidence>", never "this was not a real question."{seed_line}
+must mean "refuted, because <evidence>", never "this was not a real question."{seed_line}{field_producer_note}
 
 [Symptom / axis brief]
 {symptom}
@@ -429,9 +472,12 @@ def run_judge(*, plan_bundle: dict[str, Any], symptom: str, axis_globs: list[str
 
     # ── Call 1: verdict + (optional) need, on the first-pass bundle.
     bundle_text = summarize_bundle(plan_bundle)
+    # field-producer directive (computed from the FULL bundle, cap-proof) — corrects the
+    # judge's render-side default so a wrong FE-bound field value localises to its producer.
+    fp_note = _field_producer_note(plan_bundle)
     prompt1 = build_judge_prompt(axis_id, symptom, bundle_text,
                                  want_need=want_need, code_root=code_root,
-                                 seed_axis=seed_axis)
+                                 seed_axis=seed_axis, field_producer_note=fp_note)
     parsed1 = _call_and_parse(provider, model, prompt1, cwd=code_root,
                               axis_id=axis_id, stage="judge1", ledger=ledger,
                               provider_kwargs=pk, timeout=timeout)
@@ -454,7 +500,8 @@ def run_judge(*, plan_bundle: dict[str, Any], symptom: str, axis_globs: list[str
         merged = _merge_followup(plan_bundle, followup_bundle)
         prompt2 = build_judge_prompt(axis_id, symptom, summarize_bundle(merged),
                                      want_need=False, code_root=code_root,
-                                     seed_axis=seed_axis)
+                                     seed_axis=seed_axis,
+                                     field_producer_note=_field_producer_note(merged) or fp_note)
         parsed2 = _call_and_parse(provider, model, prompt2, cwd=code_root,
                                   axis_id=axis_id, stage="judge2", ledger=ledger,
                                   provider_kwargs=pk, timeout=timeout)
