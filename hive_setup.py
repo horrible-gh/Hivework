@@ -292,8 +292,8 @@ def choose_endpoint() -> tuple[str, str] | None:
     info("\nProvider endpoint (only the OpenAI-compatible HTTP provider needs one).")
     info("  copilot / codex roles sign in via their own CLI - skip this for them.")
     choice = select_one("Which endpoint do the openai/deepinfra roles use?",
-                        [("deepinfra", "DeepInfra (default)"),
-                         ("openai",    "OpenAI"),
+                        [("openai",    "OpenAI"),
+                         ("deepinfra", "DeepInfra (default)"),
                          ("custom",    "Custom (your own base_url)"),
                          ("skip",      "Skip - none of my roles use HTTP")],
                         "deepinfra")
