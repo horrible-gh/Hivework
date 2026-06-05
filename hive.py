@@ -37,6 +37,7 @@ from hive.investigate import (
     seed_edit_targets,
 )
 from hive import backup as backup_store
+from hive import secrets as hive_secrets
 
 
 def _force_utf8_io() -> None:
@@ -56,44 +57,13 @@ def _force_utf8_io() -> None:
 
 
 def _load_secrets() -> str | None:
-    """Load Hivework's secrets file into the environment (env-vars WIN, file fills gaps).
-
-    Secrets (DEEPINFRA_TOKEN, any DB ``*_env`` passwords) must live OUTSIDE this repo:
-    keeping a key inside a publishable project violates the standard "don't ship secrets
-    with the code" guidance (it is why the launcher keeps its keys in the home dir). So
-    Hivework reads its OWN out-of-repo file — NOT the launcher's (the two are cooperating
-    peers, not a dependency):
-
-        1. ``HIVE_ENV_FILE`` if set (point it anywhere — e.g. a shared location), else
-        2. ``~/.hivework/.env``  (``%USERPROFILE%\\.hivework\\.env`` on Windows — the home
-           dir, NOT AppData).
-
-    Format is plain ``KEY=VALUE`` lines (``#`` comments and blank lines ignored; optional
-    surrounding quotes stripped). Precedence is ``setdefault`` — a value already in the
-    real environment (e.g. injected by the launcher when it runs us) WINS over the file,
-    so launcher-driven and standalone runs both work. Never raises: a missing/garbled file
-    just means the env is unchanged and a downstream provider reports its own missing-key
-    error. Returns the path loaded (for a debug log) or None.
+    """Load Hivework's out-of-repo secrets file into the environment (env-vars WIN, file
+    fills gaps). Thin back-compat wrapper around the canonical ``hive.secrets.load_secrets``
+    so the CLI and the test suite (``tests/conftest.py``) share ONE loader — a token set
+    once by ``hive_setup`` (``~/.hivework/.env``) reaches every entry point without a
+    launcher batch / manual ``set``. See ``hive/secrets.py`` for resolution + precedence.
     """
-    path = os.environ.get("HIVE_ENV_FILE") or os.path.join(
-        os.path.expanduser("~"), ".hivework", ".env")
-    if not os.path.isfile(path):
-        return None
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            lines = f.readlines()
-    except OSError:
-        return None
-    for raw in lines:
-        line = raw.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        key, _, val = line.partition("=")
-        key = key.strip()
-        val = val.strip().strip('"').strip("'")
-        if key:
-            os.environ.setdefault(key, val)  # real env wins; file only fills gaps
-    return path
+    return hive_secrets.load_secrets()
 
 
 def setup_logging(verbose: bool = False) -> None:
