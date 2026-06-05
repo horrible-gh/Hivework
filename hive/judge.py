@@ -245,6 +245,8 @@ def _call_and_parse(provider: str, model: str, prompt: str, *, cwd: str,
             if ledger is not None else None
         try:
             wr = call_worker(provider, model, attempt_prompt, cwd=cwd, timeout=timeout,
+                             on_start=(lambda: ledger.mark_running(call_id))
+                             if (ledger is not None and call_id is not None) else None,
                              **(provider_kwargs or {}))
         except Exception as e:  # timeout, provider error, etc.
             logger.warning("judge: %s worker failed for %s: %s", stage, axis_id, e)

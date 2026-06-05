@@ -904,7 +904,10 @@ def _converge_once(seed_text: str, located: list[dict[str, Any]],
                                     attempt_prompt) if ledger is not None else None
         try:
             wr = call_worker(provider, model, attempt_prompt, cwd=None,
-                             timeout=timeout, **pk)
+                             timeout=timeout,
+                             on_start=(lambda: ledger.mark_running(call_id))
+                             if (ledger is not None and call_id is not None) else None,
+                             **pk)
         except Exception as e:  # timeout / provider error — not retried
             logger.warning("converge: worker failed: %s", e)
             if ledger is not None:
@@ -1445,7 +1448,10 @@ def _eval_locus_once(seed_text: str, focal: dict[str, Any],
                                     attempt_prompt) if ledger is not None else None
         try:
             wr = call_worker(provider, model, attempt_prompt, cwd=None,
-                             timeout=timeout, **pk)
+                             timeout=timeout,
+                             on_start=(lambda: ledger.mark_running(call_id))
+                             if (ledger is not None and call_id is not None) else None,
+                             **pk)
         except Exception as e:
             logger.warning("converge: locus worker failed: %s", e)
             if ledger is not None:

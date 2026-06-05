@@ -153,6 +153,8 @@ def run_fanout(
             if ledger is not None else None
         try:
             result = call_worker(provider, model, prompt, cwd=codebase_root, timeout=600,
+                                 on_start=(lambda: ledger.mark_running(call_id))
+                                 if (ledger is not None and call_id is not None) else None,
                                  **(provider_kwargs or {}))
             err_msg = result.stderr[:200] if result.exit_code != 0 else ""
             if ledger is not None:
@@ -305,7 +307,10 @@ def reinforce_thin_axis(task: dict[str, Any], sp, seed_text: str, code_root: str
                                     role.model, prompt) if ledger is not None else None
         try:
             wr = call_worker(role.provider, role.model, prompt, cwd=code_root,
-                             timeout=600, **pk)
+                             timeout=600,
+                             on_start=(lambda: ledger.mark_running(call_id))
+                             if (ledger is not None and call_id is not None) else None,
+                             **pk)
         except subprocess.SubprocessError as e:
             if ledger is not None:
                 ledger.finish_call(call_id, output="", latency_s=0.0, ok=False,

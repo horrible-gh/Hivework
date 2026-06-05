@@ -164,6 +164,8 @@ def run_reconcile_loop(
                                     prompt, comb_path) if ledger is not None else None
         try:
             result = call_worker(provider, model, prompt, cwd=codebase_root, timeout=600,
+                                 on_start=(lambda: ledger.mark_running(call_id))
+                                 if (ledger is not None and call_id is not None) else None,
                                  **(provider_kwargs or {}))
 
             if ledger is not None:

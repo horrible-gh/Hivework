@@ -1795,7 +1795,10 @@ def review_effectiveness(
                                     attempt_prompt) if ledger is not None else None
         try:
             wr = call_worker(provider, model, attempt_prompt, cwd=codebase_root,
-                             timeout=600, **(provider_kwargs or {}))
+                             timeout=600,
+                             on_start=(lambda: ledger.mark_running(call_id))
+                             if (ledger is not None and call_id is not None) else None,
+                             **(provider_kwargs or {}))
         except Exception as e:  # subprocess timeout, provider error, etc.
             logger.warning("specify: effectiveness review worker failed: %s", e)
             if ledger is not None:
@@ -2493,7 +2496,10 @@ def run_specify(
             if ledger is not None else None
         try:
             wr = call_worker(provider, model, prompt, cwd=codebase_root,
-                             timeout=author_timeout, **(provider_kwargs or {}))
+                             timeout=author_timeout,
+                             on_start=(lambda: ledger.mark_running(call_id))
+                             if (ledger is not None and call_id is not None) else None,
+                             **(provider_kwargs or {}))
         except Exception as e:  # subprocess timeout, provider error, etc.
             last_exc = e
             if ledger is not None:

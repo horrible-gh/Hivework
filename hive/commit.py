@@ -338,6 +338,8 @@ def run_propose(
         if ledger is not None else None
     try:
         wr = call_worker(provider, model, prompt, cwd=repo_root, timeout=600,
+                         on_start=(lambda: ledger.mark_running(call_id))
+                         if (ledger is not None and call_id is not None) else None,
                          **call_kwargs)
     except Exception as e:  # timeout / provider error — record the failed row, then re-raise
         if ledger is not None:
