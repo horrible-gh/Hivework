@@ -91,6 +91,16 @@ def build_provider_kwargs(cfg) -> dict:
         kwargs["exe"] = cfg.copilot.exe
     if cfg.copilot.allow:
         kwargs["allow_flag"] = cfg.copilot.allow
+    # Pin the copilot billing account: resolve the configured token (raw ``token``
+    # wins, else read the env var named by ``token_env``) and hand it to the
+    # copilot handler, which injects it as COPILOT_GITHUB_TOKEN so the run bills
+    # THIS account regardless of the ambient shell/login. Left unset → handler
+    # warns and falls back to the CLI's stored login (prior behavior).
+    copilot_token = cfg.copilot.token
+    if not copilot_token and cfg.copilot.token_env:
+        copilot_token = os.environ.get(cfg.copilot.token_env)
+    if copilot_token:
+        kwargs["copilot_token"] = copilot_token
     if cfg.openai.base_url:
         kwargs["base_url"] = cfg.openai.base_url
     if cfg.openai.api_key_env:

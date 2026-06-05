@@ -81,7 +81,7 @@ def _kill_tree(proc) -> None:
             pass
 
 
-def _run_capture(cmd, *, input=None, cwd=None, timeout=None) -> subprocess.CompletedProcess:
+def _run_capture(cmd, *, input=None, cwd=None, timeout=None, env=None) -> subprocess.CompletedProcess:
     """``subprocess.run`` replacement that kills the WHOLE child tree on timeout
     or interrupt — not just the direct child.
 
@@ -95,6 +95,8 @@ def _run_capture(cmd, *, input=None, cwd=None, timeout=None) -> subprocess.Compl
     kwargs = dict(stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                   stderr=subprocess.PIPE, text=True, encoding="utf-8",
                   errors="replace", cwd=cwd)
+    if env is not None:
+        kwargs["env"] = env
     if os.name == "nt":
         kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
     else:
@@ -113,7 +115,7 @@ def _run_capture(cmd, *, input=None, cwd=None, timeout=None) -> subprocess.Compl
 
 
 def _call_copilot(model, prompt, cwd, timeout, exe=None, allow_flag="--allow-all",
-                  available_tools=None, **_ignored) -> WorkerResult:
+                  available_tools=None, copilot_token=None, **_ignored) -> WorkerResult:
     """Call the copilot CLI. Prompt sent via stdin (never -p) to avoid cp932 truncation.
 
     ``available_tools``: when not None, restrict the model to exactly this tool
@@ -131,9 +133,23 @@ def _call_copilot(model, prompt, cwd, timeout, exe=None, allow_flag="--allow-all
     cmd = [exe, allow_flag, "--model", model]
     if available_tools is not None:
         cmd.append("--available-tools=" + ",".join(available_tools))
-    logger.debug("call_worker copilot: model=%s cwd=%s timeout=%d", model, cwd, timeout)
+    # Pin the billing account. COPILOT_GITHUB_TOKEN takes precedence over the CLI's
+    # stored login (`copilot help environment`), so injecting the configured token
+    # bills THIS account no matter the ambient shell/login. Without a token AND
+    # with none in the ambient env, copilot SILENTLY uses its stored login — warn
+    # loudly so a missing token can't drain the wrong account unnoticed.
+    env = None
+    if copilot_token:
+        env = {**os.environ, "COPILOT_GITHUB_TOKEN": copilot_token}
+    elif not any(os.environ.get(v) for v in
+                 ("COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN")):
+        logger.warning("copilot: no token configured (copilot.token / token_env) and "
+                       "none in env — the CLI will bill its STORED LOGIN account, not "
+                       "a token account")
+    logger.debug("call_worker copilot: model=%s cwd=%s timeout=%d token=%s",
+                 model, cwd, timeout, "pinned" if copilot_token else "ambient")
     t0 = time.monotonic()
-    result = _run_capture(cmd, input=prompt, cwd=cwd, timeout=timeout)
+    result = _run_capture(cmd, input=prompt, cwd=cwd, timeout=timeout, env=env)
     latency_s = time.monotonic() - t0
     if result.returncode != 0:
         logger.warning("copilot rc=%d (%.1fs) stderr: %s",

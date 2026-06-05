@@ -99,6 +99,16 @@ class CopilotConfig:
     exe: str | None = None
     allow: str = "--allow-all"
     timeout_sec: int = 300
+    # Which GitHub account the copilot CLI bills. The CLI picks its account from
+    # COPILOT_GITHUB_TOKEN/GH_TOKEN/GITHUB_TOKEN (these OVERRIDE the stored CLI
+    # login per `copilot help environment`); with none set it SILENTLY falls back
+    # to the logged-in account — which can bill the wrong account with no error.
+    # Set ``token`` to pin a specific account (e.g. a test account) regardless of
+    # the ambient shell/login: Hive injects it as COPILOT_GITHUB_TOKEN into the
+    # copilot subprocess. ``token_env`` instead names an env var to read the token
+    # from (keeps the secret out of the config file). ``token`` wins if both set.
+    token: str | None = None
+    token_env: str | None = None
 
 
 @dataclass
@@ -674,6 +684,8 @@ def load_config(path: str | None = None, profile: str | None = None) -> Config:
             exe=copilot_raw.get("exe"),
             allow=copilot_raw.get("allow", "--allow-all"),
             timeout_sec=int(copilot_raw.get("timeout_sec", 300)),
+            token=copilot_raw.get("token"),
+            token_env=copilot_raw.get("token_env"),
         ),
         openai=OpenAiConfig(
             base_url=str(openai_raw.get("base_url",
