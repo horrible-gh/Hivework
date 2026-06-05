@@ -1036,6 +1036,120 @@ def _harvest_inscope_fetch_urls(snippets: list[dict[str, Any]], code_root: str,
     return out
 
 
+# ── FIELD-PRODUCER grounding (cross-language response-field provenance) ──────────
+# A "screen shows the wrong X" symptom binds a FE field to a backend value; the bug
+# lives in the SERVER code that PRODUCES that field, but keyword density clusters on
+# the render side and the converger grounds on a lexically-similar DECOY. The head
+# strip is the canonical case: the field the FE actually reads is ``workflow_head_type``
+# (filled by ``out["workflow_head_type"] = head_type`` in documents.py, right under the
+# ``not in NON_HEAD_TYPES`` exclusion that IS the bug), yet a SQL helper merely *named*
+# ``get_effective_head`` — never used by the FE — outscores the real producer on the
+# word "head". :func:`_resolve_http_bindings` crosses the REQUEST-PATH boundary (URL →
+# route); it does NOT trace a RESPONSE FIELD back to the code that fills it. This does.
+#
+# Discriminator (codebase-agnostic): a snake_case identifier appearing in FE code is
+# almost certainly a backend response field — FE locals are camelCase, so a snake_case
+# token at the FE↔BE seam (``doc.value?.workflow_head_type``) is the field name as the
+# server serialized it. For each such field in the bundle, grep the tree for its
+# PRODUCING site — a quoted key followed by ``:`` (serialization) or by ``]``/``=``
+# (dict-subscript assignment ``out["field"] = …``) — and surface a window around it.
+# Reads (``x.field``, ``.get("field")``) and type-decls (``field?: T``) lack that
+# quote+[:=] shape, so FE reads and backend locals self-filter; only genuine serialized
+# fields surface — the producer PATTERN is the gate, no separate gate needed.
+#
+# Pure GROUNDING, mirrors _harvest_inscope_fetch_urls / _resolve_http_bindings: real
+# lines only, never invents, gates NOTHING. A spurious fire is at worst a real-but-
+# unused producer window (mild noise), never a wrong edit. Self-limiting: a field
+# nobody serializes yields nothing, and a field serialized in too many places is
+# dropped as a non-discriminating common key (e.g. ``project_id``).
+
+# A snake_case identifier: lowercase, at least one ``_`` boundary (so ≥2 segments).
+# camelCase FE locals and single bare words (``id``, ``name``) never match.
+_SNAKE_FIELD_RE = re.compile(r"\b([a-z][a-z0-9]*(?:_[a-z0-9]+)+)\b")
+
+# HARVEST only from front-end source: a snake_case token in a FE file is the
+# discriminator (FE locals are camelCase, so snake_case = a backend response field
+# read at the seam). Harvesting from server ``.py``/``.json``/``.sql`` instead pulls in
+# SQL query names (``get_effective_head``), DB columns (``sort_order``) and library
+# params — none of which are FE-bound response fields — and floods the producer search
+# with noise (observed: m035 reconverge harvested 26 such non-fields). Restricting to
+# FE extensions makes the snake_case signal mean what it is supposed to mean.
+_FE_EXTS = (".vue", ".jsx", ".tsx", ".svelte", ".ts", ".js", ".mjs", ".cjs")
+
+# Search everything for a field's producer EXCEPT test trees and vendored deps. A test
+# asserting ``parsed["field"] == "X"`` is a consumer, not a producer; a vendored
+# ``site-packages`` match (``return_value`` in httpcore) is never our field. Both would
+# otherwise pollute the hit count (``rg -g`` applies these as include/exclude rules).
+_PRODUCER_SEARCH_GLOBS = [
+    "*", "!**/tests/**", "!**/test/**", "!**/__tests__/**",
+    "!**/test_*.*", "!**/*_test.*", "!**/*.spec.*", "!**/*.test.*",
+    "!**/.venv/**", "!**/venv/**", "!**/site-packages/**",
+    "!**/node_modules/**", "!**/dist/**", "!**/build/**", "!**/.git/**",
+]
+
+
+def _resolve_field_producers(snippets: list[dict[str, Any]], code_root: str,
+                             min_len: int = 8, max_fields: int = 10,
+                             max_producers_per_field: int = 3,
+                             max_total_hits: int = 6, k: int = 8) -> list[dict[str, Any]]:
+    """Surface the backend code that PRODUCES a snake_case response field the FE reads.
+
+    See the section header above for the why. Harvest snake_case field tokens from the
+    bundle (most-mentioned first — the symptom field recurs), then for each grep the
+    tree for its producing site and window it in. Pure-local, deterministic, never
+    invents; bounded by ``max_fields`` / ``max_producers_per_field`` / ``max_total_hits``.
+    """
+    freq: dict[str, int] = defaultdict(int)
+    for s in snippets:
+        if not (s.get("file") or "").lower().endswith(_FE_EXTS):
+            continue  # snake_case is only a "response field" signal in FE source
+        for m in _SNAKE_FIELD_RE.finditer(s.get("text", "")):
+            tok = m.group(1)
+            if len(tok) >= min_len:
+                freq[tok] += 1
+    if not freq:
+        return []
+    fields = sorted(freq, key=lambda t: (-freq[t], t))[:max_fields]
+
+    out: list[dict[str, Any]] = []
+    for field in fields:
+        # Coarse grep (rg's Rust engine has no lookahead): a quoted key followed by
+        # ``:`` (serialization) or by ``]``/``=`` (dict-subscript assignment). Exclude
+        # test trees up front — a test ASSERTING a field is not a producer and would
+        # otherwise flood the count. The ``==`` reads this coarse pattern still admits
+        # are dropped by the precise Python re-check below.
+        pat = rf"""["']{re.escape(field)}["']\s*\]?\s*[:=]"""
+        confirm = re.compile(rf"""["']{re.escape(field)}["']\s*\]?\s*(?::|=(?!=))""")
+        raw = _ripgrep(pat, _PRODUCER_SEARCH_GLOBS, code_root, max_hits=max_total_hits + 4)
+        # precise filter: a SINGLE ``=`` (assignment) or ``:`` (serialization), never
+        # ``==`` (an equality read) — the producer vs. consumer distinction.
+        hits = [h for h in raw if confirm.search(h.get("text", ""))]
+        if not hits or len(hits) > max_total_hits:
+            continue  # 0 producers, or a common key serialized everywhere → not a pinpoint
+        added_by_file: dict[str, list[int]] = defaultdict(list)
+        added = 0
+        for h in hits:
+            if added >= max_producers_per_field:
+                break
+            rel, ln = h["file"], h["line"]
+            if rel.startswith("./"):
+                rel = rel[2:]  # rg prefixes paths with ``./`` — match bundle convention
+            if any(lo <= ln <= hi for lo, hi in _covered_ranges(snippets, rel)):
+                continue  # producer already in scope
+            if any(abs(ln - j) <= k for j in added_by_file[rel]):
+                continue  # adjacent producer in this file already surfaced
+            w = _read_window(code_root, rel, ln, k)
+            if not w["text"]:
+                continue
+            header = (f"# RESOLVED FIELD-PRODUCER (hive): backend fills response field "
+                      f"{field!r} here ← the FE reads this field\n")
+            out.append({"file": rel, "lines": w["lines"], "text": header + w["text"],
+                        "via": "field-producer", "field": field})
+            added_by_file[rel].append(ln)
+            added += 1
+    return out
+
+
 # ── PEER-IMPLEMENTATION grounding (sibling-pattern resolver).
 # The fix for a class of defects is not in the buggy file's own numbers but in how
 # the codebase ALREADY solves the same concern in a SIBLING (z-index/stacking: a
@@ -1295,6 +1409,17 @@ def retrieve(plan: SearchPlan, code_root: str, docs_root: str | None = None,
                       if http_bindings and max_hops > 0 else [])
     call_chain = call_chain + http_bindings + binding_follow + fetch_harvest
 
+    # 3d-2. field-producer grounding (N183 round-2): trace a snake_case RESPONSE FIELD
+    #     the FE reads back to the backend code that FILLS it. http-binding above
+    #     crosses the URL→route boundary but never field→producer, so a "screen shows
+    #     wrong X" symptom strands the converger on a lexically-similar decoy (the head
+    #     strip: FE reads ``workflow_head_type``, filled in documents.py, but a SQL
+    #     helper merely *named* get_effective_head — unused by the FE — outscores it on
+    #     "head"). Pure grounding; rides in call_chain so the judge/converger consume it
+    #     with the rest of the evidence (no judge.py change).
+    field_producers = _resolve_field_producers(code_snippets + call_chain, code_root)
+    call_chain = call_chain + field_producers
+
     # 3e. peer-implementation grounding: when a component file in the bundle handles a
     #     registered concern (today: stacking/layering) DIFFERENTLY from its same-dir
     #     sibling overlays, surface the asymmetry — the discriminating fact is between
@@ -1372,6 +1497,7 @@ def retrieve(plan: SearchPlan, code_root: str, docs_root: str | None = None,
             "http_bindings": len(http_bindings),
             "http_bindings_ambiguous": sum(1 for b in http_bindings if b.get("ambiguous")),
             "fetch_harvest": len(fetch_harvest),
+            "field_producers": len(field_producers),
             "peer_patterns": len(peer_patterns),
             "resolved_refs": resolved_refs,
             "design_excerpts": len(design_excerpts),

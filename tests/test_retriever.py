@@ -15,6 +15,7 @@ from hive.retriever import (
     _path_segs, _route_suffix_match, _resolve_http_bindings, _read_def_body,
     _resolve_peer_patterns, _stacking_profile,
     _harvest_inscope_fetch_urls, _covered_ranges, _follow_calls,
+    _resolve_field_producers,
 )
 
 ROOT = "C:/workspace/projects/Documents/projects/FlowGate"
@@ -865,3 +866,115 @@ def test_retrieve_reaches_store_query_through_harvested_fetch(tmp_path):
     chain_text = "\n".join(s.get("text", "") for s in out["call_chain"])
     assert "'' AS module" in chain_text, "producer chain did not reach the store query"
     assert "get_projects_with_modules" in chain_text
+
+
+# ── FIELD-PRODUCER grounding (N183 round-2) ─────────────────────────────────────
+
+def _make_head_field_tree(tmp_path):
+    """An FE that reads the snake_case response field ``workflow_head_type`` and a
+    backend that FILLS it next to the buggy ``NON_HEAD_TYPES`` exclusion — plus a SQL
+    helper merely NAMED ``get_effective_head`` (the lexical decoy, never serializes the
+    field). Mirrors the live head-strip off-by-one (M035 §4)."""
+    fe = tmp_path / "client" / "src" / "components"
+    fe.mkdir(parents=True)
+    (fe / "DocHeader.vue").write_text(
+        "<script setup>\n"
+        "// the FE reads the field exactly as the server serialized it (snake_case)\n"
+        "const workflowHeadType = computed(() => doc.value?.workflow_head_type ?? null)\n"
+        "</script>\n",
+        encoding="utf-8")
+    be = tmp_path / "server" / "documents" / "routers"
+    be.mkdir(parents=True)
+    (be / "documents.py").write_text(
+        "def build_doc_detail(doc, out, seq_items):\n"
+        "    if seq_items:\n"
+        '        NON_HEAD_TYPES = {"R", "M", "Q"}\n'
+        "        head_type = next(\n"
+        '            (it["type"] for it in seq_items\n'
+        '             if it["type"] not in NON_HEAD_TYPES),\n'
+        "            None,\n"
+        "        )\n"
+        "        if head_type is not None:\n"
+        '            out["workflow_head_type"] = head_type\n'
+        "    return out\n",
+        encoding="utf-8")
+    sql = tmp_path / "server" / "sql"
+    sql.mkdir(parents=True)
+    (sql / "queries.py").write_text(
+        "def get_effective_head(project_id):\n"
+        "    # lexical decoy: named 'head' but the FE never reads this; fills nothing\n"
+        '    return run("SELECT type FROM seq ORDER BY result_doc_id")\n',
+        encoding="utf-8")
+    return str(tmp_path)
+
+
+def test_field_producer_surfaces_filler_not_named_decoy(tmp_path):
+    root = _make_head_field_tree(tmp_path)
+    # only the FE read is in scope (the symptom side); the producer is off-path.
+    snippets = [{"file": "client/src/components/DocHeader.vue", "lines": "1-4",
+                 "text": "const workflowHeadType = doc.value?.workflow_head_type ?? null"}]
+    out = _resolve_field_producers(snippets, root)
+    assert out, "field-producer grounding surfaced nothing"
+    assert all(p["via"] == "field-producer" for p in out)
+    text = "\n".join(p["text"] for p in out)
+    # the real filler AND the buggy exclusion it sits next to are now in scope …
+    assert 'out["workflow_head_type"] = head_type' in text
+    assert "NON_HEAD_TYPES" in text
+    # … and the lexical decoy (named 'head', serializes nothing) is NOT surfaced.
+    assert "get_effective_head" not in text
+    assert all("queries.py" not in p["file"] for p in out)
+
+
+def test_field_producer_ignores_reads_and_type_decls(tmp_path):
+    # A field that only ever appears as a READ or a type-decl (never serialized) has no
+    # producing site → nothing to surface (the quote+[:=] shape is the gate).
+    d = tmp_path / "client"
+    d.mkdir()
+    (d / "Doc.vue").write_text(
+        "const x = doc.value?.workflow_head_type\n"
+        "interface H { workflow_head_type?: string | null }\n"
+        'const y = resp.get("workflow_head_type")\n',
+        encoding="utf-8")
+    snippets = [{"file": "client/Doc.vue", "lines": "1-3",
+                 "text": "doc.value?.workflow_head_type interface workflow_head_type?: string"}]
+    assert _resolve_field_producers(snippets, str(tmp_path)) == []
+
+
+def test_field_producer_skips_camelcase_and_short_tokens(tmp_path):
+    (tmp_path / "a.vue").write_text('out["headType"] = x\nout["id"] = y\n', encoding="utf-8")
+    # camelCase ``headType`` and the short bare word ``id`` are never snake_case fields.
+    snippets = [{"file": "client/a.vue", "lines": "1-2", "text": "headType id docId"}]
+    assert _resolve_field_producers(snippets, str(tmp_path)) == []
+
+
+def test_field_producer_harvests_only_from_fe_files(tmp_path):
+    # The producer exists; the only difference is which file the field is READ from.
+    (tmp_path / "svc.py").write_text('out["sort_order"] = compute()\n', encoding="utf-8")
+    # snake_case in a SERVER file is a DB column / local, not a FE-bound field → ignored.
+    server_snip = [{"file": "server/svc.py", "lines": "1", "text": "sort_order = compute()"}]
+    assert _resolve_field_producers(server_snip, str(tmp_path)) == []
+    # the SAME token read from a FE file is a response field → resolves to the producer.
+    fe_snip = [{"file": "client/x.vue", "lines": "1", "text": "const o = row.sort_order"}]
+    out = _resolve_field_producers(fe_snip, str(tmp_path))
+    assert any(p["field"] == "sort_order" for p in out), out
+
+
+def test_field_producer_skips_producer_already_in_scope(tmp_path):
+    root = _make_head_field_tree(tmp_path)
+    # When a window already covers the producer file/line, do not duplicate it.
+    snippets = [
+        {"file": "client/src/components/DocHeader.vue", "lines": "1-4",
+         "text": "workflow_head_type"},
+        {"file": "server/documents/routers/documents.py", "lines": "1-12",
+         "text": 'out["workflow_head_type"] = head_type'},
+    ]
+    out = _resolve_field_producers(snippets, root)
+    assert all("documents.py" not in p["file"] for p in out), out
+
+
+def test_field_producer_drops_overcommon_key(tmp_path):
+    # A field serialized in too many places is a common key, not a pinpoint → dropped.
+    lines = "".join(f'd{i}["project_id_field"] = {i}\n' for i in range(8))
+    (tmp_path / "many.py").write_text(lines, encoding="utf-8")
+    snippets = [{"file": "x.vue", "lines": "1", "text": "project_id_field"}]
+    assert _resolve_field_producers(snippets, str(tmp_path)) == []
