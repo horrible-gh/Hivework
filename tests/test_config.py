@@ -283,5 +283,134 @@ class TestConfigCliOverride(unittest.TestCase):
         self.assertEqual(cfg.queen.provider, "copilot")
 
 
+class TestGroupedLayout(unittest.TestCase):
+    """The new grouped layout (roles / stages / targets / ops / providers) maps onto
+    the same internal Config as the legacy flat keys — so no downstream code changes."""
+
+    def _load(self, raw):
+        tmpdir = tempfile.mkdtemp()
+        path = os.path.join(tmpdir, "hive.config.json")
+        with open(path, "w") as f:
+            json.dump(raw, f)
+        return load_config(path=path)
+
+    def test_providers_group_maps_to_copilot_openai(self):
+        cfg = self._load({"providers": {"copilot": {"timeout_sec": 222},
+                                        "openai": {"base_url": "u", "api_key_env": "E"}}})
+        self.assertEqual(cfg.copilot.timeout_sec, 222)
+        self.assertEqual(cfg.openai.base_url, "u")
+        self.assertEqual(cfg.openai.api_key_env, "E")
+
+    def test_stages_judge_maps_to_judge_caps(self):
+        cfg = self._load({"stages": {"judge": {"max_axes": 7, "votes_per_axis": 5}}})
+        self.assertEqual(cfg.judge.max_axes, 7)
+        self.assertEqual(cfg.judge.votes_per_axis, 5)
+
+    def test_stages_converge_split(self):
+        cfg = self._load({"stages": {"converge": {"split": {"enabled": True, "max_loci": 2}}}})
+        self.assertTrue(cfg.converge_split.enabled)
+        self.assertEqual(cfg.converge_split.max_loci, 2)
+        self.assertEqual(cfg.converge_split.model, "")   # no placeholder => reuse roles.converge
+
+    def test_stages_reinforce_and_reinvestigation(self):
+        cfg = self._load({"stages": {"reinforce": {"enabled": True, "max_workers": 3},
+                                     "reinvestigation": {"live": True, "max_rounds": 4}}})
+        self.assertTrue(cfg.reinforce.enabled)
+        self.assertEqual(cfg.reinforce.max_workers, 3)
+        self.assertTrue(cfg.reinvestigation.live)
+        self.assertEqual(cfg.reinvestigation.max_rounds, 4)
+
+    def test_stages_commit_maps_to_commit_stage(self):
+        cfg = self._load({"stages": {"commit": {"filename_only_threshold": 7}}})
+        self.assertEqual(cfg.commit_stage.filename_only_threshold, 7)
+
+    def test_ops_swarm_run_maps_to_safety(self):
+        cfg = self._load({"ops": {"swarm_run": {"allow": False}}})
+        self.assertFalse(cfg.safety.allow_swarm)
+
+    def test_ops_apply_and_ledger(self):
+        cfg = self._load({"ops": {"apply": {"backup_dir": "b", "backup_ttl_hours": 5},
+                                  "ledger": {"enabled": False, "db_path": "x.db"}}})
+        self.assertEqual(cfg.apply.backup_dir, "b")
+        self.assertEqual(cfg.apply.backup_ttl_hours, 5)
+        self.assertFalse(cfg.ledger.enabled)
+        self.assertEqual(cfg.ledger.db_path, "x.db")
+
+    def test_targets_map_to_db_and_runners(self):
+        cfg = self._load({"targets": {"FlowGate": {
+            "db": {"kind": "sqlite", "path": "/x/f.db"},
+            "tests": {"command": ["pytest"], "cwd": "server"}}}})
+        db = cfg.db_for_codebase("/work/FlowGate")
+        self.assertIsNotNone(db)
+        self.assertEqual(db.path, "/x/f.db")
+        r = cfg.test_runner_for_codebase("/work/FlowGate")
+        self.assertIsNotNone(r)
+        self.assertEqual(r.command, ["pytest"])
+
+    def test_targets_comment_key_skipped(self):
+        # A targets-level "_comment" is not a codebase entry and must not break parsing.
+        cfg = self._load({"targets": {"_comment": "doc", "FlowGate": {
+            "db": {"kind": "sqlite", "path": "/x/f.db"}}}})
+        self.assertIsNotNone(cfg.db_for_codebase("/work/FlowGate"))
+
+    def test_comment_keys_ignored_in_role(self):
+        cfg = self._load({"roles": {"judge": {"provider": "openai", "model": "m",
+                                              "_comment": "ignore me"}}})
+        self.assertEqual(cfg.role("judge").provider, "openai")
+        self.assertEqual(cfg.role("judge").model, "m")
+
+
+class TestShippedDefaultProfile(unittest.TestCase):
+    """The shipped config/hive.config.default.json loads via the default profile and
+    preserves today's hand-tuned values (migration is value-preserving)."""
+
+    def setUp(self):
+        self.cfg = load_config()  # profile None -> config/hive.config.default.json
+
+    def test_queen_is_codex(self):
+        self.assertEqual(self.cfg.queen.provider, "codex")
+        self.assertEqual(self.cfg.queen.model, "gpt-5.4-mini")
+
+    def test_judge_routed_to_openai_with_tuned_caps(self):
+        self.assertEqual(self.cfg.role("judge").provider, "openai")
+        self.assertEqual(self.cfg.judge.max_axes, 10)
+        self.assertEqual(self.cfg.judge.votes_per_axis, 5)
+
+    def test_swarm_run_disabled(self):
+        self.assertFalse(self.cfg.safety.allow_swarm)
+
+    def test_converge_split_enabled_without_placeholder_model(self):
+        self.assertTrue(self.cfg.converge_split.enabled)
+        self.assertEqual(self.cfg.converge_split.model, "")   # the "..." latent bug is gone
+
+    def test_flowgate_target_present(self):
+        self.assertIsNotNone(self.cfg.db_for_codebase("X:/whatever/FlowGate"))
+        self.assertIsNotNone(self.cfg.test_runner_for_codebase("X:/whatever/FlowGate"))
+
+
+class TestProfileResolutionAndBootstrap(unittest.TestCase):
+    """Profile path resolution and the auto-generated neutral bootstrap file."""
+
+    def test_profile_path_default_and_named(self):
+        import hive.config as C
+        self.assertTrue(C._profile_path(None).endswith(
+            os.path.join("config", "hive.config.default.json")))
+        self.assertTrue(C._profile_path("small").endswith(
+            os.path.join("config", "hive.config.small.json")))
+
+    def test_bootstrap_writes_neutral_defaults(self):
+        import hive.config as C
+        tmp = tempfile.mkdtemp()
+        path = os.path.join(tmp, "config", "hive.config.default.json")
+        C._write_bootstrap_default(path)
+        self.assertTrue(os.path.isfile(path))
+        cfg = load_config(path=path)
+        # Neutral (code) defaults, NOT the hand-tuned shipped values.
+        self.assertEqual(cfg.queen.provider, "copilot")
+        self.assertTrue(cfg.safety.allow_swarm)
+        self.assertFalse(cfg.reinforce.enabled)
+        self.assertEqual(cfg.judge.max_axes, 12)
+
+
 if __name__ == "__main__":
     unittest.main()

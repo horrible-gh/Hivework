@@ -443,9 +443,147 @@ def _deep_merge(base: dict, override: dict) -> dict:
     return result
 
 
-def load_config(path: str | None = None) -> Config:
-    """Load config from JSON file, falling back to built-in defaults for missing keys."""
-    resolved_path = path or _DEFAULT_CONFIG_PATH
+# Config files live in ``<repo>/config/`` as one complete file per profile
+# (hive.config.<profile>.json). Resolved off the module dir so the location is
+# independent of the caller's working directory.
+_CONFIG_DIR = os.path.join(_REPO_ROOT, "config")
+
+
+def _is_default_profile(profile: str | None) -> bool:
+    """A None/blank/'default' profile selects the default file (the auto-generate one)."""
+    return profile is None or str(profile).strip() in ("", "default")
+
+
+def _profile_path(profile: str | None) -> str:
+    """Absolute path of a profile's config file under ``config/`` (default: 'default')."""
+    name = (str(profile).strip() if profile else "") or "default"
+    return os.path.join(_CONFIG_DIR, f"hive.config.{name}.json")
+
+
+def _normalize(raw: dict) -> dict:
+    """Map the grouped layout (roles / stages / targets / ops / providers) onto the
+    flat internal keys the extractor below reads, so BOTH the new config files and any
+    legacy flat config load identically — no downstream module or test has to change.
+
+    Grouped keys win when present. ``_comment`` keys ride along harmlessly: the
+    extractor reads named fields only, so annotations need no stripping. Returns a new
+    dict; the input is not mutated.
+    """
+    if not isinstance(raw, dict):
+        return {}
+    out = dict(raw)
+
+    providers = raw.get("providers")
+    if isinstance(providers, dict):
+        if isinstance(providers.get("copilot"), dict):
+            out["copilot"] = providers["copilot"]
+        if isinstance(providers.get("openai"), dict):
+            out["openai"] = providers["openai"]
+
+    stages = raw.get("stages")
+    if isinstance(stages, dict):
+        if isinstance(stages.get("judge"), dict):
+            out["judge"] = stages["judge"]
+        if isinstance(stages.get("converge"), dict):
+            out["converge"] = stages["converge"]
+        if isinstance(stages.get("reinforce"), dict):
+            out["reinforce"] = stages["reinforce"]
+        if isinstance(stages.get("reinvestigation"), dict):
+            out["reinvestigation"] = stages["reinvestigation"]
+        if isinstance(stages.get("commit"), dict):
+            out["commit_stage"] = stages["commit"]
+
+    ops = raw.get("ops")
+    if isinstance(ops, dict):
+        sr = ops.get("swarm_run")
+        if isinstance(sr, dict) and "allow" in sr:
+            out["safety"] = {**(raw.get("safety") or {}), "allow_swarm": sr["allow"]}
+        if isinstance(ops.get("apply"), dict):
+            out["apply"] = ops["apply"]
+        if isinstance(ops.get("ledger"), dict):
+            out["ledger"] = ops["ledger"]
+
+    targets = raw.get("targets")
+    if isinstance(targets, dict):
+        db_conns = dict(raw.get("db_connections") or {})
+        runners = dict(raw.get("test_runners") or {})
+        for name, t in targets.items():
+            if not isinstance(t, dict):  # skips a targets-level "_comment", etc.
+                continue
+            if isinstance(t.get("db"), dict):
+                db_conns[name] = t["db"]
+            if isinstance(t.get("tests"), dict):
+                runners[name] = t["tests"]
+        if db_conns:
+            out["db_connections"] = db_conns
+        if runners:
+            out["test_runners"] = runners
+
+    return out
+
+
+def _grouped_default_dict() -> dict:
+    """Build the grouped-layout dict from the built-in NEUTRAL defaults — used only to
+    bootstrap a missing default-profile file (a fresh checkout that never ran setup).
+    These are code defaults, not the hand-tuned shipped values; on a normal checkout
+    ``config/hive.config.default.json`` already exists so this never fires."""
+    d = _DEFAULTS
+    return {
+        "roles": {k: dict(v) for k, v in d["roles"].items()},
+        "stages": {
+            "judge": dict(d["judge"]),
+            "converge": {"split": {"enabled": False, "max_loci": 4}},
+            "reinforce": dict(d["reinforce"]),
+            "reinvestigation": dict(d["reinvestigation"]),
+            "commit": {"filename_only_threshold": 50},
+        },
+        "targets": {},
+        "ops": {
+            "swarm_run": {"allow": d["safety"]["allow_swarm"]},
+            "apply": dict(d["apply"]),
+            "ledger": dict(d["ledger"]),
+        },
+        "providers": {
+            "copilot": dict(d["copilot"]),
+            "openai": dict(d["openai"]),
+        },
+    }
+
+
+def _write_bootstrap_default(path: str) -> None:
+    """Write the neutral grouped-layout default file (bootstrap safety net)."""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(_grouped_default_dict(), f, indent=2)
+        f.write("\n")
+    logger.info("Wrote bootstrap default config to %s", path)
+
+
+def load_config(path: str | None = None, profile: str | None = None) -> Config:
+    """Load config, falling back to built-in defaults for missing keys.
+
+    Resolution:
+
+    - ``path`` given → load that exact file (explicit override; what tests use).
+    - ``path`` None → load ``config/hive.config.<profile or 'default'>.json``. If the
+      DEFAULT-profile file is absent (a fresh checkout that never ran setup), a neutral
+      bootstrap file is written from the built-in defaults, then loaded.
+
+    The file may use the grouped layout (roles / stages / targets / ops / providers) or
+    the legacy flat keys; :func:`_normalize` maps the former onto the latter so both
+    load identically.
+    """
+    if path is not None:
+        resolved_path = path
+    else:
+        resolved_path = _profile_path(profile)
+        if not os.path.exists(resolved_path) and _is_default_profile(profile):
+            try:
+                _write_bootstrap_default(resolved_path)
+            except OSError as e:
+                logger.warning("Could not write bootstrap default config to %s: %s",
+                               resolved_path, e)
+
     raw: dict[str, Any] = {}
     if os.path.exists(resolved_path):
         try:
@@ -458,7 +596,7 @@ def load_config(path: str | None = None) -> Config:
     else:
         logger.debug("Config file not found at %s — using defaults", resolved_path)
 
-    merged = _deep_merge(_DEFAULTS, raw)
+    merged = _deep_merge(_DEFAULTS, _normalize(raw))
     roles = merged.get("roles", {})
     copilot_raw = merged.get("copilot", {})
     openai_raw = merged.get("openai", {})
