@@ -83,7 +83,16 @@ class Ledger:
 
     def _connect(self) -> None:
         try:
-            self._conn = sqlite3.connect(self._db_path, check_same_thread=False)
+            # ``timeout`` is the Python-side busy wait; the WAL journal lets one
+            # writer and many readers proceed at once, and ``busy_timeout`` makes
+            # a writer that hits the single-writer lock RETRY for 5s instead of
+            # failing immediately. This is what keeps CROSS-PROCESS writes lossless
+            # when separate batch processes (219 + 220) record to one ledger file —
+            # the in-process ``self._lock`` only covers threads of one process.
+            self._conn = sqlite3.connect(self._db_path, check_same_thread=False,
+                                         timeout=5.0)
+            self._conn.execute("PRAGMA journal_mode=WAL")
+            self._conn.execute("PRAGMA busy_timeout=5000")
             self._conn.executescript(_DDL)
             for stmt in _MIGRATIONS:
                 try:
