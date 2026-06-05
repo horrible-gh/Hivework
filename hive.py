@@ -101,6 +101,12 @@ def build_provider_kwargs(cfg) -> dict:
         copilot_token = os.environ.get(cfg.copilot.token_env)
     if copilot_token:
         kwargs["copilot_token"] = copilot_token
+    # Codex CLI provider settings (ignored by the other handlers via **_ignored):
+    # ``codex_exe`` pins the binary, ``codex_lock_timeout_sec`` is the cross-process
+    # serialization mutex's wait bound — an explicit config number, always passed.
+    if cfg.codex.exe:
+        kwargs["codex_exe"] = cfg.codex.exe
+    kwargs["codex_lock_timeout_sec"] = cfg.codex.lock_timeout_sec
     if cfg.openai.base_url:
         kwargs["base_url"] = cfg.openai.base_url
     if cfg.openai.api_key_env:

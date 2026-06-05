@@ -279,24 +279,26 @@ def _call_openai_compatible(model, prompt, cwd=None, timeout=120, *, system=None
 # file, which the kernel auto-releases if the holder dies — a crashed/killed worker
 # never strands the queue. Set HIVE_CODEX_NO_LOCK=1 to disable (e.g. tests).
 _CODEX_LOCK_PATH = os.path.join(tempfile.gettempdir(), "hivework_codex.lock")
-_CODEX_LOCK_ACQUIRE_TIMEOUT = float(os.environ.get("HIVE_CODEX_LOCK_TIMEOUT", "1800"))
+# Fallback wait bound (seconds) for the cross-process mutex when a caller passes
+# none — only reached by a bare _call_codex() such as a test. Production passes the
+# authoritative, operator-visible value from config: providers.codex.lock_timeout_sec.
+_CODEX_LOCK_DEFAULT_TIMEOUT = 1800
 
 
 @contextlib.contextmanager
-def _codex_serial_lock(acquire_timeout=None, poll=1.0):
+def _codex_serial_lock(acquire_timeout, poll=1.0):
     """Serialize codex calls ACROSS processes via an OS byte-range lock.
 
     Held only around the codex subprocess (not the whole hive run), so queued
     workers wait their turn rather than racing. Acquisition polls a non-blocking
-    lock so we can bound the wait (``acquire_timeout``); on timeout we raise
-    ``TimeoutError`` rather than hang a batch overnight. If neither msvcrt nor
-    fcntl is available, or HIVE_CODEX_NO_LOCK is set, this is a no-op.
+    lock so we can bound the wait (``acquire_timeout`` seconds, supplied by the
+    caller from config); on timeout we raise ``TimeoutError`` rather than hang a
+    batch overnight. If neither msvcrt nor fcntl is available, or HIVE_CODEX_NO_LOCK
+    is set, this is a no-op.
     """
     if os.environ.get("HIVE_CODEX_NO_LOCK") or (msvcrt is None and fcntl is None):
         yield
         return
-    if acquire_timeout is None:
-        acquire_timeout = _CODEX_LOCK_ACQUIRE_TIMEOUT
     f = open(_CODEX_LOCK_PATH, "a+")
     try:
         deadline = time.monotonic() + acquire_timeout
@@ -336,7 +338,8 @@ def _codex_serial_lock(acquire_timeout=None, poll=1.0):
 
 
 def _call_codex(model, prompt, cwd=None, timeout=300, *, sandbox="read-only",
-                codex_exe=None, on_start=None, **_ignored) -> WorkerResult:
+                codex_exe=None, codex_lock_timeout_sec=None, on_start=None,
+                **_ignored) -> WorkerResult:
     """Call the Codex CLI in non-interactive ``codex exec`` mode (tool-ON agentic).
 
     The OpenAI-equivalent of the copilot worker: an agentic CLI that reads/explores
@@ -376,7 +379,11 @@ def _call_codex(model, prompt, cwd=None, timeout=300, *, sandbox="read-only",
     try:
         # Cross-process serialization: only one codex subprocess runs at a time.
         # t0 is set INSIDE the lock so latency reflects codex time, not queue wait.
-        with _codex_serial_lock():
+        # Wait bound = the operator-visible config value providers.codex.lock_timeout_sec
+        # (falls back to the module default only for a bare call without config).
+        lock_wait = (codex_lock_timeout_sec if codex_lock_timeout_sec is not None
+                     else _CODEX_LOCK_DEFAULT_TIMEOUT)
+        with _codex_serial_lock(acquire_timeout=lock_wait):
             # We now OWN the codex slot — flip the ledger row wait→running here, so
             # a call parked on the lock reads 'wait' (queued), not a false 'running'.
             if on_start is not None:
