@@ -34,8 +34,18 @@ CREATE TABLE IF NOT EXISTS worker_calls (
     in_chars INTEGER, out_chars INTEGER,
     est_tokens INTEGER, real_tokens INTEGER,
     latency_s REAL, comb_path TEXT, ok INTEGER, err TEXT,
+    status TEXT, started_at TEXT,
     FOREIGN KEY(run_id) REFERENCES runs(id));
 """
+
+# Columns added after the original schema shipped. ``CREATE TABLE IF NOT EXISTS``
+# leaves a pre-existing worker_calls untouched, so older ledger DBs miss these.
+# Each is ALTERed in (errors ignored when the column already exists) so begin/
+# finish_call work against both fresh and historical databases.
+_MIGRATIONS = (
+    "ALTER TABLE worker_calls ADD COLUMN status TEXT",
+    "ALTER TABLE worker_calls ADD COLUMN started_at TEXT",
+)
 
 
 def estimate_tokens(text: str) -> int:
@@ -65,12 +75,21 @@ class Ledger:
         # can still interleave statements; this lock serialises every connection
         # access so concurrent ``record_call``s are safe and lossless.
         self._lock = threading.Lock()
+        # In-flight calls keyed by call_id: holds in_chars + the prompt-side token
+        # estimate so finish_call can complete est_tokens and the run aggregate
+        # without re-reading the prompt.
+        self._pending: dict[int, dict[str, Any]] = {}
         self._connect()
 
     def _connect(self) -> None:
         try:
             self._conn = sqlite3.connect(self._db_path, check_same_thread=False)
             self._conn.executescript(_DDL)
+            for stmt in _MIGRATIONS:
+                try:
+                    self._conn.execute(stmt)
+                except sqlite3.OperationalError:
+                    pass  # column already exists
             self._conn.commit()
         except Exception as e:
             logger.warning("Ledger: failed to connect/init %s: %s", self._db_path, e)
@@ -93,37 +112,83 @@ class Ledger:
         except Exception as e:
             logger.warning("Ledger: start_run failed: %s", e)
 
-    def record_call(self, stage: str, axis_id: str, provider: str, model: str,
-                    prompt: str, output: str, latency_s: float,
-                    comb_path: str = "", ok: bool = True, err: str = "",
-                    real_tokens: int | None = None) -> None:
-        """Insert a worker_calls row. Computes in_chars, out_chars, est_tokens from text.
+    def begin_call(self, stage: str, axis_id: str, provider: str, model: str,
+                   prompt: str, comb_path: str = "") -> int | None:
+        """Insert a worker_calls row at call start with status='running'.
 
-        ``real_tokens``: EXACT total token count when the provider reports it
-        (e.g. deepinfra via response.usage). None for copilot, which exposes no
-        token counts — leaving the column NULL as before.
+        Returns the new row id (pass it to ``finish_call``) or None when the
+        ledger is unavailable. Recording the row BEFORE the (possibly multi-minute)
+        worker call is what makes an in-flight run visible — and guarantees a row
+        survives even if the call later times out (see finish_call in except paths).
+        ``in_chars`` and ``started_at`` are fixed here; out_chars/latency/ok land
+        at finish.
         """
         if self._conn is None or self._run_id is None:
-            return
+            return None
         in_chars = len(prompt)
-        out_chars = len(output)
-        est_tokens = estimate_tokens(prompt) + estimate_tokens(output)
+        est_prompt = estimate_tokens(prompt)
+        started_at = datetime.now(timezone.utc).isoformat()
         try:
             with self._lock:
-                self._conn.execute(
+                cur = self._conn.execute(
                     "INSERT INTO worker_calls"
                     " (run_id, stage, axis_id, provider, model,"
-                    "  in_chars, out_chars, est_tokens, real_tokens,"
-                    "  latency_s, comb_path, ok, err)"
-                    " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    "  in_chars, comb_path, status, started_at)"
+                    " VALUES (?,?,?,?,?,?,?,?,?)",
                     (self._run_id, stage, axis_id, provider, model,
-                     in_chars, out_chars, est_tokens, real_tokens,
-                     latency_s, comb_path, int(ok), err))
+                     in_chars, comb_path, "running", started_at))
+                self._conn.commit()
+                call_id = cur.lastrowid
+                self._pending[call_id] = {"in_chars": in_chars, "est_prompt": est_prompt}
+                return call_id
+        except Exception as e:
+            logger.warning("Ledger: begin_call failed: %s", e)
+            return None
+
+    def finish_call(self, call_id: int | None, output: str, latency_s: float,
+                    ok: bool = True, err: str = "",
+                    real_tokens: int | None = None) -> None:
+        """Update a worker_calls row started by ``begin_call`` with the outcome.
+
+        Sets out_chars, est_tokens, latency, ok/err, real_tokens and status
+        ('done' on success, 'failed' otherwise). A None call_id (ledger
+        unavailable, or begin failed) silently no-ops. ``real_tokens`` is EXACT
+        when the provider reports usage (e.g. deepinfra), else None — NULL.
+        """
+        if self._conn is None or call_id is None:
+            return
+        out_chars = len(output)
+        try:
+            with self._lock:
+                pending = self._pending.pop(call_id, None)
+                est_prompt = pending["est_prompt"] if pending else 0
+                in_chars = pending["in_chars"] if pending else 0
+                est_tokens = est_prompt + estimate_tokens(output)
+                status = "done" if ok else "failed"
+                self._conn.execute(
+                    "UPDATE worker_calls SET out_chars=?, est_tokens=?, real_tokens=?,"
+                    " latency_s=?, ok=?, err=?, status=? WHERE id=?",
+                    (out_chars, est_tokens, real_tokens,
+                     latency_s, int(ok), err, status, call_id))
                 self._conn.commit()
                 self._calls.append({"in_chars": in_chars, "out_chars": out_chars,
                                     "est": est_tokens, "real": real_tokens})
         except Exception as e:
-            logger.warning("Ledger: record_call failed: %s", e)
+            logger.warning("Ledger: finish_call failed: %s", e)
+
+    def record_call(self, stage: str, axis_id: str, provider: str, model: str,
+                    prompt: str, output: str, latency_s: float,
+                    comb_path: str = "", ok: bool = True, err: str = "",
+                    real_tokens: int | None = None) -> None:
+        """Record a completed call in one shot (begin_call + finish_call).
+
+        Convenience for paths that don't need in-flight visibility and for back-
+        compat. Live worker call sites should prefer begin_call/finish_call so the
+        row appears while the call is running.
+        """
+        call_id = self.begin_call(stage, axis_id, provider, model, prompt, comb_path)
+        self.finish_call(call_id, output, latency_s, ok=ok, err=err,
+                         real_tokens=real_tokens)
 
     def finish_run(self, honey_path: str = "", axes_n: int = 0, rounds: int = 0,
                    conflicts_n: int = 0, remaining_n: int = 0,
@@ -164,6 +229,8 @@ class Ledger:
 class NullLedger:
     """No-op ledger used when ledger.enabled=False or open fails."""
     def start_run(self, *a, **kw): pass
+    def begin_call(self, *a, **kw): return None
+    def finish_call(self, *a, **kw): pass
     def record_call(self, *a, **kw): pass
     def finish_run(self, *a, **kw): pass
     def close(self): pass

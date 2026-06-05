@@ -164,6 +164,120 @@ class TestLedgerInsertAndAggregate(unittest.TestCase):
         self.assertEqual(row[1], 150)
 
 
+class TestLedgerBeginFinishCall(unittest.TestCase):
+    """begin_call inserts a 'running' row at start; finish_call completes it."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        self.db_path = os.path.join(self.tmpdir, "test_ledger.db")
+        self.ldg = Ledger(self.db_path)
+        self.ldg.start_run(seed="s.md", codebase="/r",
+                           model_queen="gpt-5-mini", model_swarm="gpt-5-mini")
+
+    def tearDown(self):
+        self.ldg.close()
+
+    def _row(self, call_id):
+        conn = sqlite3.connect(self.db_path)
+        row = conn.execute(
+            "SELECT status, started_at, in_chars, out_chars, est_tokens, ok, err"
+            " FROM worker_calls WHERE id=?", (call_id,)).fetchone()
+        conn.close()
+        return row
+
+    def test_begin_call_returns_id(self):
+        call_id = self.ldg.begin_call("queen", "decompose", "copilot", "gpt-5-mini",
+                                      prompt="x" * 40)
+        self.assertIsNotNone(call_id)
+
+    def test_begin_row_is_running_with_started_at(self):
+        call_id = self.ldg.begin_call("queen", "decompose", "copilot", "gpt-5-mini",
+                                      prompt="x" * 40)
+        status, started_at, in_chars, out_chars, est, ok, err = self._row(call_id)
+        self.assertEqual(status, "running")
+        self.assertTrue(started_at)            # ISO timestamp present
+        self.assertEqual(in_chars, 40)         # fixed at begin
+        self.assertIsNone(out_chars)           # not yet known
+        self.assertIsNone(ok)
+
+    def test_finish_call_marks_done(self):
+        call_id = self.ldg.begin_call("converge", "converge", "copilot", "gpt-5-mini",
+                                      prompt="word " * 20)
+        self.ldg.finish_call(call_id, output="out " * 10, latency_s=2.5)
+        status, _started, in_chars, out_chars, est, ok, err = self._row(call_id)
+        self.assertEqual(status, "done")
+        self.assertEqual(out_chars, len("out " * 10))
+        self.assertEqual(ok, 1)
+        self.assertGreater(est, 0)             # prompt-est + output-est
+
+    def test_finish_call_failed_status(self):
+        call_id = self.ldg.begin_call("converge", "converge", "codex", "gpt-5.4-mini",
+                                      prompt="p" * 100)
+        self.ldg.finish_call(call_id, output="", latency_s=0.0, ok=False,
+                             err="timed out after 180 seconds")
+        status, _s, in_chars, out_chars, _est, ok, err = self._row(call_id)
+        self.assertEqual(status, "failed")     # the §6 codex-timeout case
+        self.assertEqual(ok, 0)
+        self.assertIn("timed out", err)
+        self.assertEqual(in_chars, 100)        # input size survives even on timeout
+
+    def test_finish_call_none_id_noop(self):
+        # A None call_id (ledger unavailable / begin failed) must not raise.
+        self.ldg.finish_call(None, output="o", latency_s=1.0)
+
+    def test_begin_finish_feed_run_aggregate(self):
+        cid = self.ldg.begin_call("swarm", "A", "copilot", "gpt-5-mini", prompt="a" * 100)
+        self.ldg.finish_call(cid, output="b" * 50, latency_s=1.0)
+        self.ldg.finish_run()
+        conn = sqlite3.connect(self.db_path)
+        row = conn.execute("SELECT total_in_chars, total_out_chars FROM runs").fetchone()
+        conn.close()
+        self.assertEqual(row[0], 100)
+        self.assertEqual(row[1], 50)
+
+    def test_record_call_still_one_shot_done(self):
+        """The record_call wrapper begins+finishes in one shot → a 'done' row."""
+        self.ldg.record_call("assemble", "assemble", "copilot", "gpt-5-mini",
+                             prompt="p" * 20, output="o" * 10, latency_s=1.0)
+        conn = sqlite3.connect(self.db_path)
+        row = conn.execute("SELECT status, in_chars, out_chars FROM worker_calls").fetchone()
+        conn.close()
+        self.assertEqual(row[0], "done")
+        self.assertEqual(row[1], 20)
+        self.assertEqual(row[2], 10)
+
+
+class TestLedgerMigration(unittest.TestCase):
+    """An older worker_calls table (no status/started_at) is migrated on open."""
+
+    def test_legacy_db_gets_new_columns(self):
+        tmpdir = tempfile.mkdtemp()
+        db_path = os.path.join(tmpdir, "legacy.db")
+        # Build a pre-migration worker_calls table lacking status/started_at.
+        conn = sqlite3.connect(db_path)
+        conn.execute(
+            "CREATE TABLE worker_calls (id INTEGER PRIMARY KEY, run_id INTEGER,"
+            " stage TEXT, axis_id TEXT, provider TEXT, model TEXT,"
+            " in_chars INTEGER, out_chars INTEGER, est_tokens INTEGER,"
+            " real_tokens INTEGER, latency_s REAL, comb_path TEXT, ok INTEGER, err TEXT)")
+        conn.commit()
+        conn.close()
+        # Opening the Ledger should ALTER in the missing columns without error.
+        ldg = Ledger(db_path)
+        ldg.start_run(seed="s", codebase="/r", model_queen="m", model_swarm="m")
+        cid = ldg.begin_call("queen", "decompose", "copilot", "m", prompt="x" * 10)
+        ldg.finish_call(cid, output="y" * 5, latency_s=1.0)
+        ldg.close()
+        conn = sqlite3.connect(db_path)
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(worker_calls)")}
+        row = conn.execute("SELECT status, started_at FROM worker_calls").fetchone()
+        conn.close()
+        self.assertIn("status", cols)
+        self.assertIn("started_at", cols)
+        self.assertEqual(row[0], "done")
+        self.assertTrue(row[1])
+
+
 class TestLedgerDisabledIsNoop(unittest.TestCase):
     """When ledger.enabled=False, NullLedger is returned and no DB is created."""
 
@@ -174,6 +288,9 @@ class TestLedgerDisabledIsNoop(unittest.TestCase):
     def test_null_ledger_noop(self):
         ldg = NullLedger()
         ldg.start_run("seed", "codebase", "q-model", "s-model")
+        cid = ldg.begin_call("stage", "ax", "copilot", "m", prompt="p")
+        self.assertIsNone(cid)
+        ldg.finish_call(cid, output="o", latency_s=1.0)
         ldg.record_call("stage", "ax", "copilot", "m", prompt="p", output="o", latency_s=1.0)
         ldg.finish_run(status="done")
         ldg.close()
