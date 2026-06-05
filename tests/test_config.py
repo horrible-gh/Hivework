@@ -301,6 +301,19 @@ class TestGroupedLayout(unittest.TestCase):
         self.assertEqual(cfg.openai.base_url, "u")
         self.assertEqual(cfg.openai.api_key_env, "E")
 
+    def test_copilot_token_config_pins_billing_account(self):
+        # A configured token must reach the copilot subprocess as COPILOT_GITHUB_TOKEN
+        # (which overrides the CLI's stored login) so the run bills THAT account.
+        cfg = self._load({"providers": {"copilot": {"token": "github_pat_TESTACCT"}}})
+        self.assertEqual(cfg.copilot.token, "github_pat_TESTACCT")
+        # token_env names an env var to read the token from instead of inlining it.
+        cfg2 = self._load({"providers": {"copilot": {"token_env": "HIVE_COPILOT_TOK"}}})
+        self.assertEqual(cfg2.copilot.token_env, "HIVE_COPILOT_TOK")
+        # unset → both None (handler falls back to stored login + warns).
+        cfg3 = self._load({"providers": {"copilot": {}}})
+        self.assertIsNone(cfg3.copilot.token)
+        self.assertIsNone(cfg3.copilot.token_env)
+
     def test_stages_judge_maps_to_judge_caps(self):
         cfg = self._load({"stages": {"judge": {"max_axes": 7, "votes_per_axis": 5}}})
         self.assertEqual(cfg.judge.max_axes, 7)

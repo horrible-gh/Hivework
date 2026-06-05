@@ -51,6 +51,32 @@ class TestCopilotCmd(unittest.TestCase):
         self.assertIn("gpt-5-mini", cmd)
         self.assertIn("--allow-all", cmd)
 
+    def _capture_env(self, **call_kwargs):
+        """Return the env dict _run_capture received for a copilot call."""
+        seen = {}
+
+        def fake_run(cmd, **kw):
+            seen["env"] = kw.get("env")
+            return _FakeProc()
+
+        with mock.patch.object(providers.shutil, "which", return_value="copilot.cmd"), \
+             mock.patch.object(providers, "_run_capture", side_effect=fake_run):
+            providers.call_worker("copilot", "gpt-5-mini", "hi", cwd="/x",
+                                  timeout=30, **call_kwargs)
+        return seen["env"]
+
+    def test_token_injected_as_copilot_github_token(self):
+        # A configured token must reach the subprocess env as COPILOT_GITHUB_TOKEN
+        # (overrides the CLI's stored login) and must not clobber the rest of env.
+        env = self._capture_env(copilot_token="github_pat_TESTACCT")
+        self.assertEqual(env["COPILOT_GITHUB_TOKEN"], "github_pat_TESTACCT")
+        self.assertIn("PATH", env)  # inherited the rest, so copilot.cmd still resolves
+
+    def test_no_token_inherits_ambient_env(self):
+        # Without a token, env stays None (inherit ambient) — no forced override.
+        env = self._capture_env()
+        self.assertIsNone(env)
+
 
 class _FakeUsage:
     def __init__(self, total):
