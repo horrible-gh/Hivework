@@ -985,7 +985,7 @@ class TestConvergeSchemaGuard(unittest.TestCase):
     def test_unknown_table_rejected(self):
         reads = [{"id": "r", "table": "items", "where": {"doc_id": "D1"},
                   "columns": ["doc_review_status"]}]
-        block, any_rows = C._run_data_reads(reads, self.db, self.schema)
+        block, any_rows, _ = C._run_data_reads(reads, self.db, self.schema)
         self.assertIn("unknown table 'items'", block)
         self.assertFalse(any_rows)
 
@@ -993,14 +993,14 @@ class TestConvergeSchemaGuard(unittest.TestCase):
         # the NR174 hallucination: WHERE column = 'result_doc_id'
         reads = [{"id": "r", "table": "documents", "where": {"column": "result_doc_id"},
                   "columns": ["doc_review_status"]}]
-        block, any_rows = C._run_data_reads(reads, self.db, self.schema)
+        block, any_rows, _ = C._run_data_reads(reads, self.db, self.schema)
         self.assertIn("unknown column 'column'", block)
         self.assertFalse(any_rows)
 
     def test_valid_read_passes_guard(self):
         reads = [{"id": "r", "table": "documents", "where": {"doc_id": "D1"},
                   "columns": ["doc_review_status"]}]
-        block, any_rows = C._run_data_reads(reads, self.db, self.schema)
+        block, any_rows, _ = C._run_data_reads(reads, self.db, self.schema)
         self.assertTrue(any_rows)
         self.assertIn("approved", block)
 
@@ -1008,7 +1008,7 @@ class TestConvergeSchemaGuard(unittest.TestCase):
         # no schema (introspection failed) → guard cannot reject, read still runs
         reads = [{"id": "r", "table": "documents", "where": {"doc_id": "D1"},
                   "columns": ["doc_review_status"]}]
-        block, any_rows = C._run_data_reads(reads, self.db, {})
+        block, any_rows, _ = C._run_data_reads(reads, self.db, {})
         self.assertTrue(any_rows)
 
 
@@ -1514,6 +1514,77 @@ class TestSeedNegationAndMultiLocus(unittest.TestCase):
         honey = render_local_honey(result, "one thing is wrong")
         self.assertNotIn("## Converge-attributed edit targets", honey)
         self.assertNotIn("Additional independent defects", honey)
+
+
+class TestPremiseRefutedGuard(unittest.TestCase):
+    """M035: a data-dependent ``consistent`` whose own read chain collapsed (a chained
+    read found NO upstream rows → the premise rows are absent) must NOT stay converged —
+    ``data_backed`` (satisfied by an incidental id-lookup) cannot see this."""
+
+    def test_run_data_reads_flags_chain_broke_when_no_upstream(self):
+        db = _tmp_db_with_doc("approved")  # documents holds only D1
+        reads = [
+            # parent read matches nothing → produces no upstream values
+            {"id": "p", "table": "documents", "where": {"doc_id": "NOPE"},
+             "columns": ["doc_id"]},
+            # child chains on the empty parent → skipped (no upstream values)
+            {"id": "c", "table": "documents",
+             "where": {"doc_id": {"from": "p", "column": "doc_id"}},
+             "columns": ["doc_review_status"]},
+        ]
+        block, any_rows, chain_broke = C._run_data_reads(reads, db, C._introspect_schema(db))
+        self.assertFalse(any_rows)
+        self.assertTrue(chain_broke)
+        self.assertIn("no upstream values", block)
+
+    def test_run_data_reads_chain_intact_is_not_broke(self):
+        db = _tmp_db_with_doc("approved")  # D1 exists → parent yields a value to chain
+        reads = [
+            {"id": "p", "table": "documents", "where": {"doc_id": "D1"},
+             "columns": ["doc_id"]},
+            {"id": "c", "table": "documents",
+             "where": {"doc_id": {"from": "p", "column": "doc_id"}},
+             "columns": ["doc_review_status"]},
+        ]
+        _, any_rows, chain_broke = C._run_data_reads(reads, db, C._introspect_schema(db))
+        self.assertTrue(any_rows)
+        self.assertFalse(chain_broke)
+
+    def _consistent_res(self, data_dependent=True):
+        return C.ConvergeResult(
+            converged=True,
+            attributed_defect={"node": "n", "file": "q.json", "lines": "1-2"},
+            causal_check={"verdict": "consistent", "data_dependent": data_dependent,
+                          "trace": "ruled on the ordering"})
+
+    def test_guard_demotes_consistent_when_chain_broke(self):
+        res = C._premise_refuted_guard(self._consistent_res(), True, chain_broke=True)
+        self.assertFalse(res.converged)
+        self.assertTrue(res.causal_check["data_premise_refuted"])
+        self.assertIn("premise refuted", res.summary)
+
+    def test_guard_noop_when_chain_intact(self):
+        res = C._premise_refuted_guard(self._consistent_res(), True, chain_broke=False)
+        self.assertTrue(res.converged)
+        self.assertNotIn("data_premise_refuted", res.causal_check)
+
+    def test_guard_noop_when_not_data_dependent(self):
+        # a pure code-logic consistent ruling is untouched even if a chain broke
+        res = C._premise_refuted_guard(
+            self._consistent_res(data_dependent=False), True, chain_broke=True)
+        self.assertTrue(res.converged)
+
+    def test_guard_noop_when_no_db(self):
+        res = C._premise_refuted_guard(self._consistent_res(), False, chain_broke=True)
+        self.assertTrue(res.converged)
+
+    def test_guard_noop_on_contradicted(self):
+        res = C.ConvergeResult(
+            converged=False,
+            attributed_defect={"node": "n", "file": "q.json", "lines": "1"},
+            causal_check={"verdict": "contradicted", "data_dependent": True})
+        out = C._premise_refuted_guard(res, True, chain_broke=True)
+        self.assertNotIn("data_premise_refuted", out.causal_check)
 
 
 if __name__ == "__main__":

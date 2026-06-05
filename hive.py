@@ -29,7 +29,10 @@ from hive.specify import run_specify
 from hive.reinvestigate import run_reinvestigation_loop
 from hive.apply import run_apply
 from hive.commit import run_propose, run_commit, render_commit_summary_lines
+from hive.converge import run_converge
 from hive.investigate import (
+    _converge_fragments,
+    _rebuild_bundles,
     format_caller_context,
     render_local_honey,
     rerun_reinvestigation,
@@ -584,6 +587,85 @@ def run_investigate_command(args: argparse.Namespace) -> None:
             logger.error("Resume specify WITHOUT re-investigating: %s", resume_path)
         finally:
             ldg2.close()
+
+
+def run_reconverge_command(args: argparse.Namespace) -> None:
+    """Re-run ONLY the converge stage on a saved investigate ``verdict.json``.
+
+    Rebuilds each axis's evidence bundle from its stored ``search_plan`` via free LOCAL
+    retrieve (no decompose / judge re-spend, and deterministic — the SAME evidence each
+    run), then runs converge ONCE with the configured converge role and the codebase's
+    read-only DB. Lets a converge change — a guard, a prompt tweak, or a model swap — be
+    tested for ~1 call instead of an 8-minute full pipeline, and with NO decompose
+    non-determinism between runs. Propose-only; writes nothing to the target codebase.
+    """
+    logger = logging.getLogger("hive")
+    cfg = load_config()
+    cfg.apply_cli_model(args.model)
+    provider_kwargs = build_provider_kwargs(cfg)
+
+    with open(args.verdict, "r", encoding="utf-8") as f:
+        result = json.load(f)
+    with open(args.seed, "r", encoding="utf-8") as f:
+        seed_text = f.read()
+
+    verdicts = list(result.get("verdicts") or [])
+    located = [v for v in verdicts if (v.get("verdict") or {}).get("located")]
+    conv_role = cfg.role("converge")
+    db_conn = cfg.db_for_codebase(args.codebase)
+
+    logger.info("=" * 60)
+    logger.info("Hivework reconverge — rebuild bundles (local, free) → converge only")
+    logger.info("  verdict:  %s (%d verdict(s), %d located)",
+                args.verdict, len(verdicts), len(located))
+    logger.info("  codebase: %s", args.codebase)
+    logger.info("  converge: %s/%s%s", conv_role.provider, conv_role.model,
+                f" (DB data-state read: {db_conn.kind})" if db_conn else "")
+    logger.info("=" * 60)
+
+    if len(located) < 2:
+        logger.info("reconverge: <2 located verdict(s) — nothing to stitch (free skip)")
+        return
+
+    ldg = open_ledger(cfg.ledger.enabled, cfg.ledger.db_path)
+    ldg.start_run(seed=args.seed, codebase=args.codebase,
+                  model_queen=conv_role.model, model_swarm=conv_role.model)
+    try:
+        bundles = _rebuild_bundles(verdicts, args.codebase, args.docs)
+        cres = run_converge(
+            seed_text=seed_text, verdicts=_converge_fragments(verdicts), bundles=bundles,
+            provider=conv_role.provider, model=conv_role.model, code_root=args.codebase,
+            ledger=ldg, provider_kwargs=provider_kwargs, k=6, max_hops=2, db_conn=db_conn)
+        ldg.finish_run(status="done")
+    except Exception:
+        ldg.finish_run(status="failed")
+        raise
+    finally:
+        ldg.close()
+
+    cv = cres.as_dict()
+    result["converge"] = cv
+    cc = cv.get("causal_check") or {}
+    ad = cv.get("attributed_defect") or {}
+    logger.info("=" * 60)
+    logger.info("reconverge result:")
+    logger.info("  converged:         %s", cv.get("converged"))
+    logger.info("  attributed:        %s:%s", ad.get("file"), ad.get("lines"))
+    logger.info("  causal verdict:    %s (data_dependent=%s, data_premise_refuted=%s)",
+                cc.get("verdict"), cc.get("data_dependent"),
+                cc.get("data_premise_refuted"))
+    logger.info("  data_state_backed: %s", cv.get("data_state_backed"))
+    logger.info("  summary:           %s", cv.get("summary"))
+    logger.info("=" * 60)
+
+    if args.out:
+        with open(args.out, "w", encoding="utf-8") as f:
+            json.dump(result, f, ensure_ascii=False, indent=2)
+        logger.info("reconverge: updated verdict written → %s", args.out)
+        honey_out = os.path.splitext(args.out)[0] + ".honey.md"
+        with open(honey_out, "w", encoding="utf-8") as f:
+            f.write(render_local_honey(result, seed_text, args.codebase, args.docs))
+        logger.info("reconverge: re-rendered honey → %s", honey_out)
 
 
 def run_specify_command(args: argparse.Namespace) -> None:
@@ -1152,6 +1234,41 @@ def main() -> None:
         help="Enable debug logging",
     )
 
+    # 'reconverge' — re-run ONLY converge on a saved verdict.json (cheap converge iteration)
+    reconv_parser = subparsers.add_parser(
+        "reconverge",
+        help="Re-run ONLY converge on a saved verdict.json (rebuild bundles locally; "
+             "~1 call, deterministic — test a converge guard/prompt/model without a full run)",
+    )
+    reconv_parser.add_argument(
+        "--verdict", required=True,
+        help="Path to a saved investigate verdict.json (carries verdicts + search_plans)",
+    )
+    reconv_parser.add_argument(
+        "--seed", required=True,
+        help="Path to the original seed markdown (converge re-reads the symptom)",
+    )
+    reconv_parser.add_argument(
+        "--codebase", required=True,
+        help="Root path of the target codebase (local re-retrieve + live-code grounding)",
+    )
+    reconv_parser.add_argument(
+        "--docs", default=None,
+        help="Root of design docs (optional; mirrors the original run)",
+    )
+    reconv_parser.add_argument(
+        "--out", default=None,
+        help="Write the updated verdict (+ a sibling .honey.md) here (optional)",
+    )
+    reconv_parser.add_argument(
+        "--model", default=None,
+        help="Model override for all roles (default: per-role config)",
+    )
+    reconv_parser.add_argument(
+        "-v", "--verbose", action="store_true",
+        help="Enable debug logging",
+    )
+
     args = parser.parse_args()
 
     if args.command is None:
@@ -1166,6 +1283,8 @@ def main() -> None:
         run_investigate_command(args)
     elif args.command == "specify":
         run_specify_command(args)
+    elif args.command == "reconverge":
+        run_reconverge_command(args)
     elif args.command == "apply":
         run_apply_command(args)
     elif args.command == "commit-plan":

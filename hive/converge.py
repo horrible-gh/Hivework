@@ -922,8 +922,10 @@ def _validate_read(spec: dict[str, Any], schema: dict[str, list[str]]) -> str:
 
 
 def _run_data_reads(data_reads: list[dict[str, Any]], db_conn,
-                    schema: dict[str, list[str]] | None = None) -> tuple[str, bool]:
-    """Run the converger's ``data_reads`` against the live DB; return (block, any_rows).
+                    schema: dict[str, list[str]] | None = None
+                    ) -> tuple[str, bool, bool]:
+    """Run the converger's ``data_reads`` against the live DB; return
+    (block, any_rows, chain_broke).
 
     Deterministic glue — NOT a model call. Reads run IN ORDER so later ones can CHAIN on
     earlier results (a ``where`` value of ``{"from": <prior id>, "column": c}`` is
@@ -938,15 +940,19 @@ def _run_data_reads(data_reads: list[dict[str, Any]], db_conn,
     Any failure (no driver, bad identifier, connect error, an empty upstream) is logged
     and recorded, never raised: that fact just stays unconfirmed and the converge degrades
     to its static result. ``any_rows`` is True iff at least one read returned ≥1 row —
-    only then is the verdict actually data-backed.
+    only then is the verdict actually data-backed. ``chain_broke`` is True iff a CHAINED
+    read could not run because a prior read produced NO upstream values to feed it — i.e.
+    the model's own data-premise chain collapsed (the rows it expected to exist do not),
+    which a coarse ``any_rows`` (satisfied by an incidental id-lookup) cannot see.
     """
     try:
         from hive.dbread import read_rows, DbReadError
     except Exception as e:  # pragma: no cover - import guard
         logger.warning("converge: dbread unavailable (%s) — skipping data read", e)
-        return "", False
+        return "", False, False
     lines: list[str] = []
     any_rows = False
+    chain_broke = False
     by_id: dict[str, list[dict[str, Any]]] = {}
     for idx, spec in enumerate(data_reads):
         table = spec.get("table", "")
@@ -964,6 +970,11 @@ def _run_data_reads(data_reads: list[dict[str, Any]], db_conn,
             logger.info("converge: chained read %r skipped — %s", rid, skip)
             lines.append(f"- read {rid} on {table}: skipped ({skip})")
             by_id[rid] = []
+            # A reference read with no upstream values = the model's premise chain
+            # collapsed: the rows it expected to exist (e.g. a stale/non-null row to
+            # feed this read) are absent in the live DB. Flag it so a "consistent"
+            # ruling that rests on those absent rows does not ship (premise-refuted gate).
+            chain_broke = True
             continue
         try:
             rr = read_rows(db_conn, table, columns=spec.get("columns") or None,
@@ -989,7 +1000,7 @@ def _run_data_reads(data_reads: list[dict[str, Any]], db_conn,
             lines.append(f"  -> (NOTE: returned {_DATA_READ_LIMIT} rows = the read cap; "
                          f"the set may be TRUNCATED — do not draw an ordering/'which row "
                          f"wins' conclusion from a possibly-incomplete set)")
-    return "\n".join(lines), any_rows
+    return "\n".join(lines), any_rows, chain_broke
 
 
 def _fetch_data_state(data_reads: list[dict[str, Any]], db_conn) -> str:
@@ -998,7 +1009,7 @@ def _fetch_data_state(data_reads: list[dict[str, Any]], db_conn) -> str:
     Kept for callers/tests that want the auditable fact-line string; ``run_converge``
     uses :func:`_run_data_reads` directly so it can also tell whether real rows came back.
     """
-    block, _ = _run_data_reads(data_reads, db_conn)
+    block, _, _ = _run_data_reads(data_reads, db_conn)
     return block
 
 
@@ -1067,6 +1078,62 @@ def _dropped_peer_guard(res: ConvergeResult, located: list[dict[str, Any]],
         logger.info("converge: N180 guard demoted — data-certified consistent dropped "
                     "unrefuted peer %s:%s", peer["file"], peer["lines"])
         return res
+    return res
+
+
+def _premise_refuted_guard(res: ConvergeResult, db_available: bool,
+                           chain_broke: bool) -> ConvergeResult:
+    """A ``consistent`` data-dependent verdict whose OWN read chain came back with no
+    upstream rows is ruled on rows the live DB PROVES are absent — demote it.
+
+    The gap this closes (M035): the M017 data-stamp guard treats ``data_backed`` (≥1 row
+    from ANY read) as "the verdict earned its stamp". But ``data_backed`` is satisfied by
+    an INCIDENTAL upstream lookup (e.g. resolving the sequence id) while every DECIDING
+    read — the one meant to prove the suspected stored value exists (a stale / non-null
+    row) — was skipped because its parent produced NO upstream values. The converger then
+    rules ``consistent`` on a premise the rows REFUTE: it suspected an SQL ordering bug
+    that only bites when a stale row exists, the live rows show none exists (so the query
+    already returns the expected head), yet it certifies the SQL anyway. The prompt
+    already says "when the query yields the expected row, that query is NOT the defect —
+    the real cause is a different resolver / render path", but a weak single-shot
+    converger ignores it; this is the deterministic backstop.
+
+    Fires ONLY when: the result converged AND a DB is configured AND the verdict is
+    ``consistent`` AND the converger flagged it ``data_dependent`` AND the adopted ruling's
+    read chain BROKE (``chain_broke`` — a chained read had no upstream values, i.e. the
+    premise rows are absent). Demote to not-converged and stamp ``data_premise_refuted`` so
+    the honey routes it to reinvestigation / the alternate (render) path.
+
+    DELIBERATELY TIGHT (the N177 over-fire lesson): a ruling NOT flagged data_dependent is
+    untouched; a data_dependent ``consistent`` whose chain resolved cleanly (the premise
+    rows DID exist) is untouched; ``contradicted`` / ``undecidable`` are untouched. Worst-
+    case false fire costs one extra reinvestigation pass, never a wrong edit — and only
+    when the model's own declared data chain collapsed (downgrade-only, fail toward
+    re-examine).
+    """
+    if not (res.converged and db_available and chain_broke):
+        return res
+    cc = res.causal_check or {}
+    if cc.get("verdict") != "consistent" or not cc.get("data_dependent"):
+        return res
+    ad = res.attributed_defect or {}
+    res.converged = False
+    res.causal_check = {
+        **cc, "data_premise_refuted": True,
+        "trace": (cc.get("trace") or "")
+        + " [premise-refuted] verdict is data_dependent (rests on a stored value) but the "
+          "converger's OWN data-read chain came back with no upstream rows — the rows it "
+          "relied on (e.g. a stale/non-null row) are ABSENT in the live DB, so the suspected "
+          "query already yields the expected result. On a data question the live rows "
+          "outrank the framing: route to the alternate (render/binding) path, do not certify "
+          "this locus."}
+    res.summary = (
+        f"not converged: data-dependent consistent at "
+        f"{ad.get('file', '')}:{ad.get('lines', '')} rests on rows the live DB proves "
+        f"absent (premise refuted)")
+    logger.info("converge: premise-refuted guard demoted — data-dependent consistent at "
+                "%s:%s but its read chain found no upstream rows",
+                ad.get("file", ""), ad.get("lines", ""))
     return res
 
 
@@ -1192,6 +1259,11 @@ def run_converge(*, seed_text: str, verdicts: list[dict[str, Any]],
     data_ruled = False
     data_backed = False
     data_attempted = False
+    # Whether the ADOPTED ruling's data-read chain collapsed (a chained read found no
+    # upstream rows → the premise rows the verdict rests on are absent). Captured only
+    # at the round we actually adopt, so an earlier broken round the model later repaired
+    # does not taint the final ruling.
+    data_chain_broke = False
     block_parts: list[str] = []
     seen_sigs: set[str] = set()
     pending = (res.causal_check or {}).get("data_reads") or []
@@ -1205,11 +1277,11 @@ def run_converge(*, seed_text: str, verdicts: list[dict[str, Any]],
         seen_sigs.add(sig)
         data_attempted = True
         rounds += 1
-        block, backed = _run_data_reads(pending, db_conn, schema_map)
+        block, backed, chain_broke = _run_data_reads(pending, db_conn, schema_map)
         block_parts.append(block)
         data_backed = data_backed or backed
-        logger.info("converge: data read round %d → %d row-set(s), rows=%s",
-                    rounds, len(pending), backed)
+        logger.info("converge: data read round %d → %d row-set(s), rows=%s, chain_broke=%s",
+                    rounds, len(pending), backed, chain_broke)
         combined = "\n\n".join(p for p in block_parts if p)
         res2 = _converge_once(seed_text, located, unlocated, windows, known,
                               provider, model, pk, ledger, timeout,
@@ -1224,6 +1296,7 @@ def run_converge(*, seed_text: str, verdicts: list[dict[str, Any]],
             # as a ruling — it falls through to the "failed to strengthen" branch.
             res = res2
             data_ruled = True
+            data_chain_broke = chain_broke
             break
         # The re-pass could NOT rule on fact: the read came back empty/failed, or the
         # model still cannot decide. Per N174 #2 this is a FAILED CONFIRMATION, not a
@@ -1292,6 +1365,14 @@ def run_converge(*, seed_text: str, verdicts: list[dict[str, Any]],
     # FINAL result (after any data-read / missing-link re-pass); demotes to not-converged
     # and stamps the peer so the honey routes it to reinvestigation. Tight by design.
     res = _dropped_peer_guard(res, located, data_backed)
+
+    # ── Premise-refuted gate (M035): a data-dependent ``consistent`` whose adopted read
+    # chain BROKE (a chained read had no upstream rows) rests on rows the live DB proves
+    # absent — the suspected query already yields the expected result, so the real cause is
+    # elsewhere (render/alternate path). Demotes to not-converged. No-op unless the chain
+    # actually collapsed; closes the M017 gap where an incidental id-lookup satisfied
+    # ``data_backed`` while every deciding read was skipped. Tight by design.
+    res = _premise_refuted_guard(res, db_available, data_chain_broke)
 
     # ── Data-stamp gate (M017 lever 2): a ``consistent`` verdict the converger flagged
     # ``data_dependent`` must be BACKED by a real DB read, never ruled on an assumed stored
