@@ -306,5 +306,64 @@ class TestRunCaptureKillsTree(unittest.TestCase):
         self.assertTrue(killed.get("direct"), "direct child kill must also run")
 
 
+class TestCodexSerialLock(unittest.TestCase):
+    """codex is serialized ACROSS processes by an OS byte-range lock so a parallel
+    batch can't fire concurrent codex.cmd calls (one wins, the rest starve)."""
+
+    def test_lock_held_during_call_then_released(self):
+        # While the codex subprocess runs, the lock file must be held; a second
+        # *non-blocking* acquire attempt from the same process should fail, proving
+        # the region is locked. After the call returns it must release cleanly.
+        held = {}
+
+        def fake_run(cmd, **kw):
+            # Mid-call: try to grab the same lock non-blockingly — must be busy.
+            try:
+                with providers._codex_serial_lock(acquire_timeout=0):
+                    held["reentrant_acquired"] = True
+            except (TimeoutError, OSError):
+                held["busy_during_call"] = True
+            proc = _FakeProc()
+            proc.returncode = 0
+            proc.stdout = "{}"
+            return proc
+
+        with mock.patch.object(providers.shutil, "which", return_value="codex.cmd"), \
+             mock.patch.object(providers, "_run_capture", side_effect=fake_run):
+            providers.call_worker("codex", "gpt-5-codex", "do X", cwd="/x", timeout=5)
+
+        self.assertTrue(held.get("busy_during_call"),
+                        "lock must be held while the codex subprocess runs")
+        self.assertNotIn("reentrant_acquired", held)
+        # Released now: a fresh acquire must succeed immediately.
+        with providers._codex_serial_lock(acquire_timeout=1):
+            pass
+
+    def test_disabled_by_env(self):
+        with mock.patch.dict(os.environ, {"HIVE_CODEX_NO_LOCK": "1"}):
+            with providers._codex_serial_lock(acquire_timeout=0):
+                # No-op path: a nested acquire is also a no-op (never raises).
+                with providers._codex_serial_lock(acquire_timeout=0):
+                    pass
+
+    def test_only_codex_is_serialized_not_copilot(self):
+        # The guard must wrap codex only; copilot must NOT touch the lock helper.
+        with mock.patch.object(providers, "_codex_serial_lock") as lock_spy:
+            lock_spy.return_value.__enter__ = mock.Mock(return_value=None)
+            lock_spy.return_value.__exit__ = mock.Mock(return_value=False)
+            with mock.patch.object(providers, "_run_capture",
+                                   return_value=_make_proc(0, "out", "")):
+                providers.call_worker("copilot", "gpt-5-mini", "p", cwd="/x", timeout=5)
+        lock_spy.assert_not_called()
+
+
+def _make_proc(rc, stdout, stderr):
+    proc = _FakeProc()
+    proc.returncode = rc
+    proc.stdout = stdout
+    proc.stderr = stderr
+    return proc
+
+
 if __name__ == "__main__":
     unittest.main()

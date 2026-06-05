@@ -8,10 +8,22 @@ Usage:
     result = call_worker("copilot", "gpt-5-mini", prompt, cwd=root, timeout=300)
     print(result.stdout, result.latency_s)
 """
-import os, shutil, signal, subprocess, tempfile, time, logging
+import os, shutil, signal, subprocess, tempfile, time, logging, contextlib
 from dataclasses import dataclass
 
 from hive import http_tools
+
+# OS-level byte-range lock primitive — used to serialize codex across PROCESSES
+# (see _codex_serial_lock). msvcrt on Windows, fcntl on POSIX; either may be
+# absent on an exotic platform, in which case the lock degrades to a no-op.
+try:
+    import msvcrt
+except ImportError:  # not Windows
+    msvcrt = None
+try:
+    import fcntl
+except ImportError:  # not POSIX
+    fcntl = None
 
 logger = logging.getLogger("hive.providers")
 
@@ -232,6 +244,75 @@ def _call_openai_compatible(model, prompt, cwd=None, timeout=120, *, system=None
                         latency_s=latency_s, real_tokens=real_tokens)
 
 
+# Codex (ChatGPT-subscription login) tolerates only ONE concurrent request: its
+# backend caps subscription concurrency and every live `codex exec` shares the same
+# ~/.codex auth/session, so firing N codex workers at once lets one win and starves
+# the rest (observed in a 3-item parallel batch: N182 completed, N181 timed out at
+# 300s, N183 returned empty). copilot fan-out has no such limit, which is why the
+# swarm parallelizes fine — so the guard is codex-ONLY, leaving copilot untouched.
+#
+# The batch runner launches each hive item as its OWN process (pl_batch_runner spawns
+# `python hive_runner.py` per task inside a thread pool), so an in-process semaphore
+# can't coordinate them. We need an OS-level lock: a byte-range lock on a shared temp
+# file, which the kernel auto-releases if the holder dies — a crashed/killed worker
+# never strands the queue. Set HIVE_CODEX_NO_LOCK=1 to disable (e.g. tests).
+_CODEX_LOCK_PATH = os.path.join(tempfile.gettempdir(), "hivework_codex.lock")
+_CODEX_LOCK_ACQUIRE_TIMEOUT = float(os.environ.get("HIVE_CODEX_LOCK_TIMEOUT", "1800"))
+
+
+@contextlib.contextmanager
+def _codex_serial_lock(acquire_timeout=None, poll=1.0):
+    """Serialize codex calls ACROSS processes via an OS byte-range lock.
+
+    Held only around the codex subprocess (not the whole hive run), so queued
+    workers wait their turn rather than racing. Acquisition polls a non-blocking
+    lock so we can bound the wait (``acquire_timeout``); on timeout we raise
+    ``TimeoutError`` rather than hang a batch overnight. If neither msvcrt nor
+    fcntl is available, or HIVE_CODEX_NO_LOCK is set, this is a no-op.
+    """
+    if os.environ.get("HIVE_CODEX_NO_LOCK") or (msvcrt is None and fcntl is None):
+        yield
+        return
+    if acquire_timeout is None:
+        acquire_timeout = _CODEX_LOCK_ACQUIRE_TIMEOUT
+    f = open(_CODEX_LOCK_PATH, "a+")
+    try:
+        deadline = time.monotonic() + acquire_timeout
+        waited = False
+        while True:
+            try:
+                if msvcrt is not None:
+                    f.seek(0)
+                    msvcrt.locking(f.fileno(), msvcrt.LK_NBLCK, 1)
+                else:
+                    fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break  # acquired
+            except OSError:
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(
+                        f"codex serialization lock not acquired within "
+                        f"{acquire_timeout:.0f}s ({_CODEX_LOCK_PATH}); another "
+                        f"codex worker is holding it longer than expected")
+                if not waited:
+                    logger.info("codex busy — waiting for the serialization lock "
+                                "(another codex worker is running)")
+                    waited = True
+                time.sleep(poll)
+        try:
+            yield
+        finally:
+            try:
+                if msvcrt is not None:
+                    f.seek(0)
+                    msvcrt.locking(f.fileno(), msvcrt.LK_UNLCK, 1)
+                else:
+                    fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+            except OSError:
+                pass
+    finally:
+        f.close()
+
+
 def _call_codex(model, prompt, cwd=None, timeout=300, *, sandbox="read-only",
                 codex_exe=None, **_ignored) -> WorkerResult:
     """Call the Codex CLI in non-interactive ``codex exec`` mode (tool-ON agentic).
@@ -269,16 +350,20 @@ def _call_codex(model, prompt, cwd=None, timeout=300, *, sandbox="read-only",
         cmd[2:2] = ["--model", model]  # insert after "exec" (before the "-" stdin marker)
     logger.debug("call_worker codex: model=%s cwd=%s sandbox=%s timeout=%d",
                  model, cwd, sandbox, timeout)
-    t0 = time.monotonic()
+    latency_s = 0.0
     try:
-        result = _run_capture(cmd, input=prompt, cwd=cwd, timeout=timeout)
+        # Cross-process serialization: only one codex subprocess runs at a time.
+        # t0 is set INSIDE the lock so latency reflects codex time, not queue wait.
+        with _codex_serial_lock():
+            t0 = time.monotonic()
+            result = _run_capture(cmd, input=prompt, cwd=cwd, timeout=timeout)
+            latency_s = time.monotonic() - t0
     except BaseException:  # timeout / interrupt: clean up the temp file, then propagate
         try:
             os.remove(out_path)
         except OSError:
             pass
         raise
-    latency_s = time.monotonic() - t0
     # Read the final agent message (the comb), then clean up the temp file.
     final = ""
     try:
