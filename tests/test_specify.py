@@ -865,7 +865,8 @@ class TestReviewJsonRetry(unittest.TestCase):
         with mock.patch.object(specify, "call_worker", side_effect=seq):
             specify.review_effectiveness("honey", self.SPEC, "/code", "m",
                                          "deepinfra", ledger=led)
-        self.assertEqual(led.record_call.call_count, 2)  # paid retry recorded
+        self.assertEqual(led.begin_call.call_count, 2)   # paid retry recorded
+        self.assertEqual(led.finish_call.call_count, 2)
 
 
 class TestDecisivenessGate(unittest.TestCase):

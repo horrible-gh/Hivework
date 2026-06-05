@@ -241,16 +241,20 @@ def _call_and_parse(provider: str, model: str, prompt: str, *, cwd: str,
     attempt_prompt = prompt
     attempts = 2 if retry_on_unparseable else 1
     for attempt in range(attempts):
+        call_id = ledger.begin_call("judge", axis_id, provider, model, attempt_prompt) \
+            if ledger is not None else None
         try:
             wr = call_worker(provider, model, attempt_prompt, cwd=cwd, timeout=timeout,
                              **(provider_kwargs or {}))
         except Exception as e:  # timeout, provider error, etc.
             logger.warning("judge: %s worker failed for %s: %s", stage, axis_id, e)
+            if ledger is not None:
+                ledger.finish_call(call_id, output="", latency_s=0.0, ok=False,
+                                   err=str(e)[:200])
             return None
 
         if ledger is not None:
-            ledger.record_call("judge", axis_id, provider, model,
-                               prompt=attempt_prompt, output=wr.stdout, latency_s=wr.latency_s,
+            ledger.finish_call(call_id, output=wr.stdout, latency_s=wr.latency_s,
                                ok=wr.exit_code == 0,
                                err=wr.stderr[:200] if wr.exit_code != 0 else "",
                                real_tokens=wr.real_tokens)

@@ -1791,16 +1791,20 @@ def review_effectiveness(
                 len(edits))
     attempt_prompt = base_prompt
     for attempt in range(2):
+        call_id = ledger.begin_call("specify", "specify_review", provider, model,
+                                    attempt_prompt) if ledger is not None else None
         try:
             wr = call_worker(provider, model, attempt_prompt, cwd=codebase_root,
                              timeout=600, **(provider_kwargs or {}))
         except Exception as e:  # subprocess timeout, provider error, etc.
             logger.warning("specify: effectiveness review worker failed: %s", e)
+            if ledger is not None:
+                ledger.finish_call(call_id, output="", latency_s=0.0, ok=False,
+                                   err=str(e)[:200])
             return {}, True
 
         if ledger is not None:
-            ledger.record_call("specify", "specify_review", provider, model,
-                               prompt=attempt_prompt, output=wr.stdout,
+            ledger.finish_call(call_id, output=wr.stdout,
                                latency_s=wr.latency_s, ok=wr.exit_code == 0,
                                err=wr.stderr[:200] if wr.exit_code != 0 else "",
                                real_tokens=wr.real_tokens)
@@ -2403,19 +2407,23 @@ def run_specify(
     wr = None
     last_exc: Exception | None = None
     for attempt in range(author_retries + 1):
+        call_id = ledger.begin_call("specify", "specify", provider, model, prompt) \
+            if ledger is not None else None
         try:
             wr = call_worker(provider, model, prompt, cwd=codebase_root,
                              timeout=author_timeout, **(provider_kwargs or {}))
         except Exception as e:  # subprocess timeout, provider error, etc.
             last_exc = e
+            if ledger is not None:
+                ledger.finish_call(call_id, output="", latency_s=0.0, ok=False,
+                                   err=str(e)[:200])
             if attempt < author_retries:
                 logger.warning("specify: author call failed (%s) — retrying "
                                "(attempt %d/%d)", e, attempt + 2, author_retries + 1)
                 continue
             raise
         if ledger is not None:
-            ledger.record_call("specify", "specify", provider, model,
-                               prompt=prompt, output=wr.stdout, latency_s=wr.latency_s,
+            ledger.finish_call(call_id, output=wr.stdout, latency_s=wr.latency_s,
                                ok=wr.exit_code == 0,
                                err=wr.stderr[:200] if wr.exit_code != 0 else "",
                                real_tokens=wr.real_tokens)

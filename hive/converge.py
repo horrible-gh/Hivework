@@ -805,16 +805,20 @@ def _converge_once(seed_text: str, located: list[dict[str, Any]],
     attempt_prompt = prompt
     parsed: dict[str, Any] | None = None
     for attempt in range(2):
+        call_id = ledger.begin_call("converge", "converge", provider, model,
+                                    attempt_prompt) if ledger is not None else None
         try:
             wr = call_worker(provider, model, attempt_prompt, cwd=None,
                              timeout=timeout, **pk)
         except Exception as e:  # timeout / provider error — not retried
             logger.warning("converge: worker failed: %s", e)
+            if ledger is not None:
+                ledger.finish_call(call_id, output="", latency_s=0.0, ok=False,
+                                   err=str(e)[:200])
             return ConvergeResult(summary=f"converge worker failed: {e}")
 
         if ledger is not None:
-            ledger.record_call("converge", "converge", provider, model,
-                               prompt=attempt_prompt, output=wr.stdout,
+            ledger.finish_call(call_id, output=wr.stdout,
                                latency_s=wr.latency_s, ok=wr.exit_code == 0,
                                err=wr.stderr[:200] if wr.exit_code != 0 else "",
                                real_tokens=wr.real_tokens)

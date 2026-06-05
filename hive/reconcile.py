@@ -160,14 +160,15 @@ def run_reconcile_loop(
         comb_path = os.path.join(combs_dir, f"comb_{reconcile_id}.txt")
         err_path = os.path.join(combs_dir, f"err_{reconcile_id}.txt")
 
+        call_id = ledger.begin_call("queen", reconcile_id, provider, model,
+                                    prompt, comb_path) if ledger is not None else None
         try:
             result = call_worker(provider, model, prompt, cwd=codebase_root, timeout=600,
                                  **(provider_kwargs or {}))
 
             if ledger is not None:
-                ledger.record_call("queen", reconcile_id, provider, model,
-                                   prompt=prompt, output=result.stdout, latency_s=result.latency_s,
-                                   comb_path=comb_path, ok=result.exit_code == 0,
+                ledger.finish_call(call_id, output=result.stdout, latency_s=result.latency_s,
+                                   ok=result.exit_code == 0,
                                    err=result.stderr[:200] if result.exit_code != 0 else "",
                                    real_tokens=result.real_tokens)
 
@@ -186,6 +187,11 @@ def run_reconcile_loop(
 
         except (subprocess.TimeoutExpired, ValueError) as e:
             logger.error("  [reconcile] Round %d failed: %s", round_num, e)
+            # Only a worker timeout leaves the row unfinished; a ValueError is an
+            # unparseable-but-completed call already finished ok above.
+            if ledger is not None and isinstance(e, subprocess.TimeoutExpired):
+                ledger.finish_call(call_id, output="", latency_s=0.0, ok=False,
+                                   err=str(e)[:200])
             break
 
         # Re-scan for remaining conflicts (reconcile combs are resolutions, not new

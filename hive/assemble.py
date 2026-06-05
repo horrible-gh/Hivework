@@ -206,12 +206,19 @@ def run_assemble(
     logger.info("Running assemble worker...")
     logger.debug("Prompt length: %d chars", len(prompt))
 
-    wr = call_worker(provider, model, prompt, cwd=codebase_root, timeout=600,
-                     **(provider_kwargs or {}))
+    call_id = ledger.begin_call("assemble", "assemble", provider, model, prompt) \
+        if ledger is not None else None
+    try:
+        wr = call_worker(provider, model, prompt, cwd=codebase_root, timeout=600,
+                         **(provider_kwargs or {}))
+    except Exception as e:  # timeout / provider error — record the failed row, then re-raise
+        if ledger is not None:
+            ledger.finish_call(call_id, output="", latency_s=0.0, ok=False,
+                               err=str(e)[:200])
+        raise
     raw_output = wr.stdout
     if ledger is not None:
-        ledger.record_call("assemble", "assemble", provider, model,
-                           prompt=prompt, output=wr.stdout, latency_s=wr.latency_s,
+        ledger.finish_call(call_id, output=wr.stdout, latency_s=wr.latency_s,
                            ok=wr.exit_code == 0,
                            err=wr.stderr[:200] if wr.exit_code != 0 else "",
                            real_tokens=wr.real_tokens)

@@ -334,11 +334,18 @@ def run_propose(
         # the latency) on a thousand-file change set. (Ignored by tool-less providers.)
         call_kwargs["available_tools"] = []
 
-    wr = call_worker(provider, model, prompt, cwd=repo_root, timeout=600,
-                     **call_kwargs)
+    call_id = ledger.begin_call("commit", "commit-plan", provider, model, prompt) \
+        if ledger is not None else None
+    try:
+        wr = call_worker(provider, model, prompt, cwd=repo_root, timeout=600,
+                         **call_kwargs)
+    except Exception as e:  # timeout / provider error — record the failed row, then re-raise
+        if ledger is not None:
+            ledger.finish_call(call_id, output="", latency_s=0.0, ok=False,
+                               err=str(e)[:200])
+        raise
     if ledger is not None:
-        ledger.record_call("commit", "commit-plan", provider, model,
-                           prompt=prompt, output=wr.stdout, latency_s=wr.latency_s,
+        ledger.finish_call(call_id, output=wr.stdout, latency_s=wr.latency_s,
                            ok=wr.exit_code == 0,
                            err=wr.stderr[:200] if wr.exit_code != 0 else "",
                            real_tokens=wr.real_tokens)

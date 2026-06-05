@@ -234,7 +234,8 @@ class TestUnparseableRetry(unittest.TestCase):
             J.run_judge(plan_bundle=PLAN_BUNDLE, symptom="s", axis_globs=["g"],
                         code_root="/x", provider="deepinfra", model="m",
                         judge_cfg=JudgeConfig(max_calls_per_axis=1), ledger=led)
-        self.assertEqual(led.record_call.call_count, 2)  # paid retry is recorded
+        self.assertEqual(led.begin_call.call_count, 2)   # paid retry is recorded
+        self.assertEqual(led.finish_call.call_count, 2)
 
     def test_worker_exception_is_not_retried(self):
         with mock.patch.object(J, "call_worker", side_effect=RuntimeError("boom")) as cw, \
@@ -401,9 +402,10 @@ class TestLedgerRecording(unittest.TestCase):
             J.run_judge(plan_bundle=PLAN_BUNDLE, symptom="s", axis_globs=["g"],
                         code_root="/x", provider="copilot", model="gpt-5-mini",
                         judge_cfg=JudgeConfig(), ledger=led)
-        self.assertEqual(led.record_call.call_count, 2)
+        self.assertEqual(led.begin_call.call_count, 2)
+        self.assertEqual(led.finish_call.call_count, 2)
         # stage positional arg is 'judge'
-        self.assertEqual(led.record_call.call_args_list[0].args[0], "judge")
+        self.assertEqual(led.begin_call.call_args_list[0].args[0], "judge")
 
 
 class TestSummarizeBundle(unittest.TestCase):

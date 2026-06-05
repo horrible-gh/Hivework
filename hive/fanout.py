@@ -146,10 +146,19 @@ def run_fanout(
         comb_path = os.path.join(combs_dir, f"comb_{axis_id}.txt")
         err_path = os.path.join(combs_dir, f"err_{axis_id}.txt")
 
+        # Begin the ledger row BEFORE the (up to 600s) call so the in-flight worker
+        # is visible and a timeout still leaves a 'failed' row. begin/finish_call are
+        # lock-guarded, so the parallel pool can record safely.
+        call_id = ledger.begin_call("swarm", axis_id, provider, model, prompt, comb_path) \
+            if ledger is not None else None
         try:
             result = call_worker(provider, model, prompt, cwd=codebase_root, timeout=600,
                                  **(provider_kwargs or {}))
             err_msg = result.stderr[:200] if result.exit_code != 0 else ""
+            if ledger is not None:
+                ledger.finish_call(call_id, output=result.stdout, latency_s=result.latency_s,
+                                   ok=result.exit_code == 0, err=err_msg,
+                                   real_tokens=result.real_tokens)
 
             # G8-race guard: combs_dir is created once before the pool launches, but
             # call_worker above can run for minutes. If anything external removes the
@@ -169,6 +178,9 @@ def run_fanout(
         except subprocess.TimeoutExpired:
             logger.error("  [fan-out] Axis %s TIMED OUT", axis_id)
             timeout_msg = f"TIMEOUT: worker for axis {axis_id} exceeded 600s limit"
+            if ledger is not None:
+                ledger.finish_call(call_id, output="", latency_s=600.0, ok=False,
+                                   err="TIMEOUT")
             os.makedirs(combs_dir, exist_ok=True)  # same G8-race guard (600s window)
             with open(comb_path, 'w', encoding='utf-8') as f:
                 f.write(timeout_msg)
@@ -180,21 +192,14 @@ def run_fanout(
     logger.info("Fan-out: launching %d workers (max_parallel=%d)",
                 len(axes), max_workers)
 
-    results: list[tuple[str, str, str, str, float, bool, str]] = []
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
         futures = {pool.submit(_run_one_axis, axis): axis for axis in axes}
         for future in as_completed(futures):
-            result = future.result()
-            results.append(result)
-            axis_id, comb_path, *_ = result
+            axis_id, comb_path, *_ = future.result()
             comb_files[axis_id] = comb_path
 
-    if ledger is not None:
-        for axis_id, comb_path, prompt, output, latency_s, ok, err_msg in results:
-            ledger.record_call("swarm", axis_id, provider, model,
-                               prompt=prompt, output=output, latency_s=latency_s,
-                               comb_path=comb_path, ok=ok, err=err_msg)
-
+    # Each swarm call is recorded inside _run_one_axis (begin before the call,
+    # finish on success/timeout) so in-flight workers are visible live.
     logger.info("Fan-out complete: %d combs saved", len(comb_files))
     return comb_files
 
@@ -296,14 +301,18 @@ def reinforce_thin_axis(task: dict[str, Any], sp, seed_text: str, code_root: str
                 axis_id, granted, role.provider, role.model)
 
     def _one(i: int) -> str:
+        call_id = ledger.begin_call("scout", f"{axis_id}#reinforce{i}", role.provider,
+                                    role.model, prompt) if ledger is not None else None
         try:
             wr = call_worker(role.provider, role.model, prompt, cwd=code_root,
                              timeout=600, **pk)
-        except subprocess.SubprocessError:
+        except subprocess.SubprocessError as e:
+            if ledger is not None:
+                ledger.finish_call(call_id, output="", latency_s=0.0, ok=False,
+                                   err=str(e)[:200])
             return ""
         if ledger is not None:
-            ledger.record_call("scout", f"{axis_id}#reinforce{i}", role.provider,
-                               role.model, prompt=prompt, output=wr.stdout,
+            ledger.finish_call(call_id, output=wr.stdout,
                                latency_s=wr.latency_s, ok=wr.exit_code == 0,
                                err=wr.stderr[:200] if wr.exit_code != 0 else "",
                                real_tokens=wr.real_tokens)
