@@ -2068,7 +2068,8 @@ def _apply_decisiveness_gate(spec: dict[str, Any]) -> dict[str, Any]:
     return spec
 
 
-def _apply_deferred_substance_gate(spec: dict[str, Any]) -> dict[str, Any]:
+def _apply_deferred_substance_gate(spec: dict[str, Any],
+                                   honey_text: str = "") -> dict[str, Any]:
     """Downgrade a ready_to_apply spec that punted a SUBSTANTIVE fix to deferred[].
 
     A deferred item whose reason says the real fix is bigger than what was authored —
@@ -2079,6 +2080,19 @@ def _apply_deferred_substance_gate(spec: dict[str, Any]) -> dict[str, Any]:
     the back-end cause that actually clears the symptom sat in deferred. When such a
     deferral rides alongside a ready_to_apply spec we cannot vouch that the fix works, so
     we downgrade to needs_reinvestigation and let the loop re-work the FULL fix.
+
+    Converge-certified escape (N182): the blanket downgrade above assumes the punted
+    direction MIGHT be the real cause. But when converge already CERTIFIED a single causal
+    locus — its cause→symptom check ruled ``consistent`` and survived every converge-side
+    guard (N170/N180/M017), which is exactly when the honey renders the "Primary edit
+    target" block — and an authored edit lands ON that certified locus, then the certified
+    locus IS the verified cause and the substantive deferred is a genuinely secondary peer,
+    not the punted root cause this gate guards against. In that case we ship the certified
+    edit(s) ready and leave the peer surfaced in deferred[] (the operator no longer needs a
+    manual --partial for the common case). Fail-closed and narrow: only for a SINGLE-locus
+    convergence (multi-locus keeps its own stricter coverage gate), only when converge's
+    attribution is grounded, and only when an edit actually covers it — absent any of these
+    the gate fires exactly as before, so the N176 protection is untouched.
 
     Scope/limits (the deliberate side-effect): ``policy_direction`` (a genuine side note)
     is exempt; ``anchor_not_grounded`` has its own earlier gate. A spec that legitimately
@@ -2098,6 +2112,31 @@ def _apply_deferred_substance_gate(spec: dict[str, Any]) -> dict[str, Any]:
             punted.append(str(d.get("issue", "") or d.get("reason", ""))[:160])
     if not punted:
         return spec
+
+    # Converge-certified escape: single-locus convergence + an edit on the certified locus.
+    if not _converge_target_loci(honey_text):  # single-locus only (multi has its own gate)
+        certified = _converge_certified_locus(honey_text)
+        if certified:
+            edits = [e for e in (spec.get("edits") or []) if isinstance(e, dict)]
+            cb = os.path.basename(certified)
+            covered = any(
+                (f := str(e.get("file", "")).replace("\\", "/").lstrip("/"))
+                and (f == certified or f.endswith("/" + certified)
+                     or certified.endswith("/" + f) or os.path.basename(f) == cb)
+                for e in edits)
+            if covered:
+                spec["deferred_substance_escape"] = {
+                    "certified_locus": certified, "punted": punted}
+                msg = ("deferred-substance gate: converge CERTIFIED single locus "
+                       f"{certified} and an authored edit covers it — shipping the "
+                       "certified fix ready; substantive deferred peer(s) remain surfaced "
+                       "in deferred[] (" + "; ".join(punted) + ")")
+                spec["notes"] = ((spec.get("notes", "") or "") + ("\n" if spec.get(
+                    "notes") else "") + msg).strip()
+                logger.info("specify: deferred-substance gate ESCAPE — converge-certified "
+                            "locus %s covered by an edit; ready_to_apply preserved "
+                            "(deferred peer(s): %s)", certified, "; ".join(punted))
+                return spec
 
     note = ("deferred-substance gate: ready_to_apply downgraded — a substantive fix was "
             "punted to deferred[] (" + "; ".join(punted) + "); the authored edits address "
@@ -2221,6 +2260,46 @@ def _converge_target_loci(honey_text: str) -> list[str]:
                 if m:
                     files.append(m.group(1).replace("\\", "/").lstrip("/"))
     return files
+
+
+# Header the honey renders for converge's single attributed defect. It is emitted ONLY in
+# the converged+attributed branch (hive.investigate._render_converge_section), which is
+# reached AFTER converge's own causal guards (N170 cause→symptom, N180 dropped-peer,
+# M017 data-stamp) have all passed — a contradicted/undecidable/dropped-peer convergence
+# renders a DIFFERENT (re-examine) section and never this one. So the presence of this
+# block in the honey IS converge's certification that this locus is the verified cause.
+_CONVERGE_PRIMARY_HEADER = "### Primary edit target"
+
+
+def _converge_certified_locus(honey_text: str) -> str | None:
+    """Return the file converge CERTIFIED as the single attributed defect, or None.
+
+    Reads the honey's "### Primary edit target — attributed defect" block and returns the
+    repo-relative file from its ``- location: <file>:<lines>`` line. Returns None when:
+      * the block is absent (no converged+consistent attribution), or
+      * converge flagged the attributed file ungrounded (⚠ not in evidence) — a self-
+        warned attribution is not a solid certification, so we do NOT relax on it.
+    This is the SAME structured signal the converge-coverage gate trusts (converge's own
+    declaration, NOT a natural-language parse of the seed — the N177 rabbit hole).
+    """
+    in_block = False
+    for line in honey_text.splitlines():
+        if line.startswith(_CONVERGE_PRIMARY_HEADER):
+            in_block = True
+            continue
+        if in_block:
+            s = line.strip()
+            if s.startswith("## ") or s.startswith("### "):
+                break  # left the block without a location line
+            if s.startswith("- location:"):
+                if "⚠" in s:  # ⚠ ungrounded — converge itself is unsure
+                    return None
+                tok = s[len("- location:"):].strip().strip("`")
+                m = re.match(r"([A-Za-z0-9_][A-Za-z0-9_./\\-]*\.[A-Za-z0-9]+)", tok)
+                if m:
+                    return m.group(1).replace("\\", "/").lstrip("/")
+                return None
+    return None
 
 
 def _apply_converge_coverage_gate(spec: dict[str, Any], honey_text: str) -> dict[str, Any]:
@@ -2477,7 +2556,7 @@ def run_specify(
     # surface — downgrade so the loop re-works the deferred root cause instead of vouching
     # for the partial fix. Runs after decisiveness (which no longer promotes when such a
     # deferral is present) so it also guards an author-emitted ready.
-    spec = _apply_deferred_substance_gate(spec)
+    spec = _apply_deferred_substance_gate(spec, honey_text)
 
     # Seed-coverage gate: a file the user named as an explicit edit target must become an
     # edit, or a ready_to_apply spec is downgraded with the dropped target(s) reported

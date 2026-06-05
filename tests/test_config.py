@@ -367,9 +367,12 @@ class TestShippedDefaultProfile(unittest.TestCase):
     def setUp(self):
         self.cfg = load_config()  # profile None -> config/hive.config.default.json
 
-    def test_queen_is_codex(self):
-        self.assertEqual(self.cfg.queen.provider, "codex")
-        self.assertEqual(self.cfg.queen.model, "gpt-5.4-mini")
+    def test_queen_is_copilot(self):
+        # decompose queen was swapped codex/gpt-5.4-mini -> copilot/gpt-5-mini as part of
+        # the cross-process codex serialization fix (a batch of parallel codex calls starved
+        # one another; moving decompose off codex removed the contention). Validated live.
+        self.assertEqual(self.cfg.queen.provider, "copilot")
+        self.assertEqual(self.cfg.queen.model, "gpt-5-mini")
 
     def test_judge_routed_to_openai_with_tuned_caps(self):
         self.assertEqual(self.cfg.role("judge").provider, "openai")

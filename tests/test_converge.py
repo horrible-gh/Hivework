@@ -1371,6 +1371,88 @@ class TestConvergeLiveCodeGrounding(unittest.TestCase):
         self.assertNotIn("Confirmed code", prompts[0])
 
 
+class TestConvergeHttpBridge(unittest.TestCase):
+    """N183: the FE response-mapping and the BE getter that serves it are localised in
+    different axes, but the edge between them is an HTTP request (no call-chain hop), so
+    the holistic stitch reports a missing_link. The bridge resolves the FE fetch-URL to
+    its BE route deterministically and hands converge that edge as FACT."""
+
+    def _write(self, td, rel, text):
+        path = os.path.join(td, *rel.split("/"))
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(text)
+
+    def _scaffold(self, td):
+        self._write(td, "client/src/NewRequirementModal.vue",
+                    "<script>\nconst load = async () => {\n"
+                    "  const resp = await getRequest('/api/v1/projects')\n"
+                    "  projects.value = resp.projects\n}\n</script>\n")
+        self._write(td, "server/routes.py",
+                    "router = APIRouter(prefix=\"/api/v1\")\n\n\n"
+                    "@router.get('/projects')\n"
+                    "def get_projects_with_modules():\n"
+                    "    return {'projects': query_projects()}\n")
+
+    def test_bridge_resolves_fe_url_to_be_route(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            self._scaffold(td)
+            located = [
+                _verdict("FE", True, "client/src/NewRequirementModal.vue", "3-4",
+                         "maps resp.projects"),
+                _verdict("BE", True, "server/routes.py", "5-6", "getter"),
+            ]
+            block = C._http_binding_bridges(located, [], td)
+            self.assertIn("/api/v1/projects", block)
+            self.assertIn("server/routes.py", block)
+            self.assertIn("FE client", block)
+
+    def test_bridge_empty_without_code_root(self):
+        self.assertEqual(C._http_binding_bridges([], [], None), "")
+
+    def test_bridge_empty_when_no_fetch_url(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            self._write(td, "a.py", "def f():\n    return 1\n")
+            located = [_verdict("X", True, "a.py", "1-2", "r")]
+            self.assertEqual(C._http_binding_bridges(located, [], td), "")
+
+    def test_run_converge_injects_http_edge_block(self):
+        import tempfile
+        prompts = []
+
+        def fake(provider, model, prompt, cwd=None, timeout=300, **kw):
+            prompts.append(prompt)
+            return _wr(CONVERGED_OUT)
+
+        with tempfile.TemporaryDirectory() as td:
+            self._scaffold(td)
+            verdicts = [
+                _verdict("FE", True, "client/src/NewRequirementModal.vue", "3-4",
+                         "maps resp.projects"),
+                _verdict("BE", True, "server/routes.py", "5-6", "getter"),
+            ]
+            with mock.patch.object(C, "call_worker", side_effect=fake):
+                C.run_converge(seed_text="selector empty", verdicts=verdicts,
+                               bundles=[], provider="deepinfra", model="m", code_root=td)
+        self.assertIn("HTTP request edges", prompts[0])
+        self.assertIn("/api/v1/projects", prompts[0])
+        self.assertIn("Do NOT emit a missing_link", prompts[0])
+
+    def test_no_http_edge_block_without_binding(self):
+        prompts = []
+
+        def fake(provider, model, prompt, cwd=None, timeout=300, **kw):
+            prompts.append(prompt)
+            return _wr(CONVERGED_OUT)
+
+        with mock.patch.object(C, "call_worker", side_effect=fake):
+            C.run_converge(seed_text="trace", verdicts=LOCATED_VERDICTS,
+                           bundles=BUNDLES, provider="deepinfra", model="m")
+        self.assertNotIn("HTTP request edges", prompts[0])
+
+
 # ── N179: seed-negation grounding + multiple independent defects ───────────────
 # A genuine multi-locus convergence: the primary defect PLUS two SEPARATE ones in
 # different code (the highlight mapping, the step-state computation, the status badge).

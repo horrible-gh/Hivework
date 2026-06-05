@@ -270,13 +270,87 @@ def _lift_live_code(located: list[dict[str, Any]], code_root: str | None) -> str
     return "\n".join(parts)
 
 
+# ── FE→BE HTTP-edge grounding (N183) ────────────────────────────────────────────
+# The per-axis judges localise the two ends of an HTTP round-trip in DIFFERENT axes —
+# a front-end response-mapping (``NewRequirementModal.vue`` maps ``resp.projects``) and
+# the back-end getter that serves it (``process_service.get_projects_with_modules``) —
+# but the edge BETWEEN them is an HTTP request, NOT a function call, so it appears in no
+# call-chain. With no call edge to follow, the holistic stitch reports a ``missing_link``
+# (FE mapping ↔ BE getter) and returns 0 edits — exactly the N183 dead-end. The fix is the
+# same family as the retriever's binding resolver: deterministically match the FE fetch-URL
+# literal to the BE route whose path it hits, and HAND converge that resolved edge as FACT
+# so it can stitch across the boundary instead of declaring the link missing. Pure literal
+# harvest (only real URLs / routes from real source), fail-open (no match → nothing added,
+# converge behaves exactly as before), zero model cost — never SYNTHESISES a join.
+_HTTP_BRIDGE_MAX = 8           # max resolved edges rendered into the prompt
+_HTTP_BRIDGE_MAX_FILES = 16    # max in-scope files read for URL literals
+
+
+def _http_binding_bridges(located: list[dict[str, Any]],
+                          windows: list[dict[str, Any]],
+                          code_root: str | None) -> str:
+    """Resolve FE fetch-URL literals to their BE route handlers across the pooled
+    fragments → rendered ``FE client ↔ BE route`` edge lines (or "" when none/no root).
+
+    Reuses the retriever's deterministic binding machinery on the union of the evidence
+    windows + the located fragments' in-scope files. Never raises; a resolver/import
+    failure degrades silently to "" (the snippet-only path, exactly as before).
+    """
+    if not code_root:
+        return ""
+    try:
+        from hive.retriever import _read_text, _resolve_http_bindings
+    except Exception:  # pragma: no cover - import guard
+        return ""
+    # Distinct in-scope files (located loci + evidence windows). Read each file's FULL
+    # text once so a fetch-URL literal is seen regardless of which window happened to
+    # capture it — the keyword windows routinely fall in the GAP around the fetch line
+    # (N183), and a located fragment that DOES cover it carries no text on a verdict stub.
+    files: list[str] = []
+    for v in located or []:
+        rel = ((v.get("verdict") or {}).get("file") or "").replace("\\", "/")
+        if rel and rel not in files:
+            files.append(rel)
+    for w in windows or []:
+        rel = (w.get("file") or "").replace("\\", "/")
+        if rel and rel not in files:
+            files.append(rel)
+    if not files:
+        return ""
+    pool: list[dict[str, Any]] = []
+    for rel in files[:_HTTP_BRIDGE_MAX_FILES]:
+        text = _read_text(code_root, rel)
+        if text:
+            pool.append({"file": rel, "lines": "", "text": text})
+    if not pool:
+        return ""
+    try:
+        bindings = _resolve_http_bindings(pool, code_root)
+    except Exception as e:  # pragma: no cover - defensive; grounding never blocks
+        logger.warning("converge: http-binding bridge failed: %s", e)
+        return ""
+    if not bindings:
+        return ""
+    lines: list[str] = []
+    for b in bindings[:_HTTP_BRIDGE_MAX]:
+        callees = ", ".join(b.get("callees", []))
+        amb = " (AMBIGUOUS — several handlers serve this path; treat each as a candidate)" \
+            if b.get("ambiguous") else ""
+        lines.append(
+            f"- FE client `{b['url']}`"
+            + (f" (callees: {callees})" if callees else "")
+            + f" → BE {b['verb'].upper()} {b['full_path']} at {b['file']}:{b['lines']}{amb}")
+    return "\n".join(lines)
+
+
 def build_converge_prompt(seed_text: str, located: list[dict[str, Any]],
                           unlocated: list[dict[str, Any]],
                           windows: list[dict[str, Any]],
                           data_state_block: str = "",
                           db_available: bool = False,
                           db_schema: str = "",
-                          code_state_block: str = "") -> str:
+                          code_state_block: str = "",
+                          http_binding_block: str = "") -> str:
     """Build the single converge prompt: fragments + evidence → one path + one node.
 
     ``data_state_block`` is the optional ``[Confirmed data state]`` section: on the
@@ -392,6 +466,23 @@ def build_converge_prompt(seed_text: str, located: list[dict[str, Any]],
             "COMPACTED or partial; where they differ from this block, THIS block wins.]\n"
             + code_state_block.strip() + "\n")
 
+    # FE→BE HTTP edges resolved deterministically from the source (N183): the request
+    # boundary that no call-chain hop spans. Handing converge these as FACT lets it stitch
+    # an FE response-mapping to the BE getter that serves it instead of reporting the pair
+    # as a missing_link. Authoritative: a pair bridged here is NOT a missing link.
+    http_bindings = ""
+    if http_binding_block.strip():
+        http_bindings = (
+            "\n[HTTP request edges — REAL FE→BE bindings resolved from the source (a FE "
+            "fetch-URL literal matched to the BE route that serves that path). These are "
+            "FACT, not inference: each line is an EDGE on the executed path that crosses the "
+            "client→server boundary via an HTTP request (which appears in NO call-chain hop, "
+            "so you would otherwise miss it). USE them to ORDER fragments across the FE/BE "
+            "boundary: a front-end mapping and the back-end getter joined by an edge here are "
+            "ON THE SAME PATH. Do NOT emit a missing_link for a FE↔BE pair already bridged "
+            "below — the link is established; stitch it.]\n"
+            + http_binding_block.strip() + "\n")
+
     schema_block = ""
     if db_available and db_schema.strip():
         schema_block = (
@@ -435,7 +526,7 @@ the seed backwards — flip your reasoning before emitting.
 
 [Reported scenario / seed]
 {_trunc(seed_text, 2000)}
-{confirmed_block}{db_avail_block}{schema_block}{code_state}
+{confirmed_block}{db_avail_block}{schema_block}{code_state}{http_bindings}
 [Located fragments — each is ONE node candidate, from a different axis]
 {frags}
 {unloc_block}
@@ -789,7 +880,8 @@ def _converge_once(seed_text: str, located: list[dict[str, Any]],
                    known: set[str], provider: str, model: str, pk: dict[str, Any],
                    ledger, timeout: int, data_state_block: str = "",
                    db_available: bool = False, db_schema: str = "",
-                   code_state_block: str = "") -> ConvergeResult:
+                   code_state_block: str = "",
+                   http_binding_block: str = "") -> ConvergeResult:
     """One logical converge call (with a transport-level JSON-only reparse). Never raises.
 
     The reparse retry handles a model that wrapped the JSON in prose — it is a
@@ -801,7 +893,7 @@ def _converge_once(seed_text: str, located: list[dict[str, Any]],
     """
     prompt = build_converge_prompt(seed_text, located, unlocated, windows,
                                    data_state_block, db_available, db_schema,
-                                   code_state_block)
+                                   code_state_block, http_binding_block)
     attempt_prompt = prompt
     parsed: dict[str, Any] | None = None
     for attempt in range(2):
@@ -1578,6 +1670,14 @@ def run_converge(*, seed_text: str, verdicts: list[dict[str, Any]],
         logger.info("converge: live-code grounding lifted %d located locus block(s)",
                     code_state_block.count("--- "))
 
+    # FE→BE HTTP-edge grounding (N183): resolve fetch-URL literals to the BE routes they
+    # hit so converge can stitch a FE mapping to its BE getter across the request boundary
+    # instead of reporting a missing_link. Free, deterministic, fail-open (empty → no-op).
+    http_binding_block = _http_binding_bridges(located, windows, code_root)
+    if http_binding_block:
+        logger.info("converge: HTTP-edge grounding resolved %d FE→BE binding(s)",
+                    http_binding_block.count("- FE client"))
+
     # Tool-OFF single-shot (mirrors judge): no file/shell access, decide on the bundle.
     pk = dict(provider_kwargs or {})
     pk.setdefault("available_tools", [])
@@ -1611,7 +1711,8 @@ def run_converge(*, seed_text: str, verdicts: list[dict[str, Any]],
         res = _converge_once(seed_text, located, unlocated, windows, known,
                              provider, model, pk, ledger, timeout,
                              db_available=db_available, db_schema=db_schema,
-                             code_state_block=code_state_block)
+                             code_state_block=code_state_block,
+                             http_binding_block=http_binding_block)
     logger.info("converge: %s", res.summary)
 
     # ── Data-state read (N172/N173): the verdict hinges on a STORED row value static
@@ -1661,7 +1762,8 @@ def run_converge(*, seed_text: str, verdicts: list[dict[str, Any]],
         res2 = _converge_once(seed_text, located, unlocated, windows, known,
                               provider, model, pk, ledger, timeout,
                               data_state_block=combined, db_available=db_available,
-                              db_schema=db_schema, code_state_block=code_state_block)
+                              db_schema=db_schema, code_state_block=code_state_block,
+                              http_binding_block=http_binding_block)
         logger.info("converge: data re-pass %d → %s", rounds, res2.summary)
         v2 = (res2.causal_check or {}).get("verdict")
         if v2 in ("consistent", "contradicted") and backed:
@@ -1722,12 +1824,16 @@ def run_converge(*, seed_text: str, verdicts: list[dict[str, Any]],
                 merged = _dedup_windows(extra + windows)
                 known2 = known | {_norm(w.get("file", "")) for w in extra if w.get("file")}
                 # Re-lift live code at the merged loci (the follow-up may add new files).
+                # Recompute the FE→BE bridge over the MERGED windows: the follow-up may
+                # have just fetched the BE route file that completes the missing link.
                 res2 = _converge_once(seed_text, located, unlocated, merged, known2,
                                       provider, model, pk, ledger, timeout,
                                       data_state_block=data_block,
                                       db_available=db_available, db_schema=db_schema,
                                       code_state_block=_lift_live_code(located, code_root)
-                                      or code_state_block)
+                                      or code_state_block,
+                                      http_binding_block=_http_binding_bridges(
+                                          located, merged, code_root) or http_binding_block)
                 logger.info("converge: re-pass → %s", res2.summary)
                 # Adopt the re-pass only if it actually converged; otherwise keep the
                 # first result, which at least named the missing link for the author.

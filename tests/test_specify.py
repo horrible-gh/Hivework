@@ -1007,6 +1007,56 @@ class TestDeferredSubstanceGate(unittest.TestCase):
         spec = specify._apply_deferred_substance_gate(self._ready([]))
         self.assertEqual(spec["termination"], "ready_to_apply")
 
+    # ── Converge-certified escape (N182) ───────────────────────────────────────
+    def _honey(self, locus="Modal.vue:31-53", ungrounded=False, multi=False):
+        flag = " (⚠ attributed file not in evidence — re-confirm it exists)" \
+            if ungrounded else ""
+        lines = [
+            "## Converged call path (the single executed path — START HERE)",
+            "",
+            "### Primary edit target — attributed defect",
+            f"- location: {locus}{flag}",
+            "- node: render",
+            "",
+        ]
+        if multi:  # a multi-locus declaration the coverage gate owns instead
+            lines += [specify.CONVERGE_TARGET_SECTION + " (author or defer EACH)", "",
+                      "- Modal.vue:31-53", "- other_service.py:80-90", ""]
+        return "\n".join(lines)
+
+    def test_converge_certified_locus_escape_keeps_ready(self):
+        # converge certified the single locus the edit lands on → substantive deferred
+        # peer is secondary, ship the certified fix ready.
+        spec = specify._apply_deferred_substance_gate(
+            self._ready([{"issue": "backend query rewrite",
+                          "reason": "multi_file_design"}]),
+            self._honey())
+        self.assertEqual(spec["termination"], "ready_to_apply")
+        self.assertNotIn("reinvestigation", spec)
+        self.assertEqual(spec["deferred_substance_escape"]["certified_locus"], "Modal.vue")
+
+    def test_escape_requires_edit_on_certified_locus(self):
+        # converge certified a DIFFERENT file than the edit touches → no escape, downgrade.
+        spec = specify._apply_deferred_substance_gate(
+            self._ready([{"issue": "x", "reason": "multi_file_design"}]),
+            self._honey(locus="other_service.py:80-90"))
+        self.assertEqual(spec["termination"], "needs_reinvestigation")
+        self.assertNotIn("deferred_substance_escape", spec)
+
+    def test_escape_blocked_when_attribution_ungrounded(self):
+        # converge warned the attributed file may not exist → not a solid certification.
+        spec = specify._apply_deferred_substance_gate(
+            self._ready([{"issue": "x", "reason": "multi_file_design"}]),
+            self._honey(ungrounded=True))
+        self.assertEqual(spec["termination"], "needs_reinvestigation")
+
+    def test_escape_not_applied_in_multilocus(self):
+        # multi-locus convergence keeps its own stricter coverage gate — no escape here.
+        spec = specify._apply_deferred_substance_gate(
+            self._ready([{"issue": "x", "reason": "multi_file_design"}]),
+            self._honey(multi=True))
+        self.assertEqual(spec["termination"], "needs_reinvestigation")
+
 
 class TestGroundAnchors(unittest.TestCase):
     """Anchor-grounding pre-flight: lift CURRENT live values at cited file:line
