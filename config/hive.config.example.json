@@ -41,6 +41,8 @@
   },
   "providers": {
     "copilot": { "exe": null, "allow": "--allow-all", "timeout_sec": 300 },
+    "codex":   { "exe": null, "lock_timeout_sec": 1800,
+                 "_comment": "Codex CLI. lock_timeout_sec (seconds) = cross-process serialization mutex wait bound (how long a queued codex call waits before TimeoutError). Change the number here." },
     "openai":  { "base_url": "https://api.deepinfra.com/v1/openai", "api_key_env": "DEEPINFRA_TOKEN",
                  "_comment": "OpenAI-compatible endpoint. base_url = chat-completions root; api_key_env = NAME of the env var holding the key (the key lives in the out-of-repo secrets file)." }
   },

@@ -112,6 +112,20 @@ class CopilotConfig:
 
 
 @dataclass
+class CodexConfig:
+    """Codex CLI provider settings (the OpenAI-equivalent agentic worker).
+
+    ``exe`` pins the codex executable (else it is auto-discovered on PATH).
+    ``lock_timeout_sec`` is the cross-process serialization mutex's wait bound in
+    seconds: how long a queued codex call sits behind others before giving up with
+    a TimeoutError (a safety bound so a stuck holder can't hang a batch overnight).
+    An explicit, operator-visible number — change it here, not in code.
+    """
+    exe: str | None = None
+    lock_timeout_sec: int = 1800
+
+
+@dataclass
 class OpenAiConfig:
     """OpenAI-compatible HTTP endpoint for the ``openai`` / ``deepinfra`` provider.
 
@@ -359,6 +373,7 @@ class Config:
     converge_role: RoleConfig = field(
         default_factory=lambda: RoleConfig(model="claude-sonnet-4.5"))
     copilot: CopilotConfig = field(default_factory=CopilotConfig)
+    codex: CodexConfig = field(default_factory=CodexConfig)
     openai: OpenAiConfig = field(default_factory=OpenAiConfig)
     ledger: LedgerConfig = field(default_factory=LedgerConfig)
     apply: ApplyConfig = field(default_factory=ApplyConfig)
@@ -487,6 +502,8 @@ def _normalize(raw: dict) -> dict:
     if isinstance(providers, dict):
         if isinstance(providers.get("copilot"), dict):
             out["copilot"] = providers["copilot"]
+        if isinstance(providers.get("codex"), dict):
+            out["codex"] = providers["codex"]
         if isinstance(providers.get("openai"), dict):
             out["openai"] = providers["openai"]
 
@@ -609,6 +626,7 @@ def load_config(path: str | None = None, profile: str | None = None) -> Config:
     merged = _deep_merge(_DEFAULTS, _normalize(raw))
     roles = merged.get("roles", {})
     copilot_raw = merged.get("copilot", {})
+    codex_raw = merged.get("codex", {})
     openai_raw = merged.get("openai", {})
     ledger_raw = merged.get("ledger", {})
     apply_raw = merged.get("apply", {})
@@ -686,6 +704,10 @@ def load_config(path: str | None = None, profile: str | None = None) -> Config:
             timeout_sec=int(copilot_raw.get("timeout_sec", 300)),
             token=copilot_raw.get("token"),
             token_env=copilot_raw.get("token_env"),
+        ),
+        codex=CodexConfig(
+            exe=codex_raw.get("exe"),
+            lock_timeout_sec=int(codex_raw.get("lock_timeout_sec", 1800)),
         ),
         openai=OpenAiConfig(
             base_url=str(openai_raw.get("base_url",
