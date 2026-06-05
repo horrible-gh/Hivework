@@ -164,6 +164,38 @@ class TestTestRunners(unittest.TestCase):
         self.assertIsNone(cfg.test_runner_for_codebase("/abs/Other"))
 
 
+class TestConvergeSplit(unittest.TestCase):
+    """The converge.split block (M020 per-locus elimination pass)."""
+
+    def _load(self, overrides):
+        tmpdir = tempfile.mkdtemp()
+        path = os.path.join(tmpdir, "hive.config.json")
+        with open(path, "w") as f:
+            json.dump(overrides, f)
+        return load_config(path=path)
+
+    def test_off_by_default(self):
+        cfg = load_config(path="/nonexistent/hive.config.json")
+        self.assertFalse(cfg.converge_split.enabled)
+        self.assertEqual(cfg.converge_split.max_loci, 4)
+        self.assertEqual(cfg.converge_split.provider, "")
+        self.assertEqual(cfg.converge_split.model, "")
+
+    def test_parsed_from_converge_split_block(self):
+        cfg = self._load({"converge": {"split": {
+            "enabled": True, "max_loci": 3,
+            "provider": "openai", "model": "openai/gpt-oss-120b"}}})
+        self.assertTrue(cfg.converge_split.enabled)
+        self.assertEqual(cfg.converge_split.max_loci, 3)
+        self.assertEqual(cfg.converge_split.provider, "openai")
+        self.assertEqual(cfg.converge_split.model, "openai/gpt-oss-120b")
+
+    def test_partial_block_keeps_defaults(self):
+        cfg = self._load({"converge": {"split": {"enabled": True}}})
+        self.assertTrue(cfg.converge_split.enabled)
+        self.assertEqual(cfg.converge_split.max_loci, 4)
+
+
 class TestConfigPartialFile(unittest.TestCase):
     """Partial config file: only override swarm model; others stay default."""
 

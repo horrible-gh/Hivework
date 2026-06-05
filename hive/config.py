@@ -263,6 +263,38 @@ class ReinvestigationConfig:
 
 
 @dataclass
+class ConvergeSplitConfig:
+    """Gate + cap for the per-locus SPLIT converge pass (M020 follow-up).
+
+    The default converge is ONE holistic call that must, in a single weak single-shot,
+    order the whole path AND pick the one guilty node among several competing located
+    loci — too much for a cheap model, so it wanders (SQL ↔ FE ↔ peer) run to run. The
+    split pass instead asks ONE NARROW question per located locus ("does THIS locus's
+    live code produce the reported symptom?"), each low-variance enough for a cheaper
+    model, then COMBINES the answers DETERMINISTICALLY by elimination: when exactly one
+    locus survives its cause→symptom check, that one is attributed. The combine is free
+    code, not a model judgment, so the wobble at the stitch point disappears.
+
+    It is a PRECISION layer, never a new failure mode: it adopts a verdict ONLY on a
+    clean elimination (exactly one survivor). Zero, several, or more located loci than
+    ``max_loci`` (a partial evaluation cannot soundly claim "only one survives") all fall
+    back to the existing holistic converge + its guards. So turning it on can only improve
+    a result or no-op — it can never ship an answer the holistic path would not have.
+
+    ``max_loci`` is the scout-style count cap (the analog of ``ReinforceConfig.max_workers``):
+    it bounds the per-locus calls AND defines when the set is too big to evaluate soundly
+    (over it → fall back, which is also CHEAPER than N calls). Keep it small; tune the
+    per-locus quality with ``model`` (a narrow question tolerates a CHEAPER model), not by
+    raising the cap. ``provider``/``model`` empty → reuse the ``roles.converge`` role.
+    Default OFF — opt-in, A/B-gated, exactly like reinforce / reinvestigation.
+    """
+    enabled: bool = False
+    max_loci: int = 4
+    provider: str = ""
+    model: str = ""
+
+
+@dataclass
 class JudgeConfig:
     """Cost caps for the JUDGE-directed follow-up loop (M004 §4 budget).
 
@@ -325,6 +357,8 @@ class Config:
     reinforce: ReinforceConfig = field(default_factory=ReinforceConfig)
     reinvestigation: ReinvestigationConfig = field(
         default_factory=ReinvestigationConfig)
+    converge_split: ConvergeSplitConfig = field(
+        default_factory=ConvergeSplitConfig)
     commit_stage: CommitConfig = field(default_factory=CommitConfig)
     # Per-codebase read-only DB connections, keyed by a short name (e.g. "flowgate").
     # Empty by default — the converge data-state read is SKIPPED when a run's codebase
@@ -434,6 +468,8 @@ def load_config(path: str | None = None) -> Config:
     safety_raw = merged.get("safety", {})
     reinforce_raw = merged.get("reinforce", {})
     reinvest_raw = merged.get("reinvestigation", {})
+    split_raw = merged.get("converge", {}).get("split", {}) \
+        if isinstance(merged.get("converge"), dict) else {}
     commit_raw = merged.get("commit_stage", {})
     db_raw = merged.get("db_connections", {})
 
@@ -532,6 +568,12 @@ def load_config(path: str | None = None) -> Config:
         reinvestigation=ReinvestigationConfig(
             live=bool(reinvest_raw.get("live", False)),
             max_rounds=int(reinvest_raw.get("max_rounds", 2)),
+        ),
+        converge_split=ConvergeSplitConfig(
+            enabled=bool(split_raw.get("enabled", False)),
+            max_loci=int(split_raw.get("max_loci", 4)),
+            provider=str(split_raw.get("provider", "") or ""),
+            model=str(split_raw.get("model", "") or ""),
         ),
         commit_stage=CommitConfig(
             filename_only_threshold=int(
