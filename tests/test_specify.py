@@ -475,14 +475,14 @@ class TestDatasourceRegressionGate(unittest.TestCase):
         return {"edits": [{"id": "E1", "file": "list_routes.py",
                            "anchor_old": old_sql, "replacement_new": new_sql}]}
 
-    def test_swap_to_sparser_table_is_flagged(self):
+    def test_swap_to_sparser_ssot_table_not_flagged(self):
+        # M036/회귀2: groups (2 denormalized rows) -> project_modules (1 clean SSOT row) is
+        # the CORRECT fix. Row count is not coverage, so the fewer-rows swap must NOT be
+        # flagged — the earlier "strictly fewer rows" branch mis-fired on exactly this swap.
         spec = self._spec(
             'rows = q("SELECT DISTINCT module FROM groups WHERE project_id = ?", [p])',
             'rows = q("SELECT name AS module FROM project_modules WHERE project_id = ?", [p])')
-        flagged = specify._datasource_regression_ids(spec, self.conn)
-        self.assertIn("E1", flagged)
-        self.assertIn("project_modules", flagged["E1"])
-        self.assertIn("groups", flagged["E1"])
+        self.assertEqual(specify._datasource_regression_ids(spec, self.conn), {})
 
     def test_swap_to_empty_table_is_flagged(self):
         spec = self._spec('SELECT module FROM groups WHERE project_id = ?',

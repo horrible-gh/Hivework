@@ -1098,17 +1098,22 @@ def _primary_from_table(text: str) -> str | None:
 def _datasource_regression_ids(spec: dict[str, Any], db_conn: Any) -> dict[str, str]:
     """Edit ids that switch a SQL read's PRIMARY source table to an empty/sparser one → id→reason.
 
-    N176: the author rewrote a working modules query from ``SELECT DISTINCT module FROM
-    groups`` (2 rows) to a ``project_modules``-first read (1 row) on the GUESS that
-    ``project_modules`` is "authoritative" — never grounding the claim against the live DB,
-    so the dropdown lost a module. This is the data-location analogue of the callee-contract
-    gap (N175): a factual claim ("the data lives in table X") emitted as ready without being
-    grounded. When a live DB connection is configured for the codebase, we check it
-    deterministically: an anchor edit whose replacement changes the FIRST ``FROM`` table of
-    a read is flagged when the new table is MISSING, EMPTY (0 rows), or holds STRICTLY FEWER
-    rows than the table it abandoned. Fail-closed: no db_conn, or any introspection/count
-    failure, simply skips (never a false positive on a DB we cannot read). Downgrade-only —
-    a flagged spec loops back to re-investigate (a cheap re-run beats a wrong apply).
+    N176: an edit that points a SQL read at a table that does not exist, or that is
+    literally empty in the live DB, is a data-location claim ("the data lives in table X")
+    emitted as ready without being grounded — the data-location analogue of the
+    callee-contract gap (N175). When a live DB connection is configured for the codebase,
+    we check it deterministically: an anchor edit whose replacement changes the FIRST
+    ``FROM`` table of a read is flagged when the new table is MISSING or EMPTY (0 rows).
+
+    M036/회귀2 correction: we do NOT flag a "strictly fewer rows" swap. Row count is not
+    coverage — the authoritative SSOT can hold fewer rows than the denormalized source it
+    replaces (here ``groups`` 2 dup rows → ``project_modules`` 1 clean row, which is the
+    CORRECT fix). The earlier fewer-rows branch mis-fired on exactly the right swap and
+    downgraded it; only an absent or 0-row table is an unambiguous regression.
+
+    Fail-closed: no db_conn, or any introspection/count failure, simply skips (never a
+    false positive on a DB we cannot read). Downgrade-only — a flagged spec loops back to
+    re-investigate (a cheap re-run beats a wrong apply).
     """
     if db_conn is None:
         return {}
@@ -1155,13 +1160,12 @@ def _datasource_regression_ids(spec: dict[str, Any], db_conn: Any) -> dict[str, 
                 f"data-source regression — edit switches the primary read from "
                 f"{old_primary!r} to {new_primary!r}, which is EMPTY (0 rows) in the live DB")
             continue
-        old_real = by_lower.get(old_primary.lower())
-        n_old = _count(old_real) if old_real else None
-        if n_old is not None and n_new < n_old:
-            findings[eid] = (
-                f"data-source regression — edit switches the primary read from "
-                f"{old_primary!r} ({n_old} rows) to {new_primary!r} ({n_new} rows), reducing "
-                f"coverage; verify against the live DB which table actually holds the data")
+        # NOTE (M036/회귀2): we deliberately do NOT flag "strictly fewer rows". Row count
+        # is not coverage: the correct SSOT can legitimately hold fewer rows than the wrong
+        # source (here ``groups`` has 2 rows of denormalized dupes, ``project_modules`` —
+        # the authoritative table — has 1 clean row). The fewer-rows branch mis-fired on
+        # exactly the RIGHT swap (groups → project_modules) and downgraded it. Only an
+        # absent table or a literally empty (0-row) one is an unambiguous regression.
     return findings
 
 
