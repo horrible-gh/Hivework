@@ -1,5 +1,7 @@
-# Hivework custom
-hive.config.json
+# Hivework custom — live config profiles are local (machine paths, future secrets);
+# only the example reference is tracked.
+config/hive.config.*.json
+!config/hive.config.example.json
 /state/
 
 # Claude / local
