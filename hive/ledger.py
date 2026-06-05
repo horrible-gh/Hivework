@@ -190,6 +190,38 @@ class Ledger:
         self.finish_call(call_id, output, latency_s, ok=ok, err=err,
                          real_tokens=real_tokens)
 
+    def record_local(self, stage: str, axis_id: str, mechanism: str = "",
+                     detail: str = "", in_chars: int = 0, out_chars: int = 0,
+                     latency_s: float = 0.0) -> None:
+        """Insert one worker_calls row for a LOCAL (free, deterministic) step.
+
+        These are the engine's own zero-cost operations — local ripgrep retrieve,
+        a live-DB data read, etc. — that never hit a model. They get a row so the
+        ledger DB shows the FULL run trace, not just billed model calls, but are
+        recorded as provider='local' with est/real tokens left at zero/NULL and
+        are NOT folded into ``self._calls`` — so the run's token + char cost
+        aggregate stays MODEL-spend only and local rows never inflate it.
+        ``mechanism`` (e.g. 'ripgrep', 'sqlite') lands in the model column;
+        ``detail`` (e.g. 'reads=2 rows=True') lands in comb_path as a free-text note.
+        """
+        if self._conn is None or self._run_id is None:
+            return
+        started_at = datetime.now(timezone.utc).isoformat()
+        try:
+            with self._lock:
+                self._conn.execute(
+                    "INSERT INTO worker_calls"
+                    " (run_id, stage, axis_id, provider, model,"
+                    "  in_chars, out_chars, est_tokens, real_tokens,"
+                    "  latency_s, comb_path, ok, err, status, started_at)"
+                    " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (self._run_id, stage, axis_id, "local", mechanism,
+                     in_chars, out_chars, 0, None,
+                     latency_s, detail, 1, "", "done", started_at))
+                self._conn.commit()
+        except Exception as e:
+            logger.warning("Ledger: record_local failed: %s", e)
+
     def finish_run(self, honey_path: str = "", axes_n: int = 0, rounds: int = 0,
                    conflicts_n: int = 0, remaining_n: int = 0,
                    parse_errs: int = 0, status: str = "done") -> None:
@@ -232,6 +264,7 @@ class NullLedger:
     def begin_call(self, *a, **kw): return None
     def finish_call(self, *a, **kw): pass
     def record_call(self, *a, **kw): pass
+    def record_local(self, *a, **kw): pass
     def finish_run(self, *a, **kw): pass
     def close(self): pass
 

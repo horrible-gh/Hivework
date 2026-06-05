@@ -151,6 +151,51 @@ class TestLedgerInsertAndAggregate(unittest.TestCase):
         self.assertEqual(row[1], 3)
         self.assertEqual(row[2], "/out/honey.md")
 
+    def test_record_local_inserts_local_row(self):
+        """A local (free) step lands as provider='local' with the mechanism + note."""
+        self.ldg.record_local("retrieve", "A1", mechanism="ripgrep",
+                              detail="hits=12 snippets=4", out_chars=900, latency_s=0.03)
+        conn = sqlite3.connect(self.db_path)
+        row = conn.execute("SELECT provider, model, stage, out_chars, comb_path, ok,"
+                           " status FROM worker_calls").fetchone()
+        conn.close()
+        self.assertEqual(row[0], "local")
+        self.assertEqual(row[1], "ripgrep")
+        self.assertEqual(row[2], "retrieve")
+        self.assertEqual(row[3], 900)
+        self.assertEqual(row[4], "hits=12 snippets=4")
+        self.assertEqual(row[5], 1)
+        self.assertEqual(row[6], "done")
+
+    def test_record_local_excluded_from_cost_aggregate(self):
+        """Local rows are visible but never inflate the run's token/char totals."""
+        self.ldg.record_call("judge", "A", "deepinfra", "m",
+                             prompt="p" * 40, output="o" * 20, latency_s=1.0,
+                             real_tokens=100)
+        self.ldg.record_local("db_read", "converge", mechanism="sqlite",
+                             out_chars=5000, latency_s=0.01)
+        self.ldg.finish_run()
+        conn = sqlite3.connect(self.db_path)
+        row = conn.execute("SELECT total_in_chars, total_out_chars, total_real_tokens"
+                           " FROM runs").fetchone()
+        n_rows = conn.execute("SELECT COUNT(*) FROM worker_calls").fetchone()[0]
+        conn.close()
+        # Both rows are present, but only the model call feeds the cost totals.
+        self.assertEqual(n_rows, 2)
+        self.assertEqual(row[0], 40)    # in_chars: judge only, local excluded
+        self.assertEqual(row[1], 20)    # out_chars: judge only, local's 5000 excluded
+        self.assertEqual(row[2], 100)   # real_tokens: judge only
+
+    def test_record_local_noop_without_run(self):
+        """No run started → no _run_id → record_local silently no-ops (no crash)."""
+        ldg = Ledger(self.db_path + ".x")
+        ldg.record_local("retrieve", "A1")  # no start_run
+        conn = sqlite3.connect(self.db_path + ".x")
+        n = conn.execute("SELECT COUNT(*) FROM worker_calls").fetchone()[0]
+        conn.close()
+        ldg.close()
+        self.assertEqual(n, 0)
+
     def test_finish_run_aggregates(self):
         self.ldg.record_call("swarm", "A", "copilot", "gpt-5-mini",
                               prompt="a"*100, output="b"*50, latency_s=1.0)
