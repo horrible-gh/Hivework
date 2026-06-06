@@ -567,6 +567,25 @@ class TestSeedEditTargets(unittest.TestCase):
             self.assertEqual(len(targets), 1)
             self.assertEqual(targets[0]["file"], "client/src/view.ts")
 
+    def test_do_not_use_as_fix_site_is_not_target(self):
+        # T906: "Do NOT use X as the primary fix site" is a prohibition — even though the
+        # phrase "fix site" trips the edit-intent cue, the do-not-USE rule must win so the
+        # off-path file is never handed to the seed-coverage gate as a mandatory target.
+        with tempfile.TemporaryDirectory() as td:
+            self._write(td, "server/modules/flow_gate/api/v1/list_routes.py",
+                        "def list_modules():\n    return []\n")
+            seed = ("Do not use `server/modules/flow_gate/api/v1/list_routes.py` as the "
+                    "primary fix site unless live FE binding proves the modal calls it.")
+            self.assertEqual(INV.seed_edit_targets(seed, td), [])
+
+    def test_off_path_file_is_not_target(self):
+        # An "off-path" mention marks a decoy, never an edit designation.
+        with tempfile.TemporaryDirectory() as td:
+            self._write(td, "server/api/list_routes.py", "x = 1\n")
+            seed = ("T904 changed that off-path area `server/api/list_routes.py` and the "
+                    "modal still did not show the selector.")
+            self.assertEqual(INV.seed_edit_targets(seed, td), [])
+
 
 class TestApplyCallBudget(unittest.TestCase):
     """max_total_calls: one-number cap → reduce votes first, then trim axes."""

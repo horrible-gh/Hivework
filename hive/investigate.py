@@ -238,11 +238,18 @@ _EDIT_INTENT_RE = re.compile(
     r"\brewrite\b|\bmodif(?:y|ies|ied)\b|\bchange\b|\bauthor\b|\bupdate\b|"
     r"수정|편집|고쳐|교정|바꿔",
     re.IGNORECASE)
+# A do-not-edit cue rules a seed-named file OUT of edits[]. The verb list includes
+# ``use`` (T906: "Do NOT use `list_routes.py` as the primary fix site" — a prohibition
+# the earlier list missed, so the file was wrongly handed to the seed-coverage gate as a
+# mandatory target even though the same seed's §6 named it off-path). ``off-path`` and the
+# Korean off-path / do-not-use idioms (오답 경로 / 사용하지 마 / 쓰지 마) are caught the
+# same way, since a "this is the wrong/decoy path" mention is never an edit designation.
 _DO_NOT_EDIT_RE = re.compile(
-    r"do\s+not\s+(?:author|edit|modif|produce|touch|change|rewrite)|"
-    r"don'?t\s+(?:edit|touch|modify|change)|no-?op|ruled\s+out|stop\s+re-?examin|"
-    r"leave\s+(?:it\s+)?unchanged|건드리지\s*마|수정하지\s*마|편집하지\s*마|"
-    r"손대지\s*마|만지지\s*마",
+    r"do\s+not\s+(?:author|edit|modif|produce|touch|change|rewrite|use)|"
+    r"don'?t\s+(?:edit|touch|modify|change|use)|no-?op|ruled\s+out|stop\s+re-?examin|"
+    r"leave\s+(?:it\s+)?unchanged|off-?path|"
+    r"건드리지\s*마|수정하지\s*마|편집하지\s*마|손대지\s*마|만지지\s*마|"
+    r"사용하지\s*마|쓰지\s*마|오답\s*경로",
     re.IGNORECASE)
 
 
