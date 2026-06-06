@@ -60,8 +60,15 @@ CONVERGED_OUT = json.dumps({
     "causal_check": {
         "verdict": "consistent",
         "data_state_assumptions": ["R approved; M in-progress with result_doc_id set"],
-        "trace": "with M.result_doc_id set the CASE puts M first, displacing the "
+        "trace": "workflow_sequences.py: with M.result_doc_id set the CASE puts M first, "
+                 "displacing the "
                  "pending slot — reproduces the off-by-one",
+        "counterfactual": "fixing the ORDER BY removes the displacement because M no "
+                          "longer outranks the pending slot",
+        "refuted_peers": [
+            {"file": "client/src/workflow_view.ts", "lines": "160-170",
+             "why_not": "the holistic evidence selected the query path"},
+        ],
         "need_data_state": []},
     "missing_link": None,
 })
@@ -138,8 +145,16 @@ REDIRECT_CONVERGED_OUT = json.dumps({
     "causal_check": {
         "verdict": "consistent",
         "data_state_assumptions": ["memo item_seq highest though sort_order 0"],
-        "trace": "ordering by item_seq puts DS first, painting the memo done — "
+        "trace": "workflow_bar.tsx ordering by item_seq puts DS first, painting the memo done — "
                  "reproduces the observed skip.",
+        "counterfactual": "keying the render by sort_order removes the skip because the "
+                          "memo remains the current item",
+        "refuted_peers": [
+            {"file": "api/workflow_head_routes.py", "lines": "93-102",
+             "why_not": "redirect evidence moved the symptom to the render path"},
+            {"file": "db/workflow_sequences.py", "lines": "45-57",
+             "why_not": "the query was causally contradicted before redirecting"},
+        ],
         "need_data_state": []},
     "missing_link": None,
 })
@@ -211,6 +226,15 @@ class TestRunConverge(unittest.TestCase):
                            bundles=BUNDLES, provider="deepinfra", model="m")
         self.assertEqual(seen.get("available_tools"), [])
 
+    def test_run_uses_one_causal_provenance_arbiter(self):
+        with mock.patch.object(
+                C, "_causal_provenance_arbiter",
+                wraps=C._causal_provenance_arbiter) as arbiter, \
+             mock.patch.object(C, "call_worker", return_value=_wr(CONVERGED_OUT)):
+            C.run_converge(seed_text="s", verdicts=LOCATED_VERDICTS,
+                           bundles=BUNDLES, provider="deepinfra", model="m")
+        arbiter.assert_called_once()
+
 
 # ── N172: undecidable → live DB data read → re-rule on fact ────────────────────
 import sqlite3
@@ -251,7 +275,13 @@ CONVERGED_WITH_READS_OUT = json.dumps({
     "causal_check": {
         "verdict": "consistent",
         "data_state_assumptions": ["R approved"],
-        "trace": "reproduces the off-by-one",
+        "trace": "workflow_sequences.py reproduces the off-by-one",
+        "counterfactual": "fixing the ordering removes the off-by-one because the pending "
+                          "slot remains first",
+        "refuted_peers": [
+            {"file": "api/workflow_head_routes.py", "lines": "93-102",
+             "why_not": "the handler only forwards the selected row"},
+        ],
         "need_data_state": [],
         "data_reads": [{"table": "documents", "where": {"doc_id": "NOPE"},
                         "columns": ["doc_review_status"]}]},
@@ -284,7 +314,10 @@ N180_DATA_CERT_OUT = json.dumps({
     "causal_check": {
         "verdict": "consistent",
         "data_state_assumptions": ["modules exist in project_modules"],
-        "trace": "after the UNION the query returns the module rows",
+        "trace": "workflow_sequences.py returns the module rows after the UNION",
+        "counterfactual": "adding the missing source returns the rows because the query "
+                          "then includes project_modules",
+        "refuted_peers": [],
         "need_data_state": [],
         "data_reads": [{"table": "documents", "where": {"doc_id": "D1"},
                         "columns": ["doc_review_status"]}]},
@@ -423,10 +456,8 @@ class TestConvergeDataRead(unittest.TestCase):
         self.assertTrue(res.converged)
         self.assertNotIn("dropped_peer", res.causal_check or {})
 
-    def test_n180_guard_silent_without_data_backing(self):
-        """The guard targets DATA-certified consistencies ONLY: a consistent ruled on CODE
-        (no DB read backing) with a dropped peer is left to the prompt-level contract, so a
-        normal red-herring drop is never demoted by this guard."""
+    def test_p0_demotes_unrefuted_peer_without_data_backing(self):
+        """P0 generalizes N180: unrefuted distinct peers are unsafe in every domain."""
         def fake(provider, model, prompt, cwd=None, timeout=300, **kw):
             return _wr(N180_DATA_CERT_OUT)
         with mock.patch.object(C, "call_worker", side_effect=fake):
@@ -435,7 +466,8 @@ class TestConvergeDataRead(unittest.TestCase):
                                  provider="deepinfra", model="m",
                                  code_root="/repo", db_conn=None)
         self.assertFalse(res.data_state_backed)
-        self.assertTrue(res.converged)                # not data-certified → guard inert
+        self.assertFalse(res.converged)
+        self.assertIn("unrefuted_peer", res.causal_check or {})
 
     def test_no_db_conn_leaves_undecidable_unresolved(self):
         """Without a DB connection the data read is skipped — the static path stands."""
@@ -599,7 +631,15 @@ class TestConvergeDataRead(unittest.TestCase):
             "attributed_defect": {"node": "db_fn", "file": "totally/unseen.py",
                                   "lines": "1-2", "why": "x"},
             "causal_check": {"verdict": "consistent", "data_state_assumptions": [],
-                             "trace": "reproduces", "need_data_state": []},
+                             "trace": "reproduces",
+                             "counterfactual": "correcting totally/unseen.py removes the "
+                                               "symptom because its output changes",
+                             "refuted_peers": [
+                                 {"file": "api/workflow_head_routes.py", "lines": "93-102",
+                                  "why_not": "not the mechanism selected"},
+                                 {"file": "db/workflow_sequences.py", "lines": "45-57",
+                                  "why_not": "not the mechanism selected"}],
+                             "need_data_state": []},
             "missing_link": None})
         with mock.patch.object(C, "call_worker", return_value=_wr(out)):
             res = C.run_converge(seed_text="s", verdicts=LOCATED_VERDICTS,
@@ -747,7 +787,13 @@ CONSISTENT_ON_ASSUMPTION_OUT = json.dumps({
     "causal_check": {
         "verdict": "consistent",
         "data_state_assumptions": ["assumes result_doc_id = 'doc123' (non-NULL)"],
-        "trace": "with result_doc_id set the CASE displaces the pending slot",
+        "trace": "workflow_sequences.py CASE displaces the pending slot when result_doc_id is set",
+        "counterfactual": "fixing the CASE removes the displacement because non-null rows "
+                          "no longer outrank the pending slot",
+        "refuted_peers": [
+            {"file": "api/workflow_head_routes.py", "lines": "93-102",
+             "why_not": "the handler only forwards the selected row"},
+        ],
         "need_data_state": [],
         "data_reads": [{"table": "documents", "where": {"doc_id": "D1"},
                         "columns": ["doc_review_status"]}]},
@@ -776,7 +822,10 @@ M017_DATA_DEP_NO_READS_OUT = json.dumps({
     "causal_check": {
         "verdict": "consistent", "data_dependent": True,
         "data_state_assumptions": ["assumes M.result_doc_id is set (non-NULL)"],
-        "trace": "with result_doc_id set the CASE displaces the pending slot",
+        "trace": "workflow_sequences.py CASE displaces the pending slot when result_doc_id is set",
+        "counterfactual": "fixing the CASE removes the displacement because M no longer "
+                          "outranks the pending slot",
+        "refuted_peers": [],
         "need_data_state": [], "data_reads": []},
     "missing_link": None,
 })
@@ -791,7 +840,10 @@ M017_DATA_DEP_WITH_READS_OUT = json.dumps({
     "causal_check": {
         "verdict": "consistent", "data_dependent": True,
         "data_state_assumptions": ["M.result_doc_id set per the read below"],
-        "trace": "with result_doc_id set the CASE displaces the pending slot",
+        "trace": "workflow_sequences.py CASE displaces the pending slot when result_doc_id is set",
+        "counterfactual": "fixing the CASE removes the displacement because M no longer "
+                          "outranks the pending slot",
+        "refuted_peers": [],
         "need_data_state": [],
         "data_reads": [{"table": "documents", "where": {"doc_id": "D1"},
                         "columns": ["doc_review_status"]}]},
@@ -808,7 +860,10 @@ M017_PURE_CODE_OUT = json.dumps({
     "causal_check": {
         "verdict": "consistent", "data_dependent": False,
         "data_state_assumptions": [],
-        "trace": "the slice drops the last element regardless of stored state",
+        "trace": "workflow_sequences.py slice drops the last element regardless of stored state",
+        "counterfactual": "fixing the slice bound retains the last element because the "
+                          "exclusive endpoint includes the full sequence",
+        "refuted_peers": [],
         "need_data_state": [], "data_reads": []},
     "missing_link": None,
 })
@@ -1472,7 +1527,15 @@ MULTI_LOCUS_OUT = json.dumps({
          "why": "the computed step index is off by one"},
     ],
     "causal_check": {"verdict": "consistent", "data_state_assumptions": [],
-                     "trace": "reproduces", "need_data_state": []},
+                     "trace": "app.css reproduces the selector symptom",
+                     "counterfactual": "correcting the primary selector removes its "
+                                       "reported symptom because it emits the right class",
+                     "refuted_peers": [
+                         {"file": "api/workflow_head_routes.py", "lines": "93-102",
+                          "why_not": "not one of these independent UI defects"},
+                         {"file": "db/workflow_sequences.py", "lines": "45-57",
+                          "why_not": "not one of these independent UI defects"}],
+                     "need_data_state": []},
     "missing_link": None,
 })
 
@@ -1536,7 +1599,13 @@ class TestSeedNegationAndMultiLocus(unittest.TestCase):
                 {"node": "other", "file": "totally/unknown/thing.py", "lines": "1-2",
                  "why": "separate bug"}],
             "causal_check": {"verdict": "consistent", "data_state_assumptions": [],
-                             "trace": "t", "need_data_state": []},
+                             "trace": "t",
+                             "counterfactual": "correcting the handler removes the symptom "
+                                               "because its response changes",
+                             "refuted_peers": [
+                                 {"file": "db/workflow_sequences.py", "lines": "45-57",
+                                  "why_not": "not the response mechanism"}],
+                             "need_data_state": []},
             "missing_link": None,
         })
         with mock.patch.object(C, "call_worker", return_value=_wr(out)):
@@ -1555,7 +1624,13 @@ class TestSeedNegationAndMultiLocus(unittest.TestCase):
                 {"node": "db_fn", "file": "db/workflow_sequences.py", "lines": "45-57",
                  "why": "same locus restated"}],
             "causal_check": {"verdict": "consistent", "data_state_assumptions": [],
-                             "trace": "t", "need_data_state": []},
+                             "trace": "t",
+                             "counterfactual": "correcting the query removes the symptom "
+                                               "because its selected row changes",
+                             "refuted_peers": [
+                                 {"file": "api/workflow_head_routes.py", "lines": "93-102",
+                                  "why_not": "the handler only forwards the row"}],
+                             "need_data_state": []},
             "missing_link": None,
         })
         with mock.patch.object(C, "call_worker", return_value=_wr(out)):
@@ -1667,6 +1742,279 @@ class TestPremiseRefutedGuard(unittest.TestCase):
             causal_check={"verdict": "contradicted", "data_dependent": True})
         out = C._premise_refuted_guard(res, True, chain_broke=True)
         self.assertNotIn("data_premise_refuted", out.causal_check)
+
+
+class TestCounterfactualCompleteness(unittest.TestCase):
+    """P0: consistent verdicts must earn certification and account for every peer."""
+
+    LOCATED = [
+        _verdict("A", True, "server/query.py", "10-20", "query hypothesis"),
+        _verdict("B", True, "client/render.ts", "30-40", "binding hypothesis"),
+    ]
+
+    def _res(self, *, counterfactual="fixing query.py changes the selected row",
+             refuted_peers=None):
+        return C.ConvergeResult(
+            converged=True,
+            path=[{"node": "db_fn", "file": "server/query.py", "lines": "10-20"}],
+            attributed_defect={"node": "db_fn", "file": "server/query.py",
+                               "lines": "10-20"},
+            causal_check={
+                "verdict": "consistent",
+                "trace": "query.py selects the wrong row",
+                "counterfactual": counterfactual,
+                "refuted_peers": refuted_peers or [],
+            })
+
+    def test_unrefuted_distinct_peer_is_demoted(self):
+        out = C._counterfactual_complete_guard(self._res(), self.LOCATED)
+        self.assertFalse(out.converged)
+        self.assertEqual(out.causal_check["unrefuted_peer"]["file"], "client/render.ts")
+
+    def test_explicitly_refuted_peer_stays_converged(self):
+        peers = [{"file": "client/render.ts", "lines": "30-40",
+                  "why_not": "the consumer reads the key emitted by the handler"}]
+        out = C._counterfactual_complete_guard(
+            self._res(refuted_peers=peers), self.LOCATED)
+        self.assertTrue(out.converged)
+
+    def test_empty_counterfactual_is_demoted(self):
+        out = C._counterfactual_complete_guard(
+            self._res(counterfactual="   ", refuted_peers=[
+                {"file": "client/render.ts", "why_not": "not causal"}]), self.LOCATED)
+        self.assertFalse(out.converged)
+        self.assertTrue(out.causal_check["counterfactual_incomplete"])
+
+    def test_kill_switch_disables(self):
+        with mock.patch.dict(os.environ, {"HIVE_NO_COUNTERFACTUAL": "1"}):
+            out = C._counterfactual_complete_guard(self._res(counterfactual=""), self.LOCATED)
+        self.assertTrue(out.converged)
+
+    def test_malformed_causal_check_never_raises(self):
+        res = C.ConvergeResult(
+            converged=True,
+            attributed_defect={"file": "server/query.py", "lines": "10-20"},
+            causal_check="not-a-dict")
+        out = C._counterfactual_complete_guard(res, [None, {"verdict": "bad"}])
+        self.assertFalse(out.converged)
+        parsed = C._coerce_causal({
+            "verdict": "consistent",
+            "data_state_assumptions": 7,
+            "need_data_state": {"bad": "shape"},
+            "refuted_peers": "bad",
+        })
+        self.assertEqual(parsed["data_state_assumptions"], [])
+        self.assertEqual(parsed["refuted_peers"], [])
+
+    def test_prompt_and_parser_carry_new_contract(self):
+        prompt = C.build_converge_prompt("s", self.LOCATED, [], [])
+        self.assertIn("counterfactual", prompt)
+        self.assertIn("refuted_peers", prompt)
+        parsed = C._coerce_causal({
+            "verdict": "consistent",
+            "counterfactual": "fixing query.py removes the bad row",
+            "refuted_peers": [{"file": "client/render.ts", "lines": "30-40",
+                               "why_not": "binding agrees"}],
+        })
+        self.assertEqual(parsed["counterfactual"], "fixing query.py removes the bad row")
+        self.assertEqual(parsed["refuted_peers"][0]["file"], "client/render.ts")
+
+
+class TestFragmentFactCards(unittest.TestCase):
+    """P3: deterministic cards expose producer and reachability facts to the model."""
+
+    def test_producer_and_off_path_decoy_cards(self):
+        producer = _verdict("FE_STRIP", True, "server/documents.py", "375-397", "r")
+        decoy = _verdict("HEAD_SQL", True, "server/queries.json", "127-129", "r")
+        bundles = [{
+            "axis_id": "FE_STRIP",
+            "code_snippets": [
+                {"file": "server/router.py", "lines": "10-20",
+                 "symbol": "documents_handler", "text": "return build_document()"},
+            ],
+            "call_chain": [
+                {"file": "server/documents.py", "lines": "375-397",
+                 "via": "field-producer", "field": "workflow_head_type",
+                 "symbol": "build_document",
+                 "text": 'out["workflow_head_type"] = head_type'},
+            ],
+        }, {
+            "axis_id": "HEAD_SQL",
+            "code_snippets": [
+                {"file": "server/queries.json", "lines": "127-129",
+                 "text": '"get_effective_head": "SELECT ..."'},
+            ],
+            "call_chain": [],
+        }]
+        cards = C._fragment_fact_cards([producer, decoy], [], bundles, None)
+        self.assertIn("workflow_head_type", cards)
+        self.assertIn("server/router.py documents_handler", cards)
+        decoy_card = cards.split("- axis HEAD_SQL", 1)[1]
+        self.assertIn("produces FE-bound field(s): (none)", decoy_card)
+        self.assertIn("(not linked to any other located fragment)", decoy_card)
+
+    def test_empty_input_is_empty(self):
+        self.assertEqual(C._fragment_fact_cards([], [], [], None), "")
+
+    def test_malformed_window_never_raises(self):
+        located = [_verdict("A", True, "x.py", "1-2", "r")]
+        cards = C._fragment_fact_cards(
+            located, [None, {"file": 7, "via": "field-producer"}],
+            [{"code_snippets": "bad", "call_chain": [None]}], None)
+        self.assertIsInstance(cards, str)
+
+    def test_prompt_places_fact_block_after_located_fragments(self):
+        block = "[Fragment facts — deterministic annotations computed by the pipeline; " \
+                "treat as FACT]\n- axis A / x.py:1-2"
+        prompt = C.build_converge_prompt(
+            "s", [_verdict("A", True, "x.py", "1-2", "r")], [], [],
+            fragment_fact_block=block)
+        self.assertLess(prompt.index("[Located fragments"), prompt.index("[Fragment facts"))
+        self.assertIn("outranks a lexically-similar fragment", prompt)
+
+
+class TestTraceGrounding(unittest.TestCase):
+    """P4: consistent prose must engage the attributed file or a live-code symbol."""
+
+    def _res(self, trace, counterfactual=""):
+        return C.ConvergeResult(
+            converged=True,
+            attributed_defect={"node": "db_fn", "file": "server/query.py", "lines": "1-4"},
+            causal_check={"verdict": "consistent", "trace": trace,
+                          "counterfactual": counterfactual})
+
+    def test_file_basename_keeps_convergence(self):
+        out = C._trace_grounding_guard(
+            self._res("query.py selects the stale row"), None)
+        self.assertTrue(out.converged)
+
+    def test_live_symbol_keeps_convergence(self):
+        d = tempfile.mkdtemp()
+        os.makedirs(os.path.join(d, "server"))
+        with open(os.path.join(d, "server", "query.py"), "w", encoding="utf-8") as f:
+            f.write("def select_effective_head(rows):\n    return rows[0]\n")
+        out = C._trace_grounding_guard(
+            self._res("select_effective_head returns the stale row"), d)
+        self.assertTrue(out.converged)
+
+    def test_generic_trace_is_demoted(self):
+        out = C._trace_grounding_guard(
+            self._res("the code is consistent with the symptom"), None)
+        self.assertFalse(out.converged)
+        self.assertIn("trace_ungrounded", out.causal_check)
+
+    def test_kill_switch_disables(self):
+        with mock.patch.dict(os.environ, {"HIVE_NO_TRACE_GROUNDING": "1"}):
+            out = C._trace_grounding_guard(self._res("generic"), None)
+        self.assertTrue(out.converged)
+
+    def test_empty_trace_and_attribution_never_raise(self):
+        res = C.ConvergeResult(
+            converged=True, attributed_defect=None,
+            causal_check={"verdict": "consistent", "trace": None,
+                          "counterfactual": None})
+        out = C._trace_grounding_guard(res, None)
+        self.assertFalse(out.converged)
+        self.assertIn("trace_ungrounded", out.causal_check)
+
+
+class TestEvidenceSufficiency(unittest.TestCase):
+    """P5: abstain on exactly-floor, wholly ungrounded consistent guesses."""
+
+    LOCATED = [
+        _verdict("A", True, "a.py", "1-2", "r"),
+        _verdict("B", True, "b.py", "3-4", "r"),
+    ]
+
+    def _res(self):
+        return C.ConvergeResult(
+            converged=True,
+            path=[{"node": "other", "file": "a.py", "lines": "1-2"}],
+            attributed_defect={"node": "other", "file": "a.py", "lines": "1-2"},
+            causal_check={"verdict": "consistent", "trace": "a.py emits the value",
+                          "counterfactual": "fixing a.py removes the symptom",
+                          "refuted_peers": [{"file": "b.py", "why_not": "not causal"}]})
+
+    def test_floor_without_grounding_is_demoted(self):
+        out = C._evidence_sufficiency_guard(
+            self._res(), self.LOCATED, [],
+            min_located=2, data_backed=False)
+        self.assertFalse(out.converged)
+        self.assertTrue(out.causal_check["low_confidence"])
+
+    def test_field_producer_grounding_keeps_convergence(self):
+        windows = [{"file": "a.py", "via": "field-producer", "field": "result_value"}]
+        out = C._evidence_sufficiency_guard(
+            self._res(), self.LOCATED, windows,
+            min_located=2, data_backed=False)
+        self.assertTrue(out.converged)
+
+    def test_data_backing_keeps_convergence(self):
+        out = C._evidence_sufficiency_guard(
+            self._res(), self.LOCATED, [],
+            min_located=2, data_backed=True)
+        self.assertTrue(out.converged)
+
+    def test_more_than_floor_is_untouched(self):
+        located = self.LOCATED + [_verdict("C", True, "c.py", "5-6", "r")]
+        out = C._evidence_sufficiency_guard(
+            self._res(), located, [],
+            min_located=2, data_backed=False)
+        self.assertTrue(out.converged)
+
+    def test_kill_switch_disables(self):
+        with mock.patch.dict(os.environ, {"HIVE_NO_SUFFICIENCY_GATE": "1"}):
+            out = C._evidence_sufficiency_guard(
+                self._res(), self.LOCATED, [],
+                min_located=2, data_backed=False)
+        self.assertTrue(out.converged)
+
+    def _arbiter(self, **kw):
+        return C._causal_provenance_arbiter(
+            self._res(), self.LOCATED,
+            fp_windows=[], http_ds_windows=[], data_backed=False,
+            data_chain_broke=False, db_available=False, code_root=None,
+            windows=[], min_located=2, **kw)
+
+    def test_arbiter_demotes_thin_holistic_floor(self):
+        """Through the arbiter, a holistic floor-level guess still abstains."""
+        self.assertFalse(self._arbiter(split_origin=False).converged)
+
+    def test_arbiter_exempts_split_origin_from_sufficiency(self):
+        """A split's per-locus elimination IS grounding — P5 must not demote it."""
+        self.assertTrue(self._arbiter(split_origin=True).converged)
+
+
+class TestAttributionStability(unittest.TestCase):
+    """P2: already-produced holistic/split disagreement is a humility signal."""
+
+    @staticmethod
+    def _res(file):
+        return C.ConvergeResult(
+            converged=True,
+            attributed_defect={"node": "other", "file": file, "lines": "1-2"},
+            causal_check={"verdict": "consistent", "trace": f"{file} is causal"})
+
+    def test_disagreement_demotes(self):
+        out = C._attribution_stability_guard(
+            self._res("server/query.py"), self._res("client/render.ts"))
+        self.assertFalse(out.converged)
+        self.assertIn("attribution_unstable", out.causal_check)
+
+    def test_agreement_keeps_convergence(self):
+        out = C._attribution_stability_guard(
+            self._res("server/query.py"), self._res("C:/repo/server/query.py"))
+        self.assertTrue(out.converged)
+
+    def test_missing_comparison_is_noop(self):
+        out = C._attribution_stability_guard(self._res("server/query.py"), None)
+        self.assertTrue(out.converged)
+
+    def test_kill_switch_disables(self):
+        with mock.patch.dict(os.environ, {"HIVE_NO_STABILITY_CHECK": "1"}):
+            out = C._attribution_stability_guard(
+                self._res("server/query.py"), self._res("client/render.ts"))
+        self.assertTrue(out.converged)
 
 
 class TestFieldProvenanceGuard(unittest.TestCase):
@@ -1995,7 +2343,7 @@ class TestSplitConverge(unittest.TestCase):
         with mock.patch.object(C, "call_worker", side_effect=fake):
             res = C.run_converge(seed_text="s", verdicts=SPLIT_VERDICTS,
                                  bundles=SPLIT_BUNDLES, provider="deepinfra", model="m",
-                                 split_enabled=True)
+                                 split_enabled=True, min_located=1)
         self.assertTrue(saw_holistic, "holistic converge should run on a split abstain")
         # holistic CONVERGED_OUT attributes to db/workflow_sequences.py
         self.assertTrue(res.converged)

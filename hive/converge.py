@@ -353,6 +353,118 @@ def _http_binding_bridges(located: list[dict[str, Any]],
     return "\n".join(lines)
 
 
+def _coerce_refuted_peers(raw: Any) -> list[dict[str, str]]:
+    """Normalize explicit peer refutations; malformed entries are ignored."""
+    out: list[dict[str, str]] = []
+    for peer in raw if isinstance(raw, list) else []:
+        if not isinstance(peer, dict):
+            continue
+        out.append({
+            "file": str(peer.get("file", "") or ""),
+            "lines": str(peer.get("lines", "") or ""),
+            "why_not": str(peer.get("why_not", "") or ""),
+        })
+    return out
+
+
+def _fragment_fact_cards(located: list[dict[str, Any]],
+                         windows: list[dict[str, Any]],
+                         bundles: list[dict[str, Any]],
+                         code_root: str | None) -> str:
+    """Render compact deterministic provenance cards for each located fragment.
+
+    The cards expose structure the pipeline already computed: field producers, resolved
+    HTTP bindings, call-chain reachability, and whether the cited locus was lifted from
+    live source. Malformed evidence is skipped and the builder never raises.
+    """
+    if not isinstance(located, list) or not located:
+        return ""
+    try:
+        all_windows: list[dict[str, Any]] = [
+            w for w in (windows if isinstance(windows, list) else [])
+            if isinstance(w, dict)
+        ]
+        chains: list[list[dict[str, Any]]] = []
+        for bundle in bundles if isinstance(bundles, list) else []:
+            if not isinstance(bundle, dict):
+                continue
+            seq = [
+                w for w in ((bundle.get("code_snippets") or [])
+                            + (bundle.get("call_chain") or []))
+                if isinstance(w, dict)
+            ]
+            all_windows.extend(seq)
+            if seq:
+                chains.append(seq)
+
+        cards: list[str] = []
+        for v in located:
+            if not isinstance(v, dict):
+                continue
+            vd = v.get("verdict") if isinstance(v.get("verdict"), dict) else {}
+            file = str(vd.get("file", "") or "")
+            lines = str(vd.get("lines", "") or "")
+            if not file:
+                continue
+            nf = _norm(file)
+            fields: set[str] = set()
+            routes: set[str] = set()
+            reachable: set[str] = set()
+
+            for w in all_windows:
+                wf = _norm(w.get("file", ""))
+                if not _aligns(nf, wf):
+                    continue
+                if w.get("via") == "field-producer":
+                    field_name = str(w.get("field", "") or "").strip()
+                    if field_name:
+                        fields.add(field_name)
+                if w.get("via") == "http-binding":
+                    text = str(w.get("text", "") or "")
+                    route = str(w.get("full_path", "") or w.get("url", "") or "").strip()
+                    if not route:
+                        m = re.search(r"(?i)\b(?:GET|POST|PUT|PATCH|DELETE)\s+(/[^\s<]+)", text)
+                        route = m.group(1) if m else ""
+                    if route:
+                        routes.add(route.rstrip("/"))
+
+            for seq in chains:
+                for i, w in enumerate(seq):
+                    if not _aligns(nf, w.get("file", "")):
+                        continue
+                    if i > 0:
+                        prev = seq[i - 1]
+                        label = str(prev.get("symbol", "") or "").strip()
+                        prev_file = str(prev.get("file", "") or "").strip()
+                        if prev_file:
+                            reachable.add(f"{prev_file}"
+                                          + (f" {label}" if label else ""))
+                    elif w.get("via") == "call-chain":
+                        label = str(w.get("symbol", "") or "").strip()
+                        reachable.add(label or "call-chain evidence")
+
+            live = bool(_lift_live_code([v], code_root))
+            cards.extend([
+                f"- axis {v.get('axis_id', '?')} / {file}:{lines}",
+                "    produces FE-bound field(s): "
+                + (", ".join(sorted(fields)) if fields else "(none)"),
+                "    bound to HTTP route(s):     "
+                + (", ".join(sorted(routes)) if routes else "(none)"),
+                "    reachable from:             "
+                + (", ".join(sorted(reachable))
+                   if reachable else "(not linked to any other located fragment)"),
+                f"    live-code confirmed:        {'yes' if live else 'no'}",
+            ])
+        if not cards:
+            return ""
+        return (
+            "[Fragment facts — deterministic annotations computed by the pipeline; "
+            "treat as FACT]\n" + "\n".join(cards))
+    except Exception as e:  # deterministic prompt scaffolding must never block converge
+        logger.warning("converge: fragment fact-card build failed: %s", e)
+        return ""
+
+
 def build_converge_prompt(seed_text: str, located: list[dict[str, Any]],
                           unlocated: list[dict[str, Any]],
                           windows: list[dict[str, Any]],
@@ -360,7 +472,8 @@ def build_converge_prompt(seed_text: str, located: list[dict[str, Any]],
                           db_available: bool = False,
                           db_schema: str = "",
                           code_state_block: str = "",
-                          http_binding_block: str = "") -> str:
+                          http_binding_block: str = "",
+                          fragment_fact_block: str = "") -> str:
     """Build the single converge prompt: fragments + evidence → one path + one node.
 
     ``data_state_block`` is the optional ``[Confirmed data state]`` section: on the
@@ -493,6 +606,14 @@ def build_converge_prompt(seed_text: str, located: list[dict[str, Any]],
             "below — the link is established; stitch it.]\n"
             + http_binding_block.strip() + "\n")
 
+    fragment_facts = ""
+    if fragment_fact_block.strip():
+        fragment_facts = (
+            "\n" + fragment_fact_block.strip() + "\n"
+            "Use these annotations to compare candidates: a fragment that produces the "
+            "FE-bound symptom field, or that is reachable on the executed path, outranks "
+            "a lexically-similar fragment that produces nothing and links to nothing.\n")
+
     schema_block = ""
     if db_available and db_schema.strip():
         schema_block = (
@@ -539,6 +660,7 @@ the seed backwards — flip your reasoning before emitting.
 {confirmed_block}{db_avail_block}{schema_block}{code_state}{http_bindings}
 [Located fragments — each is ONE node candidate, from a different axis]
 {frags}
+{fragment_facts}
 {unloc_block}
 [Pooled evidence windows (code + call-chain hops across all axes)]
 {evidence}
@@ -551,7 +673,10 @@ one-line reason that explains the wrong behaviour at THAT node.
 must show the attributed code actually PRODUCES the reported symptom. State the \
 DATA-STATE assumptions the scenario forces (the concrete row/field values at each \
 record the attributed code reads), then TRACE what the code OUTPUTS under those \
-assumptions, and rule:
+assumptions. For a ``consistent`` verdict, also state a one-line COUNTERFACTUAL: if \
+the code AT THE ATTRIBUTED LOCUS were corrected, the reported symptom would disappear \
+BECAUSE of the concrete mechanism visible in the live code/evidence — not because the \
+seed wishes it so, and not as a paraphrase of the symptom. Then rule:
    - It reproduces the symptom under the stated assumptions → causal_check.verdict = \
 "consistent".
    - Under the ONLY data state the scenario allows it does NOT (e.g. the candidate \
@@ -617,14 +742,13 @@ without reading it — is INCOMPLETE and will be REJECTED (not trusted as a fix)
 data_dependent = true even after you rule on the rows we returned. Set data_dependent = \
 false ONLY when your ruling follows purely from the code logic plus seed-stated facts, \
 with no unread stored value involved.
-   - REFUTE BEFORE YOU DROP — when you leave a located fragment OFF the path, that is a \
-claim it is a RED HERRING. If that fragment names a DISTINCT mechanism that could \
-INDEPENDENTLY produce the reported symptom (a different file/key/branch, not a \
-corroborating view of the SAME chain), you may not drop it SILENTLY: either causally \
-REFUTE it (show, against live code, that it cannot produce the symptom) and say so in \
-your ``trace``, or carry it as an additional INDEPENDENT defect (step 5). This is \
-especially binding when your own attribution is certified only on a data read — the \
-fragment you are about to discard may be the render-layer cause your DB read cannot see.
+   - REFUTE BEFORE YOU DROP — MANDATORY for EVERY located fragment at a DISTINCT file \
+that you leave off the path. You may not drop it silently: either list it in \
+``causal_check.refuted_peers`` with a concrete evidence-grounded ``why_not`` explaining \
+why it cannot independently produce the symptom (or why it is only a corroborating view \
+of the SAME chain), or carry it as an additional INDEPENDENT defect (step 5). This applies \
+in every symptom domain, not only data-backed rulings. A data read is especially unable \
+to refute a render/binding peer it cannot observe.
 4. If — and only if — two adjacent nodes cannot be connected because a needed \
 callee/symbol is NOT shown in the evidence, set converged=false and NAME the missing \
 link instead of guessing.
@@ -669,7 +793,7 @@ refutation into the next, better-aimed search instead of a rejection.
   ],
   "attributed_defect": {{ "node": "<which node above>", "file": "<repo-relative>", "lines": "<start-end>", "why": "<one line: the wrong behaviour here>" }},
   "additional_defects": [ {{ "node": "endpoint|handler|db_fn|sql_key|fe|other", "file": "<repo-relative>", "lines": "<start-end>", "why": "<the SEPARATE wrong behaviour at this INDEPENDENT locus>" }} ],
-  "causal_check": {{ "verdict": "consistent|contradicted|undecidable", "data_dependent": false, "data_state_assumptions": ["<the row/field values the scenario forces>"], "trace": "<what the attributed code outputs under those assumptions, and whether it reproduces the symptom>", "need_data_state": ["<when undecidable: the exact stored row state / fixture to confirm>"], "data_reads": [ {{ "id": "<short name for chaining, optional>", "table": "<table name from the evidence>", "where": {{ "<key column>": "<literal row selector OR {{\\"from\\": \\"<prior read id>\\", \\"column\\": \\"<column to carry over>\\"}}>" }}, "columns": ["<column(s) whose value decides the verdict>"] }} ] }},
+  "causal_check": {{ "verdict": "consistent|contradicted|undecidable", "data_dependent": false, "data_state_assumptions": ["<the row/field values the scenario forces>"], "trace": "<what the attributed code outputs under those assumptions, and whether it reproduces the symptom>", "counterfactual": "<when consistent: correcting the attributed locus removes the symptom because...>", "refuted_peers": [ {{ "file": "<other located fragment>", "lines": "<start-end>", "why_not": "<why it cannot independently produce the symptom, or is the same chain>" }} ], "need_data_state": ["<when undecidable: the exact stored row state / fixture to confirm>"], "data_reads": [ {{ "id": "<short name for chaining, optional>", "table": "<table name from the evidence>", "where": {{ "<key column>": "<literal row selector OR {{\\"from\\": \\"<prior read id>\\", \\"column\\": \\"<column to carry over>\\"}}>" }}, "columns": ["<column(s) whose value decides the verdict>"] }} ] }},
   "missing_link": null
 }}
 
@@ -701,6 +825,11 @@ def _coerce_node(d: Any) -> dict[str, Any] | None:
 _CAUSAL_VERDICTS = ("consistent", "contradicted", "undecidable")
 
 
+def _coerce_string_list(raw: Any) -> list[str]:
+    """Return a string list for model fields that are contractually arrays."""
+    return [str(x) for x in raw] if isinstance(raw, list) else []
+
+
 def _coerce_causal(d: Any) -> dict[str, Any] | None:
     """Parse the converger's ``causal_check`` block, or None when absent.
 
@@ -720,9 +849,11 @@ def _coerce_causal(d: Any) -> dict[str, Any] | None:
         # When true the verdict must be BACKED by a real DB read (data_reads we execute);
         # the data-stamp gate demotes a ``consistent`` that is data_dependent yet unread.
         "data_dependent": bool(d.get("data_dependent", False)),
-        "data_state_assumptions": [str(x) for x in (d.get("data_state_assumptions") or [])],
+        "data_state_assumptions": _coerce_string_list(d.get("data_state_assumptions")),
         "trace": str(d.get("trace", "") or ""),
-        "need_data_state": [str(x) for x in (d.get("need_data_state") or [])],
+        "counterfactual": str(d.get("counterfactual", "") or ""),
+        "refuted_peers": _coerce_refuted_peers(d.get("refuted_peers")),
+        "need_data_state": _coerce_string_list(d.get("need_data_state")),
         "data_reads": _coerce_data_reads(d.get("data_reads")),
     }
 
@@ -891,7 +1022,8 @@ def _converge_once(seed_text: str, located: list[dict[str, Any]],
                    ledger, timeout: int, data_state_block: str = "",
                    db_available: bool = False, db_schema: str = "",
                    code_state_block: str = "",
-                   http_binding_block: str = "") -> ConvergeResult:
+                   http_binding_block: str = "",
+                   fragment_fact_block: str = "") -> ConvergeResult:
     """One logical converge call (with a transport-level JSON-only reparse). Never raises.
 
     The reparse retry handles a model that wrapped the JSON in prose — it is a
@@ -903,7 +1035,8 @@ def _converge_once(seed_text: str, located: list[dict[str, Any]],
     """
     prompt = build_converge_prompt(seed_text, located, unlocated, windows,
                                    data_state_block, db_available, db_schema,
-                                   code_state_block, http_binding_block)
+                                   code_state_block, http_binding_block,
+                                   fragment_fact_block)
     attempt_prompt = prompt
     parsed: dict[str, Any] | None = None
     for attempt in range(2):
@@ -1158,12 +1291,24 @@ def _dropped_peer_guard(res: ConvergeResult, located: list[dict[str, Any]],
     check and keeps this guard silent in the legitimate red-herring case. Worst-case false
     fire costs one extra reinvestigation pass, never a wrong edit (fail toward re-examine).
     """
-    if not (res.converged and data_backed):
+    # P0 may already have demoted this exact peer. Preserve the historical N180 stamp
+    # for data-backed cases instead of making guard ordering erase existing diagnostics.
+    p0_peer = (res.causal_check or {}).get("unrefuted_peer") \
+        if isinstance(res.causal_check, dict) else None
+    if not data_backed or (not res.converged and not isinstance(p0_peer, dict)):
         return res
     cc = res.causal_check or {}
     if cc.get("verdict") != "consistent":
         return res
     ad = res.attributed_defect or {}
+    if not res.converged and isinstance(p0_peer, dict):
+        res.causal_check = {**cc, "dropped_peer": p0_peer}
+        res.summary = (
+            f"not converged: data-certified consistent at "
+            f"{ad.get('file', '')}:{ad.get('lines', '')} dropped an UNREFUTED competing "
+            f"hypothesis at {p0_peer.get('file', '')}:{p0_peer.get('lines', '')} "
+            f"(N180 domain guard)")
+        return res
     # Files the convergence already ACCOUNTS for — anything here is on the path / a named
     # target, i.e. NOT "dropped". A located peer aligning to one of these is fine.
     accounted = {_norm(ad.get("file", ""))}
@@ -1199,6 +1344,279 @@ def _dropped_peer_guard(res: ConvergeResult, located: list[dict[str, Any]],
         logger.info("converge: N180 guard demoted — data-certified consistent dropped "
                     "unrefuted peer %s:%s", peer["file"], peer["lines"])
         return res
+    return res
+
+
+def _counterfactual_complete_guard(res: ConvergeResult,
+                                   located: list[dict[str, Any]]) -> ConvergeResult:
+    """Require a grounded counterfactual and explicit accounting for every distinct peer.
+
+    This is the proactive, domain-agnostic form of the N180 lesson: a ``consistent``
+    verdict is not earned by reachability or row existence alone. It must explain why
+    correcting the attributed locus removes the symptom, and it must refute or retain
+    every other located file. The check is deliberately demote-only and tight: trace
+    basename mentions count as accounting, malformed input degrades without raising, and
+    the worst case is one extra reinvestigation pass. Disabled by
+    ``HIVE_NO_COUNTERFACTUAL``.
+    """
+    if os.environ.get("HIVE_NO_COUNTERFACTUAL") or not res.converged:
+        return res
+    if not isinstance(res.causal_check, dict):
+        res.converged = False
+        res.causal_check = {
+            "verdict": "unverified",
+            "counterfactual_incomplete": True,
+            "trace": "[counterfactual] malformed causal_check; certification was not earned.",
+        }
+        res.summary = "not converged: malformed causal_check"
+        return res
+    cc = res.causal_check
+    if cc.get("verdict") != "consistent":
+        return res
+    ad = res.attributed_defect if isinstance(res.attributed_defect, dict) else {}
+
+    if not str(cc.get("counterfactual", "") or "").strip():
+        res.converged = False
+        res.causal_check = {
+            **cc,
+            "counterfactual_incomplete": True,
+            "trace": str(cc.get("trace", "") or "")
+            + " [counterfactual] consistent verdict supplied no cause-to-symptom "
+              "counterfactual for the attributed locus; certification was not earned.",
+        }
+        res.summary = (
+            f"not converged: consistent attribution at {ad.get('file', '')}:"
+            f"{ad.get('lines', '')} has no grounded counterfactual")
+        logger.info("converge: counterfactual facet demoted — missing counterfactual at %s:%s",
+                    ad.get("file", ""), ad.get("lines", ""))
+        return res
+
+    accounted: set[str] = set()
+    for node in [ad, *(res.path or []), *(res.additional_defects or [])]:
+        if isinstance(node, dict):
+            f = _norm(node.get("file", ""))
+            if f:
+                accounted.add(f)
+    for peer in cc.get("refuted_peers", []) if isinstance(
+            cc.get("refuted_peers"), list) else []:
+        if isinstance(peer, dict):
+            f = _norm(peer.get("file", ""))
+            if f:
+                accounted.add(f)
+
+    trace = str(cc.get("trace", "") or "").lower()
+    for v in located if isinstance(located, list) else []:
+        if not isinstance(v, dict):
+            continue
+        vd = v.get("verdict") if isinstance(v.get("verdict"), dict) else {}
+        pf = _norm(vd.get("file", ""))
+        if not pf or any(_aligns(pf, a) for a in accounted):
+            continue
+        base = pf.rsplit("/", 1)[-1]
+        if base and base in trace:
+            continue
+        peer = {
+            "axis_id": str(v.get("axis_id", "?")),
+            "file": str(vd.get("file", "") or ""),
+            "lines": str(vd.get("lines", "") or ""),
+            "reason": str(vd.get("reason", "") or ""),
+        }
+        res.converged = False
+        res.causal_check = {
+            **cc,
+            "unrefuted_peer": peer,
+            "trace": str(cc.get("trace", "") or "")
+            + f" [counterfactual] competing located hypothesis at {peer['file']}:"
+              f"{peer['lines']} (axis {peer['axis_id']}) was neither included nor "
+              "causally refuted; re-examine before certifying one locus.",
+        }
+        res.summary = (
+            f"not converged: consistent attribution at {ad.get('file', '')}:"
+            f"{ad.get('lines', '')} left an unrefuted peer at "
+            f"{peer['file']}:{peer['lines']}")
+        logger.info("converge: counterfactual facet demoted — unrefuted peer %s:%s",
+                    peer["file"], peer["lines"])
+        return res
+    return res
+
+
+_TRACE_TOKEN_STOP = {
+    "and", "async", "await", "class", "def", "else", "false", "for", "from",
+    "if", "import", "in", "is", "none", "not", "or", "return", "self", "true",
+    "with",
+}
+
+
+def _salient_locus_tokens(attributed: dict[str, Any],
+                          code_root: str | None) -> set[str]:
+    """Extract conservative function/key/field tokens from the attributed live locus."""
+    if not code_root or not isinstance(attributed, dict):
+        return set()
+    focal = {"verdict": {
+        "located": True,
+        "file": attributed.get("file", ""),
+        "lines": attributed.get("lines", ""),
+    }}
+    lifted = _lift_live_code([focal], code_root)
+    if not lifted:
+        return set()
+    tokens: set[str] = set()
+    for pat in (
+        r"\b(?:def|class)\s+([A-Za-z_][A-Za-z0-9_]*)",
+        r"""['"]([A-Za-z_][A-Za-z0-9_]{3,})['"]""",
+        r"\b([A-Z][A-Z0-9_]{3,})\b",
+        r"\b([A-Za-z][A-Za-z0-9]*_[A-Za-z0-9_]{2,})\b",
+    ):
+        for token in re.findall(pat, lifted):
+            low = token.lower()
+            if low not in _TRACE_TOKEN_STOP:
+                tokens.add(low)
+    return tokens
+
+
+def _trace_grounding_guard(res: ConvergeResult,
+                           code_root: str | None) -> ConvergeResult:
+    """Demote generic ``consistent`` prose that never references its attributed locus.
+
+    A basename mention is sufficient. When live source is available, one salient
+    function/SQL-key/field token from the cited lines is also sufficient. The facet is
+    deliberately demote-only and permissive about terse real traces; it fires only on
+    total absence of a locus reference. Disabled by ``HIVE_NO_TRACE_GROUNDING``.
+    """
+    if os.environ.get("HIVE_NO_TRACE_GROUNDING") or not res.converged:
+        return res
+    cc = res.causal_check if isinstance(res.causal_check, dict) else {}
+    if cc.get("verdict") != "consistent":
+        return res
+    ad = res.attributed_defect if isinstance(res.attributed_defect, dict) else {}
+    file = _norm(ad.get("file", ""))
+    combined = (
+        str(cc.get("trace", "") or "") + " "
+        + str(cc.get("counterfactual", "") or "")
+    ).lower()
+    base = file.rsplit("/", 1)[-1] if file else ""
+    tokens = _salient_locus_tokens(ad, code_root)
+    if (base and base in combined) or any(
+            re.search(rf"\b{re.escape(token)}\b", combined) for token in tokens):
+        return res
+
+    res.converged = False
+    res.causal_check = {
+        **cc,
+        "trace_ungrounded": {
+            "file": str(ad.get("file", "") or ""),
+            "lines": str(ad.get("lines", "") or ""),
+        },
+        "trace": str(cc.get("trace", "") or "")
+        + " [trace-grounding] consistent reasoning referenced neither the attributed "
+          "file nor any salient symbol from its live cited source; certification is "
+          "generic and must be re-examined.",
+    }
+    res.summary = (
+        f"not converged: consistent attribution at {ad.get('file', '')}:"
+        f"{ad.get('lines', '')} has an ungrounded causal trace")
+    logger.info("converge: trace-grounding facet demoted generic attribution at %s:%s",
+                ad.get("file", ""), ad.get("lines", ""))
+    return res
+
+
+def _evidence_sufficiency_guard(
+        res: ConvergeResult,
+        located: list[dict[str, Any]],
+        windows: list[dict[str, Any]],
+        *,
+        min_located: int,
+        data_backed: bool) -> ConvergeResult:
+    """Abstain at the location floor when no positive provenance grounds the choice.
+
+    This facet fires only for a ``consistent`` result with exactly ``min_located``
+    candidates, no field-producer, HTTP-binding, or call-chain evidence touching a
+    located file, and no live data backing. It is demote-only, costs at worst one extra
+    reinvestigation pass, and is disabled by ``HIVE_NO_SUFFICIENCY_GATE``.
+    """
+    if (os.environ.get("HIVE_NO_SUFFICIENCY_GATE") or not res.converged
+            or data_backed or not isinstance(located, list)
+            or len(located) != min_located):
+        return res
+    cc = res.causal_check if isinstance(res.causal_check, dict) else {}
+    if cc.get("verdict") != "consistent":
+        return res
+    located_files = {
+        _norm((v.get("verdict") or {}).get("file", ""))
+        for v in located if isinstance(v, dict) and isinstance(v.get("verdict"), dict)
+    }
+    located_files.discard("")
+    grounded = False
+    for w in windows if isinstance(windows, list) else []:
+        if not isinstance(w, dict):
+            continue
+        via = str(w.get("via", "") or "")
+        if via not in ("field-producer", "http-binding", "call-chain"):
+            continue
+        wf = _norm(w.get("file", ""))
+        if via == "http-binding" or any(_aligns(wf, lf) for lf in located_files):
+            grounded = True
+            break
+    if grounded:
+        return res
+
+    ad = res.attributed_defect if isinstance(res.attributed_defect, dict) else {}
+    res.converged = False
+    res.causal_check = {
+        **cc,
+        "low_confidence": True,
+        "trace": str(cc.get("trace", "") or "")
+        + " [evidence-sufficiency] attribution was chosen at the minimum located-fragment "
+          "floor with no field-producer, HTTP-binding, call-chain, or live-data grounding; "
+          "reinvestigate rather than certify a thin guess.",
+    }
+    res.summary = (
+        f"not converged: consistent attribution at {ad.get('file', '')}:"
+        f"{ad.get('lines', '')} has insufficient positive grounding")
+    logger.info("converge: sufficiency facet demoted thin floor-level attribution")
+    return res
+
+
+def _attribution_stability_guard(
+        res: ConvergeResult,
+        comparison: ConvergeResult | None) -> ConvergeResult:
+    """Demote when two already-produced attribution routes disagree on the file.
+
+    No model call is made here. The facet only compares a holistic result and an
+    independently available split result; absent/partial comparisons are a no-op.
+    Disagreement stamps ``attribution_unstable`` and routes to reinvestigation. Disabled
+    by ``HIVE_NO_STABILITY_CHECK``.
+    """
+    if (os.environ.get("HIVE_NO_STABILITY_CHECK") or not res.converged
+            or not isinstance(comparison, ConvergeResult)
+            or not comparison.converged):
+        return res
+    ad = res.attributed_defect if isinstance(res.attributed_defect, dict) else {}
+    other = comparison.attributed_defect \
+        if isinstance(comparison.attributed_defect, dict) else {}
+    file = str(ad.get("file", "") or "")
+    other_file = str(other.get("file", "") or "")
+    if not file or not other_file or _aligns(file, other_file):
+        return res
+    cc = res.causal_check if isinstance(res.causal_check, dict) else {}
+    res.converged = False
+    res.causal_check = {
+        **cc,
+        "attribution_unstable": {
+            "selected": {"file": file, "lines": str(ad.get("lines", "") or "")},
+            "comparison": {
+                "file": other_file,
+                "lines": str(other.get("lines", "") or ""),
+            },
+        },
+        "trace": str(cc.get("trace", "") or "")
+        + f" [stability] independent attribution routes disagree: {file} versus "
+          f"{other_file}; reinvestigate rather than ship a contested locus.",
+    }
+    res.summary = (
+        f"not converged: attribution unstable between {file} and {other_file}")
+    logger.info("converge: stability facet demoted disagreement %s versus %s",
+                file, other_file)
     return res
 
 
@@ -1753,6 +2171,65 @@ def _field_provenance_guard(res: ConvergeResult,
     return res
 
 
+def _causal_provenance_arbiter(
+        res: ConvergeResult,
+        located: list[dict[str, Any]],
+        *,
+        fp_windows: list[dict[str, Any]],
+        http_ds_windows: list[dict[str, Any]],
+        data_backed: bool,
+        data_chain_broke: bool,
+        db_available: bool,
+        code_root: str | None,
+        windows: list[dict[str, Any]],
+        min_located: int,
+        split_origin: bool = False,
+        stability_comparison: ConvergeResult | None = None) -> ConvergeResult:
+    """Apply all causal/provenance decisions through one fail-closed entry point.
+
+    Precedence is explicit. Demotion facets first collect negative evidence: incomplete
+    counterfactual/peer accounting, refuted data premise, missing data stamp, and generic
+    trace grounding. Positive deterministic provenance has the final decision: the
+    HTTP-bound datasource may confirm/re-point, then the richer field-producer grounding
+    runs last and may override a prior demotion exactly as before. Every facet retains its
+    own tight firing condition and kill-switch. Any unexpected error demotes rather than
+    escaping converge.
+
+    ``split_origin`` marks a result produced by the per-locus SPLIT pass. Its narrow,
+    deterministic per-locus elimination IS positive grounding (stronger than a single
+    field-producer/HTTP-binding window), so the evidence-sufficiency facet — which abstains
+    only on a thin, wholly UNGROUNDED floor-level guess — must not fire on it. The reactive
+    guards (dropped-peer / premise / data-stamp) and the prompt-side facets still run, so a
+    split result is held to the same causal bar a holistic one is.
+    """
+    try:
+        res = _counterfactual_complete_guard(res, located)
+        res = _dropped_peer_guard(res, located, data_backed)
+        res = _premise_refuted_guard(res, db_available, data_chain_broke)
+        res = _data_stamp_guard(res, db_available, data_backed)
+        res = _trace_grounding_guard(res, code_root)
+        if not split_origin:
+            res = _evidence_sufficiency_guard(
+                res, located, windows, min_located=min_located, data_backed=data_backed)
+        res = _attribution_stability_guard(res, stability_comparison)
+        res = _http_datasource_provenance_guard(
+            res, located, http_ds_windows, code_root)
+        res = _field_provenance_guard(res, located, fp_windows)
+        return res
+    except Exception as e:
+        logger.warning("converge: causal provenance arbiter failed closed: %s", e)
+        cc = res.causal_check if isinstance(res.causal_check, dict) else {}
+        res.converged = False
+        res.causal_check = {
+            **cc,
+            "trace": str(cc.get("trace", "") or "")
+            + " [causal-provenance-arbiter] deterministic verification failed; "
+              "re-examine rather than certifying.",
+        }
+        res.summary = "not converged: causal provenance verification failed"
+        return res
+
+
 # ── Per-locus SPLIT converge (M020 follow-up) ───────────────────────────────────
 # The holistic converge asks ONE weak single-shot to do the whole stitch AND pick the
 # guilty node among several competing located loci — so it wanders run to run. The split
@@ -2067,6 +2544,19 @@ def _split_converge(seed_text: str, located: list[dict[str, Any]],
         "data_dependent": win["data_dependent"],
         "data_state_assumptions": [],
         "trace": trace,
+        "counterfactual": (
+            f"correcting {attributed['file']}:{attributed['lines']} would remove the "
+            f"symptom because this was the only locus whose narrow cause-to-symptom "
+            f"check remained consistent"),
+        "refuted_peers": [
+            {
+                "file": (r["focal"].get("verdict") or {}).get("file", ""),
+                "lines": (r["focal"].get("verdict") or {}).get("lines", ""),
+                "why_not": r["why"] or r["trace"] or
+                           f"narrow check ruled {r['verdict']}",
+            }
+            for r in eliminated
+        ],
         "need_data_state": [],
         "data_reads": [],
     }
@@ -2138,6 +2628,8 @@ def run_converge(*, seed_text: str, verdicts: list[dict[str, Any]],
         logger.info("converge: HTTP-edge grounding resolved %d FE→BE binding(s)",
                     http_binding_block.count("- FE client"))
 
+    fragment_fact_block = _fragment_fact_cards(located, windows, bundles, code_root)
+
     # Tool-OFF single-shot (mirrors judge): no file/shell access, decide on the bundle.
     pk = dict(provider_kwargs or {})
     pk.setdefault("available_tools", [])
@@ -2172,7 +2664,8 @@ def run_converge(*, seed_text: str, verdicts: list[dict[str, Any]],
                              provider, model, pk, ledger, timeout,
                              db_available=db_available, db_schema=db_schema,
                              code_state_block=code_state_block,
-                             http_binding_block=http_binding_block)
+                             http_binding_block=http_binding_block,
+                             fragment_fact_block=fragment_fact_block)
     logger.info("converge: %s", res.summary)
 
     # ── Data-state read (N172/N173): the verdict hinges on a STORED row value static
@@ -2223,7 +2716,8 @@ def run_converge(*, seed_text: str, verdicts: list[dict[str, Any]],
                               provider, model, pk, ledger, timeout,
                               data_state_block=combined, db_available=db_available,
                               db_schema=db_schema, code_state_block=code_state_block,
-                              http_binding_block=http_binding_block)
+                              http_binding_block=http_binding_block,
+                              fragment_fact_block=fragment_fact_block)
         logger.info("converge: data re-pass %d → %s", rounds, res2.summary)
         v2 = (res2.causal_check or {}).get("verdict")
         if v2 in ("consistent", "contradicted") and backed:
@@ -2293,7 +2787,10 @@ def run_converge(*, seed_text: str, verdicts: list[dict[str, Any]],
                                       code_state_block=_lift_live_code(located, code_root)
                                       or code_state_block,
                                       http_binding_block=_http_binding_bridges(
-                                          located, merged, code_root) or http_binding_block)
+                                          located, merged, code_root) or http_binding_block,
+                                      fragment_fact_block=_fragment_fact_cards(
+                                          located, merged, bundles, code_root)
+                                      or fragment_fact_block)
                 logger.info("converge: re-pass → %s", res2.summary)
                 # Adopt the re-pass only if it actually converged; otherwise keep the
                 # first result, which at least named the missing link for the author.
@@ -2312,53 +2809,27 @@ def run_converge(*, seed_text: str, verdicts: list[dict[str, Any]],
         data_block = res.data_state_block
         data_chain_broke = False
 
-    # ── Dropped-peer domain guard (N180): a ``consistent`` certified on a live DB read
-    # must not stay converged while a DISTINCT-locus located peer was dropped without
-    # refutation — a data read cannot vouch for a render/binding-layer cause. Runs on the
-    # FINAL result (after any data-read / missing-link re-pass); demotes to not-converged
-    # and stamps the peer so the honey routes it to reinvestigation. Tight by design.
-    res = _dropped_peer_guard(res, located, data_backed)
-
-    # ── Premise-refuted gate (M035): a data-dependent ``consistent`` whose adopted read
-    # chain BROKE (a chained read had no upstream rows) rests on rows the live DB proves
-    # absent — the suspected query already yields the expected result, so the real cause is
-    # elsewhere (render/alternate path). Demotes to not-converged. No-op unless the chain
-    # actually collapsed; closes the M017 gap where an incidental id-lookup satisfied
-    # ``data_backed`` while every deciding read was skipped. Tight by design.
-    res = _premise_refuted_guard(res, db_available, data_chain_broke)
-
-    # ── Data-stamp gate (M017 lever 2): a ``consistent`` verdict the converger flagged
-    # ``data_dependent`` must be BACKED by a real DB read, never ruled on an assumed stored
-    # value. Runs on the FINAL result; demotes an unstamped data-dependent consistent to
-    # not-converged and marks ``data_unstamped`` so the honey routes it back to read the
-    # deciding row. No-op when no DB is configured, when the ruling is pure code-logic
-    # (not data_dependent), or when a real read already backed it. Tight by design.
-    res = _data_stamp_guard(res, db_available, data_backed)
-
-    # ── HTTP-bound datasource re-point (M036 module-selector off-path): when a gated FE
-    # collection is filled from an endpoint and that endpoint's datasource hardcodes the
-    # relevant field empty (``currentModules`` ← ``/api/v1/projects`` ← ``'' AS module``),
-    # re-point away from off-path list-style decoys to the datasource. Runs before the
-    # snake_case field-provenance guard; if both somehow apply, field-provenance remains
-    # the final arbiter for richer response-field symptoms.
     http_ds_windows = [s for b in (bundles or [])
                        for s in ((b.get("code_snippets") or []) + (b.get("call_chain") or []))
                        if isinstance(s, dict)]
-    res = _http_datasource_provenance_guard(res, located, http_ds_windows, code_root)
-
-    # ── Field-provenance re-point (M035 §4 head case): when the symptom is a wrong value
-    # in an FE-bound response field, field-producer grounding knows the code that FILLS
-    # that field. If converge attributed to a different locus that does NOT produce the
-    # field and is not on its production path (a lexically-similar, data-"certified"
-    # decoy), re-point the attribution to the real producer. Runs LAST and may OVERRIDE a
-    # demotion above: the structural "field is produced here" fact outranks a consistency
-    # certified on an incidental read of rows the symptom field never came from (the very
-    # N170/N180 failure mode). Structural, not seed-NL parsing (N177-safe); off via
-    # HIVE_NO_FIELD_PROVENANCE.
     fp_windows = [s for b in (bundles or [])
                   for s in ((b.get("code_snippets") or []) + (b.get("call_chain") or []))
                   if isinstance(s, dict) and s.get("via") == "field-producer"]
-    res = _field_provenance_guard(res, located, fp_windows)
+
+    # One causal/provenance decision surface. The arbiter preserves every existing stamp
+    # and kill-switch while making precedence explicit and housing P0/P4 as facets.
+    res = _causal_provenance_arbiter(
+        res, located,
+        fp_windows=fp_windows,
+        http_ds_windows=http_ds_windows,
+        data_backed=data_backed,
+        data_chain_broke=data_chain_broke,
+        db_available=db_available,
+        code_root=code_root,
+        windows=http_ds_windows,
+        min_located=min_located,
+        split_origin=split_res is not None,
+        stability_comparison=split_res if split_res is not res else None)
 
     # Carry the live-DB read onto whichever result we return so the honey can PASTE the
     # real rows (or honestly report that the read was attempted but returned nothing).
