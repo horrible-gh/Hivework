@@ -114,6 +114,26 @@ def build_provider_kwargs(cfg) -> dict:
     return kwargs
 
 
+def http_shape_specify_kwargs(cfg, codebase_root: str | None) -> dict:
+    """run_specify kwargs that bind lever ⑦'s red test to the target's TestClient.
+
+    Resolves the per-codebase ``http_shape`` harness (config ``targets.<name>.http_shape``)
+    and forwards its setup block / fixture name / test dir into ``run_specify``. Returns
+    an empty dict when the codebase has no entry — synthesis then stays a no-op (or falls
+    back to auto-discovery), so behaviour is unchanged until a harness is configured.
+    """
+    hs = cfg.http_shape_for_codebase(codebase_root)
+    if not hs:
+        return {}
+    out: dict = {"http_shape_test_dir": hs.test_dir or "tests"}
+    setup_block = hs.resolve_setup_block(codebase_root)
+    if setup_block:
+        out["http_shape_setup_block"] = setup_block
+    if hs.app_fixture:
+        out["http_shape_app_fixture"] = hs.app_fixture
+    return out
+
+
 def run_pipeline(args: argparse.Namespace) -> None:
     """Execute the full 6-stage pipeline."""
     start_time = time.time()
@@ -365,6 +385,7 @@ def run_pipeline(args: argparse.Namespace) -> None:
             specify_kwargs = dict(author_retries=specify_role.retries)
             if specify_role.timeout_sec is not None:
                 specify_kwargs["author_timeout"] = specify_role.timeout_sec
+            specify_kwargs.update(http_shape_specify_kwargs(cfg, args.codebase))
             try:
                 spec = run_specify(
                     honey_path=honey_path,
@@ -560,6 +581,7 @@ def run_investigate_command(args: argparse.Namespace) -> None:
             specify_kwargs = dict(author_retries=specify_role.retries)
             if specify_role.timeout_sec is not None:
                 specify_kwargs["author_timeout"] = specify_role.timeout_sec
+            specify_kwargs.update(http_shape_specify_kwargs(cfg, args.codebase))
 
             def _respecify():
                 spec = run_specify(
@@ -728,6 +750,7 @@ def run_specify_command(args: argparse.Namespace) -> None:
     specify_kwargs = dict(author_retries=role.retries)
     if role.timeout_sec is not None:
         specify_kwargs["author_timeout"] = role.timeout_sec
+    specify_kwargs.update(http_shape_specify_kwargs(cfg, args.codebase))
     spec: dict = {}
     try:
         spec = run_specify(

@@ -2078,5 +2078,101 @@ class TestFixtureGrounding(unittest.TestCase):
         self.assertNotIn("test_big_monkey.py", ex)
 
 
+class TestHttpShapeSynthesisPass(unittest.TestCase):
+    """Lever ⑦: specify attaches an HTTP-shape red test so apply observes red→green."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = os.path.join(self._tmp.name, "code")
+        os.makedirs(os.path.join(self.root, "app"))
+        os.makedirs(os.path.join(self.root, "tests"))
+        with open(os.path.join(self.root, "app", "routes.py"), "w",
+                  encoding="utf-8") as f:
+            f.write('from fastapi import APIRouter\n'
+                    'router = APIRouter(prefix="/api/v1")\n\n'
+                    '@router.get("/projects")\n'
+                    'def list_projects():\n'
+                    '    return {"projects": _rows()}\n')
+        with open(os.path.join(self.root, "tests", "conftest.py"), "w",
+                  encoding="utf-8") as f:
+            f.write('import pytest\n'
+                    'from fastapi.testclient import TestClient\n\n'
+                    '@pytest.fixture\n'
+                    'def client():\n'
+                    '    from app.routes import router\n'
+                    '    from fastapi import FastAPI\n'
+                    '    app = FastAPI(); app.include_router(router)\n'
+                    '    return TestClient(app)\n')
+        self.honey = ('const res = await getRequest("/api/v1/projects")\n'
+                      'modules: Array.isArray(it.modules) ? it.modules : []\n')
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _spec(self):
+        return {"edits": [{"id": "E1", "file": "app/routes.py",
+                           "anchor_old": "a", "replacement_new": "b"}],
+                "verify": {}}
+
+    def test_attaches_red_test_and_wires_verify(self):
+        spec = specify._synthesize_http_shape_red_test(
+            self._spec(), self.honey, self.root)
+        self.assertEqual(spec["verify"]["test_edit_ids"], ["HTTP_SHAPE_RED"])
+        # node = "<test file>::<generated test fn>" (the URL is sanitised into the name)
+        self.assertIn("test_http_shape_modules.py::", spec["verify"]["red_test_node"])
+        self.assertIn("api_v1_projects", spec["verify"]["red_test_node"])
+        red = [e for e in spec["edits"] if e["id"] == "HTTP_SHAPE_RED"]
+        self.assertEqual(len(red), 1)
+        self.assertEqual(red[0]["kind"], "create_file")
+
+    def test_noop_when_author_red_test_already_present(self):
+        spec = self._spec()
+        spec["verify"] = {"red_test_node": "tests/test_x.py::t",
+                          "test_edit_ids": ["E9"]}
+        out = specify._synthesize_http_shape_red_test(spec, self.honey, self.root)
+        self.assertEqual(out["verify"]["red_test_node"], "tests/test_x.py::t")
+        self.assertFalse(any(e["id"] == "HTTP_SHAPE_RED" for e in out["edits"]))
+
+    def test_noop_when_no_source_edit(self):
+        spec = {"edits": [], "verify": {}}
+        out = specify._synthesize_http_shape_red_test(spec, self.honey, self.root)
+        self.assertNotIn("red_test_node", out.get("verify", {}))
+        self.assertEqual(out["edits"], [])
+
+    def test_kill_switch_disables_pass(self):
+        with mock.patch.dict(os.environ, {specify._HTTP_SHAPE_ENV_OFF: "1"}):
+            out = specify._synthesize_http_shape_red_test(
+                self._spec(), self.honey, self.root)
+        self.assertNotIn("red_test_node", out.get("verify", {}))
+        self.assertFalse(any(e["id"] == "HTTP_SHAPE_RED" for e in out["edits"]))
+
+    def test_fail_open_when_symptom_absent(self):
+        out = specify._synthesize_http_shape_red_test(
+            self._spec(), "no http symptom here", self.root)
+        self.assertNotIn("red_test_node", out.get("verify", {}))
+
+    def test_configured_test_dir_and_setup_block_are_forwarded(self):
+        # The #1 wiring: config supplies a target-specific test_dir + setup_block
+        # (its own seeded TestClient), so synthesis binds to THAT harness and places
+        # the red test under the configured dir — not the "tests/" default.
+        setup = ("import pytest\n"
+                 "from fastapi.testclient import TestClient\n\n"
+                 "@pytest.fixture\n"
+                 "def seeded_client():\n"
+                 "    from app.routes import router\n"
+                 "    from fastapi import FastAPI\n"
+                 "    app = FastAPI(); app.include_router(router)\n"
+                 "    return TestClient(app)\n")
+        spec = specify._synthesize_http_shape_red_test(
+            self._spec(), self.honey, self.root,
+            setup_block=setup, test_dir="server/tests")
+        red = [e for e in spec["edits"] if e["id"] == "HTTP_SHAPE_RED"][0]
+        self.assertTrue(red["file"].startswith("server/tests/"))
+        self.assertTrue(spec["verify"]["red_test_node"].startswith("server/tests/"))
+        # the supplied harness is prepended and its fixture name drives the test sig
+        self.assertTrue(red["content"].startswith("import pytest"))
+        self.assertIn("(seeded_client):", red["content"])
+
+
 if __name__ == "__main__":
     unittest.main()

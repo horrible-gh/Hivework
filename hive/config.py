@@ -238,6 +238,56 @@ class RunnerConfig:
 
 
 @dataclass
+class HttpShapeConfig:
+    """One target codebase's HTTP-shape red-test harness (lever ⑦ enabler).
+
+    NEUTRAL by design — no FlowGate (or any caller) semantics, mirroring
+    :class:`RunnerConfig` / :class:`DbConnection`. It tells specify how to bind the
+    synthesised ``GET …`` red test to the TARGET's own seeded TestClient so
+    ``apply --verify`` can observe red→green. Supplied one of two ways (never invented):
+
+    - ``app_fixture``: the NAME of an existing seeded-``TestClient`` fixture in the
+      target's test tree. Overrides the auto-discovery that DECLINES when the target
+      defines several client fixtures (the common case — FlowGate has many), which is
+      exactly why naming one is needed.
+    - ``setup_block`` (inline) or ``setup_block_file`` (a path, relative resolves under
+      the codebase root): explicit pytest source — imports + a ``@pytest.fixture`` that
+      builds a seeded TestClient — prepended to the generated test. ``setup_block_file``
+      content is read at resolve time; inline ``setup_block`` wins when both are set.
+
+    ``test_dir`` is where the synthesised red test file is created (relative to the
+    codebase, e.g. ``"server/tests"`` so it lands beside the target's conftest). With
+    NEITHER a fixture name NOR a setup block the lever stays a safe no-op (synthesis
+    declines rather than emit a test that errors). ``codebase`` optionally binds this
+    entry to an explicit codebase path, exactly like the other per-target blocks.
+    """
+    app_fixture: str = ""
+    setup_block: str = ""
+    setup_block_file: str = ""
+    test_dir: str = "tests"
+    codebase: str = ""
+
+    def resolve_setup_block(self, codebase_root: str | None) -> str | None:
+        """Return the harness source: inline ``setup_block`` wins, else read the file.
+
+        A relative ``setup_block_file`` resolves under ``codebase_root``. Returns None
+        when neither is set or the file cannot be read (synthesis then falls back to
+        ``app_fixture`` / auto-discovery). Never raises."""
+        if self.setup_block.strip():
+            return self.setup_block
+        if self.setup_block_file:
+            path = self.setup_block_file
+            if not os.path.isabs(path) and codebase_root:
+                path = os.path.join(codebase_root, path)
+            try:
+                with open(path, "r", encoding="utf-8") as fh:
+                    return fh.read()
+            except OSError:
+                return None
+        return None
+
+
+@dataclass
 class SafetyConfig:
     """Cost guard-rails enforced by the CLI before any spend.
 
@@ -393,6 +443,10 @@ class Config:
     # default — the runtime red→green verify (hive.verify) is SKIPPED when a run's
     # codebase has no entry (graceful, exactly like db_connections above).
     test_runners: dict[str, RunnerConfig] = field(default_factory=dict)
+    # Per-codebase HTTP-shape red-test harnesses, keyed by a short name. Empty by
+    # default — lever ⑦ synthesis stays a no-op when a run's codebase has no entry
+    # (auto-discovery declines on an ambiguous test tree), graceful like the two above.
+    http_shape_targets: dict[str, HttpShapeConfig] = field(default_factory=dict)
 
     def db_for_codebase(self, codebase_root: str | None) -> DbConnection | None:
         """Resolve the DB connection for a run's ``--codebase`` path, or None.
@@ -436,6 +490,27 @@ class Config:
         for key, runner in self.test_runners.items():
             if key.strip().lower() == leaf:
                 return runner
+        return None
+
+    def http_shape_for_codebase(self, codebase_root: str | None) -> "HttpShapeConfig | None":
+        """Resolve the HTTP-shape harness for a run's ``--codebase`` path, or None.
+
+        Same match order as :meth:`db_for_codebase` / :meth:`test_runner_for_codebase`:
+        an explicit ``codebase`` binding wins, else the entry whose KEY equals the
+        codebase's leaf folder name (case-insensitive). Returns None when nothing matches
+        (the common case → lever ⑦ synthesis stays a no-op), never raises.
+        """
+        if not codebase_root or not self.http_shape_targets:
+            return None
+        norm = codebase_root.replace("\\", "/").rstrip("/").lower()
+        leaf = norm.rsplit("/", 1)[-1]
+        for hs in self.http_shape_targets.values():
+            cb = (hs.codebase or "").replace("\\", "/").rstrip("/").lower()
+            if cb and (cb == norm or norm.endswith("/" + cb) or cb.endswith("/" + norm)):
+                return hs
+        for key, hs in self.http_shape_targets.items():
+            if key.strip().lower() == leaf:
+                return hs
         return None
 
     def role(self, name: str) -> RoleConfig:
@@ -534,6 +609,7 @@ def _normalize(raw: dict) -> dict:
     if isinstance(targets, dict):
         db_conns = dict(raw.get("db_connections") or {})
         runners = dict(raw.get("test_runners") or {})
+        http_shapes = dict(raw.get("http_shape_targets") or {})
         for name, t in targets.items():
             if not isinstance(t, dict):  # skips a targets-level "_comment", etc.
                 continue
@@ -541,10 +617,14 @@ def _normalize(raw: dict) -> dict:
                 db_conns[name] = t["db"]
             if isinstance(t.get("tests"), dict):
                 runners[name] = t["tests"]
+            if isinstance(t.get("http_shape"), dict):
+                http_shapes[name] = t["http_shape"]
         if db_conns:
             out["db_connections"] = db_conns
         if runners:
             out["test_runners"] = runners
+        if http_shapes:
+            out["http_shape_targets"] = http_shapes
 
     return out
 
@@ -676,6 +756,21 @@ def load_config(path: str | None = None, profile: str | None = None) -> Config:
         str(k): _runner(v) for k, v in runners_raw.items() if isinstance(v, dict)
     }
 
+    http_shape_raw = merged.get("http_shape_targets", {})
+
+    def _http_shape(d: dict) -> HttpShapeConfig:
+        return HttpShapeConfig(
+            app_fixture=str(d.get("app_fixture", "")),
+            setup_block=str(d.get("setup_block", "")),
+            setup_block_file=str(d.get("setup_block_file", "")),
+            test_dir=str(d.get("test_dir", "tests")) or "tests",
+            codebase=str(d.get("codebase", "")),
+        )
+
+    http_shape_targets = {
+        str(k): _http_shape(v) for k, v in http_shape_raw.items() if isinstance(v, dict)
+    }
+
     def _role(name: str, default_model: str = "gpt-5-mini") -> RoleConfig:
         r = roles.get(name, {})
         timeout = r.get("timeout_sec")
@@ -753,4 +848,5 @@ def load_config(path: str | None = None, profile: str | None = None) -> Config:
         ),
         db_connections=db_connections,
         test_runners=test_runners,
+        http_shape_targets=http_shape_targets,
     )

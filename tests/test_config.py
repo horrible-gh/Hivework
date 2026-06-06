@@ -164,6 +164,54 @@ class TestTestRunners(unittest.TestCase):
         self.assertIsNone(cfg.test_runner_for_codebase("/abs/Other"))
 
 
+class TestHttpShapeTargets(unittest.TestCase):
+    """The per-codebase http_shape harness block (lever ⑦ enabler / #1 wiring)."""
+
+    def _load(self, overrides):
+        tmpdir = tempfile.mkdtemp()
+        path = os.path.join(tmpdir, "hive.config.json")
+        with open(path, "w") as f:
+            json.dump(overrides, f)
+        return load_config(path=path)
+
+    def test_none_by_default(self):
+        cfg = load_config(path="/nonexistent/hive.config.json")
+        self.assertEqual(cfg.http_shape_targets, {})
+        self.assertIsNone(cfg.http_shape_for_codebase("/x/FlowGate"))
+
+    def test_grouped_target_block_parsed_and_matched_by_key(self):
+        cfg = self._load({"targets": {"FlowGate": {"http_shape": {
+            "app_fixture": "client", "test_dir": "server/tests"}}}})
+        hs = cfg.http_shape_for_codebase("C:/work/FlowGate")
+        self.assertIsNotNone(hs)
+        self.assertEqual(hs.app_fixture, "client")
+        self.assertEqual(hs.test_dir, "server/tests")
+
+    def test_resolve_setup_block_inline_wins(self):
+        cfg = self._load({"http_shape_targets": {"x": {
+            "setup_block": "import pytest\n", "setup_block_file": "nope.py"}}})
+        hs = cfg.http_shape_targets["x"]
+        self.assertEqual(hs.resolve_setup_block("/anything"), "import pytest\n")
+
+    def test_resolve_setup_block_from_relative_file(self):
+        tmpdir = tempfile.mkdtemp()
+        os.makedirs(os.path.join(tmpdir, "harness"))
+        with open(os.path.join(tmpdir, "harness", "h.py"), "w") as f:
+            f.write("# seeded client harness\n")
+        cfg = self._load({"http_shape_targets": {"x": {
+            "setup_block_file": "harness/h.py"}}})
+        hs = cfg.http_shape_targets["x"]
+        self.assertEqual(hs.resolve_setup_block(tmpdir), "# seeded client harness\n")
+        # missing file → None (synthesis falls back / stays a no-op), never raises
+        self.assertIsNone(hs.resolve_setup_block("/no/such/root"))
+
+    def test_explicit_codebase_binding_wins(self):
+        cfg = self._load({"http_shape_targets": {"h1": {
+            "app_fixture": "c", "codebase": "/abs/MyApp"}}})
+        self.assertIsNotNone(cfg.http_shape_for_codebase("/abs/MyApp"))
+        self.assertIsNone(cfg.http_shape_for_codebase("/abs/Other"))
+
+
 class TestConvergeSplit(unittest.TestCase):
     """The converge.split block (M020 per-locus elimination pass)."""
 

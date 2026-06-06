@@ -41,6 +41,7 @@ import re
 from typing import Any
 
 from hive import dbread
+from hive.http_shape_synth import synthesize_http_shape_red_test
 from hive.investigate import SEED_TARGET_SECTION, CONVERGE_TARGET_SECTION
 from hive.parse import extract_first_json
 from hive.providers import call_worker
@@ -2538,6 +2539,77 @@ def _review_and_gate(
                                      incomplete_wiring, datasource_ids)
 
 
+# Kill-switch for the HTTP-shape red-test synthesis (A/B isolation + safety valve),
+# mirroring HIVE_NO_HTTP_BRIDGE / HIVE_NO_DEFERRED_ESCAPE. When set, the pass is a
+# no-op and specify keeps its prior behaviour.
+_HTTP_SHAPE_ENV_OFF = "HIVE_NO_HTTP_SHAPE"
+
+
+def _synthesize_http_shape_red_test(spec: dict[str, Any], honey_text: str,
+                                    codebase_root: str,
+                                    setup_block: str | None = None,
+                                    app_fixture: str | None = None,
+                                    test_dir: str = "tests") -> dict[str, Any]:
+    """Attach an HTTP-shape red test so apply ALWAYS observes red→green (lever ⑦).
+
+    The backstop the apply stage was missing: when the symptom is an FE-bound array
+    field served by an HTTP route (``Array.isArray(it.modules)`` off
+    ``GET /api/v1/projects``), synthesise a TestClient red test from the SAME grounding
+    the retriever already built (route via ``_resolve_http_bindings`` — mount-prefix
+    folded — and the field/container read deterministically), register it in
+    ``spec.verify`` so ``apply --verify`` runs it, and let ``verify.py`` certify the fix
+    by EXECUTION. This does NOT depend on converge's confidence: even when converge was
+    (wrongly) sure the scenario was consistent, apply now has a red test to observe.
+
+    Fail-open and conservative by construction — it leaves the spec untouched unless ALL
+    hold: the kill-switch is off, the spec carries no red-test node yet (never clobber an
+    author-written one), there is at least one SOURCE edit to certify, and the symptom +
+    a runnable harness both resolve. Adds a ``create_file`` test edit + the verify wiring;
+    never a new gate (the existing apply red→green path is what acts on it). Never raises.
+    """
+    if os.environ.get(_HTTP_SHAPE_ENV_OFF):
+        return spec
+    try:
+        verify = spec.get("verify") if isinstance(spec.get("verify"), dict) else {}
+        if verify.get("red_test_node"):
+            return spec  # an author-written red test already drives the loop — don't clobber
+        edits = [e for e in (spec.get("edits") or []) if isinstance(e, dict)]
+        source_edits = [e for e in edits
+                        if e.get("kind", "edit") != "create_file"
+                        or not _is_test_path(e.get("file", ""))]
+        if not source_edits:
+            return spec  # nothing to certify → no point synthesising a red test
+        result = synthesize_http_shape_red_test(
+            honey_text, codebase_root, setup_block=setup_block,
+            app_fixture=app_fixture, test_dir=test_dir or "tests")
+        if not result:
+            return spec  # symptom not recognised, or no runnable harness → fail-open
+        # Avoid an id/path collision with an existing edit (very unlikely; be safe).
+        existing_ids = {str(e.get("id")) for e in edits}
+        existing_files = {e.get("file") for e in edits}
+        if (result["edit"]["id"] in existing_ids
+                or result["edit"]["file"] in existing_files):
+            return spec
+        spec.setdefault("edits", []).append(result["edit"])
+        vblock = spec.setdefault("verify", {})
+        if not isinstance(vblock, dict):
+            vblock = {}
+            spec["verify"] = vblock
+        vblock["red_test_node"] = result["node"]
+        ids = list(vblock.get("test_edit_ids") or [])
+        if result["edit"]["id"] not in ids:
+            ids.append(result["edit"]["id"])
+        vblock["test_edit_ids"] = ids
+        sym = result["symptom"]
+        _append_note(spec, f"http-shape red test synthesised (lever ⑦): {sym.verb.upper()} "
+                     f"{sym.full_path} must return non-empty {sym.field!r}.")
+        logger.info("specify: synthesised HTTP-shape red test for %s %s (field=%s) → "
+                    "node %s", sym.verb.upper(), sym.full_path, sym.field, result["node"])
+    except Exception as e:  # observation must never break authoring
+        logger.warning("specify: HTTP-shape red-test synthesis skipped (%s)", e)
+    return spec
+
+
 def run_specify(
     honey_path: str,
     codebase_root: str,
@@ -2555,6 +2627,9 @@ def run_specify(
     author_timeout: int = _AUTHOR_TIMEOUT_DEFAULT,
     author_retries: int = 0,
     db_conn: Any = None,
+    http_shape_setup_block: str | None = None,
+    http_shape_app_fixture: str | None = None,
+    http_shape_test_dir: str = "tests",
 ) -> dict[str, Any]:
     """Run the specify stage: honey + live code → edit-spec JSON.
 
@@ -2731,6 +2806,17 @@ def run_specify(
     # others stay broken on screen is exactly the false-ready this catches. No-op unless
     # converge itself declared ≥2 independent loci, so a single-defect converge is untouched.
     spec = _apply_converge_coverage_gate(spec, honey_text)
+
+    # HTTP-shape red-test synthesis (lever ⑦): when the symptom is an FE-bound field
+    # served by an HTTP route, attach a TestClient red test so apply --verify ALWAYS
+    # observes the fix go red→green — the backstop that does not depend on converge's
+    # confidence. Runs after the gates (it observes the authored SOURCE edits) and is
+    # fully fail-open: a no-op unless the symptom + a runnable harness both resolve.
+    spec = _synthesize_http_shape_red_test(
+        spec, honey_text, codebase_root,
+        setup_block=http_shape_setup_block,
+        app_fixture=http_shape_app_fixture,
+        test_dir=http_shape_test_dir)
 
     # Step A finalizer: if the spec lands in needs_reinvestigation but NO gate stamped a
     # structured reason, the AUTHOR itself emitted it — record that so the reactive bridge
