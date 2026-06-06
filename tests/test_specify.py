@@ -529,6 +529,114 @@ class TestDatasourceRegressionGate(unittest.TestCase):
                          specify.RI_DATASOURCE_REGRESSION)
 
 
+class TestUndefinedColumnGate(unittest.TestCase):
+    """T906/T907: an edit whose SQL names a column ABSENT from the live schema (or a test
+    fixture that INSERTs such a column) is unrunnable — flagged deterministically so a
+    ready spec loops back instead of shipping SQL that cannot execute. Schema mirrors
+    FlowGate migration 028: project_modules has name/title, NOT module/is_active."""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.db = os.path.join(self.dir, "t.db")
+        c = sqlite3.connect(self.db)
+        c.execute("CREATE TABLE projects (project_id TEXT PRIMARY KEY, project_name TEXT, "
+                  "is_active INTEGER, created_at TEXT, updated_at TEXT)")
+        c.execute("CREATE TABLE project_modules (module_id TEXT PRIMARY KEY, "
+                  "project_id TEXT, name TEXT, title TEXT, created_at TEXT, updated_at TEXT)")
+        c.commit()
+        c.close()
+        self.conn = DbConnection(kind="sqlite", path=self.db)
+
+    def _spec(self, **edit):
+        edit.setdefault("id", "E1")
+        edit.setdefault("file", "store.py")
+        return {"edits": [edit]}
+
+    def test_qualified_missing_column_flagged(self):
+        # T906: COALESCE(pm.module, '') — project_modules has no 'module' column.
+        spec = self._spec(anchor_old="SELECT 1", replacement_new=(
+            "SELECT p.project_id, COALESCE(pm.module, '') AS module FROM projects p "
+            "LEFT JOIN project_modules pm ON pm.project_id = p.project_id"))
+        flagged = specify._undefined_column_ids(spec, self.conn)
+        self.assertIn("E1", flagged)
+        self.assertIn("project_modules.module", flagged["E1"])
+
+    def test_join_condition_missing_column_flagged(self):
+        # T907: ... AND pm.is_active = 1 — project_modules has no 'is_active' column.
+        spec = self._spec(anchor_old="SELECT 1", replacement_new=(
+            "SELECT projects.project_id, pm.name AS module FROM projects "
+            "LEFT JOIN project_modules pm ON pm.project_id = projects.project_id "
+            "AND pm.is_active = 1 WHERE projects.is_active = 1"))
+        flagged = specify._undefined_column_ids(spec, self.conn)
+        self.assertIn("E1", flagged)
+        self.assertIn("project_modules.is_active", flagged["E1"])
+        # projects.is_active is real and must NOT be flagged
+        self.assertNotIn("projects.is_active", flagged["E1"])
+
+    def test_correct_columns_not_flagged(self):
+        # The right fix (pm.name, no is_active) must pass clean.
+        spec = self._spec(anchor_old="SELECT 1", replacement_new=(
+            "SELECT projects.project_id AS project, projects.project_name, "
+            "pm.name AS module FROM projects LEFT JOIN project_modules pm "
+            "ON pm.project_id = projects.project_id WHERE projects.is_active = 1"))
+        self.assertEqual(specify._undefined_column_ids(spec, self.conn), {})
+
+    def test_fixture_insert_missing_column_flagged(self):
+        # T907 fixture: INSERT INTO project_modules (..., is_active, ...) — column absent.
+        spec = self._spec(kind="create_file", file="server/tests/test_x.py", content=(
+            "def test_x(test_db):\n"
+            "    test_db.execute(\"INSERT INTO project_modules "
+            "(project_id, name, title, is_active, created_at, updated_at) "
+            "VALUES ('p','m','M',1,'now','now')\")\n"))
+        flagged = specify._undefined_column_ids(spec, self.conn)
+        self.assertIn("E1", flagged)
+        self.assertIn("project_modules.is_active", flagged["E1"])
+
+    def test_fixture_insert_real_columns_not_flagged(self):
+        spec = self._spec(kind="create_file", file="server/tests/test_x.py", content=(
+            "test_db.execute(\"INSERT INTO project_modules "
+            "(project_id, name, title) VALUES ('p','m','M')\")\n"))
+        self.assertEqual(specify._undefined_column_ids(spec, self.conn), {})
+
+    def test_unresolved_alias_is_skipped(self):
+        # A qualifier that is not a known table alias (CTE / object) must not be flagged.
+        spec = self._spec(anchor_old="x", replacement_new=(
+            "rows = res.data.items.map(m => m.module)"))
+        self.assertEqual(specify._undefined_column_ids(spec, self.conn), {})
+
+    def test_unknown_table_is_skipped(self):
+        spec = self._spec(anchor_old="x", replacement_new=(
+            "SELECT t.bogus FROM some_unknown_table t"))
+        self.assertEqual(specify._undefined_column_ids(spec, self.conn), {})
+
+    def test_no_db_conn_is_no_op(self):
+        spec = self._spec(anchor_old="x", replacement_new=(
+            "SELECT pm.module FROM project_modules pm"))
+        self.assertEqual(specify._undefined_column_ids(spec, None), {})
+
+    def test_non_sql_edit_ignored(self):
+        spec = self._spec(anchor_old="x = 1", replacement_new="x = 2")
+        self.assertEqual(specify._undefined_column_ids(spec, self.conn), {})
+
+    def test_gate_downgrades_via_effectiveness(self):
+        spec = _fresh_ready()
+        out = specify._apply_effectiveness_gate(
+            spec, [], {}, False,
+            datasource_ids={"E1": "undefined SQL column(s) — project_modules.is_active "
+                            "not present in the live DB schema"})
+        self.assertEqual(out["termination"], "needs_reinvestigation")
+        self.assertIn("E1", out["effectiveness"]["ineffective_ids"])
+
+    def test_alias_map_resolves_join_aliases(self):
+        amap = specify._sql_alias_map(
+            "FROM projects p LEFT JOIN project_modules pm ON pm.x = p.y WHERE p.z = 1")
+        self.assertEqual(amap.get("p"), "projects")
+        self.assertEqual(amap.get("pm"), "project_modules")
+        # the bare table name maps to itself; a trailing keyword is never read as an alias
+        self.assertEqual(amap.get("projects"), "projects")
+        self.assertNotIn("where", amap)
+
+
 class TestCalleeContractGrounding(unittest.TestCase):
     """N175 round-2: an edit adds a USED call (showToast) but with the wrong argument
     order, because the callee's real signature was never on the table. We lift each
@@ -996,6 +1104,34 @@ class TestDeferredSubstanceGate(unittest.TestCase):
             self._ready([{"issue": "could add a tooltip", "reason": "policy_direction"}]))
         self.assertEqual(spec["termination"], "ready_to_apply")
         self.assertNotIn("reinvestigation", spec)
+
+    def test_live_refuted_deferral_does_not_downgrade(self):
+        # T907: a substantive-reason deferral whose OWN evidence shows the claim is refuted
+        # by live code is a disproven hypothesis, not a punted root cause — it must NOT
+        # downgrade an otherwise-complete ready spec.
+        spec = specify._apply_deferred_substance_gate(self._ready([{
+            "issue": "RequirementCreateView.vue:147-171 claimed shape-mismatch",
+            "reason": "not_expressible_as_edit",
+            "evidence": ["RequirementCreateView.vue:129-136 maps API modules into "
+                         "{id,label} objects, so the claim is not observed in live code."],
+        }]))
+        self.assertEqual(spec["termination"], "ready_to_apply")
+        self.assertNotIn("reinvestigation", spec)
+
+    def test_live_refuted_korean_evidence_does_not_downgrade(self):
+        spec = specify._apply_deferred_substance_gate(self._ready([{
+            "issue": "shape mismatch 주장", "reason": "multi_file_design",
+            "evidence": ["라이브 코드에서 {id,label} 매핑이 확인되어 반박됨"],
+        }]))
+        self.assertEqual(spec["termination"], "ready_to_apply")
+
+    def test_substantive_deferral_without_refutation_still_downgrades(self):
+        # Guard the N176 protection survives: a genuine punt (no refutation marker) still
+        # downgrades.
+        spec = specify._apply_deferred_substance_gate(self._ready([{
+            "issue": "backend query must aggregate project_modules across modules",
+            "reason": "multi_file_design"}]))
+        self.assertEqual(spec["termination"], "needs_reinvestigation")
 
     def test_only_acts_on_ready(self):
         spec = self._ready([{"issue": "x", "reason": "multi_file_design"}])

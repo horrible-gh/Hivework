@@ -103,6 +103,21 @@ _OPTIONAL_DEFERRED_REASONS = {"policy_direction"}
 # re-works the full fix rather than vouching for the partial one.
 _SUBSTANTIVE_DEFERRED_REASONS = {"not_expressible_as_edit", "multi_file_design"}
 
+# A deferral whose OWN grounding says the claimed defect was REFUTED by live code is a
+# disproven hypothesis, not a punted root cause (T907: the honey alleged a
+# RequirementCreateView shape-mismatch; the author opened the live file, found it maps the
+# API rows into {id,label} objects, and recorded that refutation in the deferral's
+# evidence). Counting such a deferral as a substantive punt re-opens a settled question and
+# downgrades a genuinely complete fix, so the deferred-substance gate exempts it.
+_LIVE_REFUTED_RE = re.compile(
+    r"not\s+observed\s+in\s+(?:the\s+)?live(?:\s+code)?|"
+    r"not\s+present\s+in\s+(?:the\s+)?live|"
+    r"\brefuted\b|\bdisproven\b|\bdisproved\b|contradicted\s+by\s+(?:the\s+)?live|"
+    r"does\s+not\s+(?:match|appear|exist)\s+in\s+(?:the\s+)?live|"
+    r"live\s+code\s+(?:shows|proves)[^.]*\bnot\b|"
+    r"라이브(?:\s*코드)?(?:에서)?[^.]*(?:반박|반증)|반박됨|반증됨|관측되지\s*않",
+    re.IGNORECASE)
+
 # ── Structured reinvestigation reason codes (Step A) ───────────────────────────
 # Every site that lands a spec in needs_reinvestigation stamps a MACHINE-READABLE
 # reason code into ``spec["reinvestigation"]`` so the reactive re-investigation can
@@ -1169,6 +1184,112 @@ def _datasource_regression_ids(spec: dict[str, Any], db_conn: Any) -> dict[str, 
     return findings
 
 
+# Tokens that can sit where a table alias would in ``FROM t <next>`` / ``JOIN t <next>`` —
+# we must not read any of these as the table's alias when mapping aliases to real tables.
+_SQL_ALIAS_STOP = frozenset({
+    "on", "where", "inner", "left", "right", "outer", "full", "cross", "natural",
+    "join", "using", "and", "or", "group", "order", "having", "limit", "offset",
+    "set", "values", "select", "from", "as", "union", "intersect", "except",
+})
+_SQL_FROM_JOIN_RE = re.compile(
+    r"\b(?:from|join)\s+([A-Za-z_][A-Za-z0-9_]*)\s*(?:\bas\b\s+)?([A-Za-z_][A-Za-z0-9_]*)?",
+    re.IGNORECASE)
+_SQL_QUALIFIED_COL_RE = re.compile(
+    r"\b([A-Za-z_][A-Za-z0-9_]*)\.([A-Za-z_][A-Za-z0-9_]*)\b")
+_SQL_INSERT_COLS_RE = re.compile(
+    r"\binsert\s+into\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(([^)]*)\)", re.IGNORECASE)
+_SQL_PLAIN_IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def _sql_alias_map(sql: str) -> dict[str, str]:
+    """Map each table alias (and bare table name) in ``sql`` to its real table name.
+
+    Parses ``FROM t [AS] a`` / ``JOIN t [AS] a`` clauses. Every table maps to itself; an
+    alias maps to its table only when the following token is not a SQL keyword (so
+    ``FROM projects WHERE`` does not read ``WHERE`` as the alias). Keys are lower-cased.
+    """
+    out: dict[str, str] = {}
+    for m in _SQL_FROM_JOIN_RE.finditer(sql):
+        table, alias = m.group(1), m.group(2)
+        out[table.lower()] = table
+        if alias and alias.lower() not in _SQL_ALIAS_STOP:
+            out[alias.lower()] = table
+    return out
+
+
+def _undefined_column_ids(spec: dict[str, Any], db_conn: Any) -> dict[str, str]:
+    """Edit ids whose SQL names a column ABSENT from the live DB schema → id→reason.
+
+    The table-existence gate (``_datasource_regression_ids``) catches a read pointed at a
+    missing/empty table; this is its column-level sibling. An edit that selects, filters or
+    joins on ``alias.column`` — or a test fixture that does ``INSERT INTO table (columns…)``
+    — naming a column the real schema does not have is an UNRUNNABLE claim shipped as ready
+    (T906: ``pm.module`` / T907: ``pm.is_active`` and the fixture INSERT of ``is_active``;
+    ``project_modules`` has neither per migration 028). We ground it deterministically
+    against the live schema (PRAGMA/information_schema via ``dbread.list_schema``):
+
+      * qualified ``alias.col`` references whose alias resolves to a REAL table, and
+      * ``INSERT INTO real_table (cols…)`` column lists (covers test fixtures too)
+
+    are checked; a column missing from that table's real column set is flagged. Fail-open:
+    no db_conn, unreadable schema, an unresolved qualifier (CTE / json / subquery alias) or
+    an unknown table is simply skipped — we only flag a column we can prove does not exist,
+    never a guess. Downgrade-only, mirroring the table gate.
+    """
+    if db_conn is None:
+        return {}
+    try:
+        schema = dbread.list_schema(db_conn)
+    except dbread.DbReadError:
+        return {}
+    if not schema:
+        return {}
+    cols_by_table = {t.lower(): {c.lower() for c in cols} for t, cols in schema.items()}
+
+    findings: dict[str, str] = {}
+    for e in spec.get("edits") or []:
+        if not isinstance(e, dict):
+            continue
+        # Validate the SQL the edit INTRODUCES: a replacement for an anchor edit, or the
+        # body of a created file (so a test fixture's INSERT is grounded the same way).
+        sql = (e.get("content") if e.get("kind") == "create_file"
+               else e.get("replacement_new")) or ""
+        if not sql.strip():
+            continue
+        amap = _sql_alias_map(sql)
+        bad: list[str] = []
+        seen: set[tuple[str, str]] = set()
+
+        def _flag(table: str, col: str) -> None:
+            key = (table.lower(), col.lower())
+            if col.lower() not in cols_by_table[table.lower()] and key not in seen:
+                seen.add(key)
+                bad.append(f"{table}.{col}")
+
+        for m in _SQL_QUALIFIED_COL_RE.finditer(sql):
+            qualifier, col = m.group(1), m.group(2)
+            real = amap.get(qualifier.lower())
+            if real is None or real.lower() not in cols_by_table:
+                continue  # unresolved alias or unknown table → cannot prove absence
+            _flag(real, col)
+
+        for m in _SQL_INSERT_COLS_RE.finditer(sql):
+            table = m.group(1)
+            if table.lower() not in cols_by_table:
+                continue
+            for raw in m.group(2).split(","):
+                col = raw.strip().strip('"`[]')
+                if _SQL_PLAIN_IDENT_RE.match(col):
+                    _flag(table, col)
+
+        if bad:
+            findings[str(e.get("id", "?"))] = (
+                "undefined SQL column(s) — " + ", ".join(bad) + " not present in the live "
+                "DB schema; the edit's SQL/fixture cannot run (verify column names against "
+                "the migration/PRAGMA schema)")
+    return findings
+
+
 # ── Callee-contract grounding (N175 round-2) ───────────────────────────────────
 # _incomplete_wiring_ids above proves an added import is USED; it does NOT prove the
 # call is invoked CORRECTLY. N175 round-2: an edit added a real, used call —
@@ -2075,6 +2196,23 @@ def _apply_decisiveness_gate(spec: dict[str, Any]) -> dict[str, Any]:
     return spec
 
 
+def _deferred_is_live_refuted(d: dict[str, Any]) -> bool:
+    """True when a deferred item's OWN text shows the claim was refuted by live code.
+
+    Scans the deferral's ``issue`` / ``reason`` / ``evidence`` for a refutation marker
+    (e.g. "not observed in live code", "refuted", Korean 라이브 코드에서 … 반박). Such a
+    deferral is a disproven hypothesis, not a substantive punted fix — see
+    ``_LIVE_REFUTED_RE``. Pure-local, never raises.
+    """
+    parts = [str(d.get("issue", "")), str(d.get("reason", ""))]
+    ev = d.get("evidence")
+    if isinstance(ev, list):
+        parts.extend(str(x) for x in ev)
+    elif ev:
+        parts.append(str(ev))
+    return bool(_LIVE_REFUTED_RE.search("\n".join(parts)))
+
+
 def _apply_deferred_substance_gate(spec: dict[str, Any],
                                    honey_text: str = "") -> dict[str, Any]:
     """Downgrade a ready_to_apply spec that punted a SUBSTANTIVE fix to deferred[].
@@ -2115,8 +2253,14 @@ def _apply_deferred_substance_gate(spec: dict[str, Any],
     for d in deferred:
         if not isinstance(d, dict):
             continue
-        if str(d.get("reason", "")).lower() in _SUBSTANTIVE_DEFERRED_REASONS:
-            punted.append(str(d.get("issue", "") or d.get("reason", ""))[:160])
+        if str(d.get("reason", "")).lower() not in _SUBSTANTIVE_DEFERRED_REASONS:
+            continue
+        # A deferral the author already refuted against live code is a disproven
+        # hypothesis, not a punted root cause — exempt it so a complete fix is not
+        # re-opened over a claim its own evidence retracted (T907).
+        if _deferred_is_live_refuted(d):
+            continue
+        punted.append(str(d.get("issue", "") or d.get("reason", ""))[:160])
     if not punted:
         return spec
 
@@ -2381,7 +2525,12 @@ def _review_and_gate(
     """Run both halves of the effectiveness gate and adjust the spec's termination."""
     noop_ids = _deterministic_noop_ids(spec)
     incomplete_wiring = _incomplete_wiring_ids(spec, codebase_root)
-    datasource_ids = _datasource_regression_ids(spec, db_conn)
+    # Both schema-grounding checks route through datasource_ids (re_retrieve): a missing/
+    # empty table (column-blind) and an absent column (column-level) are the same class of
+    # gap — SQL that cannot return the rows the symptom needs. A table-level finding wins
+    # over a column-level one for the same edit id.
+    datasource_ids = _undefined_column_ids(spec, db_conn)
+    datasource_ids.update(_datasource_regression_ids(spec, db_conn))
     judgments, inconclusive = review_effectiveness(
         honey_text, spec, codebase_root, model, provider, ledger, provider_kwargs,
         docs_root=docs_root)
