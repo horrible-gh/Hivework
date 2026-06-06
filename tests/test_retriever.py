@@ -640,6 +640,64 @@ def test_resolve_http_bindings_prefix_disambiguates_same_tail(tmp_path):
     assert "real_source" in b["text"] and "legacy_source" not in b["text"]
 
 
+def test_resolve_http_bindings_folds_outer_mount_prefix_into_route(tmp_path):
+    # M036 ground truth. The live route gets /api/v1 only where main.py mounts its
+    # prefix-less router; a legacy decoy declares /api/v1 itself. Both therefore
+    # represent the same full path and must tie rather than dropping the live
+    # producer. Crucially this mirrors FlowGate's REAL layout: code_root is the
+    # repo root but the python source root is the ``server/`` SUBDIR, so the mount
+    # wiring imports ``from modules.flow_gate...`` (no ``server.`` prefix). The
+    # mount-prefix fold must resolve that absolute import by unique path suffix —
+    # an exact-root match would miss it and silently fall back to the buggy
+    # suffix-only score that ranks the dead decoy above the live handler.
+    fe = tmp_path / "client"
+    fe.mkdir(parents=True)
+    (fe / "api.ts").write_text(
+        "const projects = await getRequest('/api/v1/projects')\n",
+        encoding="utf-8")
+
+    settings = (tmp_path / "server" / "modules" / "flow_gate" / "settings"
+                / "routers")
+    settings.mkdir(parents=True)
+    (settings / "project_settings.py").write_text(
+        'router = APIRouter(tags=["Project Settings"])\n'
+        '@router.get("/projects")\n'
+        "def live_projects():\n"
+        "    return live_source()\n",
+        encoding="utf-8")
+
+    legacy = tmp_path / "server" / "modules" / "flow_gate" / "api" / "v1"
+    legacy.mkdir(parents=True)
+    (legacy / "legacy_misc_routes.py").write_text(
+        'router = APIRouter(prefix="/api/v1")\n'
+        '@router.get("/projects")\n'
+        "def legacy_projects():\n"
+        "    return legacy_source()\n",
+        encoding="utf-8")
+
+    wiring = tmp_path / "server" / "routers"
+    wiring.mkdir(parents=True)
+    (wiring / "main.py").write_text(
+        "from modules.flow_gate.settings.routers.project_settings "
+        "import router as _settings_project_router\n"
+        'app.include_router(_settings_project_router, '
+        'prefix=f"{CONTEXT}/api/v1")\n',
+        encoding="utf-8")
+
+    snippets = [{"file": "client/api.ts", "lines": "1-1",
+                 "text": "getRequest('/api/v1/projects')\n"}]
+    bindings = _resolve_http_bindings(snippets, str(tmp_path))
+
+    assert len(bindings) == 2, [
+        (b["file"], b["full_path"]) for b in bindings
+    ]
+    assert {b["full_path"] for b in bindings} == {"/api/v1/projects"}
+    assert {os.path.basename(b["file"]) for b in bindings} == {
+        "project_settings.py", "legacy_misc_routes.py",
+    }
+    assert all(b["ambiguous"] for b in bindings)
+
+
 def test_read_def_body_reads_past_multiline_signature(tmp_path):
     # Regression: a multi-line def signature whose closing ")" sits at the def's own
     # indent stopped the body read INSIDE the signature, so the real work below was

@@ -23,6 +23,7 @@ Bundle shape::
 
 from __future__ import annotations
 
+import ast
 import os
 import re
 import subprocess
@@ -872,15 +873,166 @@ def _router_prefix(code_root: str, relpath: str) -> str | None:
     return m.group("prefix") if m else None
 
 
+def _literal_mount_prefix(node: ast.expr) -> str | None:
+    """Return the statically visible path in an include_router prefix.
+
+    Plain string literals are exact. For f-strings, dynamic fields are omitted
+    and only literal path segments survive (``f"{ROOT}/api/v1"`` → ``/api/v1``).
+    Other expressions stay unresolved rather than being guessed.
+    """
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        value = node.value
+        if value and not value.startswith("/"):
+            return None
+    elif isinstance(node, ast.JoinedStr):
+        value = "".join(
+            part.value for part in node.values
+            if isinstance(part, ast.Constant) and isinstance(part.value, str)
+        )
+        slash = value.find("/")
+        value = value[slash:] if slash >= 0 else ""
+    else:
+        return None
+    return re.sub(r"/{2,}", "/", value).rstrip("/")
+
+
+# Dirs never holding app source — pruned from the import-resolution walk so a
+# vendored copy of a module (``.venv/.../project_settings.py``) cannot create a
+# false suffix-match ambiguity that silently disables the mount-prefix fold.
+_WALK_PRUNE_DIRS = frozenset({
+    ".venv", "venv", "site-packages", "node_modules", "dist", "build",
+    ".git", "__pycache__", ".mypy_cache", ".pytest_cache", ".apply_backups",
+})
+
+
+def _list_py_files(code_root: str) -> set[str]:
+    """All ``.py`` file relpaths under ``code_root`` (forward slashes), vendored/
+    hidden dirs pruned.
+
+    Needed because the python source root is often a SUBDIR of the codebase root
+    (FlowGate runs from ``server/``, so ``from modules...`` resolves to
+    ``server/modules/...``): resolving imports purely against ``code_root`` would
+    miss every such file.
+    """
+    out: set[str] = set()
+    for dirpath, dirnames, filenames in os.walk(code_root):
+        dirnames[:] = [d for d in dirnames if d not in _WALK_PRUNE_DIRS]
+        for fn in filenames:
+            if fn.endswith(".py"):
+                rel = os.path.relpath(os.path.join(dirpath, fn), code_root)
+                out.add(rel.replace(os.sep, "/"))
+    return out
+
+
+def _imported_router_path(importer: str, node: ast.ImportFrom,
+                          py_files: set[str]) -> str | None:
+    """Resolve ``from module import router`` to one local Python file.
+
+    Exact resolution (module path rooted directly at the codebase root) wins.
+    On a miss, an ABSOLUTE import is retried as a unique path SUFFIX — the python
+    source root is a subdir (``server/``) so ``from modules...`` lives at
+    ``server/modules/...``. A relative import is already rooted at ``code_root``,
+    and a non-unique suffix is left unresolved rather than guessed.
+    """
+    module_parts = node.module.split(".") if node.module else []
+    importer = importer.replace("\\", "/")
+    if importer.startswith("./"):
+        importer = importer[2:]
+    importer_parts = importer.split("/")[:-1]
+    if node.level:
+        climb = node.level - 1
+        if climb > len(importer_parts):
+            return None
+        base = importer_parts[:len(importer_parts) - climb]
+    else:
+        base = []
+    relbase = "/".join(base + module_parts)
+    if not relbase:
+        return None
+    candidates = [f"{relbase}.py", f"{relbase}/__init__.py"]
+    exact = [c for c in candidates if c in py_files]
+    if exact:
+        return exact[0] if len(exact) == 1 else None
+    if node.level:                       # relative import: no source-root subdir to span
+        return None
+    matches = {
+        rel for rel in py_files
+        for c in candidates
+        if rel == c or rel.endswith("/" + c)
+    }
+    return next(iter(matches)) if len(matches) == 1 else None
+
+
+def _mount_prefixes(code_root: str) -> dict[str, str]:
+    """Map router source files to static outer ``include_router`` prefixes.
+
+    Candidate wiring files come from ripgrep. Within each file, AST links
+    ``from ... import router as alias`` to ``include_router(alias, prefix=...)``.
+    Unparseable files, dynamic expressions, missing targets, and conflicting
+    mounts are ignored so route collection falls back to its previous behavior.
+    """
+    hits = _ripgrep(r"\binclude_router\s*\(", [], code_root, max_hits=400)
+    wiring_files = sorted({h["file"] for h in hits})
+    if not wiring_files:                  # no FastAPI mounts → skip the tree walk
+        return {}
+    py_files = _list_py_files(code_root)
+    found: dict[str, str] = {}
+    conflicts: set[str] = set()
+    for relpath in wiring_files:
+        try:
+            with open(os.path.join(code_root, relpath), "r",
+                      encoding="utf-8", errors="replace") as fh:
+                tree = ast.parse(fh.read())
+        except (OSError, SyntaxError, ValueError):
+            continue
+
+        aliases: dict[str, str] = {}
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.ImportFrom):
+                continue
+            target = _imported_router_path(relpath, node, py_files)
+            if not target:
+                continue
+            for name in node.names:
+                if name.name == "router" and name.asname:
+                    aliases[name.asname] = target
+
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            if not (isinstance(func, ast.Attribute)
+                    and func.attr == "include_router"
+                    and node.args
+                    and isinstance(node.args[0], ast.Name)):
+                continue
+            target = aliases.get(node.args[0].id)
+            if not target:
+                continue
+            prefix_arg = next(
+                (kw.value for kw in node.keywords if kw.arg == "prefix"), None)
+            prefix = (_literal_mount_prefix(prefix_arg)
+                      if prefix_arg is not None else "")
+            if prefix is None:
+                continue
+            if target in found and found[target] != prefix:
+                conflicts.add(target)
+            else:
+                found[target] = prefix
+    return {path: prefix for path, prefix in found.items()
+            if path not in conflicts}
+
+
 def _collect_routes(code_root: str, max_hits: int = 400) -> list[dict[str, Any]]:
     """Grep all backend route declarations once (free, bounded, deterministic).
 
-    Each route's match path is the router's declared ``prefix`` + the decorator
-    tail, so two routers sharing a decorator tail (``/detail``) are told apart by
-    their own prefixes when matched against the client URL.
+    Each route's match path is its outer ``include_router`` mount prefix + the
+    router's own declared ``prefix`` + the decorator tail. This preserves the
+    previous suffix-only fallback whenever either static prefix is unavailable.
     """
     routes: list[dict[str, Any]] = []
     prefix_cache: dict[str, str | None] = {}
+    mount_prefixes = _mount_prefixes(code_root)
     pat = r"@\s*[A-Za-z_][\w.]*\.(get|post|put|patch|delete|route|head|options)\s*\(\s*['\"]/"
     for h in _ripgrep(pat, [], code_root, max_hits=max_hits):
         m = _ROUTE_DECL_RE.search(h.get("text", ""))
@@ -890,8 +1042,11 @@ def _collect_routes(code_root: str, max_hits: int = 400) -> list[dict[str, Any]]
         if f not in prefix_cache:
             prefix_cache[f] = _router_prefix(code_root, f)
         prefix = prefix_cache[f]
+        mount = mount_prefixes.get(f[2:] if f.startswith("./") else f)
         route = m.group("route")
-        full = (prefix.rstrip("/") + route) if prefix else route
+        full = "".join(
+            part.rstrip("/") for part in (mount, prefix) if part
+        ) + route
         routes.append({
             "file": f, "line": h["line"],
             "verb": m.group("verb").lower(), "route": route,
