@@ -1,0 +1,56 @@
+{
+  "_about": "Golden reference for the T901/M037 fix = the engine's own READY output that reached 'applied' (M023 milestone). Acceptance ('수정완료') is scored against THESE loci. Source of truth = TR901 proposal.md (8 edits) + the E8 red test for objective backend verification.",
+  "source_proposal": "C:\\workspace\\projects\\Documents\\projects\\FlowGate\\420_task_reports\\TR901_prevent_duplicate_r_in_group_and_fix_toast.proposal.md",
+  "source_task": "C:\\workspace\\projects\\Documents\\projects\\FlowGate\\410_tasks\\T901_prevent_duplicate_r_in_group_and_fix_toast.md",
+
+  "loci": {
+    "backend_reject": {
+      "weight": "core",
+      "file": "server/modules/flow_gate/process_service.py",
+      "expect": "create-R path returns structured error {code:'group_r_already_exists'} when the group already holds an R (checked via db.get_documents_by_group_id).",
+      "verify": "red_green",
+      "comment": "OBJECTIVE: drop in the golden E8 red test and run it; RED on reverted code, GREEN once the cell's E1-equivalent edit is applied. Model-independent (we supply the red test)."
+    },
+    "toast_teleport": {
+      "weight": "core",
+      "file": "client/src/main/components/common/ToastContainer.vue",
+      "expect": "toast-container wrapped in <teleport to=\"body\"> so the toast paints ABOVE the modal.",
+      "verify": "static",
+      "static_must_contain": ["<teleport to=\"body\">"],
+      "comment": "No Vue test in M037 -> golden-diff/static equivalence (honest limit; documented in README)."
+    },
+    "toast_showtoast_call": {
+      "weight": "core",
+      "file": "client/src/main/components/NewRequirementModal.vue",
+      "expect": "submit catch block calls showToast(<i18n message>, 'danger') with the message as body (NOT the literal variant string), and useToast is imported.",
+      "verify": "static",
+      "static_must_contain": ["useToast", "showToast("],
+      "static_must_not": ["showToast('danger')", "showToast(\"danger\")"],
+      "comment": "This is NR178 E7 — the locus that previously failed to anchor. Static heuristic only (no FE test)."
+    },
+    "i18n_keys": {
+      "weight": "support",
+      "files": {
+        "client/shared/i18n/ko.ts": "error_group_r_exists: '그룹 내 생성된 문서입니다.'",
+        "client/shared/i18n/en.ts": "error_group_r_exists: 'A requirement already exists in this group.'",
+        "client/shared/i18n/ja.ts": "error_group_r_exists: 'グループ内に既に作成されたドキュメントがあります。'"
+      },
+      "verify": "static",
+      "static_key": "error_group_r_exists",
+      "comment": "Support locus: key must be present in all three. Required for ko at minimum."
+    }
+  },
+
+  "red_test": {
+    "node_id": "server/tests/test_group_r.py::test_create_requirement_rejects_second_r",
+    "dest_in_codebase": "server/tests/test_group_r.py",
+    "source_file": "golden/test_group_r.py",
+    "comment": "Verbatim E8 from the TR901 proposal. score.py copies this into the (cell-applied) tree, runs it, then removes it. GREEN = backend locus 수정완료."
+  },
+
+  "pass_rule": {
+    "PASS": "backend_reject red->green GREEN AND toast_teleport static AND toast_showtoast_call static AND i18n_keys(ko present)",
+    "PARTIAL": "backend_reject GREEN but one or more FE/i18n loci missing (mirrors NR178 6/7)",
+    "FAIL": "backend_reject not GREEN, or apply NOT READY / produced nothing"
+  }
+}

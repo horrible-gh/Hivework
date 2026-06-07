@@ -1,0 +1,67 @@
+{
+  "_about": "T901/TR901 Hive model-performance sweep. One-Factor-At-A-Time (OFAT): hold every role at baseline, vary ONE role across 3 levels (down/base/up), run the stage path REPEATS times, and score module-unit golden-locus recall from that stage's own artifact. No apply/pytest fix-completion scoring. Each cell -> one generated profile config/hive.config.perf-<id>.json (the --profile mechanism). See README.md.",
+  "repeats": 3,
+  "target": {
+    "codebase": "C:\\workspace\\projects\\FlowGate-dev\\branches\\20260607",
+    "branch_leaf": "20260607",
+    "baseline_sha": "fc2a26e",
+    "db_path": "C:\\workspace\\projects\\FlowGate-dev\\branches\\20260607\\server\\flowgate.db",
+    "tests_cwd": "server",
+    "_note": "codebase is the REVERTED (bug-present) branch; baseline_sha is its clean HEAD that the sweep resets to between runs."
+  },
+  "seed": "C:\\workspace\\projects\\Documents\\projects\\FlowGate\\410_tasks\\T901_prevent_duplicate_r_in_group_and_fix_toast.md",
+  "docs": "C:\\workspace\\projects\\Documents\\projects\\FlowGate\\210_design",
+  "recipe": "recipes\\recipe_code_bug.md",
+  "golden": "golden\\manifest.json",
+  "smoke_model": { "provider": "openai", "model": "openai/gpt-oss-20b" },
+
+  "corrections": [
+    "gpt-5-mini is NOT served by deepinfra(openai); the table rows 'specify/converge/assemble/review | openai | gpt-5-mini | 보통' are run with provider=copilot (the only provider serving gpt-5-mini, and the current baseline). Flip provider here to override.",
+    "scout(reinforce) fires ONLY on a coverage_risk-flagged axis whose blind FIND came back empty. The scout cells force reinforce.enabled=true, but if M037 never produces such an axis, scout stays UN-FIRED and the cell is recorded as measurement=null (engine never called scout)."
+  ],
+
+  "baseline_roles": {
+    "queen":    { "provider": "codex",   "model": "gpt-5.4-mini" },
+    "swarm":    { "provider": "openai",  "model": "openai/gpt-oss-120b" },
+    "scout":    { "provider": "openai",  "model": "Qwen/Qwen3-VL-235B-A22B-Instruct" },
+    "judge":    { "provider": "openai",  "model": "openai/gpt-oss-120b" },
+    "converge": { "provider": "copilot", "model": "gpt-5-mini" },
+    "assemble": { "provider": "copilot", "model": "gpt-5-mini" },
+    "specify":  { "provider": "copilot", "model": "gpt-5-mini" },
+    "review":   { "provider": "copilot", "model": "gpt-5-mini" }
+  },
+
+  "cells": [
+    { "id": "queen-down2",   "stage": "queen",    "path": "investigate", "level": "down2", "provider": "openai",  "model": "Qwen/Qwen3-VL-235B-A22B-Instruct" },
+    { "id": "queen-down1",   "stage": "queen",    "path": "investigate", "level": "down1", "provider": "copilot", "model": "gpt-5-mini" },
+    { "id": "queen-base",    "stage": "queen",    "path": "investigate", "level": "base",  "provider": "codex", "model": "gpt-5.4-mini", "is_baseline": true },
+
+    { "id": "judge-down",    "stage": "judge",    "path": "investigate", "level": "down",  "provider": "openai", "model": "openai/gpt-oss-20b" },
+    { "id": "judge-base",    "stage": "judge",    "path": "investigate", "level": "base",  "provider": "openai", "model": "openai/gpt-oss-120b", "is_baseline": true },
+    { "id": "judge-up",      "stage": "judge",    "path": "investigate", "level": "up",    "provider": "openai", "model": "Qwen/Qwen3-235B-A22B-Instruct-2507" },
+
+    { "id": "converge-down", "stage": "converge", "path": "investigate", "level": "down",  "provider": "openai",  "model": "Qwen/Qwen3-VL-235B-A22B-Instruct" },
+    { "id": "converge-base", "stage": "converge", "path": "investigate", "level": "base",  "provider": "copilot", "model": "gpt-5-mini", "is_baseline": true, "_table_said": "openai/gpt-5-mini (corrected -> copilot)" },
+    { "id": "converge-up",   "stage": "converge", "path": "investigate", "level": "up",    "provider": "codex",   "model": "gpt-5.4-mini" },
+
+    { "id": "scout-down2",   "stage": "scout",    "path": "investigate", "level": "down2", "provider": "openai", "model": "openai/gpt-oss-20b", "needs_reinforce": true },
+    { "id": "scout-down",    "stage": "scout",    "path": "investigate", "level": "down",  "provider": "openai", "model": "openai/gpt-oss-120b", "needs_reinforce": true },
+    { "id": "scout-base",    "stage": "scout",    "path": "investigate", "level": "base",  "provider": "openai", "model": "Qwen/Qwen3-VL-235B-A22B-Instruct", "is_baseline": true, "needs_reinforce": true },
+
+    { "id": "specify-down",  "stage": "specify",  "path": "investigate", "level": "down",  "provider": "openai",  "model": "Qwen/Qwen3-VL-235B-A22B-Instruct" },
+    { "id": "specify-base",  "stage": "specify",  "path": "investigate", "level": "base",  "provider": "copilot", "model": "gpt-5-mini", "is_baseline": true, "_table_said": "openai/gpt-5-mini (corrected -> copilot)" },
+    { "id": "specify-up",    "stage": "specify",  "path": "investigate", "level": "up",    "provider": "codex",   "model": "gpt-5.4-mini" },
+
+    { "id": "review-down",   "stage": "review",   "path": "investigate", "level": "down",  "provider": "openai",  "model": "Qwen/Qwen3-VL-235B-A22B-Instruct" },
+    { "id": "review-base",   "stage": "review",   "path": "investigate", "level": "base",  "provider": "copilot", "model": "gpt-5-mini", "is_baseline": true, "_table_said": "openai/gpt-5-mini (corrected -> copilot)" },
+    { "id": "review-up",     "stage": "review",   "path": "investigate", "level": "up",    "provider": "codex",   "model": "gpt-5.4-mini" },
+
+    { "id": "swarm-down",    "stage": "swarm",    "path": "run", "level": "down",  "provider": "openai", "model": "openai/gpt-oss-20b" },
+    { "id": "swarm-base",    "stage": "swarm",    "path": "run", "level": "base",  "provider": "openai", "model": "openai/gpt-oss-120b", "is_baseline": true },
+    { "id": "swarm-up",      "stage": "swarm",    "path": "run", "level": "up",    "provider": "openai", "model": "Qwen/Qwen3-235B-A22B-Instruct-2507" },
+
+    { "id": "assemble-down", "stage": "assemble", "path": "run", "level": "down",  "provider": "openai",  "model": "Qwen/Qwen3-VL-235B-A22B-Instruct" },
+    { "id": "assemble-base", "stage": "assemble", "path": "run", "level": "base",  "provider": "copilot", "model": "gpt-5-mini", "is_baseline": true, "_table_said": "openai/gpt-5-mini (corrected -> copilot)" },
+    { "id": "assemble-up",   "stage": "assemble", "path": "run", "level": "up",    "provider": "codex",   "model": "gpt-5.4-mini" }
+  ]
+}
