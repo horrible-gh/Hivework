@@ -542,6 +542,7 @@ def run_decompose(
     provider: str = "copilot",
     ledger=None,
     provider_kwargs: dict | None = None,
+    retries: int = 0,
 ) -> dict[str, Any]:
     """Run the decompose stage by calling a copilot worker.
 
@@ -582,24 +583,42 @@ def run_decompose(
     except OSError:
         pass
 
-    call_id = ledger.begin_call("queen", "decompose", provider, model, prompt) \
-        if ledger is not None else None
-    try:
-        wr = call_worker(provider, model, prompt, cwd=codebase_root, timeout=300,
-                         on_start=(lambda: ledger.mark_running(call_id))
-                         if (ledger is not None and call_id is not None) else None,
-                         **(provider_kwargs or {}))
-    except Exception as e:  # timeout / provider error — record the failed row, then re-raise
+    # The queen is a single blocking call that gates the whole run. A slow agentic CLI
+    # (codex) occasionally finishes CLEAN — rc=0, no stderr, well under the timeout —
+    # yet returns a BLANK final message (T905: rc=0, 24s, 1-char output). That blank is
+    # transient, so ``retries`` extra attempts cover it (and a non-zero exit / timeout
+    # hiccup) rather than discarding the run on one shot. Each attempt hits the ledger.
+    wr = None
+    for attempt in range(retries + 1):
+        call_id = ledger.begin_call("queen", "decompose", provider, model, prompt) \
+            if ledger is not None else None
+        try:
+            wr = call_worker(provider, model, prompt, cwd=codebase_root, timeout=300,
+                             on_start=(lambda: ledger.mark_running(call_id))
+                             if (ledger is not None and call_id is not None) else None,
+                             **(provider_kwargs or {}))
+        except Exception as e:  # timeout / provider error — record the failed row
+            if ledger is not None:
+                ledger.finish_call(call_id, output="", latency_s=0.0, ok=False,
+                                   err=str(e)[:200])
+            if attempt < retries:
+                logger.warning("decompose: queen call failed (%s) — retrying "
+                               "(attempt %d/%d)", e, attempt + 2, retries + 1)
+                continue
+            raise
         if ledger is not None:
-            ledger.finish_call(call_id, output="", latency_s=0.0, ok=False,
-                               err=str(e)[:200])
-        raise
-    raw_output = wr.stdout
-    if ledger is not None:
-        ledger.finish_call(call_id, output=wr.stdout, latency_s=wr.latency_s,
-                           ok=wr.exit_code == 0,
-                           err=wr.stderr[:200] if wr.exit_code != 0 else "",
-                           real_tokens=wr.real_tokens)
+            ledger.finish_call(call_id, output=wr.stdout, latency_s=wr.latency_s,
+                               ok=wr.exit_code == 0,
+                               err=wr.stderr[:200] if wr.exit_code != 0 else "",
+                               real_tokens=wr.real_tokens)
+        # rc=0 + blank comb is the observed codex failure — retry if budget remains.
+        if (wr.exit_code != 0 or not wr.stdout.strip()) and attempt < retries:
+            logger.warning("decompose: queen returned exit=%d / %d-char output — "
+                           "retrying (attempt %d/%d)", wr.exit_code,
+                           len(wr.stdout or ""), attempt + 2, retries + 1)
+            continue
+        break
+    raw_output = wr.stdout if wr is not None else ""
 
     # Persist raw output so decompose failures are never blind (was: no dump).
     dump_path = os.path.join(os.getcwd(), "decompose_raw_last.txt")
@@ -610,9 +629,17 @@ def run_decompose(
         dump_path = "(dump failed)"
 
     if not raw_output or not raw_output.strip():
+        # Honest diagnosis: report the ACTUAL signals (rc / latency / out-chars /
+        # stderr) instead of guessing "(quota/timeout/rc!=0?)". T905 was a clean rc=0,
+        # 24s, 1-char blank — none of those guesses applied, which sent debugging the
+        # wrong way (zombie-lock / quota) when the queen simply answered blank.
+        rc = wr.exit_code if wr is not None else "n/a"
+        lat = f"{wr.latency_s:.1f}s" if wr is not None else "n/a"
+        err = (wr.stderr or "").strip()[:300] if wr is not None else ""
         raise ValueError(
-            f"Decompose worker returned empty output (quota/timeout/rc!=0?). "
-            f"Raw saved to {dump_path}"
+            f"Decompose worker returned empty output after {retries + 1} attempt(s) "
+            f"(rc={rc}, latency={lat}, out_chars={len(raw_output or '')}, "
+            f"stderr={err or '(none)'}). Raw saved to {dump_path}"
         )
 
     try:

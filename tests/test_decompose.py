@@ -34,6 +34,50 @@ def _add(repo, rel, text="x\n"):
     subprocess.run(["git", "-C", repo, "add", "--", rel], check=True)
 
 
+def test_decompose_retries_past_clean_blank_comb_then_succeeds(tmp_path, monkeypatch):
+    # T905: codex finished CLEAN (rc=0, no stderr, well under timeout) yet returned a
+    # BLANK final message. With retries>0 the queen call is re-fired and the run survives.
+    from hive import decompose as dec
+    from hive.providers import WorkerResult
+    monkeypatch.chdir(tmp_path)  # decompose_raw_last.txt is written to cwd
+    calls = {"n": 0}
+
+    def fake(provider, model, prompt, cwd=None, timeout=300, on_start=None, **kw):
+        calls["n"] += 1
+        if calls["n"] <= 2:  # first two attempts: the clean rc=0 blank that bit T905
+            return WorkerResult(stdout="\n", stderr="", exit_code=0, latency_s=24.1)
+        return WorkerResult(stdout='{"tasks": [{"id": "A"}]}', stderr="",
+                            exit_code=0, latency_s=12.0)
+
+    monkeypatch.setattr(dec, "call_worker", fake)
+    out = dec.run_decompose(seed_text="boom", retries=2)
+    assert calls["n"] == 3  # blank, blank, good
+    assert out["tasks"][0]["id"] == "A"
+
+
+def test_decompose_blank_exhausts_retries_with_honest_error(tmp_path, monkeypatch):
+    # When every attempt blanks, the error reports the ACTUAL signals (rc/latency/
+    # out_chars) — not the old misleading "(quota/timeout/rc!=0?)" guess that sent
+    # T905 debugging toward zombie-locks and quota when the queen just answered blank.
+    import pytest
+    from hive import decompose as dec
+    from hive.providers import WorkerResult
+    monkeypatch.chdir(tmp_path)
+    calls = {"n": 0}
+
+    def fake(provider, model, prompt, cwd=None, timeout=300, on_start=None, **kw):
+        calls["n"] += 1
+        return WorkerResult(stdout="", stderr="", exit_code=0, latency_s=24.1)
+
+    monkeypatch.setattr(dec, "call_worker", fake)
+    with pytest.raises(ValueError) as ei:
+        dec.run_decompose(seed_text="boom", retries=2)
+    assert calls["n"] == 3  # 1 + 2 retries, all blank
+    msg = str(ei.value)
+    assert "rc=0" in msg and "out_chars=0" in msg  # honest, observed signals
+    assert "quota/timeout/rc!=0?" not in msg       # the guess is gone
+
+
 def test_tree_useful_drops_binaries_and_noise_dirs():
     assert _tree_useful("client/src/components/DocWorkflow.vue")
     assert _tree_useful("server/modules/flow_gate/db/workflow_sequences.py")
