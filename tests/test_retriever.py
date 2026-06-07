@@ -15,7 +15,7 @@ from hive.retriever import (
     _path_segs, _route_suffix_match, _resolve_http_bindings, _read_def_body,
     _resolve_peer_patterns, _stacking_profile,
     _harvest_inscope_fetch_urls, _covered_ranges, _follow_calls,
-    _resolve_field_producers,
+    _resolve_field_producers, _resolve_http_producer_paths,
 )
 
 ROOT = "C:/workspace/projects/Documents/projects/FlowGate"
@@ -696,6 +696,56 @@ def test_resolve_http_bindings_folds_outer_mount_prefix_into_route(tmp_path):
         "project_settings.py", "legacy_misc_routes.py",
     }
     assert all(b["ambiguous"] for b in bindings)
+
+
+def test_http_binding_uses_first_mounted_duplicate_and_traces_its_producer(tmp_path):
+    app = tmp_path / "app"
+    app.mkdir()
+    (app / "__init__.py").write_text("", encoding="utf-8")
+    (app / "first.py").write_text(
+        'from fastapi import APIRouter\n'
+        'from app.data import list_projects\n'
+        'router = APIRouter(prefix="/api/v1")\n'
+        '@router.get("/projects")\n'
+        'def first_projects():\n'
+        '    projects = list_projects()\n'
+        '    return {"projects": projects}\n',
+        encoding="utf-8")
+    (app / "second.py").write_text(
+        'from fastapi import APIRouter\n'
+        'router = APIRouter(prefix="/api/v1")\n'
+        '@router.get("/projects")\n'
+        'def second_projects():\n'
+        '    return {"projects": off_path_projects()}\n'
+        'def off_path_projects():\n'
+        '    return []\n',
+        encoding="utf-8")
+    (app / "data.py").write_text(
+        'def list_projects():\n'
+        '    return store._fetch_all("SELECT * FROM projects ORDER BY project_id")\n',
+        encoding="utf-8")
+    (app / "main.py").write_text(
+        'from fastapi import FastAPI\n'
+        'from app.first import router as first_router\n'
+        'from app.second import router as second_router\n'
+        'app = FastAPI()\n'
+        'app.include_router(first_router)\n'
+        'app.include_router(second_router)\n',
+        encoding="utf-8")
+    snippets = [{"file": "client/view.ts", "lines": "1",
+                 "text": "client.get('/api/v1/projects')"}]
+
+    bindings = _resolve_http_bindings(snippets, str(tmp_path))
+    assert len(bindings) == 1
+    assert bindings[0]["file"].endswith("app/first.py")
+    assert bindings[0]["winning"] is True
+    assert bindings[0]["ambiguous"] is False
+    assert bindings[0]["shadowed"][0]["file"].endswith("app/second.py")
+
+    producers = _resolve_http_producer_paths(bindings, str(tmp_path))
+    assert any(p["file"].endswith("app/data.py") and p["producer"]
+               for p in producers)
+    assert all("off_path_projects" not in p.get("text", "") for p in producers)
 
 
 def test_read_def_body_reads_past_multiline_signature(tmp_path):

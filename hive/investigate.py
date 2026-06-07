@@ -822,6 +822,45 @@ def _render_converge_section(converge: dict[str, Any] | None,
     if not converge:
         return []
     out: list[str] = []
+    winning = [node for node in (converge.get("winning_path") or [])
+               if isinstance(node, dict) and node.get("file") and node.get("url")]
+    if winning:
+        out += [
+            "## Winning HTTP request path (deterministic grounding)",
+            "",
+            "The following nodes were derived from the mounted router registration "
+            "order and return-value call chain. Specify gates consume the structured "
+            "markers below; edits/tests outside this path are off-path.",
+            "",
+        ]
+        for node in winning:
+            payload = json.dumps(node, ensure_ascii=True, sort_keys=True)
+            out.append(f"<!-- hive-winning-http-path: {payload} -->")
+            symbol = f" — {node.get('symbol')}" if node.get("symbol") else ""
+            out.append(
+                f"- {node.get('verb', 'GET')} `{node.get('url', '')}` "
+                f"[{node.get('role', '?')}] "
+                f"{node.get('file', '')}:{node.get('lines', '')}{symbol}"
+            )
+        out.append("")
+
+    ad_any = converge.get("attributed_defect")
+    cc_any = converge.get("causal_check") or {}
+    if isinstance(ad_any, dict) and ad_any.get("file"):
+        attribution = {
+            "file": ad_any.get("file", ""),
+            "lines": ad_any.get("lines", ""),
+            "node": ad_any.get("node", ""),
+            "converged": bool(converge.get("converged")),
+            "causal_verdict": cc_any.get("verdict", ""),
+        }
+        out += [
+            "<!-- hive-converge-attribution: "
+            + json.dumps(attribution, ensure_ascii=True, sort_keys=True)
+            + " -->",
+            "",
+        ]
+
     if converge.get("converged") and converge.get("attributed_defect"):
         ad = converge["attributed_defect"]
         extra = [d for d in (converge.get("additional_defects") or [])

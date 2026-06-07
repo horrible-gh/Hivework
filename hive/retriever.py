@@ -963,20 +963,23 @@ def _imported_router_path(importer: str, node: ast.ImportFrom,
     return next(iter(matches)) if len(matches) == 1 else None
 
 
-def _mount_prefixes(code_root: str) -> dict[str, str]:
-    """Map router source files to static outer ``include_router`` prefixes.
+def _mount_metadata(code_root: str) -> dict[str, dict[str, Any]]:
+    """Map router source files to static mount prefixes and registration order.
 
     Candidate wiring files come from ripgrep. Within each file, AST links
     ``from ... import router as alias`` to ``include_router(alias, prefix=...)``.
-    Unparseable files, dynamic expressions, missing targets, and conflicting
-    mounts are ignored so route collection falls back to its previous behavior.
+    The source line of ``include_router`` is the deterministic FastAPI registration
+    order within that app assembly: when two routes have the same method/path,
+    Starlette dispatches the first registered route. Unparseable files, dynamic
+    expressions, missing targets, and conflicting mounts are ignored so route
+    collection falls back to ambiguity instead of guessing a winner.
     """
     hits = _ripgrep(r"\binclude_router\s*\(", [], code_root, max_hits=400)
     wiring_files = sorted({h["file"] for h in hits})
     if not wiring_files:                  # no FastAPI mounts → skip the tree walk
         return {}
     py_files = _list_py_files(code_root)
-    found: dict[str, str] = {}
+    found: dict[str, dict[str, Any]] = {}
     conflicts: set[str] = set()
     for relpath in wiring_files:
         try:
@@ -997,9 +1000,11 @@ def _mount_prefixes(code_root: str) -> dict[str, str]:
                 if name.name == "router" and name.asname:
                     aliases[name.asname] = target
 
-        for node in ast.walk(tree):
-            if not isinstance(node, ast.Call):
-                continue
+        calls = sorted(
+            (node for node in ast.walk(tree) if isinstance(node, ast.Call)),
+            key=lambda node: getattr(node, "lineno", 0),
+        )
+        for node in calls:
             func = node.func
             if not (isinstance(func, ast.Attribute)
                     and func.attr == "include_router"
@@ -1015,12 +1020,23 @@ def _mount_prefixes(code_root: str) -> dict[str, str]:
                       if prefix_arg is not None else "")
             if prefix is None:
                 continue
-            if target in found and found[target] != prefix:
+            meta = {
+                "prefix": prefix,
+                "wiring_file": relpath.replace("\\", "/"),
+                "order": int(getattr(node, "lineno", 0) or 0),
+            }
+            if target in found and found[target] != meta:
                 conflicts.add(target)
             else:
-                found[target] = prefix
-    return {path: prefix for path, prefix in found.items()
+                found[target] = meta
+    return {path: meta for path, meta in found.items()
             if path not in conflicts}
+
+
+def _mount_prefixes(code_root: str) -> dict[str, str]:
+    """Backward-compatible prefix-only view of :func:`_mount_metadata`."""
+    return {path: str(meta.get("prefix", ""))
+            for path, meta in _mount_metadata(code_root).items()}
 
 
 def _collect_routes(code_root: str, max_hits: int = 400) -> list[dict[str, Any]]:
@@ -1032,7 +1048,7 @@ def _collect_routes(code_root: str, max_hits: int = 400) -> list[dict[str, Any]]
     """
     routes: list[dict[str, Any]] = []
     prefix_cache: dict[str, str | None] = {}
-    mount_prefixes = _mount_prefixes(code_root)
+    mount_metadata = _mount_metadata(code_root)
     pat = r"@\s*[A-Za-z_][\w.]*\.(get|post|put|patch|delete|route|head|options)\s*\(\s*['\"]/"
     for h in _ripgrep(pat, [], code_root, max_hits=max_hits):
         m = _ROUTE_DECL_RE.search(h.get("text", ""))
@@ -1042,7 +1058,9 @@ def _collect_routes(code_root: str, max_hits: int = 400) -> list[dict[str, Any]]
         if f not in prefix_cache:
             prefix_cache[f] = _router_prefix(code_root, f)
         prefix = prefix_cache[f]
-        mount = mount_prefixes.get(f[2:] if f.startswith("./") else f)
+        rel = f[2:] if f.startswith("./") else f
+        mount_meta = mount_metadata.get(rel, {})
+        mount = mount_meta.get("prefix")
         route = m.group("route")
         full = "".join(
             part.rstrip("/") for part in (mount, prefix) if part
@@ -1051,6 +1069,8 @@ def _collect_routes(code_root: str, max_hits: int = 400) -> list[dict[str, Any]]
             "file": f, "line": h["line"],
             "verb": m.group("verb").lower(), "route": route,
             "full_path": full, "segs": _path_segs(full),
+            "mount_file": mount_meta.get("wiring_file", ""),
+            "mount_order": mount_meta.get("order"),
         })
     return routes
 
@@ -1069,6 +1089,7 @@ def _resolve_http_bindings(snippets: list[dict[str, Any]], code_root: str,
     look. Pure-local, deterministic, zero model cost.
     """
     urls: dict[str, set[str]] = defaultdict(set)
+    url_files: dict[str, set[str]] = defaultdict(set)
     for s in snippets:
         for m in _HTTP_CALL_RE.finditer(s.get("text", "")):
             if m.group("callee").split(".")[-1].lower() not in _HTTP_CALLEES:
@@ -1077,6 +1098,8 @@ def _resolve_http_bindings(snippets: list[dict[str, Any]], code_root: str,
             if path.count("/") < 1 or len(_path_segs(path)) < 1:
                 continue
             urls[path].add(m.group("callee"))
+            if s.get("file"):
+                url_files[path].add(str(s["file"]))
     if not urls:
         return []
 
@@ -1087,8 +1110,15 @@ def _resolve_http_bindings(snippets: list[dict[str, Any]], code_root: str,
     bindings: list[dict[str, Any]] = []
     for path in sorted(urls)[:max_urls]:
         usegs = _path_segs(path)
+        inferred_verbs = {
+            verb for callee in urls[path]
+            for verb in [_http_verb_from_callee(callee)]
+            if verb
+        }
         scored: list[tuple[int, int, int, dict[str, Any]]] = []
         for r in routes:
+            if inferred_verbs and r["verb"] not in inferred_verbs:
+                continue
             ok, lit, par = _route_suffix_match(usegs, r["segs"])
             if ok:
                 scored.append((len(r["segs"]), lit, -par, r))
@@ -1096,21 +1126,262 @@ def _resolve_http_bindings(snippets: list[dict[str, Any]], code_root: str,
             continue
         scored.sort(key=lambda t: (t[0], t[1], t[2]), reverse=True)
         top = scored[0][:3]
-        # keep only routes tying the top specificity (genuine ambiguity), capped.
-        cands = [r for (a, b, c, r) in scored if (a, b, c) == top][:max_candidates]
+        # Keep routes tying the top specificity. When every tied route is mounted by
+        # the SAME app assembly, registration order proves the FastAPI/Starlette winner:
+        # first include_router wins for an identical method/path. Otherwise preserve the
+        # old ambiguity behavior rather than comparing unrelated app files.
+        tied = [r for (a, b, c, r) in scored if (a, b, c) == top]
+        mount_files = {r.get("mount_file") for r in tied if r.get("mount_file")}
+        ordered = bool(tied) and len(mount_files) == 1 and all(
+            isinstance(r.get("mount_order"), int) for r in tied
+        )
+        shadowed: list[dict[str, Any]] = []
+        if len(tied) > 1 and ordered:
+            tied.sort(key=lambda r: (r["mount_order"], r["line"], r["file"]))
+            shadowed = tied[1:]
+            cands = tied[:1]
+        else:
+            cands = tied[:max_candidates]
         for r in cands:
             w = _read_def_below(code_root, r["file"], r["line"])
+            def_match = re.search(
+                r"\b(?:async\s+def|def)\s+([A-Za-z_][A-Za-z0-9_]*)\b",
+                w["text"],
+            )
             full = r.get("full_path", r["route"])
             header = (f"# RESOLVED BINDING (hive): {r['verb'].upper()} {full} "
                       f"← client {path}\n")
             bindings.append({
                 "url": path, "route": r["route"], "full_path": full,
                 "verb": r["verb"], "file": r["file"], "lines": w["lines"],
+                "symbol": def_match.group(1) if def_match else "",
                 "text": header + w["text"],
                 "via": "http-binding", "callees": sorted(urls[path]),
+                "client_files": sorted(url_files[path]),
                 "ambiguous": len(cands) > 1,
+                "winning": len(cands) == 1,
+                "mount_file": r.get("mount_file", ""),
+                "mount_order": r.get("mount_order"),
+                "shadowed": [
+                    {
+                        "file": s["file"], "line": s["line"],
+                        "full_path": s.get("full_path", s["route"]),
+                        "mount_order": s.get("mount_order"),
+                    }
+                    for s in shadowed
+                ],
             })
     return bindings
+
+
+def _http_verb_from_callee(callee: str) -> str:
+    """Infer an HTTP verb from common client helper names, or ``""`` if generic."""
+    tail = str(callee or "").split(".")[-1].lower()
+    for verb in ("get", "post", "put", "patch", "delete", "head", "options"):
+        if tail == verb or tail.startswith(verb):
+            return verb
+    if tail == "del":
+        return "delete"
+    return ""
+
+
+_RESPONSE_STORE_CALLS = frozenset({
+    "_fetch_all", "_fetch_one", "execute", "fetchall", "fetchone",
+})
+
+
+def _response_dependency_refs(text: str) -> list[tuple[str, str]]:
+    """Return callees that contribute to a function's returned response value.
+
+    This is a narrow AST data-flow walk: start at every ``return`` expression, follow
+    local assignments referenced by that expression, and collect calls encountered on
+    those value paths. Incidental calls such as authentication/logging are excluded.
+    """
+    try:
+        tree = ast.parse(text or "")
+    except (SyntaxError, ValueError):
+        return []
+    fn = next(
+        (node for node in ast.walk(tree)
+         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))),
+        None,
+    )
+    if fn is None:
+        return []
+
+    assigned: dict[str, ast.AST] = {}
+    returns: list[ast.AST] = []
+    for node in ast.walk(fn):
+        if isinstance(node, (ast.Assign, ast.AnnAssign)):
+            value = node.value
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            if value is None:
+                continue
+            for target in targets:
+                if isinstance(target, ast.Name):
+                    assigned[target.id] = value
+        elif isinstance(node, ast.Return) and node.value is not None:
+            returns.append(node.value)
+
+    calls: list[tuple[str, str]] = []
+    seen_names: set[str] = set()
+
+    def visit_value(node: ast.AST) -> None:
+        if isinstance(node, ast.Name) and node.id in assigned and node.id not in seen_names:
+            seen_names.add(node.id)
+            visit_value(assigned[node.id])
+            return
+        if isinstance(node, ast.Call):
+            func = node.func
+            qualifier = ""
+            name = ""
+            if isinstance(func, ast.Name):
+                name = func.id
+            elif isinstance(func, ast.Attribute):
+                name = func.attr
+                if isinstance(func.value, ast.Name):
+                    qualifier = func.value.id
+            ref = (qualifier, name)
+            if name and ref not in calls:
+                calls.append(ref)
+        for child in ast.iter_child_nodes(node):
+            visit_value(child)
+
+    for value in returns:
+        visit_value(value)
+    return calls
+
+
+def _response_dependency_calls(text: str) -> list[str]:
+    """Compatibility name-only view used by focused unit tests/debugging."""
+    return [name for _, name in _response_dependency_refs(text)]
+
+
+def _import_alias_paths(code_root: str, relpath: str,
+                        py_files: set[str] | None = None) -> dict[str, str]:
+    """Resolve imported module/function aliases in one Python source file."""
+    text = _read_text(code_root, relpath)
+    if not text:
+        return {}
+    try:
+        tree = ast.parse(text)
+    except (SyntaxError, ValueError):
+        return {}
+    py_files = py_files if py_files is not None else _list_py_files(code_root)
+    out: dict[str, str] = {}
+
+    def unique(candidates: list[str]) -> str | None:
+        matches = {
+            rel for rel in py_files
+            for candidate in candidates
+            if rel == candidate or rel.endswith("/" + candidate)
+        }
+        return next(iter(matches)) if len(matches) == 1 else None
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.module:
+            module = node.module.replace(".", "/")
+            for name in node.names:
+                alias = name.asname or name.name
+                target = unique([
+                    f"{module}/{name.name}.py",
+                    f"{module}/{name.name}/__init__.py",
+                ])
+                if target is None:
+                    target = unique([f"{module}.py", f"{module}/__init__.py"])
+                if target:
+                    out[alias] = target
+        elif isinstance(node, ast.Import):
+            for name in node.names:
+                alias = name.asname or name.name.split(".")[0]
+                module = name.name.replace(".", "/")
+                target = unique([f"{module}.py", f"{module}/__init__.py"])
+                if target:
+                    out[alias] = target
+    return out
+
+
+def _is_response_producer(text: str) -> bool:
+    """Whether a returned value is assembled/read at this function."""
+    if re.search(r"(?is)\bSELECT\b.+\bFROM\b", text or ""):
+        return True
+    try:
+        tree = ast.parse(text or "")
+    except (SyntaxError, ValueError):
+        return False
+    return any(
+        isinstance(node, (ast.Dict, ast.ListComp, ast.DictComp))
+        for node in ast.walk(tree)
+    )
+
+
+def _resolve_http_producer_paths(bindings: list[dict[str, Any]], code_root: str,
+                                 max_hops: int = 4,
+                                 max_defs_per_call: int = 2) -> list[dict[str, Any]]:
+    """Trace each proven winning HTTP handler to its response-value producers.
+
+    Unlike the generic call-chain follower, this follows only calls that feed a
+    ``return`` value and carries the URL/handler identity on every hop. That makes the
+    result a deterministic winning-request-path proof instead of an unordered bag of
+    same-named functions.
+    """
+    out: list[dict[str, Any]] = []
+    py_files = _list_py_files(code_root)
+    for binding in bindings or []:
+        if binding.get("ambiguous") or not binding.get("winning", True):
+            continue
+        url = str(binding.get("url", "") or "")
+        handler_file = str(binding.get("file", "") or "")
+        frontier = [(binding, 0)]
+        seen_defs: set[str] = {f"{handler_file}:{binding.get('lines', '')}"}
+        while frontier:
+            current, depth = frontier.pop(0)
+            if depth >= max_hops:
+                continue
+            text = str(current.get("text", "") or "")
+            # A SQL-returning function is the concrete row producer. Do not descend
+            # into generic store helpers such as _fetch_all, which are shared plumbing.
+            if depth > 0 and re.search(r"(?is)\bSELECT\b.+\bFROM\b", text):
+                continue
+            aliases = _import_alias_paths(
+                code_root, str(current.get("file", "") or ""), py_files)
+            for qualifier, symbol in _response_dependency_refs(text):
+                if symbol in _RESPONSE_STORE_CALLS:
+                    continue
+                target = aliases.get(qualifier or symbol)
+                globs = [target] if target else []
+                hits = _ripgrep(rf"def {re.escape(symbol)}\b", globs, code_root,
+                                max_hits=max_defs_per_call + 1)
+                if not hits or len(hits) > max_defs_per_call:
+                    continue
+                for h in hits[:max_defs_per_call]:
+                    key = f"{h['file']}:{h['line']}"
+                    if key in seen_defs:
+                        continue
+                    seen_defs.add(key)
+                    w = _read_def_body(code_root, h["file"], h["line"])
+                    if not w["text"]:
+                        continue
+                    node = {
+                        "url": url,
+                        "verb": binding.get("verb", ""),
+                        "full_path": binding.get("full_path", ""),
+                        "handler_file": handler_file,
+                        "file": h["file"],
+                        "lines": w["lines"],
+                        "text": (
+                            f"# WINNING HTTP RESPONSE PATH (hive): {url} "
+                            f"handler {handler_file} -> {symbol}\n" + w["text"]
+                        ),
+                        "symbol": symbol,
+                        "via": "http-producer",
+                        "winning": True,
+                        "path_depth": depth + 1,
+                        "producer": _is_response_producer(w["text"]),
+                    }
+                    out.append(node)
+                    frontier.append((node, depth + 1))
+    return out
 
 
 def _covered_ranges(snippets: list[dict[str, Any]], rel: str) -> list[tuple[int, int]]:
@@ -1562,7 +1833,9 @@ def retrieve(plan: SearchPlan, code_root: str, docs_root: str | None = None,
     # so the real source is one or two hops past the handler the URL points at.
     binding_follow = (_follow_calls(http_bindings, [], code_root, k, max_hops)
                       if http_bindings and max_hops > 0 else [])
-    call_chain = call_chain + http_bindings + binding_follow + fetch_harvest
+    http_producers = _resolve_http_producer_paths(http_bindings, code_root)
+    call_chain = (call_chain + http_bindings + http_producers
+                  + binding_follow + fetch_harvest)
 
     # 3d-2. field-producer grounding (N183 round-2): trace a snake_case RESPONSE FIELD
     #     the FE reads back to the backend code that FILLS it. http-binding above
@@ -1640,6 +1913,7 @@ def retrieve(plan: SearchPlan, code_root: str, docs_root: str | None = None,
         "call_chain": call_chain,
         "call_sites": call_sites,
         "http_bindings": http_bindings,
+        "http_producers": http_producers,
         "peer_patterns": peer_patterns,
         "git_history": git_history,
         "design_excerpts": design_excerpts,
@@ -1651,6 +1925,7 @@ def retrieve(plan: SearchPlan, code_root: str, docs_root: str | None = None,
             "call_chain": len(call_chain),
             "http_bindings": len(http_bindings),
             "http_bindings_ambiguous": sum(1 for b in http_bindings if b.get("ambiguous")),
+            "http_producers": len(http_producers),
             "fetch_harvest": len(fetch_harvest),
             "field_producers": len(field_producers),
             "peer_patterns": len(peer_patterns),
