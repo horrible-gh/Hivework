@@ -438,12 +438,16 @@ class TestShippedDefaultProfile(unittest.TestCase):
     def setUp(self):
         self.cfg = load_config()  # profile None -> config/hive.config.default.json
 
-    def test_queen_is_copilot(self):
-        # decompose queen was swapped codex/gpt-5.4-mini -> copilot/gpt-5-mini as part of
-        # the cross-process codex serialization fix (a batch of parallel codex calls starved
-        # one another; moving decompose off codex removed the contention). Validated live.
-        self.assertEqual(self.cfg.queen.provider, "copilot")
-        self.assertEqual(self.cfg.queen.model, "gpt-5-mini")
+    def test_queen_alternates_copilot_or_codex_with_retries(self):
+        # The decompose queen is deliberately ALTERNATED between copilot/gpt-5-mini and
+        # codex/gpt-5.4-mini (operator toggles it; the cross-process codex serialization
+        # lock makes codex safe under parallelism, so it is no longer pinned off codex).
+        # The real invariant is therefore "one of the two intended pairs" — plus retries,
+        # because codex occasionally returns a clean rc=0 BLANK comb that killed a whole
+        # run on one shot (T905). retries>=1 covers that transient on either provider.
+        self.assertIn((self.cfg.queen.provider, self.cfg.queen.model),
+                      {("copilot", "gpt-5-mini"), ("codex", "gpt-5.4-mini")})
+        self.assertGreaterEqual(self.cfg.queen.retries, 1)
 
     def test_judge_routed_to_openai_with_tuned_caps(self):
         self.assertEqual(self.cfg.role("judge").provider, "openai")
