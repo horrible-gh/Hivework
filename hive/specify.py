@@ -41,6 +41,7 @@ import re
 from typing import Any
 
 from hive import dbread
+from hive import schema_ground
 from hive.http_shape_synth import synthesize_http_shape_red_test
 from hive.investigate import SEED_TARGET_SECTION, CONVERGE_TARGET_SECTION
 from hive.parse import extract_first_json
@@ -133,6 +134,7 @@ _LIVE_REFUTED_RE = re.compile(
 #   seed_target_uncovered → re-author the edit for the dropped seed target
 #   converge_locus_uncovered → re-author the dropped INDEPENDENT defect locus (multi-locus)
 #   deferred_root_cause   → re-retrieve the punted substantive fix's axis (if thin)
+#   verify_inconsistent   → re-author the same honey with internally consistent ids
 #   legacy_coerce         → a retired needs_pm coerced here (no real gap)
 #   author_declared       → the author itself emitted NR (read its own detail)
 RI_STALE_ANCHOR = "stale_anchor"
@@ -143,6 +145,7 @@ RI_SEED_TARGET_UNCOVERED = "seed_target_uncovered"
 RI_CONVERGE_LOCUS_UNCOVERED = "converge_locus_uncovered"
 RI_DEFERRED_ROOT_CAUSE = "deferred_root_cause"
 RI_DATASOURCE_REGRESSION = "datasource_regression"
+RI_VERIFY_INCONSISTENT = "verify_inconsistent"
 RI_LEGACY_COERCE = "legacy_coerce"
 RI_AUTHOR_DECLARED = "author_declared"
 
@@ -898,6 +901,19 @@ def _validate_spec(spec: dict[str, Any]) -> list[str]:
         problems.append("edits is not a list")
     if "deferred" in spec and not isinstance(spec["deferred"], list):
         problems.append("deferred is not a list")
+    verify = spec.get("verify")
+    if isinstance(verify, dict) and isinstance(verify.get("test_edit_ids"), list):
+        edit_ids = {
+            str(edit.get("id")) for edit in (spec.get("edits") or [])
+            if isinstance(edit, dict) and edit.get("id") is not None
+        }
+        unknown = sorted({
+            str(edit_id) for edit_id in verify["test_edit_ids"]
+            if str(edit_id) not in edit_ids
+        })
+        if unknown:
+            problems.append(
+                "verify.test_edit_ids reference missing edits: " + ", ".join(unknown))
     return problems
 
 
@@ -1631,8 +1647,13 @@ def _render_fixture_block(fixtures: list[tuple[str, str]]) -> str:
         "MUST run against this isolated harness and seed the rows the symptom needs. NEVER let "
         "a red test read/write the production store/database: that mutates live data and is "
         "unsafe to run. If the symptom is data-dependent (a DB read returning the wrong/empty "
-        "value), that is STILL a narrow, biting test — do not omit the verify block as 'needs "
-        "app state'. CRUCIAL: production code under test usually reads through a global "
+        "value) AND the spec also contains a production/source fix, that is STILL a narrow, "
+        "biting test — do not omit the verify block as 'needs app state'. For an explicit "
+        "test-only coverage request with no source fix, author the test but omit `verify` because "
+        "there is no red→green transition. Requesting one of these EXISTING fixtures as a "
+        "test-function argument is "
+        "ordinary single-file test code: it does NOT require editing conftest.py and is NOT "
+        "multi_file_design. CRUCIAL: production code under test usually reads through a global "
         "`get_store()`; merely requesting a raw-connection fixture and seeding it is NOT enough "
         "— the function will still hit the REAL database unless `get_store` is pointed at the "
         "test DB. Use the STRING-TARGET form `patch(\"<module.path>.get_store\", "
@@ -2085,6 +2106,88 @@ def _apply_effectiveness_gate(
                                 note=note)
 
 
+def _apply_schema_insert_gate(
+    spec: dict[str, Any],
+    migration_schema: schema_ground.Schema,
+) -> dict[str, Any]:
+    """Downgrade generated test INSERTs that provably violate migration constraints.
+
+    This is local, deterministic and fail-open: unsupported SQL yields no finding.
+    Findings only annotate/downgrade; they never promote a spec.
+    """
+    findings = schema_ground.validate_test_inserts(
+        spec.get("edits") or [], migration_schema)
+    if not findings:
+        return spec
+
+    edits = [edit for edit in (spec.get("edits") or []) if isinstance(edit, dict)]
+    effectiveness = spec.get("effectiveness")
+    if not isinstance(effectiveness, dict):
+        effectiveness = {"inconclusive": False, "ineffective_ids": []}
+        spec["effectiveness"] = effectiveness
+    ineffective_ids = {
+        str(edit_id) for edit_id in (effectiveness.get("ineffective_ids") or [])
+    }
+    ineffective_ids.update(findings)
+    effectiveness["ineffective_ids"] = sorted(ineffective_ids)
+
+    for edit in edits:
+        edit_id = str(edit.get("id", "?"))
+        if edit_id in findings:
+            edit["effectiveness"] = {
+                "ok": False,
+                "reason": "migration schema constraint violation — " + findings[edit_id],
+            }
+
+    if spec.get("termination") != "ready_to_apply":
+        return spec
+    note = "schema-constraint gate: " + "; ".join(
+        f"{edit_id} {reason}" for edit_id, reason in sorted(findings.items()))
+    logger.warning(
+        "specify: generated test INSERTs in %s violate migration constraints — "
+        "downgrading ready_to_apply", sorted(findings))
+    return _set_reinvestigation(
+        spec, reason_code=RI_INEFFECTIVE, gate="schema_constraints", note=note)
+
+
+def _apply_verify_consistency_gate(spec: dict[str, Any]) -> dict[str, Any]:
+    """Remove a verify block that references test edits the author did not emit.
+
+    An absent edit cannot be executed, so this is a certain authoring contradiction,
+    not an effectiveness judgement. The same grounded honey should be re-authored;
+    no retrieval or convergence work can make a dangling id valid.
+    """
+    verify = spec.get("verify")
+    if not isinstance(verify, dict):
+        return spec
+    refs = verify.get("test_edit_ids")
+    if not isinstance(refs, list):
+        return spec
+
+    edit_ids = {
+        str(edit.get("id")) for edit in (spec.get("edits") or [])
+        if isinstance(edit, dict) and edit.get("id") is not None
+    }
+    unknown = sorted({str(edit_id) for edit_id in refs
+                      if str(edit_id) not in edit_ids})
+    if not unknown:
+        return spec
+
+    valid = [str(edit_id) for edit_id in refs if str(edit_id) in edit_ids]
+    if valid:
+        verify["test_edit_ids"] = valid
+    else:
+        spec.pop("verify", None)
+    spec["verify_consistency"] = {"missing_test_edit_ids": unknown}
+
+    note = ("verify-consistency gate: verify.test_edit_ids referenced missing "
+            "edits — " + ", ".join(unknown))
+    logger.warning("specify: %s; removing the invalid verify reference(s)", note)
+    return _set_reinvestigation(
+        spec, reason_code=RI_VERIFY_INCONSISTENT,
+        gate="verify_consistency", note=note)
+
+
 def _apply_anchor_not_grounded_gate(spec: dict[str, Any]) -> dict[str, Any]:
     """Remove edits that contradict an anchor_not_grounded deferred item for the same file.
 
@@ -2153,6 +2256,9 @@ def _apply_decisiveness_gate(spec: dict[str, Any]) -> dict[str, Any]:
     ``ready_to_apply`` is left untouched.
     """
     if spec.get("termination") != "needs_reinvestigation":
+        return spec
+
+    if (spec.get("verify_consistency") or {}).get("missing_test_edit_ids"):
         return spec
 
     # The promotion stands on the effectiveness review having actually run and been
@@ -2664,6 +2770,8 @@ def run_specify(
                        "has no way to lift anchors; forcing grounding on", provider)
         ground = True
 
+    migration_schema = schema_ground.load_migration_schema(codebase_root)
+
     # Anchor-grounding pre-flight: lift the CURRENT value at each cited file:line
     # into the honey so the author writes a real change and the effectiveness
     # reviewer can judge the behavioral delta (NR164/NR165/TR891 fix). Local/free.
@@ -2705,6 +2813,16 @@ def run_specify(
             logger.info("specify: test-fixture grounding lifted %d fixture(s)%s for the "
                         "author prompt", len(fixtures),
                         " + a DB-test wiring example" if example else "")
+
+        # Migration-schema grounding: constrain generated fixture INSERTs with the
+        # UNIQUE/FK/NOT NULL/PK rules of tables named by the seed/honey. Pure local DDL
+        # parsing; unsupported migration syntax is skipped rather than guessed.
+        schema_tables = schema_ground.touched_tables(honey_text, migration_schema)
+        sblock = schema_ground.render_schema_grounding(migration_schema, schema_tables)
+        if sblock:
+            honey_text = honey_text + "\n\n" + sblock
+            logger.info("specify: migration-schema grounding lifted constraints for %s",
+                        schema_tables)
 
     contract_text = load_contract(contract_path)
     prompt = build_specify_prompt(honey_text, contract_text, codebase_root, docs_root,
@@ -2774,6 +2892,7 @@ def run_specify(
     spec = _reanchor_drifted(spec, codebase_root, docs_root)
     spec = _normalize_spec(spec)
     spec = _apply_anchor_not_grounded_gate(spec)
+    spec = _apply_verify_consistency_gate(spec)
 
     # Effectiveness gate: a second, independent pass that refuses to present edits
     # which are anchored but do not change the reported behavior as ready. The
@@ -2799,6 +2918,10 @@ def run_specify(
     # edit, or a ready_to_apply spec is downgraded with the dropped target(s) reported
     # (Defect 2 / T892).
     spec = _apply_seed_coverage_gate(spec, honey_text)
+
+    # Migration INSERT gate: generated test fixtures must obey the same deterministic
+    # constraints injected into the author prompt. It only downgrades provable violations.
+    spec = _apply_schema_insert_gate(spec, migration_schema)
 
     # Converge-coverage gate (runs LAST so it has final say): when converge declared the
     # scenario has MULTIPLE INDEPENDENT defects (N179), a ready_to_apply spec that authored

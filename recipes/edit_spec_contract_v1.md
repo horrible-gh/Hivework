@@ -22,10 +22,11 @@ Some fixes ADD behavior that does not exist yet: a new call inside a catch block
 This keeps the anchor live-verifiable (anchor_status = "verified") while adding brand-new content. Never anchor on code that does not yet exist.
 
 [Envelope filter — the spec defines its own boundary]
-Test each fix direction in the honey against one question: "can this be expressed as anchor_old → replacement_new against live code?"
-- YES → it goes into `edits[]`.
+Test each fix direction in the honey against one question: "can this be expressed as a concrete edit — either (a) anchor_old → replacement_new against an existing live file, or (b) a create_file with complete content for an absent path?"
+- YES → it goes into `edits[]` using the applicable edit kind.
 - NO → it goes into `deferred[]` with a reason; it stays as investigation/surface, NOT an edit. Do not force it.
   Reasons: "not_expressible_as_edit" (it is a direction, not a concrete change) | "needs_runtime" (needs execution evidence to decide) | "policy_direction" (business/architecture decision, not a local edit) | "multi_file_design" (a coordinated cross-file change that is a design task, not a local before→after).
+- `multi_file_design` is NOT a synonym for "the test uses an existing fixture". Requesting an existing fixture as a test-function argument, importing an existing helper, or creating one new test file is still ONE concrete edit. If the requested test file is absent, emit one `create_file` edit. Use `multi_file_design` only when multiple files themselves require unresolved coordinated design and you cannot state their concrete edits.
 - SPECIAL CASE — the honey's premise is FALSE, not merely stale: if, on reading live code, the "bug" simply does not exist — the code already does the right thing (e.g. the honey says "rename column X→Y" but the live table actually uses X), or the cited file/schema/migration is absent — then there is NO edit to make and it is NOT a cross-file design task. Record it in `deferred[]` with reason "not_expressible_as_edit", stays_as "investigation", set termination = "needs_reinvestigation", and in `notes` state plainly that live code CONTRADICTS the honey's premise, citing the live file:line you found. Do NOT reach for "multi_file_design" as a catch-all when the real situation is "no bug here — the honey was wrong".
 
 [Runtime verify — the red test that closes the loop]
@@ -42,6 +43,10 @@ The missing connecting line between *a bug* and *a failing test* is the one thin
 Trust comes from the OBSERVED transition, never your word: apply runs the node with ONLY the test edit (must be RED — proves it reproduces), then with the source fix on top (must be GREEN). A test that is already green WITHOUT the fix is rejected as non-biting. Author the test so red-before is real. When you genuinely cannot lower the rationale to a narrow test (it needs whole-app state, a browser, external I/O), OMIT the `verify` block — do not fabricate a test that cannot bite.
 
 DATA-DEPENDENT symptoms are NOT an excuse to omit. If the bug is a DB read returning the wrong/empty value (e.g. a query that yields `'' AS module` or never joins a table), the narrow test still exists: SEED the rows the symptom needs and call the function directly, then assert on its return. Use the target's EXISTING isolated test fixtures for this — they are listed in the "Test fixtures" grounding block when present (e.g. a fixture that hands you a temp/migrated DB connection). Request the fixture as a test argument; NEVER connect a red test to the production store/database (a bare `get_store()` or the live db file) — that mutates real data and is unsafe to run under `apply --verify`. Reserve the omit-escape for genuinely un-narrowable cases (browser/whole-app/external I/O), not for "it touches the DB".
+
+TEST-ONLY REQUESTS are different from runtime proof. When the honey explicitly asks only to add coverage, a schema/fixture validation test, or another test with NO production/source fix, author the requested test edit normally. It may already pass on current code. OMIT the top-level `verify` block because there is no source edit that can produce a red→green transition. `gate.commands` still names the test command. Never invent a source defect merely to make a test red.
+
+VERIFY REFERENTIAL INTEGRITY is mandatory. Every id in `verify.test_edit_ids` MUST name an actual entry in `edits[]`, and the `red_test_node` MUST live in one of those test edits (or in an existing test file when `test_edit_ids` is intentionally omitted). If `edits[]` is empty, do not emit `test_edit_ids`. Never describe a hypothetical `E1` in `verify` while omitting `E1` from `edits[]`.
 
 [Stage-1 safety] `gate.apply` is ALWAYS false at this stage. specify proposes; the PM applies. Auto-apply behind the gate is a later promotion, not now. Never write to the target codebase yourself.
 
@@ -104,7 +109,7 @@ DATA-DEPENDENT symptoms are NOT an excuse to omit. If the bug is a DB read retur
 | absent or `"edit"` | The target file already exists. You are replacing a span of text in it (the anchor model above). |
 | `"create_file"` | The target file does not exist yet. You are writing it from scratch. |
 
-Choose based solely on whether the file is present in the live codebase at specify time. If it exists, use an anchor edit. If it is absent, use `create_file`. Never use `create_file` to overwrite an existing file.
+Choose based solely on whether the file is present in the live codebase at specify time. If it exists, use an anchor edit. If it is absent, use `create_file`. Never use `create_file` to overwrite an existing file. A new test file that consumes an existing fixture is the canonical single-`create_file` case; consuming the fixture does not require editing `conftest.py` and is not `multi_file_design`.
 
 ### Fields for a `create_file` edit
 

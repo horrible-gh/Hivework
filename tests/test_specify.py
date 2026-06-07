@@ -101,6 +101,18 @@ class TestBuildPrompt(unittest.TestCase):
         # The author must be told to prefer the doc over the nearest source file.
         self.assertIn("Prefer the design document", prompt)
 
+    def test_contract_disambiguates_existing_fixture_and_test_only_requests(self):
+        contract = specify.load_contract()
+        self.assertIn(
+            "Requesting an existing fixture as a test-function argument",
+            contract)
+        self.assertIn(
+            "either (a) anchor_old → replacement_new", contract)
+        self.assertIn("TEST-ONLY REQUESTS are different from runtime proof", contract)
+        self.assertIn(
+            "Every id in `verify.test_edit_ids` MUST name an actual entry",
+            contract)
+
 
 class TestStampRoot(unittest.TestCase):
     """codebase_root is stamped with the tree that actually holds the edited
@@ -256,6 +268,15 @@ class TestValidateSpec(unittest.TestCase):
             {"edits": [], "deferred": [], "gate": {}, "termination": "bogus"})
         self.assertTrue(any("termination" in p for p in problems))
 
+    def test_verify_reference_to_missing_edit_is_flagged(self):
+        problems = specify._validate_spec({
+            "edits": [], "deferred": [], "gate": {},
+            "termination": "needs_reinvestigation",
+            "verify": {"red_test_node": "tests/test_x.py::test_x",
+                       "test_edit_ids": ["E1"]},
+        })
+        self.assertTrue(any("missing edits: E1" in p for p in problems))
+
 
 class TestRunSpecify(unittest.TestCase):
     def setUp(self):
@@ -303,6 +324,29 @@ class TestRunSpecify(unittest.TestCase):
         spec = self._run(json.dumps(bare))
         self.assertEqual(spec["source_honey"], self.honey)
         self.assertEqual(spec["codebase_root"], os.path.abspath(self.tmp))
+
+    def test_qwen_shaped_ghost_verify_is_routed_as_reauthoring_error(self):
+        contradictory = {
+            "edits": [],
+            "deferred": [{
+                "issue": "Create tests/test_x.py using the existing test_db fixture",
+                "reason": "multi_file_design",
+            }],
+            "gate": {"commands": [], "apply": False},
+            "verify": {
+                "red_test_node": "tests/test_x.py::test_x",
+                "test_edit_ids": ["E1"],
+            },
+            "termination": "needs_reinvestigation",
+            "notes": "new file requires multi-file fixture wiring",
+        }
+        spec = self._run(json.dumps(contradictory))
+        self.assertNotIn("verify", spec)
+        self.assertEqual(
+            spec["reinvestigation"]["reason_code"],
+            specify.RI_VERIFY_INCONSISTENT)
+        self.assertEqual(
+            spec["verify_consistency"]["missing_test_edit_ids"], ["E1"])
 
     def test_no_json_raises(self):
         with self.assertRaises(ValueError):
@@ -1822,6 +1866,45 @@ class TestReinvestigationReason(unittest.TestCase):
         self.assertEqual(out["reinvestigation"]["reason_code"],
                          specify.RI_SEED_TARGET_UNCOVERED)
         self.assertIn("workflowViewState.spec.ts", out["reinvestigation"]["detail"])
+
+    def test_verify_consistency_removes_ghost_reference_and_stamps_reason(self):
+        spec = {
+            "edits": [],
+            "deferred": [{"issue": "create test", "reason": "multi_file_design"}],
+            "gate": {"apply": False},
+            "verify": {
+                "red_test_node": "server/tests/test_x.py::test_x",
+                "test_edit_ids": ["E1"],
+            },
+            "termination": "needs_reinvestigation",
+            "notes": "",
+        }
+        out = specify._apply_verify_consistency_gate(spec)
+        self.assertNotIn("verify", out)
+        self.assertEqual(
+            out["verify_consistency"]["missing_test_edit_ids"], ["E1"])
+        self.assertEqual(
+            out["reinvestigation"]["reason_code"],
+            specify.RI_VERIFY_INCONSISTENT)
+        self.assertEqual(out["reinvestigation"]["gate"], "verify_consistency")
+
+    def test_verify_consistency_keeps_valid_ids_and_drops_only_missing(self):
+        spec = _fresh_ready()
+        spec["verify"] = {
+            "red_test_node": "tests/test_x.py::test_x",
+            "test_edit_ids": ["E1", "E9"],
+        }
+        out = specify._apply_verify_consistency_gate(spec)
+        self.assertEqual(out["verify"]["test_edit_ids"], ["E1"])
+        self.assertEqual(out["termination"], "needs_reinvestigation")
+
+    def test_decisiveness_cannot_repromote_verify_inconsistency(self):
+        spec = _fresh_ready()
+        spec["termination"] = "needs_reinvestigation"
+        spec["effectiveness"] = {"inconclusive": False, "ineffective_ids": []}
+        spec["verify_consistency"] = {"missing_test_edit_ids": ["E9"]}
+        out = specify._apply_decisiveness_gate(spec)
+        self.assertEqual(out["termination"], "needs_reinvestigation")
 
     def test_decisiveness_promotion_clears_reason(self):
         # A downgraded spec carrying a structured reason, when promoted back to ready,
