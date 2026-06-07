@@ -362,6 +362,16 @@ class TestGroupedLayout(unittest.TestCase):
         self.assertIsNone(cfg3.copilot.token)
         self.assertIsNone(cfg3.copilot.token_env)
 
+    def test_copilot_read_only_defaults_true(self):
+        # Capability enforcement: absent the key, copilot workers are read-only
+        # (--deny-tool=write,shell). Secure-by-default.
+        cfg = self._load({"providers": {"copilot": {}}})
+        self.assertTrue(cfg.copilot.read_only)
+
+    def test_copilot_read_only_can_be_disabled(self):
+        cfg = self._load({"providers": {"copilot": {"read_only": False}}})
+        self.assertFalse(cfg.copilot.read_only)
+
     def test_stages_judge_maps_to_judge_caps(self):
         cfg = self._load({"stages": {"judge": {"max_axes": 7, "votes_per_axis": 5}}})
         self.assertEqual(cfg.judge.max_axes, 7)

@@ -114,9 +114,27 @@ def _run_capture(cmd, *, input=None, cwd=None, timeout=None, env=None) -> subpro
     return subprocess.CompletedProcess(cmd, proc.returncode, stdout, stderr)
 
 
+# read_only=True translates to copilot's permission DENYLIST. ``write`` and
+# ``shell`` are permission KINDS, not individual tool names: ``write`` matches
+# every file-create/modify tool, ``shell`` every shell command (see
+# `copilot help permissions`). Two properties make this the right enforcement:
+#   1. Denial takes precedence over --allow-all-tools, so even with --allow-all
+#      live, writes/shell are hard-blocked — the model physically cannot edit the
+#      target tree or shell out, while read/grep/list stay available so anchor
+#      grounding never dies. No per-tool-name whitelist to drift or hallucinate.
+#   2. ``write`` excludes shell redirections (`echo > f`), but denying ``shell``
+#      too closes that path — so the pair is airtight.
+# codex (--sandbox read-only) and the HTTP provider (no write tool in its
+# registry) are already read-only, so they ignore this flag (absorbed by
+# **_ignored). Every Hive copilot role is read-only (queen/swarm explore,
+# specify is propose-only, apply writes in deterministic Python — never a worker),
+# so this defaults ON; the config switch providers.copilot.read_only is the escape.
+_READ_ONLY_DENY = ("write", "shell")
+
+
 def _call_copilot(model, prompt, cwd, timeout, exe=None, allow_flag="--allow-all",
                   available_tools=None, copilot_token=None, on_start=None,
-                  **_ignored) -> WorkerResult:
+                  read_only=True, **_ignored) -> WorkerResult:
     """Call the copilot CLI. Prompt sent via stdin (never -p) to avoid cp932 truncation.
 
     ``available_tools``: when not None, restrict the model to exactly this tool
@@ -124,6 +142,11 @@ def _call_copilot(model, prompt, cwd, timeout, exe=None, allow_flag="--allow-all
     forcing a single-shot completion (no file/shell access). The JUDGE uses this
     to rule on the supplied bundle instead of turning into an agentic explorer —
     which both defeats the retrieval redesign and blows the timeout.
+
+    ``read_only`` (default True): when True, append ``--deny-tool=write
+    --deny-tool=shell`` so the worker can read/grep/list the target tree but can
+    NEVER edit it or shell out, regardless of ``allow_flag`` (denial wins over
+    --allow-all). See ``_READ_ONLY_DENY`` above for why this is the enforcement.
 
     ``**_ignored`` absorbs the OpenAI-compatible endpoint kwargs (``base_url`` /
     ``api_key_env``) that callers put in the single shared ``provider_kwargs`` dict
@@ -134,6 +157,8 @@ def _call_copilot(model, prompt, cwd, timeout, exe=None, allow_flag="--allow-all
     cmd = [exe, allow_flag, "--model", model]
     if available_tools is not None:
         cmd.append("--available-tools=" + ",".join(available_tools))
+    if read_only:
+        cmd += [f"--deny-tool={kind}" for kind in _READ_ONLY_DENY]
     # Pin the billing account. COPILOT_GITHUB_TOKEN takes precedence over the CLI's
     # stored login (`copilot help environment`), so injecting the configured token
     # bills THIS account no matter the ambient shell/login. Without a token AND

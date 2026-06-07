@@ -18,6 +18,7 @@ from hive.specify import (
     RI_ANCHOR_NOT_GROUNDED, RI_AUTHOR_DECLARED, RI_CONVERGE_LOCUS_UNCOVERED,
     RI_DEFERRED_ROOT_CAUSE, RI_INCONCLUSIVE, RI_INEFFECTIVE,
     RI_LEGACY_COERCE, RI_SEED_TARGET_UNCOVERED, RI_STALE_ANCHOR,
+    RI_VERIFY_INCONSISTENT,
 )
 
 
@@ -132,6 +133,14 @@ class TestReauthorRouting(unittest.TestCase):
         plan = plan_reinvestigation(_nr_spec(RI_CONVERGE_LOCUS_UNCOVERED), [])
         self.assertEqual(plan.action, ACTION_RE_AUTHOR)
         self.assertEqual(plan.axis_ids, [])
+
+    def test_verify_inconsistency_routes_to_re_author(self):
+        spec = _nr_spec(RI_VERIFY_INCONSISTENT)
+        spec["verify_consistency"] = {"missing_test_edit_ids": ["E1"]}
+        plan = plan_reinvestigation(spec, [])
+        self.assertEqual(plan.action, ACTION_RE_AUTHOR)
+        self.assertEqual(plan.axis_ids, ["E1"])
+        self.assertIn("internally consistent", plan.rationale)
 
 
 class TestTerminalReasons(unittest.TestCase):

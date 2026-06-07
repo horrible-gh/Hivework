@@ -91,6 +91,10 @@ def build_provider_kwargs(cfg) -> dict:
         kwargs["exe"] = cfg.copilot.exe
     if cfg.copilot.allow:
         kwargs["allow_flag"] = cfg.copilot.allow
+    # Capability enforcement: read-only copilot workers (--deny-tool=write,shell).
+    # One semantic flag set here, translated once per provider in the handler;
+    # codex/http ignore it (already read-only). See CopilotConfig.read_only.
+    kwargs["read_only"] = cfg.copilot.read_only
     # Pin the copilot billing account: resolve the configured token (raw ``token``
     # wins, else read the env var named by ``token_env``) and hand it to the
     # copilot handler, which injects it as COPILOT_GITHUB_TOKEN so the run bills

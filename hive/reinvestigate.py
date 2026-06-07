@@ -40,6 +40,7 @@ from hive.specify import (
     RI_INCONCLUSIVE,
     RI_INEFFECTIVE,
     RI_SEED_TARGET_UNCOVERED,
+    RI_VERIFY_INCONSISTENT,
 )
 
 logger = logging.getLogger("hive.reinvestigate")
@@ -66,7 +67,10 @@ _CONVERGE_REASONS = frozenset({RI_INEFFECTIVE, RI_INCONCLUSIVE})
 # fewer edits than loci. Re-fetching or re-stitching adds nothing; the cheap fix is to
 # RE-AUTHOR the SAME honey (the per-locus contract now drives one edit per declared locus).
 # No model evidence gap, so this never re-fetches — it re-runs specify on the same evidence.
-_REAUTHOR_REASONS = frozenset({RI_CONVERGE_LOCUS_UNCOVERED})
+_REAUTHOR_REASONS = frozenset({
+    RI_CONVERGE_LOCUS_UNCOVERED,
+    RI_VERIFY_INCONSISTENT,
+})
 # Everything else (stale_anchor → specify-local re-anchor, not a re-investigate;
 # legacy_coerce / author_declared → no machine-routable evidence gap) → honest terminate.
 
@@ -124,6 +128,15 @@ def plan_reinvestigation(spec: dict[str, Any],
                        "re-fetching the same scope adds nothing (honest NR)"))
 
     if reason in _REAUTHOR_REASONS:
+        if reason == RI_VERIFY_INCONSISTENT:
+            missing = (spec.get("verify_consistency") or {}).get(
+                "missing_test_edit_ids") or []
+            return ReinvestPlan(
+                ACTION_RE_AUTHOR, reason,
+                axis_ids=[str(edit_id) for edit_id in missing],
+                rationale=(f"{reason}: verify referenced missing edit ids {missing} — "
+                           "re-author the SAME honey with internally consistent edits[] "
+                           "and verify.test_edit_ids; no new evidence is needed"))
         cov = spec.get("converge_coverage") or {}
         loci = cov.get("loci") or []
         return ReinvestPlan(

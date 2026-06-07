@@ -40,14 +40,15 @@
     "ledger":    { "enabled": true, "db_path": "hive_ledger.db" }
   },
   "providers": {
-    "copilot": { "exe": null, "allow": "--allow-all", "timeout_sec": 300 },
+    "copilot": { "exe": null, "allow": "--allow-all", "timeout_sec": 300, "read_only": true,
+                 "_comment": "read_only=true => --deny-tool=write,shell on every copilot worker (denial wins over --allow-all): reads/grep stay live, writes/shell hard-blocked. Set false only to let a worker mutate the target." },
     "codex":   { "exe": null, "lock_timeout_sec": 1800,
                  "_comment": "Codex CLI. lock_timeout_sec (seconds) = cross-process serialization mutex wait bound (how long a queued codex call waits before TimeoutError). Change the number here." },
     "openai":  { "base_url": "https://api.deepinfra.com/v1/openai", "api_key_env": "DEEPINFRA_TOKEN",
                  "_comment": "OpenAI-compatible endpoint. base_url = chat-completions root; api_key_env = NAME of the env var holding the key (the key lives in the out-of-repo secrets file)." }
   },
   "_openai_presets": {
-    "deepinfra": { "base_url": "https://api.deepinfra.com/v1/openai", "api_key_env": "DEEPINFRA_TOKEN" },
-    "openai":    { "base_url": "https://api.openai.com/v1", "api_key_env": "OPENAI_API_KEY" }
+    "openai":    { "base_url": "https://api.openai.com/v1", "api_key_env": "OPENAI_API_KEY" },
+    "deepinfra": { "base_url": "https://api.deepinfra.com/v1/openai", "api_key_env": "DEEPINFRA_TOKEN" }
   }
 }

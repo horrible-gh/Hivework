@@ -37,7 +37,7 @@ _DEFAULTS: dict[str, Any] = {
         # provider/model; hive.config.json routes it to deepinfra like judge.
         "converge": {"provider": "copilot", "model": "claude-sonnet-4.5"},
     },
-    "copilot": {"exe": None, "allow": "--allow-all", "timeout_sec": 300},
+    "copilot": {"exe": None, "allow": "--allow-all", "timeout_sec": 300, "read_only": True},
     # OpenAI-compatible HTTP endpoint for the 'openai'/'deepinfra' provider. These
     # are the SAME backend; the defaults below are the DeepInfra preset (kept for
     # back-compat). Point at any other vendor (OpenAI proper, a self-hosted vLLM, …)
@@ -109,6 +109,13 @@ class CopilotConfig:
     # from (keeps the secret out of the config file). ``token`` wins if both set.
     token: str | None = None
     token_env: str | None = None
+    # Capability enforcement: when True, every copilot worker runs with
+    # --deny-tool=write --deny-tool=shell so it can read/grep the target tree but
+    # never edit it or shell out (denial wins over --allow-all). All Hive copilot
+    # roles are read-only by design (queen/swarm explore, specify is propose-only,
+    # apply writes in deterministic Python), so this defaults True. Flip to False
+    # only to deliberately let a copilot worker mutate the target codebase.
+    read_only: bool = True
 
 
 @dataclass
@@ -799,6 +806,7 @@ def load_config(path: str | None = None, profile: str | None = None) -> Config:
             timeout_sec=int(copilot_raw.get("timeout_sec", 300)),
             token=copilot_raw.get("token"),
             token_env=copilot_raw.get("token_env"),
+            read_only=bool(copilot_raw.get("read_only", True)),
         ),
         codex=CodexConfig(
             exe=codex_raw.get("exe"),

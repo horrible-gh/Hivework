@@ -51,6 +51,25 @@ class TestCopilotCmd(unittest.TestCase):
         self.assertIn("gpt-5-mini", cmd)
         self.assertIn("--allow-all", cmd)
 
+    def test_read_only_default_denies_write_and_shell(self):
+        # Capability enforcement: copilot defaults to read-only. write/shell are
+        # permission KINDS, denied even though --allow-all is present (denial wins).
+        cmd = _capture_cmd()
+        self.assertIn("--deny-tool=write", cmd)
+        self.assertIn("--deny-tool=shell", cmd)
+        self.assertIn("--allow-all", cmd)  # reads/grep stay live
+
+    def test_read_only_false_omits_deny(self):
+        cmd = _capture_cmd(read_only=False)
+        self.assertFalse(any(c.startswith("--deny-tool") for c in cmd))
+
+    def test_read_only_compatible_with_available_tools(self):
+        # A read-only single-shot (judge-style) keeps BOTH the whitelist and the
+        # write/shell denial — they are orthogonal filters.
+        cmd = _capture_cmd(available_tools=["read", "grep"])
+        self.assertIn("--available-tools=read,grep", cmd)
+        self.assertIn("--deny-tool=write", cmd)
+
     def _capture_env(self, **call_kwargs):
         """Return the env dict _run_capture received for a copilot call."""
         seen = {}
@@ -277,9 +296,10 @@ class TestCodexHandler(unittest.TestCase):
         # provider_kwargs carries copilot's exe/allow_flag/available_tools; codex
         # must tolerate them (resolve its own exe, not copilot's) without error.
         wr, seen = _run_codex(allow_flag="--allow-all", available_tools=[],
-                              exe="copilot.cmd")
+                              exe="copilot.cmd", read_only=True)
         self.assertEqual(seen["cmd"][0], "codex.cmd")   # codex exe, not copilot's
         self.assertNotIn("--allow-all", seen["cmd"])
+        self.assertNotIn("--deny-tool=write", seen["cmd"])  # already --sandbox read-only
         self.assertEqual(wr.exit_code, 0)
 
     def test_nonzero_exit_surfaced(self):
