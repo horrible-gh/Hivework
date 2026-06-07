@@ -761,6 +761,18 @@ class TestCalleeContractGrounding(unittest.TestCase):
         self.assertIn("severity", prompt)        # the real signature reached the reviewer
         self.assertIn("MIS-INVOKED", prompt)     # the mandate to flag a mismatched call
 
+    def test_review_prompt_carries_full_create_file_content(self):
+        # TR909: a long create_file (a red test) must reach the reviewer in FULL, with no
+        # "(truncated)" marker injected into the content — that marker once read as the
+        # file's real final line and false-failed a valid test, downgrading a ready spec.
+        body = "\n".join(f"line_{i} = {i}" for i in range(1, 61)) + "\nassert line_60 == 60\n"
+        spec = {"edits": [{"id": "E1", "kind": "create_file",
+                           "file": "server/tests/test_big.py", "content": body,
+                           "rationale": "red test"}]}
+        prompt = specify.build_review_prompt("honey", spec, self.root)
+        self.assertIn("assert line_60 == 60", prompt)   # the final line survived
+        self.assertNotIn("(truncated)", prompt)
+
     def test_review_prompt_no_block_when_nothing_resolves(self):
         # The MANDATE always names "Callee contracts"; the rendered BLOCK ('## …') only
         # appears when a callee actually resolved. Nothing resolves here → no block.
@@ -2255,6 +2267,154 @@ class TestHttpShapeSynthesisPass(unittest.TestCase):
         # the supplied harness is prepended and its fixture name drives the test sig
         self.assertTrue(red["content"].startswith("import pytest"))
         self.assertIn("(seeded_client):", red["content"])
+
+
+class TestWinningPathAndLayerGates(unittest.TestCase):
+    """T909: off-path source/test edits cannot survive effectiveness."""
+
+    def _honey(self, *, attributed="server/modules/flow_gate/db/projects.py"):
+        nodes = [
+            {"url": "/api/v1/projects", "verb": "GET", "role": "handler",
+             "file": "server/modules/flow_gate/settings/routers/project_settings.py",
+             "lines": "45-49", "symbol": "list_projects_endpoint", "depth": 0},
+            {"url": "/api/v1/projects", "verb": "GET", "role": "producer",
+             "file": "server/modules/flow_gate/db/projects.py",
+             "lines": "19-27", "symbol": "list_projects", "depth": 1},
+        ]
+        lines = [
+            "<!-- hive-winning-http-path: "
+            + json.dumps(node, sort_keys=True) + " -->"
+            for node in nodes
+        ]
+        lines.append(
+            "<!-- hive-converge-attribution: "
+            + json.dumps({
+                "file": attributed, "lines": "19-27", "node": "db_fn",
+                "converged": True, "causal_verdict": "consistent",
+            }, sort_keys=True)
+            + " -->"
+        )
+        return "\n".join(lines)
+
+    @staticmethod
+    def _ready(edits):
+        return {
+            "edits": edits, "deferred": [], "gate": {"apply": False},
+            "termination": "ready_to_apply",
+            "effectiveness": {"inconclusive": False, "ineffective_ids": []},
+            "notes": "",
+        }
+
+    def test_t909_off_path_store_and_process_service_test_are_both_downgraded(self):
+        spec = self._ready([
+            {"id": "E1", "file": "server/modules/flow_gate/store.py",
+             "anchor_old": "old", "replacement_new": "new",
+             "anchor_status": "verified", "confidence": "high"},
+            {"id": "E2", "kind": "create_file",
+             "file": "server/tests/test_projects_endpoint_modules.py",
+             "content": (
+                 "from modules.flow_gate import process_service\n"
+                 "def test_projects(test_db):\n"
+                 "    assert process_service.get_projects_with_modules()\n"
+             ),
+             "confidence": "high"},
+        ])
+        out = specify._apply_winning_path_gate(spec, self._honey())
+        self.assertEqual(out["termination"], "needs_reinvestigation")
+        self.assertEqual(out["reinvestigation"]["gate"], "winning_path")
+        self.assertEqual(out["effectiveness"]["ineffective_ids"], ["E1", "E2"])
+        self.assertIn("off winning HTTP path",
+                      out["edits"][0]["effectiveness"]["reason"])
+        self.assertIn("off winning HTTP path",
+                      out["edits"][1]["effectiveness"]["reason"])
+
+    def test_legitimate_on_path_source_and_route_test_survive(self):
+        spec = self._ready([
+            {"id": "E1", "file": "server/modules/flow_gate/db/projects.py",
+             "anchor_old": "old", "replacement_new": "new",
+             "anchor_status": "verified", "confidence": "high"},
+            {"id": "E2", "kind": "create_file",
+             "file": "server/tests/test_projects_route_modules.py",
+             "content": (
+                 "def test_projects(client):\n"
+                 "    response = client.get('/api/v1/projects')\n"
+                 "    assert response.status_code == 200\n"
+             ),
+             "confidence": "high"},
+        ])
+        out = specify._apply_winning_path_gate(spec, self._honey())
+        self.assertEqual(out["termination"], "ready_to_apply")
+        self.assertEqual(out["effectiveness"]["ineffective_ids"], [])
+
+    def test_converge_fe_author_be_contradiction_is_downgraded(self):
+        spec = self._ready([
+            {"id": "E1", "file": "server/modules/flow_gate/store.py",
+             "anchor_old": "old", "replacement_new": "new",
+             "anchor_status": "verified", "confidence": "high"},
+        ])
+        out = specify._apply_layer_consistency_gate(
+            spec, self._honey(attributed="client/src/NewRequirementModal.vue"))
+        self.assertEqual(out["termination"], "needs_reinvestigation")
+        self.assertEqual(out["reinvestigation"]["gate"], "converge_author_layer")
+        self.assertEqual(out["effectiveness"]["ineffective_ids"], ["E1"])
+
+    def test_cross_layer_author_with_attributed_layer_present_is_allowed(self):
+        spec = self._ready([
+            {"id": "E1", "file": "client/src/NewRequirementModal.vue",
+             "anchor_old": "old", "replacement_new": "new",
+             "anchor_status": "verified", "confidence": "high"},
+            {"id": "E2", "file": "server/modules/flow_gate/store.py",
+             "anchor_old": "old2", "replacement_new": "new2",
+             "anchor_status": "verified", "confidence": "high"},
+        ])
+        out = specify._apply_layer_consistency_gate(
+            spec, self._honey(attributed="client/src/NewRequirementModal.vue"))
+        self.assertEqual(out["termination"], "ready_to_apply")
+        self.assertEqual(out["effectiveness"]["ineffective_ids"], [])
+
+    def test_layer_gate_defers_to_winning_path_for_onpath_be_edit(self):
+        # converge attributed FE, but the correct fix is the BE producer that the
+        # deterministic winning-path proof reached. The layer gate must NOT fight that
+        # producer grounding — the on-path BE edit is exonerated (winning-path is arbiter).
+        spec = self._ready([
+            {"id": "E1", "file": "server/modules/flow_gate/db/projects.py",
+             "anchor_old": "old", "replacement_new": "new",
+             "anchor_status": "verified", "confidence": "high"},
+        ])
+        out = specify._apply_layer_consistency_gate(
+            spec, self._honey(attributed="client/src/NewRequirementModal.vue"))
+        self.assertEqual(out["termination"], "ready_to_apply")
+        self.assertEqual(out["effectiveness"]["ineffective_ids"], [])
+
+    def test_winning_path_gate_skips_source_veto_when_proof_has_no_producer(self):
+        # Handler-only proof (no producer node reached): the reachability proof is
+        # incomplete for siting a producer fix, so a BE source edit is NOT failed-closed.
+        # The off-path test rule still applies regardless of producer depth.
+        handler_only = (
+            "<!-- hive-winning-http-path: " + json.dumps(
+                {"url": "/api/v1/projects", "verb": "GET", "role": "handler",
+                 "file": "server/modules/flow_gate/settings/routers/project_settings.py",
+                 "lines": "45-49", "symbol": "list_projects_endpoint", "depth": 0},
+                sort_keys=True) + " -->"
+        )
+        spec = self._ready([
+            {"id": "E1", "file": "server/modules/flow_gate/store.py",
+             "anchor_old": "old", "replacement_new": "new",
+             "anchor_status": "verified", "confidence": "high"},
+            {"id": "E2", "kind": "create_file",
+             "file": "server/tests/test_off_path.py",
+             "content": (
+                 "from modules.flow_gate import process_service\n"
+                 "def test_x(test_db):\n"
+                 "    assert process_service.get_projects_with_modules()\n"
+             ),
+             "confidence": "high"},
+        ])
+        out = specify._apply_winning_path_gate(spec, handler_only)
+        # E1 (BE source) survives — proof reached no producer to site against.
+        self.assertNotIn("E1", out["effectiveness"]["ineffective_ids"])
+        # E2 (off-path test) is still flagged — the test-coverage contract is explicit.
+        self.assertIn("E2", out["effectiveness"]["ineffective_ids"])
 
 
 if __name__ == "__main__":

@@ -148,6 +148,8 @@ RI_DATASOURCE_REGRESSION = "datasource_regression"
 RI_VERIFY_INCONSISTENT = "verify_inconsistent"
 RI_LEGACY_COERCE = "legacy_coerce"
 RI_AUTHOR_DECLARED = "author_declared"
+RI_OFF_WINNING_PATH = "off_winning_path"
+RI_LAYER_CONTRADICTION = "converge_author_layer_contradiction"
 
 
 def _append_note(spec: dict[str, Any], note: str) -> None:
@@ -1731,6 +1733,11 @@ def _lift_db_test_example(codebase_root: str) -> str:
     window = lines[start:start + _DBTEST_EXAMPLE_MAX_LINES]
     excerpt = "\n".join(header[:20] + ["..."] + window)
     return (f"## DB-test wiring example (from {rel}) — copy this import root + get_store patch\n"
+            "# Your red test MUST patch the SAME db accessor the code under test calls — patch\n"
+            "# get_store AS IMPORTED BY the module under test (patch('<module-under-test>.get_store')).\n"
+            "# Do NOT copy a different patch target from a sibling test in the file you edit (e.g. a\n"
+            "# legacy store handle or a '_conn'/'_store' attribute): it routes to a DIFFERENT store,\n"
+            "# silently fails to intercept this path, and the test then never exercises the fix.\n"
             f"```python\n{excerpt}\n```")
 
 
@@ -1770,10 +1777,6 @@ def _edit_call_items(spec: dict[str, Any],
     return items
 
 
-# How many lines of a create_file's content to surface to the effectiveness
-# reviewer — enough to judge "non-empty and on-target" without ballooning the prompt.
-_REVIEW_CONTENT_MAX_LINES = 40
-
 # One terse JSON-only retry for the effectiveness review (mirrors judge's lever):
 # now that the reviewer runs on a tool-OFF API provider (deepinfra), a stray prose
 # wrapper or fence would otherwise degrade a ready spec straight to needs_reinvestigation.
@@ -1798,9 +1801,10 @@ def build_review_prompt(honey_text: str, spec: dict[str, Any], codebase_root: st
     assignment, a guard whose condition can never be true, a value set to what it
     already is) is effective=false — exactly the failure this review exists to catch.
 
-    create_file edits: the block carries ``content`` (truncated to
-    _REVIEW_CONTENT_MAX_LINES lines) instead of the absent anchor fields, so the
-    reviewer can judge whether the new file is genuinely non-empty and on-target.
+    create_file edits: the block carries the FULL ``content`` (instead of the absent
+    anchor fields) so the reviewer can judge whether the new file is genuinely non-empty
+    and on-target — never truncated, since a truncation marker injected into the content
+    reads as the file's real final line and false-fails a valid edit.
 
     The review also judges ``in_scope`` — whether the edit changes ONLY what the
     Requested change targets, or ALSO affects elements/behaviors the seed said to
@@ -1814,17 +1818,16 @@ def build_review_prompt(honey_text: str, spec: dict[str, Any], codebase_root: st
     blocks = []
     for e in edits:
         if e.get("kind", "edit") == "create_file":
-            content = e.get("content") or ""
-            lines = content.splitlines()
-            if len(lines) > _REVIEW_CONTENT_MAX_LINES:
-                content_display = "\n".join(lines[:_REVIEW_CONTENT_MAX_LINES]) + "\n(truncated)"
-            else:
-                content_display = content
+            # Surface the FULL new-file content: it IS the substance the effectiveness
+            # review judges (non-empty, on-target, a real red test). Truncating it once
+            # injected a literal "(truncated)" marker INTO the content — the reviewer read
+            # that as the file's actual final line and failed an otherwise-valid test edit,
+            # downgrading a ready spec to needs_reinvestigation. Never corrupt the content.
             block = {
                 "id": e.get("id"),
                 "kind": "create_file",
                 "file": e.get("file"),
-                "content": content_display,
+                "content": e.get("content") or "",
                 "rationale": e.get("rationale"),
             }
         else:
@@ -2104,6 +2107,188 @@ def _apply_effectiveness_gate(
 
     return _set_reinvestigation(spec, reason_code=reason_code, gate="effectiveness",
                                 note=note)
+
+
+_WINNING_PATH_MARKER_RE = re.compile(
+    r"<!--\s*hive-winning-http-path:\s*(\{.*?\})\s*-->"
+)
+_CONVERGE_ATTR_MARKER_RE = re.compile(
+    r"<!--\s*hive-converge-attribution:\s*(\{.*?\})\s*-->"
+)
+_FE_SOURCE_EXTS = frozenset({".vue", ".jsx", ".tsx", ".svelte", ".js", ".ts",
+                             ".mjs", ".cjs"})
+_BE_SOURCE_EXTS = frozenset({".py", ".go", ".java", ".kt", ".rb", ".php", ".rs",
+                             ".cs"})
+
+
+def _parse_json_markers(pattern: re.Pattern[str], honey_text: str) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for match in pattern.finditer(honey_text or ""):
+        try:
+            value = json.loads(match.group(1))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        if isinstance(value, dict):
+            out.append(value)
+    return out
+
+
+def _path_aligns(a: str, b: str) -> bool:
+    a = str(a or "").replace("\\", "/").strip().strip("/").lower()
+    b = str(b or "").replace("\\", "/").strip().strip("/").lower()
+    return bool(a) and bool(b) and (
+        a == b or a.endswith("/" + b) or b.endswith("/" + a)
+    )
+
+
+def _edit_text(edit: dict[str, Any]) -> str:
+    return str(edit.get("content", "") or edit.get("replacement_new", "") or "")
+
+
+def _test_targets_winning_path(text: str, proof: list[dict[str, Any]]) -> bool:
+    """Whether a test executes the proven URL or directly invokes a proven symbol."""
+    lowered = text.lower()
+    for node in proof:
+        url = str(node.get("url", "") or "").rstrip("/")
+        if url:
+            request_pat = re.compile(
+                rf"(?is)(?:client|app|test_client|http|axios|request)\s*\.\s*"
+                rf"(?:get|post|put|patch|delete|request)\s*\([^)]*{re.escape(url)}"
+            )
+            if request_pat.search(text):
+                return True
+        symbol = str(node.get("symbol", "") or "").strip()
+        if symbol and re.search(
+            rf"\b{re.escape(symbol.lower())}\s*\(", lowered
+        ):
+            return True
+    return False
+
+
+def _mark_ineffective(spec: dict[str, Any], findings: dict[str, str]) -> None:
+    effectiveness = spec.get("effectiveness")
+    if not isinstance(effectiveness, dict):
+        effectiveness = {"inconclusive": False, "ineffective_ids": []}
+        spec["effectiveness"] = effectiveness
+    ids = {str(item) for item in (effectiveness.get("ineffective_ids") or [])}
+    ids.update(findings)
+    effectiveness["ineffective_ids"] = sorted(ids)
+    for edit in spec.get("edits") or []:
+        if not isinstance(edit, dict):
+            continue
+        eid = str(edit.get("id", "?"))
+        if eid in findings:
+            edit["effectiveness"] = {"ok": False, "reason": findings[eid]}
+
+
+def _apply_layer_consistency_gate(spec: dict[str, Any],
+                                  honey_text: str) -> dict[str, Any]:
+    """Downgrade an author draft that crosses FE/BE against converge's attribution."""
+    markers = _parse_json_markers(_CONVERGE_ATTR_MARKER_RE, honey_text)
+    if not markers:
+        return spec
+    attribution = markers[-1]
+    if attribution.get("causal_verdict") != "consistent":
+        return spec
+
+    def layer(path: str) -> str:
+        ext = os.path.splitext(str(path or "").lower())[1]
+        if ext in _FE_SOURCE_EXTS:
+            return "fe"
+        if ext in _BE_SOURCE_EXTS:
+            return "be"
+        return ""
+
+    expected = layer(str(attribution.get("file", "") or ""))
+    if not expected:
+        return spec
+
+    # The deterministic winning-path proof is stronger evidence of where the fix
+    # belongs than converge's (model-authored) attribution. An edit that sits ON the
+    # proven request path is legitimately placed even if it crosses converge's FE/BE
+    # attribution — the winning-path gate is its arbiter, not this one (this gate exists
+    # to catch the OFF-path cross-layer guess, and must not fight the producer grounding
+    # that lifts a BE producer converge's FE attribution missed). Only an edit that is
+    # BOTH cross-layer AND off the proven path is a real contradiction.
+    proof_files = [str(node.get("file", "") or "")
+                   for node in _parse_json_markers(_WINNING_PATH_MARKER_RE, honey_text)]
+
+    def _on_winning_path(path: str) -> bool:
+        return any(_path_aligns(path, pf) for pf in proof_files)
+
+    source_edits = [
+        edit for edit in (spec.get("edits") or [])
+        if isinstance(edit, dict) and not _is_test_path(edit.get("file", ""))
+        and layer(edit.get("file", ""))
+        and not _on_winning_path(edit.get("file", ""))
+    ]
+    authored_layers = {layer(edit.get("file", "")) for edit in source_edits}
+    if not source_edits or expected in authored_layers:
+        return spec
+
+    findings = {
+        str(edit.get("id", "?")): (
+            f"converge-author layer contradiction: converge attributed the defect to "
+            f"{expected.upper()} at {attribution.get('file', '')}, but this source edit "
+            f"targets {layer(edit.get('file', '')).upper()} only"
+        )
+        for edit in source_edits
+    }
+    _mark_ineffective(spec, findings)
+    note = "converge-author layer gate: " + "; ".join(
+        f"{eid} {reason}" for eid, reason in sorted(findings.items())
+    )
+    return _set_reinvestigation(
+        spec, reason_code=RI_LAYER_CONTRADICTION,
+        gate="converge_author_layer", note=note)
+
+
+def _apply_winning_path_gate(spec: dict[str, Any],
+                             honey_text: str) -> dict[str, Any]:
+    """Require source edits and regression targets to sit on the proven request path."""
+    proof = _parse_json_markers(_WINNING_PATH_MARKER_RE, honey_text)
+    if not proof:
+        return spec
+    path_files = [str(node.get("file", "") or "") for node in proof]
+    # A source-edit veto needs a proven RESPONSE PRODUCER to site against. If the trace
+    # reached only the handler/client (no producer node), the reachability proof is
+    # incomplete for placing a producer fix — do not fail-closed against source edits on
+    # it. The test-target rule below still applies, since the off-path-test contract is
+    # explicit regardless of producer depth.
+    has_producer = any(str(node.get("role", "")) == "producer" for node in proof)
+    findings: dict[str, str] = {}
+    for edit in spec.get("edits") or []:
+        if not isinstance(edit, dict):
+            continue
+        eid = str(edit.get("id", "?"))
+        file = str(edit.get("file", "") or "")
+        if _is_test_path(file):
+            if not _test_targets_winning_path(_edit_text(edit), proof):
+                findings[eid] = (
+                    "off winning HTTP path: regression test neither calls the proven "
+                    "route nor invokes a proven handler/producer symbol"
+                )
+            continue
+        ext = os.path.splitext(file.lower())[1]
+        if ext not in (_FE_SOURCE_EXTS | _BE_SOURCE_EXTS):
+            continue
+        if not has_producer:
+            continue
+        if not any(_path_aligns(file, path_file) for path_file in path_files):
+            findings[eid] = (
+                "off winning HTTP path: source edit targets a file not proven reachable "
+                "from the first registered handler"
+            )
+    if not findings:
+        return spec
+
+    _mark_ineffective(spec, findings)
+    note = "winning-path gate: " + "; ".join(
+        f"{eid} {reason}" for eid, reason in sorted(findings.items())
+    )
+    return _set_reinvestigation(
+        spec, reason_code=RI_OFF_WINNING_PATH,
+        gate="winning_path", note=note)
 
 
 def _apply_schema_insert_gate(
@@ -2902,6 +3087,13 @@ def run_specify(
                                 review_model or model, review_provider or provider,
                                 ledger, provider_kwargs, docs_root=docs_root,
                                 db_conn=db_conn)
+
+    # Converge-author consistency: a draft that moves wholly to the opposite FE/BE
+    # layer contradicts the causal attribution. The winning-path gate then applies the
+    # stronger request-reachability proof to both source edits and regression targets.
+    # Both are deterministic and annotate effectiveness before decisiveness can promote.
+    spec = _apply_layer_consistency_gate(spec, honey_text)
+    spec = _apply_winning_path_gate(spec, honey_text)
 
     # Decisiveness gate: a verified+effective edit must be applyable even when the
     # honey also surfaced optional/policy directions (which sit in deferred[]).
