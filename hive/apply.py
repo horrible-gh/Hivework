@@ -462,14 +462,37 @@ def build_proposal(spec: dict[str, Any], codebase_root: str) -> dict[str, Any]:
         and bool(edit_results)
         and all(r["applicable"] for r in edit_results)
     )
+    # --partial must respect the deferred-substance gate. That specify-side guard
+    # fires precisely when a SUBSTANTIVE fix was punted to deferred[] and only
+    # surface edits remain — specify itself stamps the spec "not vouched". --partial
+    # exists to ship a VOUCHED root-cause fix blocked by an UNRELATED deferred
+    # sibling (Defect 3 / T892 E1); it must NOT become the escape hatch that ships
+    # the surface remainder the gate just rejected (T909). When that gate is why the
+    # spec is not ready, partial write is refused — nothing is written (exit 2).
+    reinv = spec.get("reinvestigation") if isinstance(spec.get("reinvestigation"), dict) else {}
+    partial_write_blocked = (
+        str(reinv.get("gate", "")) == "deferred_substance"
+        or str(reinv.get("reason_code", "")) == "deferred_root_cause"
+    )
+    partial_blocked_reason = (
+        "deferred-substance gate: the writable edits are surface-only — specify "
+        "punted the substantive fix to deferred[] and stamped them not vouched; "
+        "--partial will not ship an unvouched surface change"
+        if partial_write_blocked else ""
+    )
+
     # Partial-ready: not fully ready, but ≥1 edit is individually writable — the
     # operator can apply just those with --partial without waiting on the deferred
     # items. We never down-rank a writable edit for a sibling's unresolved state.
-    partial_ready = (not ready) and bool(writable_ids)
+    # A spec the deferred-substance gate blocked is NOT partial-ready: its writable
+    # edits are the rejected surface remainder, not a vouched fix.
+    partial_ready = (not ready) and bool(writable_ids) and not partial_write_blocked
 
     return {
         "ready": ready,
         "partial_ready": partial_ready,
+        "partial_write_blocked": partial_write_blocked,
+        "partial_blocked_reason": partial_blocked_reason,
         "writable_ids": writable_ids,
         "not_ready_reasons": reasons,
         "codebase_root": os.path.abspath(codebase_root),
@@ -655,6 +678,11 @@ def render_proposal_markdown(proposal: dict[str, Any]) -> str:
                          "applicable and passed the effectiveness review — they are NOT "
                          "blocked by the unresolved items above. Re-run `apply --write "
                          "--partial` to write just those.")
+        elif proposal.get("partial_write_blocked"):
+            lines.append("")
+            lines.append("> **Partial apply refused:** "
+                         f"{proposal.get('partial_blocked_reason', '')}. "
+                         "These edits will not be written, even with `--partial`.")
     lines.append("")
 
     rv = proposal.get("runtime_verify")
@@ -871,7 +899,7 @@ def run_apply(
             raise ValueError("write=True requires a backup_root")
         if proposal["ready"]:
             proposal["write"] = write_edits(spec, root, backup_root, ttl_hours)
-        elif partial and proposal["writable_ids"]:
+        elif partial and proposal["writable_ids"] and not proposal.get("partial_write_blocked"):
             # Partial apply (Defect 3): the spec is not globally ready, but some
             # edits are individually applicable + effective. Write JUST those so a
             # verified root-cause fix ships instead of being blocked by a deferred
@@ -887,10 +915,17 @@ def run_apply(
             proposal["write"] = w
             proposal["applied_partial"] = bool(w.get("ok"))
         else:
-            why = ("no individually-writable edit (every edit is non-applicable "
-                   "or flagged ineffective)" if not proposal["writable_ids"]
-                   else "proposal not ready — rerun with --partial to apply the "
-                        f"{len(proposal['writable_ids'])} individually-ready edit(s)")
+            if proposal.get("partial_write_blocked"):
+                # The deferred-substance gate rejected these very edits as surface-
+                # only; --partial does not override it. Nothing is written (exit 2).
+                why = proposal.get("partial_blocked_reason") or (
+                    "deferred-substance gate blocked partial write")
+            elif not proposal["writable_ids"]:
+                why = ("no individually-writable edit (every edit is non-applicable "
+                       "or flagged ineffective)")
+            else:
+                why = ("proposal not ready — rerun with --partial to apply the "
+                       f"{len(proposal['writable_ids'])} individually-ready edit(s)")
             logger.warning("apply: --write requested but proposal is NOT READY — "
                            "nothing written (%s)", why)
             proposal["write"] = {

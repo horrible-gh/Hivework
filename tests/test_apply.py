@@ -497,6 +497,74 @@ class TestPartialApply(unittest.TestCase):
         self.assertTrue(proposal["applied_partial"])
 
 
+class TestDeferredSubstancePartialBlock(unittest.TestCase):
+    """T909 leak: --partial must NOT ship surface edits the deferred-substance gate
+    rejected. That gate fires when the SUBSTANTIVE fix was punted to deferred[] and
+    only surface edits remain — specify stamps them not vouched. Partial-write must
+    refuse (nothing written, exit-2 path), distinct from the legitimate Defect 3 case
+    where an UNRELATED sibling deferred but the writable edit IS the vouched fix."""
+
+    def setUp(self):
+        self.root = tempfile.mkdtemp()
+        self.target = os.path.join(self.root, "a.py")
+        self._original = "before\nx = 1\nafter\n"
+        with open(self.target, "w", encoding="utf-8") as f:
+            f.write(self._original)
+        self.tmp = tempfile.mkdtemp()
+        self.spec_path = os.path.join(self.tmp, "spec.json")
+        self.backup_root = tempfile.mkdtemp()
+
+    def _read_target(self):
+        with open(self.target, encoding="utf-8") as f:
+            return f.read()
+
+    def _surface_only_spec(self):
+        # Surface edit applicable, but specify's deferred-substance gate downgraded
+        # the spec: the real fix was punted to deferred[] and these edits are not vouched.
+        spec = _spec(
+            [_edit("x = 1", "x = 2", eid="E1")],
+            termination="needs_reinvestigation",
+            deferred=[{"issue": "real FE shape fix", "reason": "not_expressible_as_edit"}],
+            codebase_root=self.root)
+        spec["reinvestigation"] = {
+            "reason_code": "deferred_root_cause",
+            "gate": "deferred_substance",
+            "detail": "authored edits address only the surface; fix not vouched",
+        }
+        return spec
+
+    def test_proposal_marks_partial_blocked(self):
+        p = apply.build_proposal(self._surface_only_spec(), self.root)
+        self.assertFalse(p["ready"])
+        self.assertTrue(p["partial_write_blocked"])
+        # writable_ids still computed, but NOT advertised as partial-ready
+        self.assertEqual(p["writable_ids"], ["E1"])
+        self.assertFalse(p["partial_ready"])
+
+    def test_partial_write_refused_nothing_written(self):
+        with open(self.spec_path, "w", encoding="utf-8") as f:
+            json.dump(self._surface_only_spec(), f)
+        proposal = apply.run_apply(
+            self.spec_path, write=True, partial=True,
+            backup_root=self.backup_root, ttl_hours=24)
+        # The leak is closed: the surface edit is NOT applied even with --partial.
+        self.assertEqual(self._read_target(), self._original)
+        self.assertFalse(proposal.get("applied_partial"))
+        self.assertFalse(proposal["write"]["attempted"])
+
+    def test_unrelated_sibling_defer_still_ships(self):
+        # Guard against over-blocking: a plain needs_reinvestigation WITHOUT the
+        # deferred-substance marker is the legitimate Defect 3 case — still writable.
+        spec = _spec(
+            [_edit("x = 1", "x = 2", eid="E1")],
+            termination="needs_reinvestigation",
+            deferred=[{"issue": "unrelated", "reason": "anchor_not_grounded"}],
+            codebase_root=self.root)
+        p = apply.build_proposal(spec, self.root)
+        self.assertFalse(p["partial_write_blocked"])
+        self.assertTrue(p["partial_ready"])
+
+
 class TestIsTestFile(unittest.TestCase):
     """Path-convention recognition that drives partial atomicity."""
 
