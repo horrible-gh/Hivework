@@ -126,6 +126,10 @@ class ConvergeResult:
     data_state_block: str = ""
     data_state_backed: bool = False
     data_state_attempted: bool = False
+    # Deterministic route -> response-producer proof carried from retriever evidence.
+    # Unlike ``path`` (model-authored), this is free local grounding and is safe for
+    # specify's on-path gate to consume.
+    winning_path: list[dict[str, Any]] = field(default_factory=list)
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -139,6 +143,7 @@ class ConvergeResult:
             "data_state_block": self.data_state_block,
             "data_state_backed": self.data_state_backed,
             "data_state_attempted": self.data_state_attempted,
+            "winning_path": self.winning_path,
         }
 
 
@@ -202,6 +207,104 @@ def _known_files(verdicts: list[dict[str, Any]], windows: list[dict[str, Any]]) 
         if f:
             files.add(f)
     return files
+
+
+def _winning_http_path_nodes(bundles: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Extract ordered, deterministic winning HTTP path nodes from bundle evidence."""
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for bundle in bundles or []:
+        if not isinstance(bundle, dict):
+            continue
+        seq = (bundle.get("code_snippets") or []) + (bundle.get("call_chain") or [])
+        for window in seq:
+            if not isinstance(window, dict):
+                continue
+            via = window.get("via")
+            if via not in ("http-binding", "http-producer"):
+                continue
+            if window.get("ambiguous") or not window.get("winning", True):
+                continue
+            url = str(window.get("url", "") or "").rstrip("/")
+            if not url:
+                continue
+            grouped.setdefault(url, []).append(window)
+
+    out: list[dict[str, Any]] = []
+    seen: set[tuple[str, str, str, str]] = set()
+    for url in sorted(grouped):
+        windows = sorted(
+            grouped[url],
+            key=lambda w: (
+                0 if w.get("via") == "http-binding" else 1,
+                int(w.get("path_depth", 0) or 0),
+                _norm(w.get("file", "")),
+            ),
+        )
+        for window in windows:
+            if window.get("via") == "http-binding":
+                for client_file in window.get("client_files") or []:
+                    client_node = {
+                        "url": url,
+                        "verb": str(window.get("verb", "") or "").upper(),
+                        "role": "client",
+                        "file": str(client_file),
+                        "lines": "",
+                        "symbol": "",
+                        "depth": -1,
+                    }
+                    client_key = (url, _norm(client_node["file"]), "", "client")
+                    if client_node["file"] and client_key not in seen:
+                        seen.add(client_key)
+                        out.append(client_node)
+            role = "handler" if window.get("via") == "http-binding" else (
+                "producer" if window.get("producer") else "response-call")
+            node = {
+                "url": url,
+                "verb": str(window.get("verb", "") or "").upper(),
+                "role": role,
+                "file": str(window.get("file", "") or ""),
+                "lines": str(window.get("lines", "") or ""),
+                "symbol": str(window.get("symbol", "") or ""),
+                "depth": int(window.get("path_depth", 0) or 0),
+            }
+            key = (url, _norm(node["file"]), node["lines"], role)
+            if not node["file"] or key in seen:
+                continue
+            seen.add(key)
+            out.append(node)
+    return out
+
+
+def _winning_producer_loci(nodes: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Lift the deepest proven response producer per URL into converge's located set."""
+    out: list[dict[str, Any]] = []
+    by_url: dict[str, list[dict[str, Any]]] = {}
+    for node in nodes:
+        by_url.setdefault(str(node.get("url", "")), []).append(node)
+    for url, path in by_url.items():
+        producers = [node for node in path if node.get("role") == "producer"]
+        candidates = producers or [
+            node for node in path if node.get("role") == "response-call"
+        ]
+        if not candidates:
+            continue
+        node = max(candidates, key=lambda item: int(item.get("depth", 0) or 0))
+        out.append({
+            "axis_id": f"HTTP_WINNING_PATH:{url}",
+            "title": f"winning HTTP response producer for {url}",
+            "verdict": {
+                "located": True,
+                "file": node.get("file", ""),
+                "lines": node.get("lines", ""),
+                "reason": (
+                    f"Deterministic winning request-path grounding: {url} reaches "
+                    f"this response producer through the first registered handler."
+                ),
+                "symbol": node.get("symbol", ""),
+                "via": "http-winning-path",
+            },
+        })
+    return out
 
 
 # ── Live-code grounding (N177) ──────────────────────────────────────────────────
@@ -1267,6 +1370,50 @@ def _fetch_data_state(data_reads: list[dict[str, Any]], db_conn) -> str:
     return block
 
 
+_HTTP_WINNING_AXIS_PREFIX = "HTTP_WINNING_PATH:"
+
+
+def _attributed_winning_urls(located: list[dict[str, Any]],
+                             ad: dict[str, Any] | None) -> set[str]:
+    """URLs whose lifted winning-path producer aligns with the attributed locus.
+
+    Empty when the attributed defect is not on any grounded HTTP path — the caller then
+    fails OPEN (keeps the legacy file-only peer behaviour) so this never touches non-HTTP
+    bugs. Built only from the synthetic ``HTTP_WINNING_PATH:`` loci already in ``located``.
+    """
+    ad_file = _norm((ad or {}).get("file", "")) if isinstance(ad, dict) else ""
+    if not ad_file:
+        return set()
+    urls: set[str] = set()
+    for item in located if isinstance(located, list) else []:
+        if not isinstance(item, dict):
+            continue
+        axis = str(item.get("axis_id", "") or "")
+        if not axis.startswith(_HTTP_WINNING_AXIS_PREFIX):
+            continue
+        vf = _norm((item.get("verdict") or {}).get("file", ""))
+        if vf and _aligns(vf, ad_file):
+            urls.add(axis[len(_HTTP_WINNING_AXIS_PREFIX):])
+    return urls
+
+
+def _is_offpath_synthetic_peer(v: dict[str, Any], attributed_urls: set[str]) -> bool:
+    """True for a winning-path synthetic peer on a DIFFERENT URL than the attributed locus.
+
+    Such a peer is cross-endpoint noise (e.g. an auth/JWT producer harvested from an
+    UNRELATED request path), not a competing locus for THIS symptom. Filters ONLY the
+    synthetic ``HTTP_WINNING_PATH:`` peers; real judge-axis peers are untouched. Fail-open:
+    only filters when the attributed URL set is known AND the peer's URL resolves and differs.
+    """
+    axis = str((v or {}).get("axis_id", "") or "")
+    if not axis.startswith(_HTTP_WINNING_AXIS_PREFIX):
+        return False
+    if not attributed_urls:
+        return False
+    peer_url = axis[len(_HTTP_WINNING_AXIS_PREFIX):]
+    return bool(peer_url) and peer_url not in attributed_urls
+
+
 def _dropped_peer_guard(res: ConvergeResult, located: list[dict[str, Any]],
                         data_backed: bool) -> ConvergeResult:
     """N180: a DATA-certified ``consistent`` must not ship while a DISTINCT-locus located
@@ -1318,7 +1465,10 @@ def _dropped_peer_guard(res: ConvergeResult, located: list[dict[str, Any]],
         accounted.add(_norm(d.get("file", "")))
     accounted.discard("")
     trace = (cc.get("trace") or "").lower()
+    attributed_urls = _attributed_winning_urls(located, ad)
     for v in located:
+        if _is_offpath_synthetic_peer(v, attributed_urls):
+            continue  # cross-endpoint winning-path noise, not a competing locus for this URL
         vd = v.get("verdict") or {}
         pf = _norm(vd.get("file", ""))
         if not pf or any(_aligns(pf, a) for a in accounted):
@@ -1405,9 +1555,12 @@ def _counterfactual_complete_guard(res: ConvergeResult,
                 accounted.add(f)
 
     trace = str(cc.get("trace", "") or "").lower()
+    attributed_urls = _attributed_winning_urls(located, ad)
     for v in located if isinstance(located, list) else []:
         if not isinstance(v, dict):
             continue
+        if _is_offpath_synthetic_peer(v, attributed_urls):
+            continue  # cross-endpoint winning-path noise, not a competing locus for this URL
         vd = v.get("verdict") if isinstance(v.get("verdict"), dict) else {}
         pf = _norm(vd.get("file", ""))
         if not pf or any(_aligns(pf, a) for a in accounted):
@@ -2603,10 +2756,27 @@ def run_converge(*, seed_text: str, verdicts: list[dict[str, Any]],
     When fewer than ``min_located`` axes located there is nothing to stitch and the
     whole stage is SKIPPED (free, no model spend).
     """
+    winning_path = _winning_http_path_nodes(bundles)
     located = _located(verdicts)
+    for lifted in _winning_producer_loci(winning_path):
+        lf = (lifted.get("verdict") or {}).get("file", "")
+        ll = (lifted.get("verdict") or {}).get("lines", "")
+        if not any(
+            _aligns(lf, (item.get("verdict") or {}).get("file", ""))
+            and str((item.get("verdict") or {}).get("lines", "")) == str(ll)
+            for item in located
+        ):
+            located.append(lifted)
+    if winning_path:
+        logger.info("converge: winning HTTP path grounded %d node(s), lifted %d "
+                    "response producer locus/loci",
+                    len(winning_path),
+                    sum(1 for item in located
+                        if str(item.get("axis_id", "")).startswith("HTTP_WINNING_PATH:")))
     if len(located) < min_located:
         return ConvergeResult(
-            summary=f"skipped: {len(located)} located verdict(s) < min_located={min_located}")
+            summary=f"skipped: {len(located)} located verdict(s) < min_located={min_located}",
+            winning_path=winning_path)
 
     unlocated = [v for v in verdicts if v not in located]
     windows = _evidence_windows(bundles)
@@ -2837,4 +3007,5 @@ def run_converge(*, seed_text: str, verdicts: list[dict[str, Any]],
         res.data_state_attempted = True
         res.data_state_block = data_block
         res.data_state_backed = data_backed
+    res.winning_path = winning_path
     return res

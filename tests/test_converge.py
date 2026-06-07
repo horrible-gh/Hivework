@@ -1790,6 +1790,41 @@ class TestCounterfactualCompleteness(unittest.TestCase):
             out = C._counterfactual_complete_guard(self._res(counterfactual=""), self.LOCATED)
         self.assertTrue(out.converged)
 
+    def test_offpath_winning_peer_does_not_block(self):
+        # TR909: the attributed locus is the /api/v1/projects producer; a synthetic
+        # winning-path peer harvested from an UNRELATED url (/api/v1/document auth) must
+        # NOT count as a competing locus — different endpoint, not this symptom's cause.
+        located = [
+            _verdict("HTTP_WINNING_PATH:/api/v1/projects", True,
+                     "server/query.py", "10-20", "projects producer"),
+            _verdict("HTTP_WINNING_PATH:/api/v1/document", True,
+                     "server/auth_outbound.py", "38-70", "jwt verify on another path"),
+        ]
+        out = C._counterfactual_complete_guard(self._res(), located)
+        self.assertTrue(out.converged)
+
+    def test_samepath_winning_peer_still_blocks(self):
+        # A competing winning-path peer on the SAME url is a real second locus → blocks.
+        located = [
+            _verdict("HTTP_WINNING_PATH:/api/v1/projects", True,
+                     "server/query.py", "10-20", "projects producer"),
+            _verdict("HTTP_WINNING_PATH:/api/v1/projects", True,
+                     "server/other.py", "1-9", "competing producer on same url"),
+        ]
+        out = C._counterfactual_complete_guard(self._res(), located)
+        self.assertFalse(out.converged)
+        self.assertEqual(out.causal_check["unrefuted_peer"]["file"], "server/other.py")
+
+    def test_offpath_filter_fail_open_when_attributed_not_on_http_path(self):
+        # Attributed locus is NOT a lifted winning-path producer → URL set unknown →
+        # fail open: a distinct synthetic peer is treated by legacy file-only behaviour.
+        located = [
+            _verdict("HTTP_WINNING_PATH:/api/v1/document", True,
+                     "client/render.ts", "30-40", "unrelated synthetic peer"),
+        ]
+        out = C._counterfactual_complete_guard(self._res(), located)
+        self.assertFalse(out.converged)
+
     def test_malformed_causal_check_never_raises(self):
         res = C.ConvergeResult(
             converged=True,
@@ -1871,6 +1906,55 @@ class TestFragmentFactCards(unittest.TestCase):
             fragment_fact_block=block)
         self.assertLess(prompt.index("[Located fragments"), prompt.index("[Fragment facts"))
         self.assertIn("outranks a lexically-similar fragment", prompt)
+
+
+class TestWinningHttpPathGrounding(unittest.TestCase):
+    """T909: mounted winner -> response producer is deterministic converge evidence."""
+
+    def _bundles(self):
+        return [{
+            "axis_id": "HTTP",
+            "code_snippets": [],
+            "call_chain": [
+                {"via": "http-binding", "winning": True, "ambiguous": False,
+                 "url": "/api/v1/projects", "verb": "get",
+                 "file": "server/settings/project_settings.py", "lines": "45-49",
+                 "symbol": "list_projects_endpoint", "text": "def list_projects_endpoint(): ..."},
+                {"via": "http-producer", "winning": True,
+                 "url": "/api/v1/projects", "verb": "get", "path_depth": 1,
+                 "producer": True, "file": "server/db/projects.py", "lines": "19-27",
+                 "symbol": "list_projects",
+                 "text": "def list_projects(): return fetch('SELECT * FROM projects')"},
+            ],
+        }]
+
+    def test_deepest_response_producer_becomes_located_locus(self):
+        nodes = C._winning_http_path_nodes(self._bundles())
+        loci = C._winning_producer_loci(nodes)
+        self.assertEqual(len(nodes), 2)
+        self.assertEqual(len(loci), 1)
+        self.assertEqual(loci[0]["verdict"]["file"], "server/db/projects.py")
+        self.assertEqual(loci[0]["verdict"]["via"], "http-winning-path")
+
+    def test_honey_emits_machine_readable_path_and_attribution(self):
+        result = {
+            "verdicts": [], "axes_judged": 0, "axes_total": 0, "seed_kind": "fix",
+            "converge": {
+                "converged": True,
+                "winning_path": C._winning_http_path_nodes(self._bundles()),
+                "path": [],
+                "attributed_defect": {
+                    "node": "db_fn", "file": "server/db/projects.py",
+                    "lines": "19-27", "why": "modules omitted",
+                },
+                "additional_defects": [],
+                "causal_check": {"verdict": "consistent", "trace": "projects.py omits modules"},
+            },
+        }
+        honey = render_local_honey(result, "modules are missing")
+        self.assertIn("hive-winning-http-path:", honey)
+        self.assertIn('"role": "producer"', honey)
+        self.assertIn("hive-converge-attribution:", honey)
 
 
 class TestTraceGrounding(unittest.TestCase):
