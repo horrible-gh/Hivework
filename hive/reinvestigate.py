@@ -83,10 +83,40 @@ class ReinvestPlan:
     reason_code: str
     axis_ids: list[str] = field(default_factory=list)
     rationale: str = ""
+    # M035 ⑥→④ feedback: loci specify REFUTED against live code that the re-converge must
+    # EXCLUDE from its candidate set, so the re-stitch lands on a different (e.g. FE)
+    # located fragment instead of re-crowning the disproven node. Empty for every other
+    # route; only ``re_converge`` driven by a specify refutation populates it.
+    exclude_loci: list[dict[str, Any]] = field(default_factory=list)
 
     @property
     def will_rerun(self) -> bool:
         return self.action in (ACTION_RE_RETRIEVE, ACTION_RE_CONVERGE, ACTION_RE_AUTHOR)
+
+
+def _norm_path(p: str) -> str:
+    return (p or "").replace("\\", "/").strip().strip("/").lower()
+
+
+def _same_locus(a: str, b: str) -> bool:
+    """Path-segment-aligned equality/suffix match (handles abs↔rel, basename-degrade)."""
+    a, b = _norm_path(a), _norm_path(b)
+    return bool(a) and bool(b) and (a == b or a.endswith("/" + b) or b.endswith("/" + a))
+
+
+def _redirect_target_exists(verdicts: list[dict[str, Any]],
+                            refuted_loci: list[dict[str, Any]]) -> bool:
+    """True when a LOCATED verdict sits at a file NOT among the refuted loci — i.e. a
+    non-refuted candidate exists for the re-converge to redirect the attribution onto."""
+    refuted_files = [_norm_path(x.get("file", "")) for x in refuted_loci if x.get("file")]
+    for v in verdicts:
+        vd = v.get("verdict") or {}
+        if not vd.get("located"):
+            continue
+        f = vd.get("file", "")
+        if f and not any(_same_locus(f, rf) for rf in refuted_files):
+            return True
+    return False
 
 
 def _thin_axes(verdicts: list[dict[str, Any]]) -> list[str]:
@@ -114,6 +144,31 @@ def plan_reinvestigation(spec: dict[str, Any],
     if spec.get("termination") != "needs_reinvestigation":
         return ReinvestPlan(ACTION_TERMINATE, reason,
                             rationale="spec is not needs_reinvestigation — nothing to route")
+
+    # ── M035 ⑥→④ feedback (priority route): specify REFUTED the honey's attributed locus
+    # against live code (no bug there) and stamped it in ``reinvestigation.refuted_loci``.
+    # Without this, such an NR routes by its base reason — most commonly ``author_declared``
+    # → terminate — i.e. the punt the operator's first principle forbids. The refutation is
+    # a LEAD: when a LOCATED verdict at a DIFFERENT file still exists (e.g. the FE render
+    # locus a sibling axis localised), re-converge with the refuted loc/i EXCLUDED so the
+    # stitch must land on the surviving candidate. This is the cross-stage analog of
+    # converge's own redirect re-stitch — it closes the loop instead of handing it back.
+    refuted_loci = [x for x in (ri.get("refuted_loci") or [])
+                    if isinstance(x, dict) and x.get("file")]
+    if refuted_loci:
+        names = [str(x.get("file")) for x in refuted_loci]
+        if _redirect_target_exists(verdicts, refuted_loci):
+            return ReinvestPlan(
+                ACTION_RE_CONVERGE, reason or "locus_refuted",
+                axis_ids=names, exclude_loci=refuted_loci,
+                rationale=(f"specify refuted the honey's locus/loci {names} against live "
+                           "code, and a located candidate at a DIFFERENT file remains — "
+                           "re-converge with the refuted loc/i EXCLUDED so the stitch lands "
+                           "on it (the ⑥→④ feedback edge, not a dead-end punt)"))
+        return ReinvestPlan(
+            ACTION_TERMINATE, reason or "locus_refuted",
+            rationale=(f"specify refuted the honey's locus/loci {names} but NO other located "
+                       "candidate exists to redirect to — honest NR (no reachable evidence)"))
 
     if reason in _RETRIEVE_REASONS:
         thin = _thin_axes(verdicts)

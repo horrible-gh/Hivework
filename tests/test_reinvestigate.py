@@ -285,6 +285,55 @@ class TestReauthorLoop(unittest.TestCase):
         self.assertEqual(spec["termination"], "ready_to_apply")
         self.assertEqual(calls, ["respec"])         # re-authored; NEVER re-fetched
 
+
+def _located_at(axis, file, lines="1-2"):
+    return {"axis_id": axis,
+            "verdict": {"located": True, "file": file, "lines": lines, "reason": "r"}}
+
+
+class TestRefutedLocusRedirect(unittest.TestCase):
+    """M035 ⑥→④: specify refuted the honey locus ⇒ re_converge EXCLUDING it when a
+    non-refuted located candidate remains; honest terminate when none does."""
+
+    def _nr_with_refuted(self, reason_code, refuted_loci):
+        return {"termination": "needs_reinvestigation",
+                "reinvestigation": {"reason_code": reason_code, "gate": "author",
+                                    "refuted_loci": refuted_loci}}
+
+    def test_refuted_locus_with_other_candidate_re_converges_excluding(self):
+        spec = self._nr_with_refuted(
+            RI_AUTHOR_DECLARED,
+            [{"file": "db/workflow_sequences.py", "lines": "45-57", "why": "no bug"}])
+        verdicts = [_located_at("BE", "db/workflow_sequences.py", "45-57"),
+                    _located_at("FE", "client/src/workflow_view.ts", "20-40")]
+        plan = plan_reinvestigation(spec, verdicts)
+        self.assertEqual(plan.action, ACTION_RE_CONVERGE)
+        self.assertTrue(plan.will_rerun)
+        self.assertEqual([x["file"] for x in plan.exclude_loci],
+                         ["db/workflow_sequences.py"])
+
+    def test_refuted_locus_takes_priority_over_base_reason(self):
+        # author_declared alone routes to terminate; refuted_loci + a redirect target
+        # overrides that to re_converge (the ⑥→④ edge, not a punt).
+        spec = self._nr_with_refuted(
+            RI_AUTHOR_DECLARED, [{"file": "be/x.py", "lines": "1-2"}])
+        verdicts = [_located_at("BE", "be/x.py"), _located_at("FE", "fe/y.ts")]
+        self.assertEqual(plan_reinvestigation(spec, verdicts).action, ACTION_RE_CONVERGE)
+        # Without refuted_loci, the same author_declared spec terminates.
+        bare = {"termination": "needs_reinvestigation",
+                "reinvestigation": {"reason_code": RI_AUTHOR_DECLARED, "gate": "author"}}
+        self.assertEqual(plan_reinvestigation(bare, verdicts).action, ACTION_TERMINATE)
+
+    def test_refuted_locus_no_other_candidate_terminates(self):
+        # The ONLY located verdict is the refuted one → nowhere to redirect → honest NR.
+        spec = self._nr_with_refuted(
+            RI_AUTHOR_DECLARED, [{"file": "db/workflow_sequences.py", "lines": "45-57"}])
+        verdicts = [_located_at("BE", "db/workflow_sequences.py", "45-57"),
+                    _verdict("U", located=False)]
+        plan = plan_reinvestigation(spec, verdicts)
+        self.assertEqual(plan.action, ACTION_TERMINATE)
+        self.assertFalse(plan.will_rerun)
+
     def test_re_author_caps_at_max_rounds_when_persistent(self):
         respec = []
         run_reinvestigation_loop(
