@@ -2064,6 +2064,99 @@ def _http_ds_empty_field(text: str, stems: set[str]) -> str | None:
     return None
 
 
+def _read_locus_text(code_root: str | None, file: str, lines: str) -> str:
+    """Read live source at a located locus's ``file:lines`` (best-effort, "" on failure)."""
+    if not code_root or not file:
+        return ""
+    rng = _parse_line_range(lines)
+    rel = (file or "").replace("\\", "/").lstrip("./")
+    try:
+        with open(os.path.join(code_root, rel), "r",
+                  encoding="utf-8", errors="replace") as fh:
+            all_lines = fh.readlines()
+    except OSError:
+        return ""
+    if not rng:
+        return "".join(all_lines)
+    lo, hi = rng
+    return "".join(all_lines[max(1, lo) - 1:min(len(all_lines), hi)])
+
+
+def _winningpath_ds_targets(edges: list[dict[str, Any]],
+                            located: list[dict[str, Any]],
+                            code_root: str | None) -> list[dict[str, Any]]:
+    """Fallback datasource targets: the deterministic winning-path PRODUCER for a gated
+    FE field's URL, used only when no explicit empty-literal datasource window was found.
+
+    The live producer of a symptom field is often an OMISSION (the response simply never
+    carries the field — e.g. ``SELECT * FROM projects`` with no module column) rather than
+    an explicit ``'' AS field``. :func:`_http_ds_empty_field` is blind to omission, so the
+    older guard could only re-point to a handler that HARDCODES the field empty — which on a
+    shadowed route is the dead path (M036: store.py ``'' AS module`` vs the live
+    db/projects.py that omits modules entirely). The registration-order-aware winning-path
+    producer (already lifted into ``located`` as ``HTTP_WINNING_PATH:<url>``) is the
+    deterministic producer of the URL the gated FE variable is filled from; re-pointing there
+    is structural grounding, not seed parsing or a guess. Fires only when (a) the gated FE
+    edge's URL has such a producer locus AND (b) that producer's live code does NOT mention
+    the field (true omission) — if it emits the field, the emptiness is elsewhere and we
+    abstain. The apply-side red→green backstop is the final check on any re-point.
+    """
+    wp_by_url: dict[str, dict[str, Any]] = {}
+    for v in located or []:
+        ax = str(v.get("axis_id", "") or "")
+        if ax.startswith(_HTTP_WINNING_AXIS_PREFIX):
+            wp_by_url[ax[len(_HTTP_WINNING_AXIS_PREFIX):].rstrip("/")] = v
+    if not wp_by_url:
+        return []
+    targets: list[dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+    for edge in edges:
+        stems = {s for s in (edge.get("stems") or []) if s}
+        for url in edge.get("urls", []):
+            lv = wp_by_url.get(str(url).rstrip("/"))
+            if not lv:
+                continue
+            vd = lv.get("verdict") or {}
+            key = (_norm(vd.get("file", "")), str(vd.get("lines", "")))
+            if key in seen:
+                continue
+            ptext = _read_locus_text(code_root, vd.get("file", ""), vd.get("lines", ""))
+            if ptext and stems and any(
+                    re.search(rf"\b{re.escape(s)}\b", ptext, re.I) for s in stems):
+                continue  # producer DOES emit the field → emptiness is not here; abstain
+            seen.add(key)
+            targets.append({
+                "edge": edge, "binding": {"url": str(url).rstrip("/")},
+                "window": {"text": ""}, "located": lv,
+                "field": edge.get("field") or (sorted(stems)[0] if stems else ""),
+                "reachable_files": set(), "via_winning_path": True,
+            })
+    return targets
+
+
+def _clear_resolved_peer(cc: dict[str, Any] | None,
+                         ad: dict[str, Any] | None) -> dict[str, Any]:
+    """Drop a now-RESOLVED unrefuted/dropped peer once the attribution lands on it.
+
+    The dropped-peer / counterfactual guards may stamp a competing peer (stored as
+    ``unrefuted_peer`` / ``dropped_peer``) before a later provenance guard re-points the
+    attribution ONTO that very peer. Leaving the stamp makes the honey read "a peer was left
+    unrefuted" about the file we just selected. Removed ONLY when the peer aligns with the
+    final attribution, so every genuinely-dropped peer stays intact.
+    """
+    if not isinstance(cc, dict):
+        return cc or {}
+    af = _norm((ad or {}).get("file", ""))
+    if not af:
+        return cc
+    out = dict(cc)
+    for key in ("unrefuted_peer", "dropped_peer"):
+        peer = out.get(key)
+        if isinstance(peer, dict) and _aligns(af, peer.get("file", "")):
+            out.pop(key, None)
+    return out
+
+
 def _http_datasource_provenance_guard(res: ConvergeResult,
                                       located: list[dict[str, Any]],
                                       windows: list[dict[str, Any]],
@@ -2073,23 +2166,30 @@ def _http_datasource_provenance_guard(res: ConvergeResult,
     Fires only when all grounding lines up:
       • FE evidence shows a collection variable gated by ``length > 0`` and assigned from
         a response field (e.g. ``currentModules`` ← ``modules``);
-      • a real HTTP binding resolves the FE URL to a backend handler;
-      • following real call-chain windows from that handler reaches a non-FE window that
-        hardcodes the field empty (``'' AS module`` / empty collection);
-      • that datasource file is already a located candidate.
+      • EITHER a real HTTP binding's call-chain reaches a non-FE window that hardcodes the
+        field empty (``'' AS module`` / empty collection) at a LOCATED file [explicit case],
+      • OR the gated field's URL has a deterministic winning-path PRODUCER locus (lifted into
+        ``located`` as ``HTTP_WINNING_PATH:<url>``) whose live code OMITS the field entirely
+        [omission case, :func:`_winningpath_ds_targets`]. The explicit scan is blind to
+        omission and to registration-order shadowing, so on a shadowed route it would re-point
+        to the dead handler (M036: store.py ``'' AS module`` vs the live db/projects.py that
+        omits modules); the winning-path producer is the registration-order-aware live source.
 
-    No located datasource → no-op. Ambiguous/no structural FE signal → no-op. Disabled by
-    ``HIVE_NO_HTTP_DATASOURCE_PROVENANCE``. This is a re-point/confirm guard only; it
-    never invents an edit target.
+    No located/winning-path datasource → no-op. Ambiguous/no structural FE signal → no-op.
+    Disabled by ``HIVE_NO_HTTP_DATASOURCE_PROVENANCE``. This is a re-point/confirm guard
+    only; it never invents an edit target, and the apply-side red→green backstop is the final
+    execution check on any re-point.
     """
     if os.environ.get("HIVE_NO_HTTP_DATASOURCE_PROVENANCE"):
         return res
     edges = _http_ds_fe_edges(windows, code_root)
     if not edges:
         return res
+    # http-binding windows drive the explicit-empty datasource scan. Their ABSENCE no longer
+    # short-circuits the guard: the winning-path producer fallback below grounds on the
+    # deterministic HTTP_WINNING_PATH loci in ``located``, which exist independently of a
+    # binding window surviving the bundle cap.
     bindings = [w for w in windows if w.get("via") == "http-binding"]
-    if not bindings:
-        return res
 
     located_by_file: dict[str, dict[str, Any]] = {}
     for v in located or []:
@@ -2120,6 +2220,12 @@ def _http_datasource_provenance_guard(res: ConvergeResult,
                                 "located": lv, "field": empty_field,
                                 "reachable_files": reachable_files})
     if not targets:
+        # No explicit empty-literal datasource found. Fall back to the deterministic
+        # winning-path producer for a gated FE field's URL (handles the OMISSION case the
+        # explicit-empty scan is blind to, and prefers the live registration-order handler
+        # over a shadowed one). Fail-open: empty → original no-op behaviour.
+        targets = _winningpath_ds_targets(edges, located, code_root)
+    if not targets:
         return res
 
     # Prefer the deepest reachable constant site (a datasource) over wrappers with the
@@ -2148,12 +2254,13 @@ def _http_datasource_provenance_guard(res: ConvergeResult,
             }
             cc["trace"] = (cc.get("trace") or "") + (
                 f" [http-datasource-provenance] attribution {ad.get('file', '')}:"
-                f"{ad.get('lines', '')} is the HTTP-bound datasource that hardcodes "
-                f"{target['field']} empty for gated FE variable {target['edge'].get('var', '')}.")
+                f"{ad.get('lines', '')} is the HTTP-bound datasource that does not produce a "
+                f"non-empty {target['field']} for gated FE variable {target['edge'].get('var', '')}.")
             res.causal_check = cc
             res.summary = (
                 f"converged (HTTP datasource provenance): defect at {ad.get('file', '')}:"
                 f"{ad.get('lines', '')} empties the field feeding the gated FE variable")
+        res.causal_check = _clear_resolved_peer(res.causal_check, ad)
         return res
 
     old = {"file": ad.get("file", ""), "lines": ad.get("lines", "")}
@@ -2163,7 +2270,7 @@ def _http_datasource_provenance_guard(res: ConvergeResult,
         "lines": tvd.get("lines", ""),
         "why": (f"the FE gates {target['edge'].get('var', '')} on non-empty values from "
                 f"{_http_ds_binding_url(target['binding'])}, and this HTTP-bound datasource "
-                f"hardcodes {target['field']} empty; the prior attribution "
+                f"does not produce a non-empty {target['field']}; the prior attribution "
                 f"{old['file']}:{old['lines']} is not the datasource producing that empty "
                 f"field for the executed endpoint"),
     }
@@ -2179,18 +2286,19 @@ def _http_datasource_provenance_guard(res: ConvergeResult,
         f" [http-datasource-provenance] FE variable {target['edge'].get('var', '')} is "
         f"gated on non-empty data and is filled from {_http_ds_binding_url(target['binding'])}; "
         f"the resolved HTTP path reaches {tvd.get('file', '')}:{tvd.get('lines', '')}, "
-        f"which hardcodes {target['field']} empty. Re-pointed from {old['file']}:"
+        f"which does not produce a non-empty {target['field']}. Re-pointed from {old['file']}:"
         f"{old['lines']} to the executed datasource and refuted the off-path/non-datasource "
         f"attribution.")
-    res.causal_check = cc
+    res.causal_check = _clear_resolved_peer(cc, res.attributed_defect)
     res.converged = True
     res.summary = (
         f"converged (HTTP datasource re-point): defect at {tvd.get('file', '')}:"
         f"{tvd.get('lines', '')} empties {target['field']} for the endpoint feeding "
         f"{target['edge'].get('var', '')} (was mis-attributed to {old['file']}:"
         f"{old['lines']})")
-    logger.info("converge: HTTP datasource guard re-pointed attribution %s:%s → %s:%s",
-                old["file"], old["lines"], tvd.get("file", ""), tvd.get("lines", ""))
+    logger.info("converge: HTTP datasource guard re-pointed attribution %s:%s -> %s:%s%s",
+                old["file"], old["lines"], tvd.get("file", ""), tvd.get("lines", ""),
+                " (winning-path producer)" if target.get("via_winning_path") else "")
     return res
 
 

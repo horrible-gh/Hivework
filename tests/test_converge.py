@@ -2348,6 +2348,84 @@ class TestHttpDatasourceProvenanceGuard(unittest.TestCase):
         self.assertEqual(out.causal_check["http_datasource_provenance_repointed"]["field"],
                          "module")
 
+    # ── Winning-path producer fallback (omission case, M036 live route) ──────────────
+    DBPROJ = "server/modules/flow_gate/db/projects.py"
+    NEXT = "client/src/main/components/NextActionModal.vue"
+
+    def _fe_only_windows(self):
+        """A gated FE collection filled from /api/v1/projects, with NO backend
+        explicit-empty window and NO http-binding — only the FE edge survives. This is the
+        omission shape: the live producer omits the field, so _http_ds_empty_field finds
+        nothing and the older guard would no-op."""
+        return [
+            {"file": self.FE, "lines": "35-43", "text":
+             '<div v-if="currentModules.length > 0">\n'
+             '<option v-for="m in currentModules" :key="m.id">'},
+            {"file": self.FE, "lines": "239-260", "text":
+             "const res = await getRequest('/api/v1/projects')\n"
+             "currentModules.value = res.data.modules ?? []\n"},
+        ]
+
+    def _wp_located(self, producer_file, lines="19-27"):
+        return [
+            {"axis_id": "AX0", "verdict": {"located": True, "file": self.NEXT,
+             "lines": "293-311", "reason": "fe normalize decoy"}},
+            {"axis_id": "HTTP_WINNING_PATH:/api/v1/projects",
+             "verdict": {"located": True, "file": producer_file, "lines": lines,
+                         "reason": "deterministic winning request-path producer"}},
+        ]
+
+    def test_winningpath_repoints_on_omission(self):
+        # Weak model wandered to an off-symptom FE modal; the deterministic winning-path
+        # producer (db/projects.py) omits the field. No code_root → omission check defers to
+        # the deterministic grounding and re-points to the live producer.
+        res = self._res_attr(self.NEXT, lines="293-311")
+        out = C._http_datasource_provenance_guard(
+            res, self._wp_located(self.DBPROJ), self._fe_only_windows())
+        self.assertEqual(C._norm(out.attributed_defect["file"]), C._norm(self.DBPROJ))
+        self.assertTrue(out.converged)
+        self.assertIn("http_datasource_provenance_repointed", out.causal_check)
+        self.assertEqual(
+            out.causal_check["http_datasource_provenance_repointed"]["url"],
+            "/api/v1/projects")
+
+    def test_winningpath_abstains_when_producer_emits_field(self):
+        # If the winning-path producer's LIVE code DOES emit the field, the emptiness is not
+        # here → abstain (do not re-point), protecting genuine downstream/FE-shape bugs.
+        import tempfile
+        with tempfile.TemporaryDirectory() as root:
+            rel = self.DBPROJ.replace("/", os.sep)
+            abspath = os.path.join(root, rel)
+            os.makedirs(os.path.dirname(abspath), exist_ok=True)
+            with open(abspath, "w", encoding="utf-8") as fh:
+                fh.write("def list_projects():\n"
+                         "    return [{'project_id': p, 'modules': fetch(p)} for p in rows]\n")
+            res = self._res_attr(self.NEXT, lines="293-311")
+            out = C._http_datasource_provenance_guard(
+                res, self._wp_located(self.DBPROJ, lines="1-2"),
+                self._fe_only_windows(), code_root=root)
+        self.assertEqual(C._norm(out.attributed_defect["file"]), C._norm(self.NEXT))
+        self.assertNotIn("http_datasource_provenance_repointed",
+                         out.causal_check or {})
+
+    def test_winningpath_noop_without_winningpath_locus(self):
+        # No HTTP_WINNING_PATH locus among located → fallback yields nothing → no-op.
+        located = [{"axis_id": "AX0", "verdict": {"located": True, "file": self.NEXT,
+                    "lines": "293-311", "reason": "r"}}]
+        res = self._res_attr(self.NEXT, lines="293-311")
+        out = C._http_datasource_provenance_guard(res, located, self._fe_only_windows())
+        self.assertEqual(C._norm(out.attributed_defect["file"]), C._norm(self.NEXT))
+        self.assertNotIn("http_datasource_provenance_repointed", out.causal_check or {})
+
+    def test_resolved_peer_cleared_on_repoint(self):
+        # A dropped-peer stamp naming the producer must be cleared once attribution lands there.
+        res = self._res_attr(self.NEXT, lines="293-311")
+        res.causal_check["unrefuted_peer"] = {"file": self.DBPROJ, "lines": "19-27"}
+        out = C._http_datasource_provenance_guard(
+            res, self._wp_located(self.DBPROJ), self._fe_only_windows())
+        self.assertEqual(C._norm(out.attributed_defect["file"]), C._norm(self.DBPROJ))
+        self.assertNotIn("unrefuted_peer", out.causal_check or {})
+
 
 # ── M020 follow-up: per-locus SPLIT elimination converge ────────────────────────
 def _focal_file(prompt: str) -> str | None:
