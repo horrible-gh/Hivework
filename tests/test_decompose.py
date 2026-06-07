@@ -10,8 +10,12 @@ import os
 import subprocess
 
 from hive.decompose import (
-    build_repo_tree, build_decompose_prompt, build_literal_preview, _tree_useful,
+    FE_DERIVED_AXIS_ID, build_repo_tree, build_decompose_prompt,
+    build_literal_preview, ensure_fe_derived_state_axis,
+    is_fe_derived_state_symptom, _frontend_source_globs, _tree_useful,
 )
+from hive.retriever import retrieve
+from hive.searchplan import task_to_searchplan
 
 
 def _git_repo(tmp_path):
@@ -156,3 +160,160 @@ def test_contract_carries_coverage_risk_self_doubt_flag():
     assert "coverage_risk" in prompt
     assert '"thin"' in prompt                  # the canonical flag value
     assert "self-doubt" in prompt              # framed as confidence, not a verdict
+
+
+# ── Conditional FE derived-state axis (M035) ──────────────────────────────────
+
+M035_SEED = (
+    "The workflow head is shifted by one step: the wrong current stage is "
+    "highlighted and the done/current/future colors are off by one."
+)
+M036_SEED = (
+    "The HTTP data source returns an empty workflow_head_type field, so inspect "
+    "the API response serializer and database producer."
+)
+
+
+def _backend_only_decomposition():
+    return {
+        "fanout_decision": "fanout",
+        "reason": "backend hypotheses",
+        "steps": [["SQL_HEAD"]],
+        "tasks": [{
+            "id": "SQL_HEAD",
+            "title": "SQL head ordering",
+            "brief": "Inspect get_effective_head ORDER BY and service callers.",
+            "depends_on": [],
+            "coverage_risk": "ok",
+            "search_plan": {
+                "keywords": ["get_effective_head", "ORDER BY"],
+                "file_globs": ["server/**/*.py", "server/sql/**/*.json"],
+                "doc_topics": [],
+            },
+        }],
+    }
+
+
+def _make_flowgate_fe(repo):
+    _add(
+        repo,
+        "client/src/main/workflow/workflowViewState.ts",
+        "type StepVisual = 'done' | 'current' | 'future'\n"
+        "export function buildStepStates(workflowSteps: string[], headType: string) {\n"
+        "  const headIndex = workflowSteps.indexOf(headType)\n"
+        "  return workflowSteps.map((_, idx) =>\n"
+        "    idx < headIndex ? 'done' : idx === headIndex ? 'current' : 'future')\n"
+        "}\n",
+    )
+    _add(
+        repo,
+        "client/src/main/components/DocWorkflow.vue",
+        "<template><div v-for=\"step in stepStates\" :class=\"step\" /></template>\n",
+    )
+    _add(
+        repo,
+        "server/sql/queries/queries.json",
+        '{"get_effective_head":"SELECT * FROM wsi ORDER BY sort_order ASC"}\n',
+    )
+    subprocess.run(["git", "-C", repo, "commit", "-q", "-m", "fixture"], check=True)
+
+
+def test_m035_symptom_injects_fe_axis_but_m036_http_does_not(tmp_path):
+    repo = _git_repo(tmp_path)
+    _make_flowgate_fe(repo)
+
+    m035 = _backend_only_decomposition()
+    ensure_fe_derived_state_axis(m035, M035_SEED, repo)
+    assert m035["tasks"][0]["id"] == FE_DERIVED_AXIS_ID
+    assert m035["steps"][0][0] == FE_DERIVED_AXIS_ID
+    assert len(m035["tasks"]) == 2
+
+    m036 = _backend_only_decomposition()
+    ensure_fe_derived_state_axis(m036, M036_SEED, repo)
+    assert [task["id"] for task in m036["tasks"]] == ["SQL_HEAD"]
+
+
+def test_fe_axis_reuses_existing_axis_without_increasing_paid_axis_count(tmp_path):
+    repo = _git_repo(tmp_path)
+    _make_flowgate_fe(repo)
+    result = _backend_only_decomposition()
+    result["tasks"].insert(0, {
+        "id": "FE_VIEW",
+        "title": "Frontend view-state derivation",
+        "brief": "Inspect current step state and its Vue renderer.",
+        "depends_on": [],
+        "search_plan": {
+            "keywords": ["current"],
+            "file_globs": ["client/src/**/*.vue"],
+            "doc_topics": [],
+        },
+    })
+    before = len(result["tasks"])
+
+    ensure_fe_derived_state_axis(result, M035_SEED, repo)
+
+    assert len(result["tasks"]) == before
+    fe = result["tasks"][0]
+    assert "headIndex" in fe["search_plan"]["keywords"]
+    assert (
+        "client/src/main/workflow/workflowViewState.ts"
+        in fe["search_plan"]["file_globs"]
+    )
+
+
+def test_m035_fe_axis_retrieve_reaches_workflow_view_state(tmp_path):
+    repo = _git_repo(tmp_path)
+    _make_flowgate_fe(repo)
+    result = _backend_only_decomposition()
+    ensure_fe_derived_state_axis(result, M035_SEED, repo)
+    fe_task = result["tasks"][0]
+
+    plan = task_to_searchplan(fe_task)
+    bundle = retrieve(plan, repo, k=3, top_files=8, blame_files=0)
+
+    candidates = {
+        item["file"].removeprefix("./") for item in
+        bundle["code_snippets"] + bundle["call_chain"]
+    }
+    assert "client/src/main/workflow/workflowViewState.ts" in candidates
+    assert bundle["stats"]["snippets"] > 0
+
+
+def test_fe_axis_without_frontend_scope_stays_honestly_thin(tmp_path):
+    repo = _git_repo(tmp_path)
+    _add(repo, "server/workflow.py",
+         "currentStep = 'backend-only name must not become an FE candidate'\n")
+    subprocess.run(["git", "-C", repo, "commit", "-q", "-m", "backend"], check=True)
+    result = _backend_only_decomposition()
+    ensure_fe_derived_state_axis(result, M035_SEED, repo)
+    fe_task = result["tasks"][0]
+
+    assert fe_task["search_plan"]["file_globs"] == []
+    assert fe_task["search_plan"]["keywords"] == []
+    bundle = retrieve(task_to_searchplan(fe_task), repo, blame_files=0)
+    assert bundle["code_snippets"] == []
+    assert bundle["call_chain"] == []
+
+
+def test_fe_symptom_gate_is_conservative():
+    assert is_fe_derived_state_symptom(M035_SEED)
+    assert is_fe_derived_state_symptom(
+        "워크플로 head가 한 칸 밀려 현재 단계 색이 잘못 표시된다")
+    assert is_fe_derived_state_symptom(
+        "The current step highlight color is wrong in the workflow bar.")
+    assert is_fe_derived_state_symptom(
+        "The workflow view-state derivation is stale.")
+    assert not is_fe_derived_state_symptom(M036_SEED)
+    assert not is_fe_derived_state_symptom(
+        "M036 HTTP 데이터소스 응답의 workflow_head_type 값이 비어 있다")
+    assert not is_fe_derived_state_symptom(
+        "The API returns done/current/future status values in its JSON payload.")
+
+
+def test_frontend_globs_are_derived_only_from_existing_frontend_roots(tmp_path):
+    repo = _git_repo(tmp_path)
+    _make_flowgate_fe(repo)
+    assert _frontend_source_globs(repo) == [
+        "client/src/main/workflow/workflowViewState.ts",
+        "client/src/main/components/DocWorkflow.vue",
+    ]

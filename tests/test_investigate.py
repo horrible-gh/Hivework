@@ -133,6 +133,107 @@ class TestInvestigateWiring(unittest.TestCase):
             self.assertEqual(result["axes_judged"], 1)
             self.assertEqual(judge_cw.call_count, 1)
 
+    def test_m035_fe_candidate_reaches_converge_from_backend_only_decompose(self):
+        """The conditional decompose axis must put the real FE node in ④ input."""
+        cfg = load_config()
+        cfg.judge.max_calls_per_axis = 1
+        cfg.judge.votes_per_axis = 1
+        cfg.judge.max_axes = 12
+        backend_only = json.dumps({
+            "fanout_decision": "single",
+            "reason": "queen only considered backend head ordering",
+            "steps": [["SQL_HEAD"]],
+            "tasks": [{
+                "id": "SQL_HEAD", "title": "SQL head ordering",
+                "brief": "Inspect get_effective_head ORDER BY.",
+                "depends_on": [],
+                "search_plan": {
+                    "keywords": ["get_effective_head", "ORDER BY"],
+                    "file_globs": ["server/sql/queries/*.json"],
+                    "doc_topics": [],
+                },
+            }],
+        })
+        seed = (
+            "The workflow head is shifted by one step: the wrong current stage "
+            "is highlighted and done/current/future colors are off by one."
+        )
+
+        def judge_result(_provider, _model, prompt, **_kwargs):
+            if 'axis "FE_DERIVED_STATE"' in prompt:
+                return _wr(json.dumps({"verdict": {
+                    "located": True,
+                    "file": "client/src/main/workflow/workflowViewState.ts",
+                    "lines": "2-5",
+                    "reason": "headIndex drives done/current/future state",
+                }}))
+            return _wr(json.dumps({"verdict": {
+                "located": True,
+                "file": "server/sql/queries/queries.json",
+                "lines": "1-1",
+                "reason": "backend comparison candidate",
+            }}))
+
+        with tempfile.TemporaryDirectory() as td:
+            fe = os.path.join(td, "client", "src", "main", "workflow",
+                              "workflowViewState.ts")
+            be = os.path.join(td, "server", "sql", "queries", "queries.json")
+            os.makedirs(os.path.dirname(fe), exist_ok=True)
+            os.makedirs(os.path.dirname(be), exist_ok=True)
+            with open(fe, "w", encoding="utf-8") as f:
+                f.write(
+                    "export function buildStepStates(steps, headType) {\n"
+                    "  const headIndex = steps.indexOf(headType)\n"
+                    "  return steps.map((_, idx) => idx < headIndex ? 'done' : "
+                    "idx === headIndex ? 'current' : 'future')\n"
+                    "}\n")
+            with open(be, "w", encoding="utf-8") as f:
+                f.write('{"get_effective_head":"SELECT * ORDER BY sort_order ASC"}\n')
+
+            cres = mock.Mock(
+                converged=True,
+                attributed_defect={
+                    "file": "client/src/main/workflow/workflowViewState.ts",
+                    "lines": "2-5",
+                },
+                causal_check={"verdict": "consistent"},
+                missing_link=None,
+            )
+            cres.as_dict.return_value = {
+                "converged": True,
+                "attributed_defect": cres.attributed_defect,
+            }
+            out = os.path.join(td, "verdicts.json")
+            with mock.patch("hive.decompose.call_worker",
+                            return_value=_wr(backend_only)), \
+                 mock.patch("hive.judge.call_worker",
+                            side_effect=judge_result), \
+                 mock.patch.object(INV, "run_converge",
+                                   return_value=cres) as converge:
+                result = INV.run_investigate(
+                    seed_text=seed, recipe_path=None, code_root=td,
+                    docs_root=None, output_path=out, cfg=cfg, ledger=None)
+
+        fe_verdict = next(
+            v for v in result["verdicts"]
+            if v["axis_id"] == "FE_DERIVED_STATE")
+        self.assertTrue(fe_verdict["verdict"]["located"])
+        self.assertEqual(
+            fe_verdict["verdict"]["file"],
+            "client/src/main/workflow/workflowViewState.ts")
+        converge_kwargs = converge.call_args.kwargs
+        self.assertTrue(any(
+            (v.get("verdict") or {}).get("file")
+            == "client/src/main/workflow/workflowViewState.ts"
+            for v in converge_kwargs["verdicts"]))
+        pooled_files = {
+            s["file"].removeprefix("./")
+            for bundle in converge_kwargs["bundles"]
+            for s in (bundle.get("code_snippets") or [])
+        }
+        self.assertIn(
+            "client/src/main/workflow/workflowViewState.ts", pooled_files)
+
     # N164 regression: 5 leaf axes, a decisive one (css_rules) last in order.
     # The old cap (3) sliced leaves[:3] and silently dropped css_rules; the
     # runaway-ceiling default (12) must judge every leaf so the decisive axis

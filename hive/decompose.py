@@ -16,6 +16,7 @@ local retriever (hive.searchplan bridge) lowers into a SearchPlan.
 import json
 import logging
 import os
+import re
 import subprocess
 from collections import Counter
 from typing import Any
@@ -26,6 +27,226 @@ from hive.retriever import _ripgrep
 from hive.searchplan import extract_keywords
 
 logger = logging.getLogger("hive.decompose")
+
+# Conditional FE-derived-state axis. This is deliberately opt-in: every leaf
+# reaches the paid judge, so a generic "also inspect the frontend" axis would
+# turn a targeted escalation into a permanent cost increase.
+FE_DERIVED_AXIS_ID = "FE_DERIVED_STATE"
+_FE_SOURCE_EXTS = frozenset({".ts", ".tsx", ".js", ".jsx", ".vue"})
+_FE_ROOT_NAMES = frozenset({"client", "frontend", "web", "ui"})
+_FE_DERIVED_KEYWORDS = (
+    "buildStepStates", "headIndex", "workflowSteps", "stepStates",
+    "nextStepIndex", "headType", "StepVisual", "indexOf",
+    "currentStep", "activeStep",
+)
+
+_FE_POSITION_RE = re.compile(
+    r"\boff[- ]by[- ]one\b"
+    r"|\bone\s+(?:slot|step|stage|position)\s+(?:off|ahead|behind|shifted)\b"
+    r"|\b(?:shifted|offset|misaligned)\s+(?:by\s+)?one\b"
+    r"|\bwrong\s+(?:step|stage)\s+(?:is\s+)?(?:current|active|highlighted)\b"
+    r"|\bindex(?:ing)?\s+(?:is\s+)?(?:wrong|off|shifted)\b"
+    r"|\b(?:current|active)\s+(?:step|stage).{0,20}"
+    r"(?:color|highlight).{0,12}(?:wrong|incorrect)\b"
+    r"|\b(?:view[- ]?state|derived\s+(?:step\s+)?state).{0,20}"
+    r"(?:wrong|incorrect|stale|mismatch)\b"
+    r"|한\s*(?:칸|단계)\s*(?:씩\s*)?(?:밀림|밀려|어긋|차이)"
+    r"|(?:현재|완료|다음)\s*(?:단계|스텝).{0,12}(?:밀림|어긋|잘못)"
+    r"|뷰\s*상태.{0,12}(?:잘못|오류|불일치|낡)"
+    r"|(?:앞|뒤)\s*(?:단계|스텝).{0,8}(?:표시|강조)",
+    re.IGNORECASE,
+)
+_FE_PRESENTATION_RE = re.compile(
+    r"\b(?:workflow|progress|step|stage)\s+(?:head|state|status|indicator|bar)\b"
+    r"|\b(?:current|active)\s+(?:step|stage)\b"
+    r"|\b(?:head|step|stage).{0,24}\b(?:color|highlight|current|active)\b"
+    r"|\bview[- ]?state\b"
+    r"|워크플로(?:우)?.{0,12}(?:헤드|head|단계|스텝|상태)"
+    r"|(?:현재|완료|다음)\s*(?:단계|스텝)"
+    r"|(?:단계|스텝).{0,12}(?:색|강조|상태)",
+    re.IGNORECASE,
+)
+_FE_STATE_TRIO_RE = re.compile(
+    r"\b(?:done|completed).{0,20}(?:current|active).{0,20}(?:future|pending)\b"
+    r"|완료.{0,20}현재.{0,20}(?:미래|다음|예정)",
+    re.IGNORECASE,
+)
+
+
+def is_fe_derived_state_symptom(seed_text: str) -> bool:
+    """Whether the symptom warrants a paid FE derived-state investigation axis.
+
+    The gate requires positional/state-derivation evidence plus a workflow/UI
+    presentation cue. A generic HTTP/data-source report therefore stays on its
+    existing axes even when it mentions a UI field such as ``workflow_head_type``.
+    """
+    text = seed_text or ""
+    presentation = bool(_FE_PRESENTATION_RE.search(text))
+    derived_error = bool(
+        _FE_POSITION_RE.search(text) or _FE_STATE_TRIO_RE.search(text))
+    return presentation and derived_error
+
+
+def _frontend_source_globs(code_root: str | None, max_globs: int = 4) -> list[str]:
+    """Return bounded FE source globs rooted only in frontend trees that exist.
+
+    Prefer exact workflow/state producer and renderer files visible in the free
+    repo tree. Fall back to an extension glob only when filenames provide no
+    useful derived-state clue.
+    """
+    if not code_root:
+        return []
+    files = _git_tracked_files(code_root) or _walk_files(code_root)
+    roots: dict[str, set[str]] = {}
+    source_files: list[str] = []
+    for raw in files:
+        path = raw.replace("\\", "/").lstrip("./")
+        if os.path.splitext(path)[1].lower() not in _FE_SOURCE_EXTS:
+            continue
+        parts = path.split("/")
+        if not parts or parts[0].lower() not in _FE_ROOT_NAMES:
+            continue
+        try:
+            src_idx = next(i for i, part in enumerate(parts)
+                           if part.lower() == "src")
+        except StopIteration:
+            continue
+        root = "/".join(parts[:src_idx + 1])
+        roots.setdefault(root, set()).add(os.path.splitext(path)[1].lower())
+        source_files.append(path)
+
+    globs: list[str] = []
+
+    def _score(path: str) -> int:
+        low = path.lower()
+        return (
+            5 * ("workflow" in low)
+            + 5 * ("viewstate" in low or "view_state" in low)
+            + 3 * ("step" in low)
+            + 2 * ("progress" in low)
+            + 1 * ("state" in low)
+            + 1 * ("head" in low)
+        )
+
+    logic = [p for p in source_files
+             if os.path.splitext(p)[1].lower() != ".vue" and _score(p) > 0]
+    renderers = [p for p in source_files
+                 if os.path.splitext(p)[1].lower() == ".vue" and _score(p) > 0]
+    logic.sort(key=lambda p: (-_score(p), p.lower()))
+    renderers.sort(key=lambda p: (-_score(p), p.lower()))
+    for path in logic[:2] + renderers[:2]:
+        if path not in globs:
+            globs.append(path)
+        if len(globs) >= max_globs:
+            return globs
+
+    # No revealing filename: retain locality at the real FE src root and use
+    # extensions that actually exist there. TS and Vue lead because producer and
+    # renderer commonly split across those file classes.
+    ext_order = (".ts", ".vue", ".tsx", ".js", ".jsx")
+    for root in sorted(roots):
+        for ext in ext_order:
+            if ext == ".vue" and renderers:
+                continue
+            if ext != ".vue" and logic:
+                continue
+            if ext in roots[root]:
+                globs.append(f"{root}/**/*{ext}")
+                if len(globs) >= max_globs:
+                    return globs
+    return globs
+
+
+def _task_covers_fe_derived_state(task: dict[str, Any]) -> bool:
+    """True when a queen task already represents the conditional FE axis."""
+    if task.get("depends_on"):
+        return False
+    if str(task.get("id", "")).upper() == FE_DERIVED_AXIS_ID:
+        return True
+    sp = task.get("search_plan") or {}
+    if not isinstance(sp, dict):
+        sp = {}
+    blob = " ".join([
+        str(task.get("id", "")), str(task.get("title", "")),
+        str(task.get("brief", "")),
+        *[str(x) for x in (sp.get("file_globs") or [])],
+        *[str(x) for x in (sp.get("keywords") or [])],
+    ]).lower()
+    has_fe_scope = any(token in blob for token in (
+        "client/", "frontend/", "web/src/", "ui/src/", ".vue", ".ts",
+    ))
+    has_derived_logic = any(token in blob for token in (
+        "view state", "view-state", "derived state", "step state", "headindex",
+        "indexof", "buildstepstates", "current step", "active step",
+    ))
+    return has_fe_scope and has_derived_logic
+
+
+def ensure_fe_derived_state_axis(result: dict[str, Any], seed_text: str,
+                                 code_root: str | None) -> dict[str, Any]:
+    """Conditionally ensure one FE derived-state leaf exists in decomposition.
+
+    Mutates and returns ``result``. Existing matching axes are enriched in place
+    so the paid axis count does not grow. If the queen omitted the class entirely,
+    one leaf is prepended so later position-based caps cannot bury it.
+    """
+    if not is_fe_derived_state_symptom(seed_text):
+        return result
+
+    tasks = result.get("tasks")
+    if not isinstance(tasks, list):
+        return result
+    globs = _frontend_source_globs(code_root)
+
+    for task in tasks:
+        if not isinstance(task, dict) or not _task_covers_fe_derived_state(task):
+            continue
+        sp = task.get("search_plan")
+        if not isinstance(sp, dict):
+            sp = {}
+            task["search_plan"] = sp
+        existing_kw = [str(x) for x in (sp.get("keywords") or [])]
+        sp["keywords"] = list(dict.fromkeys(
+            list(_FE_DERIVED_KEYWORDS[:6]) + existing_kw
+            + list(_FE_DERIVED_KEYWORDS[6:])))[:10]
+        if globs:
+            sp["file_globs"] = list(dict.fromkeys(
+                [str(x) for x in (sp.get("file_globs") or [])] + globs))
+        sp.setdefault("doc_topics", [])
+        task.setdefault("coverage_risk", "thin")
+        logger.info("FE derived-state symptom: reinforced existing axis %s",
+                    task.get("id", "?"))
+        return result
+
+    axis = {
+        "id": FE_DERIVED_AXIS_ID,
+        "title": "Frontend derived workflow/view state",
+        "brief": (
+            "Trace the frontend logic that derives done, current, and future or active "
+            "step state from the workflow head/index. Check index lookup, boundary "
+            "and off-by-one handling, then follow the derived state into the "
+            "rendering component; report the exact producer, not merely the view."
+        ),
+        "depends_on": [],
+        "coverage_risk": "thin",
+        "search_plan": {
+            # With no real FE source scope, leave FIND empty so this axis stays
+            # honestly thin instead of whole-tree matching backend names.
+            "keywords": list(_FE_DERIVED_KEYWORDS) if globs else [],
+            "file_globs": globs,
+            "doc_topics": [],
+        },
+    }
+    tasks.insert(0, axis)
+    steps = result.get("steps")
+    if isinstance(steps, list):
+        if steps and isinstance(steps[0], list):
+            steps[0].insert(0, FE_DERIVED_AXIS_ID)
+        else:
+            steps.insert(0, [FE_DERIVED_AXIS_ID])
+    logger.info("FE derived-state symptom: injected conditional axis %s "
+                "(frontend globs=%s)", FE_DERIVED_AXIS_ID, globs)
+    return result
 
 # ── Repo file tree given to the queen so axes anchor on REAL paths ─────────────
 # The decomposer fans out blind to the repo, so it guesses file_globs (wrong
@@ -225,6 +446,13 @@ make sure your axes cover BOTH trees. Then output the decomposition JSON.
    local FIND really retrieved and only reinforces the axes you flagged AND that
    came back empty. Flag honestly — over-flagging wastes a check, under-flagging
    lets a thin axis slip through unreinforced.
+8. CONDITIONAL FE-DERIVED-STATE AXIS: only when the symptom says a workflow/progress
+   head or current step is shifted/off-by-one, the wrong step is highlighted/colored,
+   or done/current/future view state is derived incorrectly, include one frontend
+   axis covering the state producer (`*.ts`/`*.tsx`/`*.js`) and its renderer
+   (`*.vue`/templates). Do NOT add this axis for ordinary HTTP, API, database, or
+   data-source symptoms. Every axis reaches a paid judge, so this condition is a
+   cost gate, not an optional suggestion.
 
 ## Output format (STRICT) — return ONLY this JSON, no prose, no markdown fence:
 
@@ -400,6 +628,7 @@ def run_decompose(
     if "tasks" not in result:
         raise ValueError("Decompose output missing 'tasks' key")
 
+    ensure_fe_derived_state_axis(result, seed_text, codebase_root)
     axes = result["tasks"]
     logger.info("Decompose produced %d axes: %s",
                 len(axes), [a.get("id", "?") for a in axes])
