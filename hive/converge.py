@@ -576,7 +576,8 @@ def build_converge_prompt(seed_text: str, located: list[dict[str, Any]],
                           db_schema: str = "",
                           code_state_block: str = "",
                           http_binding_block: str = "",
-                          fragment_fact_block: str = "") -> str:
+                          fragment_fact_block: str = "",
+                          refuted_block: str = "") -> str:
     """Build the single converge prompt: fragments + evidence → one path + one node.
 
     ``data_state_block`` is the optional ``[Confirmed data state]`` section: on the
@@ -717,6 +718,30 @@ def build_converge_prompt(seed_text: str, located: list[dict[str, Any]],
             "FE-bound symptom field, or that is reachable on the executed path, outranks "
             "a lexically-similar fragment that produces nothing and links to nothing.\n")
 
+    # Refuted-node exclusion (M035): a PRIOR pass attributed the defect to a node whose
+    # cause→symptom check came back ``contradicted`` — it provably cannot produce the
+    # symptom — but the model did NOT name where to look next (no missing_link). The
+    # symptom still has a home; this is the deterministic redirect the prompt's [Keep
+    # hunting] asks for, made explicit. The refuted node has been REMOVED from the
+    # located fragments above; this block names it so the converger does not re-attribute
+    # there. It must attribute to a DIFFERENT remaining fragment that CAN produce the
+    # symptom (e.g. the front-end render/binding locus a sibling axis localised — a
+    # render symptom can never be produced by the contradicted backend node), or, if none
+    # can, emit a missing_link naming the producing path — never re-crown a refuted node.
+    refuted_excl = ""
+    if refuted_block.strip():
+        refuted_excl = (
+            "\n[REFUTED nodes — EXCLUDED candidates. A prior cause→symptom check PROVED "
+            "each of these cannot produce the reported symptom. They are NOT in the "
+            "located-fragment list above and you MUST NOT attribute the defect to any of "
+            "them. Re-stitch the executed path and attribute to a DIFFERENT remaining "
+            "fragment that CAN produce the symptom. A render/shape/binding symptom in "
+            "particular cannot originate in a contradicted backend/query node — prefer "
+            "the front-end render or response-binding locus. If NO remaining fragment can "
+            "produce it, emit a missing_link naming where the producing path lives; do "
+            "NOT re-attribute to a refuted node below.]\n"
+            + refuted_block.strip() + "\n")
+
     schema_block = ""
     if db_available and db_schema.strip():
         schema_block = (
@@ -763,7 +788,7 @@ the seed backwards — flip your reasoning before emitting.
 {confirmed_block}{db_avail_block}{schema_block}{code_state}{http_bindings}
 [Located fragments — each is ONE node candidate, from a different axis]
 {frags}
-{fragment_facts}
+{fragment_facts}{refuted_excl}
 {unloc_block}
 [Pooled evidence windows (code + call-chain hops across all axes)]
 {evidence}
@@ -1119,6 +1144,33 @@ def _dedup_windows(windows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return out
 
 
+def _render_refuted_block(res: "ConvergeResult") -> str:
+    """Render the refuted attributed node (+ any model-listed refuted peers) as the
+    exclusion lines for a redirect re-stitch (M035). Each line is ``file:lines — why``
+    drawn from the contradicted causal check, so the re-pass knows EXACTLY which loci a
+    prior pass proved cannot produce the symptom. Deterministic; never raises."""
+    causal = res.causal_check or {}
+    lines: list[str] = []
+    ad = res.attributed_defect or {}
+    if ad.get("file"):
+        why = (causal.get("trace") or ad.get("why")
+               or "cause→symptom check contradicted").strip()
+        lines.append(f"- {ad.get('file')}:{ad.get('lines', '')} — "
+                     f"{_trunc(why, _REASON_CHARS)}")
+    seen = {(_norm(ad.get("file", "")), str(ad.get("lines", "")))}
+    for peer in causal.get("refuted_peers") or []:
+        pf = str(peer.get("file", "") or "")
+        if not pf:
+            continue
+        key = (_norm(pf), str(peer.get("lines", "")))
+        if key in seen:
+            continue
+        seen.add(key)
+        lines.append(f"- {pf}:{peer.get('lines', '')} — "
+                     f"{_trunc(str(peer.get('why_not', '') or ''), _REASON_CHARS)}")
+    return "\n".join(lines)
+
+
 def _converge_once(seed_text: str, located: list[dict[str, Any]],
                    unlocated: list[dict[str, Any]], windows: list[dict[str, Any]],
                    known: set[str], provider: str, model: str, pk: dict[str, Any],
@@ -1126,7 +1178,8 @@ def _converge_once(seed_text: str, located: list[dict[str, Any]],
                    db_available: bool = False, db_schema: str = "",
                    code_state_block: str = "",
                    http_binding_block: str = "",
-                   fragment_fact_block: str = "") -> ConvergeResult:
+                   fragment_fact_block: str = "",
+                   refuted_block: str = "") -> ConvergeResult:
     """One logical converge call (with a transport-level JSON-only reparse). Never raises.
 
     The reparse retry handles a model that wrapped the JSON in prose — it is a
@@ -1139,7 +1192,7 @@ def _converge_once(seed_text: str, located: list[dict[str, Any]],
     prompt = build_converge_prompt(seed_text, located, unlocated, windows,
                                    data_state_block, db_available, db_schema,
                                    code_state_block, http_binding_block,
-                                   fragment_fact_block)
+                                   fragment_fact_block, refuted_block)
     attempt_prompt = prompt
     parsed: dict[str, Any] | None = None
     for attempt in range(2):
@@ -3074,6 +3127,48 @@ def run_converge(*, seed_text: str, verdicts: list[dict[str, Any]],
                 # first result, which at least named the missing link for the author.
                 if res2.converged:
                     res = res2
+
+    # ── Redirect re-stitch on a LEADLESS contradiction (M035). The missing-link re-pass
+    # above only fires when the model NAMED where to look next. A flaky converger instead
+    # rules ``contradicted`` (the suspected node provably can't produce the symptom) and
+    # leaves missing_link null — dead-ending at "not here", so the honey ships the refuted
+    # node and specify, finding no bug there, defers → needs_reinvestigation (the punt the
+    # operator's first principle forbids). When a LOCATED front-end render/binding fragment
+    # distinct from the refuted node exists, the symptom's home is almost certainly there
+    # (a contradicted backend/query node can NEVER produce a render symptom — the prompt's
+    # own SYMPTOM DOMAIN rule). So we deterministically RE-STITCH with the refuted node
+    # EXCLUDED, forcing the converger to attribute among the remaining fragments — the
+    # redirect the prompt's [Keep hunting] asks for, made to fire even when the model
+    # forgot the lead. No new retrieve (free re-ask over the same evidence); ONE converge
+    # call; adopt only if it actually converges. Gated tightly so a plain leadless
+    # contradiction WITH no FE alternative still dead-ends honestly (unchanged). Kill via
+    # HIVE_NO_REDIRECT_RESTITCH.
+    if (not res.converged and not res.missing_link and max_calls > 1
+            and not os.environ.get("HIVE_NO_REDIRECT_RESTITCH")
+            and (res.causal_check or {}).get("verdict") == "contradicted"
+            and res.attributed_defect):
+        rfile = _norm((res.attributed_defect or {}).get("file", ""))
+        fe_targets = [v for v in located
+                      if _is_fe_file((v.get("verdict") or {}).get("file", ""))
+                      and not _aligns((v.get("verdict") or {}).get("file", ""), rfile)]
+        if rfile and fe_targets:
+            remaining = [v for v in located
+                         if not _aligns((v.get("verdict") or {}).get("file", ""), rfile)]
+            refuted_block = _render_refuted_block(res)
+            logger.info("converge: leadless contradiction at %s, but %d located FE "
+                        "render locus/loci exist — re-stitching with the refuted node "
+                        "excluded", rfile, len(fe_targets))
+            res2 = _converge_once(seed_text, remaining, unlocated, windows, known,
+                                  provider, model, pk, ledger, timeout,
+                                  data_state_block=data_block,
+                                  db_available=db_available, db_schema=db_schema,
+                                  code_state_block=code_state_block,
+                                  http_binding_block=http_binding_block,
+                                  fragment_fact_block=fragment_fact_block,
+                                  refuted_block=refuted_block)
+            logger.info("converge: redirect re-stitch → %s", res2.summary)
+            if res2.converged:
+                res = res2
 
     # When the split pass produced this result, the holistic data loop above no-op'd, so
     # the local data_* vars are still their False defaults. Reflect the WINNER's actual

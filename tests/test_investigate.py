@@ -838,6 +838,53 @@ class TestRerunReinvestigation(unittest.TestCase):
             honey_out=self.honey)
         self.assertIsNone(out)
 
+    def _verdict_at(self, axis, file):
+        return {"axis_id": axis, "title": f"axis {axis}",
+                "search_plan": {"keywords": ["k"], "file_globs": ["s/*.py"],
+                                "doc_topics": []},
+                "verdict": {"located": True, "file": file, "lines": "1-2", "reason": "r"},
+                "candidates": [{"file": file, "lines": "1-2", "reason": "r"}]}
+
+    def test_re_converge_excludes_refuted_locus_from_verdicts(self):
+        """M035 ⑥→④: plan.exclude_loci drops the refuted locus from verdicts BEFORE the
+        re-converge, so the re-stitch cannot re-crown it and must use the survivors."""
+        self.cfg.reinvestigation.live = True
+        verdicts = [self._verdict_at("BE", "db/workflow_sequences.py"),
+                    self._verdict_at("FE", "client/src/workflow_view.ts"),
+                    self._verdict_at("EP", "api/workflow_head_routes.py")]
+        plan = ReinvestPlan(action=ACTION_RE_CONVERGE, reason_code="author_declared",
+                            exclude_loci=[{"file": "db/workflow_sequences.py",
+                                           "lines": "45-57"}])
+        cres = mock.MagicMock()
+        cres.as_dict.return_value = {"converged": True, "summary": "redirected"}
+        with mock.patch.object(INV, "run_converge", return_value=cres) as rc, \
+             mock.patch.object(INV, "retrieve", return_value={"axis_id": "X", "stats": {}}):
+            out = rerun_reinvestigation(
+                plan, self._result(verdicts), seed_text="s", code_root=".",
+                docs_root=None, cfg=self.cfg, honey_out=self.honey)
+        self.assertIsNotNone(out)
+        passed = rc.call_args.kwargs["verdicts"]
+        files = {f["verdict"]["file"] for f in passed}
+        self.assertNotIn("db/workflow_sequences.py", files)   # refuted locus excluded
+        self.assertEqual(files, {"client/src/workflow_view.ts",
+                                 "api/workflow_head_routes.py"})
+
+    def test_re_converge_exclusion_below_two_located_returns_none(self):
+        """Excluding the refuted locus can drop below 2 survivors → honest NR, no spend."""
+        self.cfg.reinvestigation.live = True
+        verdicts = [self._verdict_at("BE", "db/workflow_sequences.py"),
+                    self._verdict_at("FE", "client/src/workflow_view.ts")]
+        plan = ReinvestPlan(action=ACTION_RE_CONVERGE, reason_code="author_declared",
+                            exclude_loci=[{"file": "client/src/workflow_view.ts"},
+                                          {"file": "db/workflow_sequences.py"}])
+        with mock.patch.object(INV, "run_converge") as rc, \
+             mock.patch.object(INV, "retrieve", return_value={"stats": {}}):
+            out = rerun_reinvestigation(
+                plan, self._result(verdicts), seed_text="s", code_root=".",
+                docs_root=None, cfg=self.cfg, honey_out=self.honey)
+        self.assertIsNone(out)
+        rc.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -2417,5 +2417,51 @@ class TestWinningPathAndLayerGates(unittest.TestCase):
         self.assertIn("E2", out["effectiveness"]["ineffective_ids"])
 
 
+_HONEY_WITH_PRIMARY = (
+    "## Findings\n\n"
+    "### Primary edit target — attributed defect\n"
+    "- location: `db/workflow_sequences.py:45-57`\n"
+    "- why: ORDER BY suspected\n\n"
+    "## Next\n")
+
+
+class TestRefutedLocusStamp(unittest.TestCase):
+    """M035 ⑥→④: an author-declared NR stamps the honey's primary locus into
+    refuted_loci so the reactive bridge can re-converge with it EXCLUDED."""
+
+    def test_honey_primary_locus_parsed(self):
+        loc = specify._honey_primary_locus(_HONEY_WITH_PRIMARY)
+        self.assertEqual(loc, {"file": "db/workflow_sequences.py", "lines": "45-57"})
+
+    def test_honey_primary_locus_absent_returns_none(self):
+        self.assertIsNone(specify._honey_primary_locus("## Findings\nno target here\n"))
+
+    def test_author_declared_stamps_refuted_locus(self):
+        spec = {"termination": "needs_reinvestigation",
+                "notes": "no bug at the attributed locus; reinvestigate FE"}
+        out = specify._ensure_reinvestigation_reason(spec, _HONEY_WITH_PRIMARY)
+        ri = out["reinvestigation"]
+        self.assertEqual(ri["reason_code"], specify.RI_AUTHOR_DECLARED)
+        self.assertEqual([x["file"] for x in ri["refuted_loci"]],
+                         ["db/workflow_sequences.py"])
+
+    def test_gate_stamped_reason_is_not_overwritten(self):
+        # A gate already stamped a structured reason → author finalizer leaves it (and
+        # does NOT add refuted_loci): gate routing stays untouched.
+        spec = {"termination": "needs_reinvestigation",
+                "reinvestigation": {"reason_code": specify.RI_DEFERRED_ROOT_CAUSE,
+                                    "gate": "deferred_substance"}}
+        out = specify._ensure_reinvestigation_reason(spec, _HONEY_WITH_PRIMARY)
+        self.assertEqual(out["reinvestigation"]["reason_code"],
+                         specify.RI_DEFERRED_ROOT_CAUSE)
+        self.assertNotIn("refuted_loci", out["reinvestigation"])
+
+    def test_author_declared_without_honey_locus_stamps_no_refuted(self):
+        spec = {"termination": "needs_reinvestigation", "notes": "unclear"}
+        out = specify._ensure_reinvestigation_reason(spec, "## no primary target\n")
+        self.assertEqual(out["reinvestigation"]["reason_code"], specify.RI_AUTHOR_DECLARED)
+        self.assertNotIn("refuted_loci", out["reinvestigation"])
+
+
 if __name__ == "__main__":
     unittest.main()

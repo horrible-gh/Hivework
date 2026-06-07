@@ -177,7 +177,8 @@ def _set_reinvestigation(spec: dict[str, Any], *, reason_code: str, gate: str,
     return spec
 
 
-def _ensure_reinvestigation_reason(spec: dict[str, Any]) -> dict[str, Any]:
+def _ensure_reinvestigation_reason(spec: dict[str, Any],
+                                   honey_text: str = "") -> dict[str, Any]:
     """Stamp an author-declared reason when NR was emitted by the author, not a gate.
 
     Runs last in ``run_specify``. A gate that downgrades to needs_reinvestigation
@@ -186,17 +187,32 @@ def _ensure_reinvestigation_reason(spec: dict[str, Any]) -> dict[str, Any]:
     ``author_declared`` (carrying the author's own narrative) so the reactive bridge
     never meets a needs_reinvestigation with no routable cause. A non-NR spec keeps
     no stray reason field.
+
+    M035 ⑥→④: an author_declared NR means the author refused to author a fix at the
+    honey's primary locus (typically it found no bug there). We stamp that locus into
+    ``refuted_loci`` so the reactive bridge can re-converge with it EXCLUDED and redirect
+    the attribution onto a surviving (e.g. FE) candidate — instead of routing
+    author_declared straight to terminate, the dead-end punt. Only the author_declared
+    branch stamps this; gate-driven reasons keep their existing routing untouched.
     """
     if spec.get("termination") != "needs_reinvestigation":
         spec.pop("reinvestigation", None)
         return spec
     if not isinstance(spec.get("reinvestigation"), dict):
-        spec["reinvestigation"] = {
+        ri: dict[str, Any] = {
             "reason_code": RI_AUTHOR_DECLARED,
             "gate": "author",
             "detail": str(spec.get("notes", "")).strip()[:300] or "author emitted "
             "needs_reinvestigation",
         }
+        loc = _honey_primary_locus(honey_text) if honey_text else None
+        if loc and loc.get("file"):
+            ri["refuted_loci"] = [{
+                "file": loc["file"], "lines": loc.get("lines", ""),
+                "why": "author declared needs_reinvestigation without an edit at this "
+                       "honey-attributed locus (no fix expressible here)",
+            }]
+        spec["reinvestigation"] = ri
     return spec
 
 
@@ -2748,6 +2764,33 @@ def _converge_certified_locus(honey_text: str) -> str | None:
     return None
 
 
+def _honey_primary_locus(honey_text: str) -> dict[str, str] | None:
+    """The honey's '### Primary edit target' file (+lines) — the locus the honey directed
+    specify to edit. Used to stamp ``refuted_loci`` when the author DECLARES NR without an
+    edit there (M035), so the reactive bridge re-converges with it EXCLUDED. Unlike
+    :func:`_converge_certified_locus` this does NOT require the attribution to be grounded —
+    a refused locus is excluded whether or not converge was sure of it. None when absent."""
+    in_block = False
+    for line in honey_text.splitlines():
+        if line.startswith(_CONVERGE_PRIMARY_HEADER):
+            in_block = True
+            continue
+        if in_block:
+            s = line.strip()
+            if s.startswith("## ") or s.startswith("### "):
+                break
+            if s.startswith("- location:"):
+                tok = s[len("- location:"):].strip().strip("`").lstrip("⚠").strip()
+                m = re.match(
+                    r"([A-Za-z0-9_][A-Za-z0-9_./\\-]*\.[A-Za-z0-9]+)(?::([0-9][0-9\-]*))?",
+                    tok)
+                if m:
+                    return {"file": m.group(1).replace("\\", "/").lstrip("/"),
+                            "lines": m.group(2) or ""}
+                return None
+    return None
+
+
 def _apply_converge_coverage_gate(spec: dict[str, Any], honey_text: str) -> dict[str, Any]:
     """A genuine MULTI-locus convergence must not ship a ready spec covering only some.
 
@@ -3136,7 +3179,7 @@ def run_specify(
     # Step A finalizer: if the spec lands in needs_reinvestigation but NO gate stamped a
     # structured reason, the AUTHOR itself emitted it — record that so the reactive bridge
     # always finds a routable cause (it reads the author's own narrative from notes/detail).
-    spec = _ensure_reinvestigation_reason(spec)
+    spec = _ensure_reinvestigation_reason(spec, honey_text)
 
     problems = _validate_spec(spec)
     if problems:

@@ -159,6 +159,51 @@ REDIRECT_CONVERGED_OUT = json.dumps({
     "missing_link": None,
 })
 
+# M035 shape: a backend node + an FE render node both located. The first pass refutes
+# the backend node (contradicted) but names NO lead; the redirect re-stitch must land on
+# the FE locus with the refuted backend node excluded.
+LOCATED_WITH_FE = [
+    _verdict("BE", True, "db/workflow_sequences.py", "45-57",
+             "get_effective_head ORDER BY suspected of shifting the head"),
+    _verdict("FE", True, "client/src/workflow_view.ts", "20-40",
+             "render keys 'current' off item_seq"),
+]
+BUNDLES_WITH_FE = [
+    {"axis_id": "BE",
+     "code_snippets": [{"file": "db/workflow_sequences.py", "lines": "45-57",
+                        "text": "def get_effective_head(): ORDER BY ..."}],
+     "call_chain": []},
+    {"axis_id": "FE",
+     "code_snippets": [{"file": "client/src/workflow_view.ts", "lines": "20-40",
+                        "text": "renderWorkflowBar: order by item_seq"}],
+     "call_chain": [{"file": "client/src/workflow_view.ts", "lines": "20-40",
+                     "text": "renderWorkflowBar(items) { items.sort(byItemSeq) }",
+                     "via": "call-chain"}]},
+]
+# The redirect re-pass lands the defect on the FE render locus — proving a leadless
+# refutation became a deterministic redirect rather than a punt.
+FE_REDIRECT_OUT = json.dumps({
+    "converged": True,
+    "path": [{"node": "fe", "file": "client/src/workflow_view.ts", "lines": "20-40",
+              "symbol": "renderWorkflowBar"}],
+    "attributed_defect": {"node": "fe", "file": "client/src/workflow_view.ts",
+                          "lines": "20-40",
+                          "why": "render keys 'current' off item_seq, skipping the "
+                                 "sort_order-0 memo"},
+    "causal_check": {
+        "verdict": "consistent",
+        "data_state_assumptions": ["memo sort_order 0 but highest item_seq"],
+        "trace": "workflow_view.ts orders the render by item_seq, painting the memo "
+                 "done — reproduces the observed skip.",
+        "counterfactual": "keying the render by sort_order removes the skip because the "
+                          "memo stays current",
+        "refuted_peers": [{"file": "db/workflow_sequences.py", "lines": "45-57",
+                           "why_not": "the query was causally contradicted before "
+                                      "redirecting"}],
+        "need_data_state": []},
+    "missing_link": None,
+})
+
 # Outcome depends on stored row state the static evidence cannot determine.
 UNDECIDABLE_OUT = json.dumps({
     "converged": True,
@@ -763,6 +808,58 @@ class TestConvergeDataRead(unittest.TestCase):
         self.assertTrue(res.converged)                      # adopted the redirect
         self.assertEqual(res.attributed_defect["node"], "fe")
         self.assertIn("workflow_bar", res.attributed_defect["file"])
+
+    def test_leadless_contradiction_with_fe_locus_restitches_to_fe(self):
+        """M035: a contradicted backend node with NO model lead, but a LOCATED FE render
+        locus exists ⇒ deterministically re-stitch with the refuted node excluded and land
+        the defect on the FE locus — closing the punt without a new retrieve."""
+        outs = [_wr(CONTRADICTED_OUT), _wr(FE_REDIRECT_OUT)]
+        with mock.patch.object(C, "call_worker", side_effect=outs) as cw, \
+             mock.patch.object(C, "retrieve_followup") as rf:
+            res = C.run_converge(seed_text="R-head bar skips M, shows DS",
+                                 verdicts=LOCATED_WITH_FE, bundles=BUNDLES_WITH_FE,
+                                 provider="deepinfra", model="m", code_root="/repo")
+        rf.assert_not_called()                  # redirect re-stitch uses NO new retrieve
+        self.assertEqual(cw.call_count, 2)      # 1st + redirect re-stitch
+        self.assertTrue(res.converged)
+        self.assertEqual(res.attributed_defect["node"], "fe")
+        self.assertIn("workflow_view", res.attributed_defect["file"])
+
+    def test_leadless_contradiction_without_fe_locus_dead_ends(self):
+        """Cost discipline: a leadless contradiction with NO FE alternative does NOT
+        re-stitch — a single call, honest dead-end (the existing N170 posture)."""
+        with mock.patch.object(C, "call_worker",
+                               return_value=_wr(CONTRADICTED_OUT)) as cw, \
+             mock.patch.object(C, "retrieve_followup") as rf:
+            res = C.run_converge(seed_text="s", verdicts=LOCATED_VERDICTS,
+                                 bundles=BUNDLES, provider="deepinfra", model="m",
+                                 code_root="/repo")
+        rf.assert_not_called()
+        self.assertEqual(cw.call_count, 1)
+        self.assertFalse(res.converged)
+
+    def test_redirect_restitch_kill_switch(self):
+        """HIVE_NO_REDIRECT_RESTITCH disables the redirect re-stitch entirely."""
+        with mock.patch.dict(os.environ, {"HIVE_NO_REDIRECT_RESTITCH": "1"}), \
+             mock.patch.object(C, "call_worker",
+                               return_value=_wr(CONTRADICTED_OUT)) as cw:
+            res = C.run_converge(seed_text="s", verdicts=LOCATED_WITH_FE,
+                                 bundles=BUNDLES_WITH_FE, provider="deepinfra",
+                                 model="m", code_root="/repo")
+        self.assertEqual(cw.call_count, 1)
+        self.assertFalse(res.converged)
+
+    def test_redirect_restitch_that_fails_keeps_refuted_result(self):
+        """A redirect re-stitch that still cannot converge ⇒ keep the 1st (refuted)
+        result, reported honestly as not-converged — never PROMOTE on a failed redirect."""
+        with mock.patch.object(
+                C, "call_worker",
+                side_effect=[_wr(CONTRADICTED_OUT), _wr(CONTRADICTED_OUT)]) as cw:
+            res = C.run_converge(seed_text="s", verdicts=LOCATED_WITH_FE,
+                                 bundles=BUNDLES_WITH_FE, provider="deepinfra",
+                                 model="m", code_root="/repo")
+        self.assertEqual(cw.call_count, 2)      # tried the re-stitch
+        self.assertFalse(res.converged)         # did not adopt a non-converged pass
 
     def test_converged_claim_without_node_is_demoted(self):
         out = json.dumps({"converged": True, "path": [],

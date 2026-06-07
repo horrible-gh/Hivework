@@ -1338,17 +1338,45 @@ def _rebuild_bundles(verdicts: list[dict[str, Any]], code_root: str | None,
     return bundles
 
 
+def _norm_locus(p: str) -> str:
+    return (p or "").replace("\\", "/").strip().strip("/").lower()
+
+
+def _locus_aligns(a: str, b: str) -> bool:
+    """Path-segment-aligned equality/suffix match (handles abs↔rel, basename-degrade)."""
+    a, b = _norm_locus(a), _norm_locus(b)
+    return bool(a) and bool(b) and (a == b or a.endswith("/" + b) or b.endswith("/" + a))
+
+
 def _rerun_converge(result: dict[str, Any], seed_text: str, *, code_root: str | None,
                     docs_root: str | None, cfg, ledger, provider_kwargs,
-                    honey_out: str | None) -> dict[str, Any] | None:
+                    honey_out: str | None,
+                    exclude_loci: list[dict[str, Any]] | None = None
+                    ) -> dict[str, Any] | None:
     """Reaction #3 (ineffective/inconclusive): re-stitch on LIVE-re-grounded evidence.
 
     Re-derives each axis's bundle from the current source (free local retrieve) and re-runs
     ``converge`` so its causal gate rules on TODAY's code, not the first pass's compacted
     snippets (the N177 live-grounding lever, applied at the reaction edge). Updates
     ``result['converge']``, re-renders the local honey to ``honey_out``, and returns the
-    updated result — or ``None`` when there is nothing to re-stitch (<2 located)."""
+    updated result — or ``None`` when there is nothing to re-stitch (<2 located).
+
+    ``exclude_loci`` (M035 ⑥→④): loci specify refuted against live code. They are DROPPED
+    from the verdicts before re-converging so the re-stitch cannot re-crown the disproven
+    node and must attribute to a surviving candidate (the FE render locus). The drop is by
+    path-aligned file match; a verdict on any other file is kept."""
     verdicts = list(result.get("verdicts") or [])
+    if exclude_loci:
+        ex_files = [_norm_locus(x.get("file", "")) for x in exclude_loci if x.get("file")]
+        kept = [v for v in verdicts
+                if not any(_locus_aligns((v.get("verdict") or {}).get("file", ""), ef)
+                           for ef in ex_files)]
+        dropped = len(verdicts) - len(kept)
+        if dropped:
+            logger.info("reinvestigation live: re-converge EXCLUDING %d refuted locus/loci "
+                        "%s (specify ⑥→④ feedback)", dropped,
+                        [x.get("file") for x in exclude_loci])
+            verdicts = kept
     located = [v for v in verdicts if (v.get("verdict") or {}).get("located")]
     if len(located) < 2:
         logger.info("reinvestigation live: <2 located verdict(s) on re-run — "
@@ -1395,7 +1423,8 @@ def rerun_reinvestigation(plan, result: dict[str, Any], *, seed_text: str,
     if plan.action == "re_converge":
         return _rerun_converge(result, seed_text, code_root=code_root, docs_root=docs_root,
                                cfg=cfg, ledger=ledger, provider_kwargs=provider_kwargs,
-                               honey_out=honey_out)
+                               honey_out=honey_out,
+                               exclude_loci=getattr(plan, "exclude_loci", None))
     if plan.action == "re_retrieve":
         logger.info("reinvestigation live: re_retrieve re-judge not yet wired (needs the "
                     "per-axis judge core extracted) — plan stands on axes %s, no spend",
