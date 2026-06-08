@@ -93,6 +93,22 @@ class RoleConfig:
     timeout_sec: int | None = None
     retries: int = 0
 
+    def worker_timeout(self, base_default: int = 300) -> int:
+        """Effective subprocess timeout (seconds) for this role's worker call.
+
+        An explicit ``timeout_sec`` always wins. Otherwise the default is
+        provider-aware: ``codex`` is a slow agentic CLI whose queen/specify
+        explorations routinely run 150–290s and tip over a flat 300s wall once
+        parallel batch load starves the single serialized codex slot
+        (ledger-observed: queen avg 158s, max 290s, intermittent 300s
+        TimeoutExpired). Give it a roomier default so a legitimately-slow run
+        completes instead of being killed and retried; fast providers (copilot,
+        the HTTP endpoint) keep the lean ``base_default``.
+        """
+        if self.timeout_sec is not None:
+            return self.timeout_sec
+        return 600 if self.provider == "codex" else base_default
+
 
 @dataclass
 class CopilotConfig:
@@ -127,9 +143,16 @@ class CodexConfig:
     seconds: how long a queued codex call sits behind others before giving up with
     a TimeoutError (a safety bound so a stuck holder can't hang a batch overnight).
     An explicit, operator-visible number — change it here, not in code.
+
+    Default 3600 (1h), not 1800: codex per-call timeouts are now roomier (queen
+    600s via worker_timeout, specify up to ~800s observed), so under a parallel
+    batch the SINGLE serialized codex slot can have a legitimate queue whose total
+    wait exceeds 30min — a 1800s bound killed honest waiters mid-queue (ledger:
+    "lock not acquired within 1800s"). 3600s absorbs a realistic overnight queue
+    while still bounding a genuinely stuck holder.
     """
     exe: str | None = None
-    lock_timeout_sec: int = 1800
+    lock_timeout_sec: int = 3600
 
 
 @dataclass
@@ -840,7 +863,7 @@ def load_config(path: str | None = None, profile: str | None = None) -> Config:
         ),
         codex=CodexConfig(
             exe=codex_raw.get("exe"),
-            lock_timeout_sec=int(codex_raw.get("lock_timeout_sec", 1800)),
+            lock_timeout_sec=int(codex_raw.get("lock_timeout_sec", 3600)),
         ),
         openai=OpenAiConfig(
             base_url=str(openai_raw.get("base_url",

@@ -6,6 +6,35 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from hive.config import load_config, Config, RoleConfig, _DEFAULTS
 
 
+class TestRoleWorkerTimeout(unittest.TestCase):
+    """RoleConfig.worker_timeout — provider-aware subprocess timeout default.
+
+    Locks in the A1 fix: codex (slow agentic CLI hugging the 300s wall under
+    parallel load) gets a roomier default than fast providers, and an explicit
+    timeout_sec always wins.
+    """
+
+    def test_explicit_timeout_sec_always_wins(self):
+        self.assertEqual(
+            RoleConfig(provider="codex", timeout_sec=450).worker_timeout(), 450)
+        self.assertEqual(
+            RoleConfig(provider="copilot", timeout_sec=120).worker_timeout(), 120)
+
+    def test_codex_default_is_roomier(self):
+        self.assertEqual(RoleConfig(provider="codex").worker_timeout(), 600)
+
+    def test_fast_provider_keeps_base_default(self):
+        self.assertEqual(RoleConfig(provider="copilot").worker_timeout(), 300)
+        self.assertEqual(RoleConfig(provider="deepinfra").worker_timeout(), 300)
+
+    def test_base_default_is_overridable(self):
+        self.assertEqual(
+            RoleConfig(provider="copilot").worker_timeout(base_default=180), 180)
+        # codex ignores base_default (uses its own roomier default)
+        self.assertEqual(
+            RoleConfig(provider="codex").worker_timeout(base_default=180), 600)
+
+
 class TestConfigDefaults(unittest.TestCase):
     """With no file, defaults must reproduce today's behavior."""
 
