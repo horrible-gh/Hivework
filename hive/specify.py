@@ -116,8 +116,7 @@ _LIVE_REFUTED_RE = re.compile(
     r"not\s+present\s+in\s+(?:the\s+)?live|"
     r"\brefuted\b|\bdisproven\b|\bdisproved\b|contradicted\s+by\s+(?:the\s+)?live|"
     r"does\s+not\s+(?:match|appear|exist)\s+in\s+(?:the\s+)?live|"
-    r"live\s+code\s+(?:shows|proves)[^.]*\bnot\b|"
-    r"라이브(?:\s*코드)?(?:에서)?[^.]*(?:반박|반증)|반박됨|반증됨|관측되지\s*않",
+    r"live\s+code\s+(?:shows|proves)[^.]*\bnot\b",
     re.IGNORECASE)
 
 # ── Structured reinvestigation reason codes (Step A) ───────────────────────────
@@ -2508,7 +2507,7 @@ def _deferred_is_live_refuted(d: dict[str, Any]) -> bool:
     """True when a deferred item's OWN text shows the claim was refuted by live code.
 
     Scans the deferral's ``issue`` / ``reason`` / ``evidence`` for a refutation marker
-    (e.g. "not observed in live code", "refuted", Korean 라이브 코드에서 … 반박). Such a
+    (e.g. "not observed in live code", "refuted"). Such a
     deferral is a disproven hypothesis, not a substantive punted fix — see
     ``_LIVE_REFUTED_RE``. Pure-local, never raises.
     """

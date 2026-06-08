@@ -1174,13 +1174,6 @@ class TestDeferredSubstanceGate(unittest.TestCase):
         self.assertEqual(spec["termination"], "ready_to_apply")
         self.assertNotIn("reinvestigation", spec)
 
-    def test_live_refuted_korean_evidence_does_not_downgrade(self):
-        spec = specify._apply_deferred_substance_gate(self._ready([{
-            "issue": "shape mismatch 주장", "reason": "multi_file_design",
-            "evidence": ["라이브 코드에서 {id,label} 매핑이 확인되어 반박됨"],
-        }]))
-        self.assertEqual(spec["termination"], "ready_to_apply")
-
     def test_substantive_deferral_without_refutation_still_downgrades(self):
         # Guard the N176 protection survives: a genuine punt (no refutation marker) still
         # downgrades.
