@@ -67,10 +67,10 @@ python perf/run_sweep.py
 #    부분만:  python perf/run_sweep.py --only judge-up,judge-base,judge-down
 ```
 
-실행 환경 예:
+실행 환경 예 (토큰은 `hive.py`가 `~/.hivework/.env`에서 자동 로드 — 별도 시크릿 호출 불필요):
 
 ```powershell
-cmd /c call %USERPROFILE%\.ai_launcher_secrets.bat && .venv\Scripts\python perf\run_sweep.py --smoke
+.venv\Scripts\python perf\run_sweep.py --smoke
 ```
 
 결과: `perf/results/<cell>/<rep>/` (verdict/honey, log, result.json) + 셀별 `ledger.db` +

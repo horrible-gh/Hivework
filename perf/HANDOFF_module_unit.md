@@ -90,7 +90,7 @@ specify+review를 덧붙일 뿐. 그래서 queen/judge/converge/scout 셀은 싸
 - **본 스윕(유료)은 사용자 승인 전 실행 금지.** smoke/dry-run만 무승인 OK.
 - smoke 모델 = `openai/gpt-oss-20b` (matrix.smoke_model). 연결 확인용.
 - `gpt-5-mini`는 deepinfra에 없음 → 해당 "보통" 행은 **provider=copilot**(matrix corrections 참조).
-- 실행 환경: copilot 토큰 + .venv 필요. `cmd /c call %USERPROFILE%\.ai_launcher_secrets.bat && .venv\Scripts\python perf\run_sweep.py --smoke`.
+- 실행 환경: copilot 토큰 + .venv 필요. 토큰은 `hive.py`가 `~/.hivework/.env`에서 자동 로드(별도 시크릿 호출 불필요): `.venv\Scripts\python perf\run_sweep.py --smoke`.
 - 대상 브랜치 `FlowGate-dev/branches/20260607`(되돌린 버그 상태), baseline_sha `fc2a26e`.
   reset 가드: work tree ∧ 경로에 `20260607` 포함 아니면 중단.
 
