@@ -19,7 +19,11 @@
       "max_calls_per_axis": 2, "max_total_calls": 0,
       "_comment": "votes_per_axis ~5 = best-of-N voting; max_total_calls 0 = unlimited. max_parallel = V, max_axes = 2 x V, max_total_calls = 0.8 x V x max_axes."
     },
-    "converge": { "split": { "enabled": false, "max_loci": 4, "_comment": "model omitted = reuse roles.converge." } },
+    "converge": {
+      "split": { "enabled": false, "max_loci": 4, "_comment": "model omitted = reuse roles.converge." },
+      "lens": { "enabled": false, "lenses": ["datasource-liveness", "omission", "reproduction"], "min_refute": 0,
+                "_comment": "Adversarial best-of-N refutation of a CONSISTENT converge attribution. Each lens = ONE swarm call (provider/model omitted = reuse roles.swarm, the 120b tier); a majority refutation demotes converged->False (routes to reinvestigation). OFF by default; kill at runtime with HIVE_NO_LENS_REFUTE." }
+    },
     "reinforce": { "enabled": false, "max_workers": 2, "max_total_calls": 4,
                    "_comment": "Worker = roles.scout. OFF by default." },
     "reinvestigation": { "live": false, "max_rounds": 2,

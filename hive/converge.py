@@ -82,6 +82,45 @@ _JSON_ONLY_REMINDER = (
     "explanation, no markdown code fences, nothing before or after it."
 )
 
+# ── Adversarial LENS refutation (swarm best-of-N at converge) ─────────────────────
+# converge's causal_check is best-of-1: ONE cheap single-shot rules consistent/contradicted
+# over compacted evidence. It WOBBLES at depth (right call chain, wrong node — store.py vs
+# process_service) and is blind to OMISSION/SHADOW it was never shown (a dead/legacy route a
+# sibling overrides, a field the fix leaves missing). judge already de-risks its own noise
+# with best-of-N UNION voting; converge had no equivalent. This is it — pointed the OTHER
+# way: when converge ships an ACTIONABLE ``consistent`` attribution, N INDEPENDENT refuters
+# (the cheap swarm tier, e.g. gpt-oss-120b), EACH through a DISTINCT lens, try to REFUTE it.
+# A majority refutation DEMOTES converged→False so a wobbly/omission/shadow attribution never
+# ships as a fix — it routes to reinvestigation instead. Runs ONCE on the FINAL adopted
+# attribution (NOT the data-read / missing-link inner re-passes), so the added cost is
+# EXACTLY ``len(lenses)`` swarm calls per actionable converge, and ZERO when the lens set is
+# empty (opt-in) or the verdict was not an actionable ``consistent``. Kill: HIVE_NO_LENS_REFUTE.
+_LENS_MAX_EVIDENCE = 12        # evidence windows shown to a refuter (tighter than converge's 24)
+
+# The distinct refutation angles. Each maps to one confirmed converge failure class, so a
+# panel of all three covers shadow + omission + wobble. A lens NOT in this map still runs
+# with a generic "refute on <name> grounds" instruction (config may add bespoke lenses).
+_LENS_DEFINITIONS: dict[str, str] = {
+    "datasource-liveness": (
+        "Is the attributed locus actually ON the LIVE executed path for THIS scenario, or is "
+        "it shadowed / dead / legacy code that the real live route overrides? If a DIFFERENT "
+        "module, registration, or handler serves this request FIRST (so this locus never runs "
+        "for the reported case), the attribution is REFUTED — name the live path that wins."),
+    "omission": (
+        "Would correcting ONLY this locus FULLY remove the symptom, or is something that "
+        "SHOULD exist still MISSING elsewhere on the path — an absent field/key, branch, "
+        "registration, or handler the edit here does not add? A defect of OMISSION cannot be "
+        "fixed by changing a node that is present; if the real gap is a missing element the "
+        "attributed edit would not create, REFUTE and say what is absent."),
+    "reproduction": (
+        "Under the CONCRETE data/scenario state the seed forces, does the attributed code "
+        "ACTUALLY produce the reported symptom, and would correcting it remove the symptom — "
+        "by the mechanism visible in the live code, NOT a paraphrase of the symptom? If the "
+        "code already yields the EXPECTED output under the only state the scenario allows "
+        "(e.g. the rows tie so a later branch never decides), the cause contradicts the "
+        "symptom — REFUTE."),
+}
+
 
 @dataclass
 class ConvergeResult:
@@ -130,6 +169,12 @@ class ConvergeResult:
     # Unlike ``path`` (model-authored), this is free local grounding and is safe for
     # specify's on-path gate to consume.
     winning_path: list[dict[str, Any]] = field(default_factory=list)
+    # Adversarial LENS refutation panel result (swarm best-of-N). Empty when the panel
+    # did not run (disabled, or the verdict was not an actionable ``consistent``). When it
+    # DID run it records ``{lenses, votes, refuted_votes, of, threshold, verdict}``; a
+    # ``verdict == "refuted"`` means a majority of the distinct lenses broke the attribution
+    # and ``converged`` was demoted to False (routed to reinvestigation, not an edit).
+    lens_check: dict[str, Any] = field(default_factory=dict)
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -144,6 +189,7 @@ class ConvergeResult:
             "data_state_backed": self.data_state_backed,
             "data_state_attempted": self.data_state_attempted,
             "winning_path": self.winning_path,
+            "lens_check": self.lens_check,
         }
 
 
@@ -305,6 +351,68 @@ def _winning_producer_loci(nodes: list[dict[str, Any]]) -> list[dict[str, Any]]:
             },
         })
     return out
+
+
+# ── Omission nominator: winning-path gap (① negative-space probe) ────────────────
+# converge attributes among the LOCATED fragments and reasons over the UNION of what the
+# per-axis judges retrieved. It therefore cannot, by construction, attribute to a node NO
+# axis located — the located set can never reveal what is ABSENT from it. The deterministic
+# ``winning_path`` (route→producer proof) is the should-exist set: any winning-path node whose
+# file no located/known fragment covers is a live hop converge never saw — the omission/
+# coverage gap. Diffing winning_path AGAINST located names that uncovered node, which the
+# existing free scoped re-retrieve then fetches so a re-converge can reach it. Free,
+# deterministic, never raises. (The deepest winning producer is already LIFTED into located
+# upstream, so in practice this surfaces uncovered HANDLER / response-call hops — exactly the
+# nodes the located-only stitch is blind to.) Kill via HIVE_NO_OMISSION_LEAD at the call site.
+_OMISSION_ROLE_RANK = {"producer": 0, "response-call": 1, "handler": 2}
+
+
+def _winning_path_omission(winning_path: list[dict[str, Any]],
+                           located: list[dict[str, Any]],
+                           known: set[str]) -> dict[str, Any] | None:
+    """Name the deepest winning-path node uncovered by any located/known fragment.
+
+    Returns a ``missing_link``-shaped dict ``{between, need:{symbols, greps, file_globs}}``
+    scoping a re-retrieve to that node, or None when the winning path is empty or every
+    node is already covered. Pure, deterministic, never raises.
+    """
+    if not winning_path:
+        return None
+    covered: set[str] = set()
+    for v in located or []:
+        f = _norm((v.get("verdict") or {}).get("file", ""))
+        if f:
+            covered.add(f)
+    for k in known or set():
+        nk = _norm(k)
+        if nk:
+            covered.add(nk)
+
+    cands: list[dict[str, Any]] = []
+    for node in winning_path:
+        role = node.get("role", "")
+        if role not in _OMISSION_ROLE_RANK:   # skip client nodes — not a server-side cause site
+            continue
+        nf = _norm(node.get("file", ""))
+        if not nf or any(_aligns(nf, c) for c in covered):
+            continue
+        cands.append(node)
+    if not cands:
+        return None
+    node = sorted(cands, key=lambda n: (_OMISSION_ROLE_RANK.get(n.get("role", ""), 9),
+                                        -int(n.get("depth", 0) or 0)))[0]
+    sym = str(node.get("symbol", "") or "").strip()
+    url = str(node.get("url", "") or "")
+    seg = url.rstrip("/").rsplit("/", 1)[-1] if url else ""
+    greps = [g for g in (sym, seg) if g]
+    return {
+        "between": ["winning-path", str(node.get("role", "node") or "node")],
+        "need": {
+            "symbols": [sym] if sym else [],
+            "greps": greps,
+            "file_globs": [str(node.get("file", "") or "")],
+        },
+    }
 
 
 # ── Live-code grounding (N177) ──────────────────────────────────────────────────
@@ -2895,6 +3003,149 @@ def _split_converge(seed_text: str, located: list[dict[str, Any]],
     return res
 
 
+def _build_lens_prompt(seed_text: str, attributed: dict[str, Any],
+                       causal_check: dict[str, Any] | None, lens: str, lens_desc: str,
+                       code_state_block: str, evidence: str) -> str:
+    """One adversarial refutation prompt: break the attribution through ONE lens."""
+    cc = causal_check or {}
+    return f"""[Role] You are a REFUTER auditing a Hivework converge result. Another model \
+attributed a reported defect to ONE code locus and ruled it the cause. Your ONLY job is to \
+try to PROVE that attribution WRONG, strictly through the {lens} lens. You are adversarial: \
+unless YOUR lens positively confirms the attribution holds, you REFUTE it. Default to \
+refuted=true when uncertain — a false "survives" ships a wrong fix to a human; a false \
+"refuted" only costs one more re-hunt. You have NO tools; decide from the evidence below.
+
+[The {lens} lens] {lens_desc}
+
+[Reported scenario / seed]
+{_trunc(seed_text, 1500)}
+
+[Attributed defect — the claim you must try to break]
+{attributed.get('file', '')}:{attributed.get('lines', '')} — {attributed.get('why', '')}
+
+[The converger's own causal reasoning]
+trace: {_trunc(cc.get('trace', '') or '(none)', 600)}
+counterfactual: {_trunc(cc.get('counterfactual', '') or '(none)', 400)}
+
+[Confirmed live code at the attributed locus]
+{code_state_block.strip() or '(none lifted)'}
+
+[Pooled evidence windows]
+{evidence}
+
+[Output contract] Output ONLY this JSON object — no prose, no fences, nothing else:
+{{ "refuted": true, "why": "<one line: the concrete {lens} reason the attribution does NOT survive — or, if it does survive, set refuted=false and say why it holds>" }}
+"""
+
+
+def _lens_refute_once(prompt: str, provider: str, model: str, pk: dict[str, Any],
+                      ledger, timeout: int, lens: str) -> dict[str, Any] | None:
+    """One refuter model call (with a JSON-only reparse). Never raises; None on no JSON.
+
+    Recorded to the ledger under the ``swarm`` role so the cost lands in the cheap-tier
+    accounting (these are swarm-tier 120b calls, not the premium converge call).
+    """
+    attempt_prompt = prompt
+    parsed: dict[str, Any] | None = None
+    for attempt in range(2):
+        call_id = ledger.begin_call("swarm", f"lens:{lens}", provider, model,
+                                    attempt_prompt) if ledger is not None else None
+        try:
+            wr = call_worker(provider, model, attempt_prompt, cwd=None, timeout=timeout,
+                             on_start=(lambda: ledger.mark_running(call_id))
+                             if (ledger is not None and call_id is not None) else None,
+                             **pk)
+        except Exception as e:
+            logger.warning("converge: lens %s worker failed: %s", lens, e)
+            if ledger is not None:
+                ledger.finish_call(call_id, output="", latency_s=0.0, ok=False,
+                                   err=str(e)[:200])
+            return None
+        if ledger is not None:
+            ledger.finish_call(call_id, output=wr.stdout, latency_s=wr.latency_s,
+                               ok=wr.exit_code == 0,
+                               err=wr.stderr[:200] if wr.exit_code != 0 else "",
+                               real_tokens=wr.real_tokens)
+        try:
+            parsed = extract_first_json(wr.stdout)
+            break
+        except ValueError:
+            if attempt == 0:
+                attempt_prompt = prompt + _JSON_ONLY_REMINDER
+            else:
+                logger.warning("converge: lens %s — no parseable JSON after retry", lens)
+    return parsed if isinstance(parsed, dict) else None
+
+
+def _lens_refute(res: ConvergeResult, seed_text: str, located: list[dict[str, Any]],
+                 windows: list[dict[str, Any]], code_state_block: str,
+                 lenses: list[str], provider: str, model: str, pk: dict[str, Any],
+                 ledger, timeout: int, min_refute: int) -> ConvergeResult:
+    """Adversarial best-of-N lens refutation of an ACTIONABLE converge attribution.
+
+    Assumes the caller already gated on ``res`` being a converged, causal-``consistent``
+    attribution with a file. Runs ONE refuter per lens; a refuter that fails to parse
+    ABSTAINS (counts as "survives") so the panel can only demote on a REAL majority — never
+    on a flaky call. A majority (``min_refute`` votes, or simple majority when 0) demotes
+    ``converged`` to False and stamps ``res.lens_check``. Never raises.
+    """
+    attributed = res.attributed_defect or {}
+    ev_lines: list[str] = []
+    for w in (windows or [])[:_LENS_MAX_EVIDENCE]:
+        ev_lines.append(f"--- {w.get('file')}:{w.get('lines')}")
+        ev_lines.append(_trunc(w.get("text", ""), _EVIDENCE_CHARS))
+    evidence = "\n".join(ev_lines) or "(no evidence windows)"
+
+    votes: list[dict[str, Any]] = []
+    for lens in lenses:
+        desc = _LENS_DEFINITIONS.get(lens) or \
+            f"Try to refute the attribution on {lens} grounds; default to refuted when unsure."
+        prompt = _build_lens_prompt(seed_text, attributed, res.causal_check, lens, desc,
+                                    code_state_block, evidence)
+        parsed = _lens_refute_once(prompt, provider, model, pk, ledger, timeout, lens)
+        refuted = bool(parsed.get("refuted")) if isinstance(parsed, dict) else False
+        why = str(parsed.get("why", "") or "") if isinstance(parsed, dict) else ""
+        votes.append({"lens": lens, "refuted": refuted, "why": why,
+                      "answered": parsed is not None})
+
+    n = len(votes)
+    refutes = [v for v in votes if v["refuted"]]
+    threshold = min_refute if (min_refute and min_refute > 0) else (n // 2 + 1)
+    demoted = n > 0 and len(refutes) >= threshold
+    res.lens_check = {
+        "lenses": [v["lens"] for v in votes],
+        "votes": votes,
+        "refuted_votes": len(refutes),
+        "of": n,
+        "threshold": threshold,
+        "verdict": "refuted" if demoted else "survived",
+    }
+    if demoted:
+        res.converged = False
+        # Neutralize the causal verdict too: a refuted attribution must NOT keep a
+        # ``consistent`` stamp. The honey writes ``causal_verdict`` into its attribution
+        # marker INDEPENDENTLY of ``converged``, and downstream gates (e.g. specify's
+        # _apply_layer_consistency_gate) key off ``causal_verdict == "consistent"`` alone —
+        # leaving it consistent would let the refuted locus still be trusted, bypassing this
+        # demotion. The lenses proved the code does not produce the symptom, which is exactly
+        # this codebase's definition of ``contradicted``; stamp it so the refutation is
+        # honored end to end. ``lens_refuted`` marks WHY (vs a model-authored contradiction).
+        if isinstance(res.causal_check, dict):
+            res.causal_check["verdict"] = "contradicted"
+            res.causal_check["lens_refuted"] = True
+        reasons = "; ".join(f"[{v['lens']}] {v['why']}" for v in refutes if v["why"])
+        res.summary = _trunc(
+            (res.summary or "") + f" | LENS-REFUTED {len(refutes)}/{n}: " + reasons, 1000)
+        logger.info("converge: lens panel REFUTED attribution %s:%s (%d/%d ≥ %d) — "
+                    "demoting converged→False (routed to reinvestigation)",
+                    attributed.get("file"), attributed.get("lines"),
+                    len(refutes), n, threshold)
+    else:
+        logger.info("converge: lens panel — attribution SURVIVED (%d/%d refuted, need %d)",
+                    len(refutes), n, threshold)
+    return res
+
+
 def run_converge(*, seed_text: str, verdicts: list[dict[str, Any]],
                  bundles: list[dict[str, Any]], provider: str, model: str,
                  code_root: str | None = None, ledger=None,
@@ -2902,7 +3153,9 @@ def run_converge(*, seed_text: str, verdicts: list[dict[str, Any]],
                  min_located: int = 2, max_calls: int = 2,
                  k: int = 6, max_hops: int = 2, db_conn=None,
                  split_enabled: bool = False, split_max_loci: int = 4,
-                 split_provider: str = "", split_model: str = "") -> ConvergeResult:
+                 split_provider: str = "", split_model: str = "",
+                 lens_lenses: list[str] | None = None, lens_provider: str = "",
+                 lens_model: str = "", lens_min_refute: int = 0) -> ConvergeResult:
     """Stitch the per-axis verdicts into one path. Tool-OFF; never raises.
 
     Budget (mirrors judge's retrieve→re-judge): ONE converge call, plus — ONLY when
@@ -3170,6 +3423,55 @@ def run_converge(*, seed_text: str, verdicts: list[dict[str, Any]],
             if res2.converged:
                 res = res2
 
+    # ── Deterministic OMISSION nominator (winning-path gap, ①). LAST deterministic fallback,
+    # after the model's own missing-link re-pass AND the M035 contradiction-redirect have both
+    # had their turn. A still-unconverged result with NO named lead may simply be BLIND to the
+    # real node: the proven winning HTTP path runs through a hop NO axis located, so the cause
+    # cannot be among the located fragments converge reasoned over (the located set never
+    # reveals what is absent from it). Diff winning_path (should-exist) against located/known,
+    # name the uncovered live node as a missing_link, then run the SAME free scoped re-retrieve
+    # over it and re-converge — the negative-space probe the located-only stitch structurally
+    # cannot do. Adopts only on a real convergence; else leaves the named lead for honey /
+    # reinvestigation (better-aimed than a blank re-ask). Kill via HIVE_NO_OMISSION_LEAD.
+    if (not res.converged and not res.missing_link
+            and not os.environ.get("HIVE_NO_OMISSION_LEAD")):
+        omission = _winning_path_omission(winning_path, located, known)
+        if omission:
+            res.missing_link = omission
+            need_d = omission.get("need") or {}
+            logger.info("converge: omission nominator — winning-path node %s uncovered by any "
+                        "located fragment; synthesized missing_link lead",
+                        need_d.get("file_globs"))
+            if code_root and max_calls > 1:
+                need = FollowupNeed(
+                    axis_id="CONVERGE_OMISSION",
+                    symbols=[str(s) for s in (need_d.get("symbols") or [])],
+                    greps=[str(g) for g in (need_d.get("greps") or [])],
+                    file_globs=[str(g) for g in (need_d.get("file_globs") or [])])
+                try:
+                    fu = retrieve_followup(need, code_root, k=k, max_hops=max_hops)
+                except Exception as e:  # local retrieve must never crash converge
+                    logger.warning("converge: omission follow-up retrieve failed: %s", e)
+                    fu = None
+                if fu:
+                    extra = list(fu.get("seeds") or []) + list(fu.get("call_chain") or [])
+                    merged = _dedup_windows(extra + windows)
+                    known2 = known | {_norm(w.get("file", "")) for w in extra if w.get("file")}
+                    res2 = _converge_once(seed_text, located, unlocated, merged, known2,
+                                          provider, model, pk, ledger, timeout,
+                                          data_state_block=data_block,
+                                          db_available=db_available, db_schema=db_schema,
+                                          code_state_block=_lift_live_code(located, code_root)
+                                          or code_state_block,
+                                          http_binding_block=_http_binding_bridges(
+                                              located, merged, code_root) or http_binding_block,
+                                          fragment_fact_block=_fragment_fact_cards(
+                                              located, merged, bundles, code_root)
+                                          or fragment_fact_block)
+                    logger.info("converge: omission re-pass → %s", res2.summary)
+                    if res2.converged:
+                        res = res2
+
     # When the split pass produced this result, the holistic data loop above no-op'd, so
     # the local data_* vars are still their False defaults. Reflect the WINNER's actual
     # read state (captured per-locus inside the split) so the trailing guards see the truth
@@ -3211,4 +3513,30 @@ def run_converge(*, seed_text: str, verdicts: list[dict[str, Any]],
         res.data_state_block = data_block
         res.data_state_backed = data_backed
     res.winning_path = winning_path
+
+    # ── Adversarial LENS refutation (swarm best-of-N) — the converge analog of judge's
+    # best-of-N, pointed at REFUTATION. Runs ONCE on the FINAL adopted attribution and ONLY
+    # when it is actionable (converged + causal ``consistent`` + an attributed file). N
+    # independent refuters, each through a DISTINCT lens, try to break it; a majority demotes
+    # converged→False so a wobbly / omission / shadow attribution routes to reinvestigation
+    # instead of shipping as a fix. Added cost = exactly ``len(lenses)`` swarm calls; zero
+    # when the lens set is empty (opt-in) or the verdict was not consistent. Kill-switch env
+    # HIVE_NO_LENS_REFUTE. Never crashes converge — a failing panel keeps the attribution.
+    lenses = [str(x) for x in (lens_lenses or []) if str(x).strip()]
+    if (lenses and not os.environ.get("HIVE_NO_LENS_REFUTE")
+            and res.converged
+            and (res.causal_check or {}).get("verdict") == "consistent"
+            and (res.attributed_defect or {}).get("file")):
+        lp = lens_provider or provider
+        lm = lens_model or model
+        logger.info("converge: lens refutation panel (%s/%s) — %d lens(es) over "
+                    "attribution %s:%s", lp, lm, len(lenses),
+                    (res.attributed_defect or {}).get("file"),
+                    (res.attributed_defect or {}).get("lines"))
+        try:
+            res = _lens_refute(res, seed_text, located, windows, code_state_block,
+                               lenses, lp, lm, pk, ledger, timeout, lens_min_refute)
+        except Exception as e:  # the adversarial layer must never crash converge
+            logger.warning("converge: lens panel failed (kept attribution): %s", e)
+
     return res

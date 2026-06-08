@@ -281,6 +281,212 @@ class TestRunConverge(unittest.TestCase):
         arbiter.assert_called_once()
 
 
+# ── Adversarial LENS refutation panel (swarm best-of-N at converge) ────────────
+_LENS_REFUTE = json.dumps({"refuted": True, "why": "a dead/legacy route overrides this"})
+_LENS_SURVIVE = json.dumps({"refuted": False, "why": "holds under the only allowed state"})
+
+# A converged, non-consistent (undecidable) attribution with no data_reads, no missing_link,
+# no FE peer — so it does NOT trigger the data loop / missing-link / redirect re-stitch and
+# lands as a plain not-converged result the lens gate must SKIP.
+_UNDECIDABLE_OUT = json.dumps({
+    "converged": False,
+    "path": [{"node": "db_fn", "file": "db/workflow_sequences.py", "lines": "45-57",
+              "symbol": "get_effective_head"}],
+    "attributed_defect": {"node": "db_fn", "file": "db/workflow_sequences.py",
+                          "lines": "45-57", "why": "suspected ORDER BY"},
+    "causal_check": {"verdict": "undecidable", "data_dependent": False,
+                     "data_state_assumptions": [], "trace": "depends on stored state",
+                     "counterfactual": "", "refuted_peers": [], "need_data_state": [],
+                     "data_reads": []},
+    "missing_link": None,
+})
+
+
+def _seq(*outs):
+    """A call_worker side_effect that returns each scripted stdout in order."""
+    it = iter(outs)
+
+    def fake(provider, model, prompt, cwd=None, timeout=300, **kw):
+        return _wr(next(it))
+
+    return fake
+
+
+class TestLensRefutation(unittest.TestCase):
+    """The lens panel adds exactly len(lenses) swarm calls on an actionable consistent
+    attribution, and a majority refutation demotes converged→False."""
+
+    def _run(self, *, lenses, scripted, **extra):
+        with mock.patch.object(C, "call_worker",
+                               side_effect=_seq(*scripted)) as cw:
+            res = C.run_converge(seed_text="head off-by-one", verdicts=LOCATED_VERDICTS,
+                                 bundles=BUNDLES, provider="prem", model="premM",
+                                 lens_lenses=lenses, lens_provider="swarm",
+                                 lens_model="120b", **extra)
+        return res, cw
+
+    def test_majority_refute_demotes_converged(self):
+        res, cw = self._run(lenses=["datasource-liveness", "omission"],
+                            scripted=[CONVERGED_OUT, _LENS_REFUTE, _LENS_REFUTE])
+        self.assertEqual(cw.call_count, 3)            # 1 premium converge + 2 swarm lenses
+        self.assertFalse(res.converged)               # demoted
+        self.assertEqual(res.lens_check["verdict"], "refuted")
+        self.assertEqual(res.lens_check["refuted_votes"], 2)
+        self.assertIn("LENS-REFUTED", res.summary)
+        # The causal verdict must be neutralized too (not left "consistent"), else the honey
+        # marker / specify gates would still trust the refuted locus, bypassing the demotion.
+        self.assertEqual(res.causal_check["verdict"], "contradicted")
+        self.assertTrue(res.causal_check.get("lens_refuted"))
+
+    def test_minority_refute_survives(self):
+        res, cw = self._run(lenses=["a", "b", "c"],
+                            scripted=[CONVERGED_OUT, _LENS_REFUTE, _LENS_SURVIVE,
+                                      _LENS_SURVIVE])
+        self.assertEqual(cw.call_count, 4)            # 1 + 3 lenses
+        self.assertTrue(res.converged)                # 1/3 < majority(2) → survives
+        self.assertEqual(res.lens_check["verdict"], "survived")
+        self.assertEqual(res.lens_check["refuted_votes"], 1)
+
+    def test_unparseable_lens_abstains_as_survive(self):
+        # 1 refute + 1 garbage (abstain) over 2 lenses → 1 < threshold 2 → survives.
+        res, _ = self._run(lenses=["a", "b"],
+                           scripted=[CONVERGED_OUT, _LENS_REFUTE, "not json at all"])
+        self.assertTrue(res.converged)
+        self.assertEqual(res.lens_check["refuted_votes"], 1)
+
+    def test_lens_calls_route_to_swarm_tier(self):
+        seen = []
+
+        def fake(provider, model, prompt, cwd=None, timeout=300, **kw):
+            seen.append((provider, model))
+            return _wr(CONVERGED_OUT if len(seen) == 1 else _LENS_SURVIVE)
+
+        with mock.patch.object(C, "call_worker", side_effect=fake):
+            C.run_converge(seed_text="s", verdicts=LOCATED_VERDICTS, bundles=BUNDLES,
+                           provider="prem", model="premM", lens_lenses=["omission"],
+                           lens_provider="swarm", lens_model="120b")
+        self.assertEqual(seen[0], ("prem", "premM"))   # converge = premium tier
+        self.assertEqual(seen[1], ("swarm", "120b"))   # lens   = swarm tier
+
+    def test_disabled_adds_no_calls(self):
+        with mock.patch.object(C, "call_worker",
+                               return_value=_wr(CONVERGED_OUT)) as cw:
+            res = C.run_converge(seed_text="s", verdicts=LOCATED_VERDICTS,
+                                 bundles=BUNDLES, provider="prem", model="premM")
+        cw.assert_called_once()                        # only the converge call
+        self.assertTrue(res.converged)
+        self.assertEqual(res.lens_check, {})
+
+    def test_kill_switch_env_disables_panel(self):
+        with mock.patch.dict(os.environ, {"HIVE_NO_LENS_REFUTE": "1"}):
+            with mock.patch.object(C, "call_worker",
+                                   return_value=_wr(CONVERGED_OUT)) as cw:
+                res = C.run_converge(seed_text="s", verdicts=LOCATED_VERDICTS,
+                                     bundles=BUNDLES, provider="prem", model="premM",
+                                     lens_lenses=["omission", "reproduction"])
+        cw.assert_called_once()
+        self.assertEqual(res.lens_check, {})
+
+    def test_skipped_when_attribution_not_consistent(self):
+        with mock.patch.object(C, "call_worker",
+                               return_value=_wr(_UNDECIDABLE_OUT)) as cw:
+            res = C.run_converge(seed_text="s", verdicts=LOCATED_VERDICTS,
+                                 bundles=BUNDLES, provider="prem", model="premM",
+                                 lens_lenses=["omission", "reproduction"])
+        cw.assert_called_once()                        # not consistent → panel never runs
+        self.assertFalse(res.converged)
+        self.assertEqual(res.lens_check, {})
+
+
+# ── Omission nominator: winning-path gap (① negative-space probe) ──────────────
+_NOT_CONVERGED_NO_LEAD = json.dumps({
+    "converged": False,
+    "path": [],
+    "attributed_defect": {"node": "db_fn", "file": "db/workflow_sequences.py",
+                          "lines": "45-57", "why": "suspected, unverified"},
+    "causal_check": {"verdict": "undecidable", "data_dependent": False,
+                     "data_state_assumptions": [], "trace": "depends on unread state",
+                     "counterfactual": "", "refuted_peers": [], "need_data_state": [],
+                     "data_reads": []},
+    "missing_link": None,
+})
+
+
+class TestOmissionNominator(unittest.TestCase):
+    """The deterministic winning-path gap names an uncovered live node as a missing_link
+    lead — with ZERO extra model calls."""
+
+    WP = [
+        {"url": "/api/x", "verb": "GET", "role": "handler", "file": "api/x_routes.py",
+         "lines": "10-20", "symbol": "get_x", "depth": 0},
+        {"url": "/api/x", "verb": "GET", "role": "producer", "file": "services/x_service.py",
+         "lines": "30-40", "symbol": "build_x", "depth": 2},
+    ]
+
+    def test_names_deepest_uncovered_node(self):
+        # handler covered, producer NOT → names the producer (deepest uncovered cause site).
+        located = [_verdict("A", True, "api/x_routes.py", "10-20", "r")]
+        ml = C._winning_path_omission(self.WP, located, {"api/x_routes.py"})
+        self.assertIsNotNone(ml)
+        self.assertEqual(ml["need"]["file_globs"], ["services/x_service.py"])
+        self.assertIn("build_x", ml["need"]["symbols"])
+        self.assertIn("x", ml["need"]["greps"])           # url last segment
+
+    def test_none_when_all_covered(self):
+        located = [_verdict("A", True, "api/x_routes.py", "10-20", "r"),
+                   _verdict("B", True, "services/x_service.py", "30-40", "r")]
+        self.assertIsNone(C._winning_path_omission(self.WP, located, set()))
+
+    def test_none_when_no_winning_path(self):
+        self.assertIsNone(C._winning_path_omission([], [], set()))
+
+    def test_skips_client_role(self):
+        wp = [{"url": "/api/x", "role": "client", "file": "fe/call.ts", "lines": "",
+               "symbol": "", "depth": -1}]
+        self.assertIsNone(C._winning_path_omission(wp, [], set()))
+
+    def test_run_synthesizes_lead_when_stuck(self):
+        # A single uncovered HANDLER (no producer → nothing auto-lifted into located), an
+        # initial converge that does NOT converge and names no lead → the nominator fills it.
+        wp = [{"url": "/api/x", "verb": "GET", "role": "handler", "file": "api/x_routes.py",
+               "lines": "10-20", "symbol": "get_x", "depth": 0}]
+        with mock.patch.object(C, "_winning_http_path_nodes", return_value=wp), \
+             mock.patch.object(C, "call_worker",
+                               return_value=_wr(_NOT_CONVERGED_NO_LEAD)) as cw:
+            res = C.run_converge(seed_text="s", verdicts=LOCATED_VERDICTS, bundles=BUNDLES,
+                                 provider="p", model="m")  # code_root None → no re-retrieve
+        cw.assert_called_once()                            # ZERO extra model calls
+        self.assertFalse(res.converged)
+        self.assertIsNotNone(res.missing_link)
+        self.assertEqual(res.missing_link["need"]["file_globs"], ["api/x_routes.py"])
+
+    def test_run_kill_switch_disables_nominator(self):
+        wp = [{"url": "/api/x", "verb": "GET", "role": "handler", "file": "api/x_routes.py",
+               "lines": "10-20", "symbol": "get_x", "depth": 0}]
+        with mock.patch.dict(os.environ, {"HIVE_NO_OMISSION_LEAD": "1"}), \
+             mock.patch.object(C, "_winning_http_path_nodes", return_value=wp), \
+             mock.patch.object(C, "call_worker", return_value=_wr(_NOT_CONVERGED_NO_LEAD)):
+            res = C.run_converge(seed_text="s", verdicts=LOCATED_VERDICTS, bundles=BUNDLES,
+                                 provider="p", model="m")
+        self.assertIsNone(res.missing_link)
+
+    def test_run_does_not_override_model_named_lead(self):
+        with_lead = json.dumps({
+            "converged": False, "path": [], "attributed_defect": None,
+            "causal_check": None,
+            "missing_link": {"between": ["a", "b"],
+                             "need": {"symbols": ["foo"], "greps": [], "file_globs": []}},
+        })
+        wp = [{"url": "/api/x", "verb": "GET", "role": "handler", "file": "api/x_routes.py",
+               "lines": "10-20", "symbol": "get_x", "depth": 0}]
+        with mock.patch.object(C, "_winning_http_path_nodes", return_value=wp), \
+             mock.patch.object(C, "call_worker", return_value=_wr(with_lead)):
+            res = C.run_converge(seed_text="s", verdicts=LOCATED_VERDICTS, bundles=BUNDLES,
+                                 provider="p", model="m")
+        # the model's own lead survives; the nominator does NOT clobber it
+        self.assertEqual(res.missing_link["need"]["symbols"], ["foo"])
+
+
 # ── N172: undecidable → live DB data read → re-rule on fact ────────────────────
 import sqlite3
 import tempfile

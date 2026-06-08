@@ -726,13 +726,19 @@ def run_investigate(
         # fragment count), so a single noisy axis splitting into two files does not
         # by itself trigger converge.
         split_cfg = cfg.converge_split
+        lens_cfg = cfg.converge_lens
+        swarm_role = cfg.role("swarm")
         cres = run_converge(
             seed_text=seed_text, verdicts=_converge_fragments(verdicts),
             bundles=bundles,
             provider=conv_role.provider, model=conv_role.model, code_root=code_root,
             ledger=ledger, provider_kwargs=pk, k=k, max_hops=2, db_conn=db_conn,
             split_enabled=split_cfg.enabled, split_max_loci=split_cfg.max_loci,
-            split_provider=split_cfg.provider, split_model=split_cfg.model)
+            split_provider=split_cfg.provider, split_model=split_cfg.model,
+            lens_lenses=(lens_cfg.lenses if lens_cfg.enabled else []),
+            lens_provider=(lens_cfg.provider or swarm_role.provider),
+            lens_model=(lens_cfg.model or swarm_role.model),
+            lens_min_refute=lens_cfg.min_refute)
         converge_dict = cres.as_dict()
         cc = cres.causal_check or {}
         if cres.converged and cres.attributed_defect:
@@ -1388,10 +1394,16 @@ def _rerun_converge(result: dict[str, Any], seed_text: str, *, code_root: str | 
     logger.info("reinvestigation live: re-converge %d located verdict(s) on re-grounded "
                 "evidence (%s/%s)", len(located), conv_role.provider, conv_role.model)
     pk = dict(provider_kwargs or {})
+    lens_cfg = cfg.converge_lens
+    swarm_role = cfg.role("swarm")
     cres = run_converge(
         seed_text=seed_text, verdicts=_converge_fragments(verdicts), bundles=bundles,
         provider=conv_role.provider, model=conv_role.model, code_root=code_root,
-        ledger=ledger, provider_kwargs=pk, k=6, max_hops=2, db_conn=db_conn)
+        ledger=ledger, provider_kwargs=pk, k=6, max_hops=2, db_conn=db_conn,
+        lens_lenses=(lens_cfg.lenses if lens_cfg.enabled else []),
+        lens_provider=(lens_cfg.provider or swarm_role.provider),
+        lens_model=(lens_cfg.model or swarm_role.model),
+        lens_min_refute=lens_cfg.min_refute)
     result["converge"] = cres.as_dict()
     if honey_out:
         with open(honey_out, "w", encoding="utf-8") as f:

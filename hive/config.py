@@ -376,6 +376,32 @@ class ConvergeSplitConfig:
 
 
 @dataclass
+class ConvergeLensConfig:
+    """Gate + lens set for the adversarial LENS refutation pass at converge.
+
+    converge's causal_check is best-of-1: ONE cheap single-shot rules consistent/contradicted
+    and wobbles at depth (right chain, wrong node) and is blind to omission/shadow it was
+    never shown. judge de-risks its own noise with best-of-N voting; this is the converge
+    analog, pointed at REFUTATION. When converge ships an ACTIONABLE ``consistent``
+    attribution, one refuter per lens (the cheap swarm tier) tries to break it; a majority
+    refutation demotes converged→False so a wobbly attribution routes to reinvestigation
+    instead of an edit. Added cost = exactly ``len(lenses)`` swarm calls per actionable
+    converge, zero otherwise. Default OFF — opt-in, A/B-gated, exactly like converge_split.
+
+    ``lenses`` is the set of distinct refutation angles (each = ONE swarm call); empty →
+    no-op. The three defaults map to the confirmed failure classes (shadow / omission /
+    wobble). ``provider``/``model`` empty → reuse the ``roles.swarm`` role (the best-of-N
+    tier, e.g. gpt-oss-120b). ``min_refute`` 0 → simple majority of the lenses.
+    """
+    enabled: bool = False
+    lenses: list[str] = field(default_factory=lambda: [
+        "datasource-liveness", "omission", "reproduction"])
+    provider: str = ""
+    model: str = ""
+    min_refute: int = 0
+
+
+@dataclass
 class JudgeConfig:
     """Cost caps for the JUDGE-directed follow-up loop (M004 §4 budget).
 
@@ -441,6 +467,8 @@ class Config:
         default_factory=ReinvestigationConfig)
     converge_split: ConvergeSplitConfig = field(
         default_factory=ConvergeSplitConfig)
+    converge_lens: ConvergeLensConfig = field(
+        default_factory=ConvergeLensConfig)
     commit_stage: CommitConfig = field(default_factory=CommitConfig)
     # Per-codebase read-only DB connections, keyed by a short name (e.g. "flowgate").
     # Empty by default — the converge data-state read is SKIPPED when a run's codebase
@@ -723,6 +751,8 @@ def load_config(path: str | None = None, profile: str | None = None) -> Config:
     reinvest_raw = merged.get("reinvestigation", {})
     split_raw = merged.get("converge", {}).get("split", {}) \
         if isinstance(merged.get("converge"), dict) else {}
+    lens_raw = merged.get("converge", {}).get("lens", {}) \
+        if isinstance(merged.get("converge"), dict) else {}
     commit_raw = merged.get("commit_stage", {})
     db_raw = merged.get("db_connections", {})
 
@@ -849,6 +879,14 @@ def load_config(path: str | None = None, profile: str | None = None) -> Config:
             max_loci=int(split_raw.get("max_loci", 4)),
             provider=str(split_raw.get("provider", "") or ""),
             model=str(split_raw.get("model", "") or ""),
+        ),
+        converge_lens=ConvergeLensConfig(
+            enabled=bool(lens_raw.get("enabled", False)),
+            lenses=[str(x) for x in (lens_raw.get("lenses") or [
+                "datasource-liveness", "omission", "reproduction"]) if str(x).strip()],
+            provider=str(lens_raw.get("provider", "") or ""),
+            model=str(lens_raw.get("model", "") or ""),
+            min_refute=int(lens_raw.get("min_refute", 0)),
         ),
         commit_stage=CommitConfig(
             filename_only_threshold=int(

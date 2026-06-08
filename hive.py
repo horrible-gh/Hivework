@@ -683,12 +683,18 @@ def run_reconverge_command(args: argparse.Namespace) -> None:
     try:
         bundles = _rebuild_bundles(verdicts, args.codebase, args.docs)
         split_cfg = cfg.converge_split
+        lens_cfg = cfg.converge_lens
+        swarm_role = cfg.role("swarm")
         cres = run_converge(
             seed_text=seed_text, verdicts=_converge_fragments(verdicts), bundles=bundles,
             provider=conv_role.provider, model=conv_role.model, code_root=args.codebase,
             ledger=ldg, provider_kwargs=provider_kwargs, k=6, max_hops=2, db_conn=db_conn,
             split_enabled=split_cfg.enabled, split_max_loci=split_cfg.max_loci,
-            split_provider=split_cfg.provider, split_model=split_cfg.model)
+            split_provider=split_cfg.provider, split_model=split_cfg.model,
+            lens_lenses=(lens_cfg.lenses if lens_cfg.enabled else []),
+            lens_provider=(lens_cfg.provider or swarm_role.provider),
+            lens_model=(lens_cfg.model or swarm_role.model),
+            lens_min_refute=lens_cfg.min_refute)
         ldg.finish_run(status="done")
     except Exception:
         ldg.finish_run(status="failed")
