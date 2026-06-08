@@ -451,6 +451,45 @@ class TestLensRefutation(unittest.TestCase):
         self.assertGreaterEqual(len(prompts), 2)
         self.assertNotIn("DESIGN-CHANGE carve-out", prompts[1])
 
+    def test_winning_path_attribution_override_blocks_demote(self):
+        # M036: a winning-path live datasource refuted by the cheap panel (3/3, fooled by a
+        # shadowed look-alike sibling) is HELD converged — registration-order grounding
+        # outranks the adversarial vote. Votes are still recorded for visibility.
+        res = C.ConvergeResult(
+            converged=True,
+            attributed_defect={"file": "server/db/projects.py", "lines": "19-27",
+                               "why": "omits modules"},
+            causal_check={"verdict": "consistent", "trace": "t"},
+            winning_path=[{"file": "server/db/projects.py", "lines": "19-27"},
+                          {"file": "server/routers/project_settings.py", "lines": "46-51"}])
+        with mock.patch.object(C, "call_worker", return_value=_wr(_LENS_REFUTE)):
+            out = C._lens_refute(
+                res, "selector missing", located=[], windows=[], code_state_block="",
+                lenses=["datasource-liveness", "omission", "reproduction"],
+                provider="swarm", model="120b", pk={}, ledger=None, timeout=60, min_refute=0)
+        self.assertTrue(out.converged)                       # override held it converged
+        self.assertTrue(out.lens_check["winning_path_override"])
+        self.assertEqual(out.lens_check["refuted_votes"], 3)  # votes still recorded
+        self.assertEqual(out.lens_check["verdict"], "survived")
+
+    def test_off_winning_path_attribution_still_demotes(self):
+        # The override is scoped: an attribution NOT on the winning path demotes as before
+        # (M035: pipeline_service refuted 3/3 must still demote — no false immunity).
+        res = C.ConvergeResult(
+            converged=True,
+            attributed_defect={"file": "server/workflow/pipeline_service.py",
+                               "lines": "133-134", "why": "x"},
+            causal_check={"verdict": "consistent", "trace": "t"},
+            winning_path=[{"file": "server/db/workflow_sequences.py", "lines": "45-57"}])
+        with mock.patch.object(C, "call_worker", return_value=_wr(_LENS_REFUTE)):
+            out = C._lens_refute(
+                res, "head off-by-one", located=[], windows=[], code_state_block="",
+                lenses=["a", "b"], provider="swarm", model="120b", pk={},
+                ledger=None, timeout=60, min_refute=0)
+        self.assertFalse(out.converged)                       # not on winning path → demoted
+        self.assertFalse(out.lens_check.get("winning_path_override"))
+        self.assertEqual(out.lens_check["verdict"], "refuted")
+
 
 class TestLensDesignChangeCarveOutPrompt(unittest.TestCase):
     """Unit-level: _build_lens_prompt injects the DESIGN-CHANGE carve-out only when the
@@ -473,6 +512,18 @@ class TestLensDesignChangeCarveOutPrompt(unittest.TestCase):
 
     def test_carveout_absent_when_flag_false(self):
         self.assertNotIn("DESIGN-CHANGE carve-out", self._prompt(False))
+
+    def test_winning_path_note_present_only_when_flagged(self):
+        common = dict(
+            seed_text="selector missing",
+            attributed={"file": "server/db/projects.py", "lines": "19-27"},
+            causal_check={"verdict": "consistent"}, lens="datasource-liveness",
+            lens_desc=C._LENS_DEFINITIONS["datasource-liveness"],
+            code_state_block="(code)", evidence="(ev)")
+        self.assertIn("WINNING-PATH grounding",
+                      C._build_lens_prompt(**common, winning_path_site=True))
+        self.assertNotIn("WINNING-PATH grounding",
+                         C._build_lens_prompt(**common, winning_path_site=False))
 
 
 # ── Lever 1: lens refutation → re-aim (redirect re-stitch, then omission fallback) ──

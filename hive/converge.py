@@ -2526,6 +2526,21 @@ def _field_provenance_reaim(res: ConvergeResult,
     for txt in prod_text.values():       # C read by a producer (on its path) → upstream, leave
         if c_stem and c_stem in (txt or "").lower():
             return res
+    # A node ON the converger's winning path is, by definition, live executed code for THIS
+    # request — it cannot be a name-decoy, which the docstring defines as a file OFF the
+    # production path matched only on a shared concept token. An attribution there that does
+    # not PRODUCE the field is an OMISSION site (the live datasource simply never adds it —
+    # M036: db/projects.py ``SELECT * FROM projects`` omits ``modules``), which is the correct
+    # fix target. Re-aiming away would chase a richer OFF-path producer that is often the
+    # lexical decoy itself (M036: ``module_id`` from the /modules list route). The positive
+    # winning-path re-point is the datasource guard's job; here we only refuse to DEMOTE a
+    # winning-path attribution as a decoy. (HIVE_NO_FIELD_PROVENANCE_REAIM still disables all.)
+    wp_files = {n.get("file", "") for n in (res.winning_path or []) if n.get("file")}
+    if any(_aligns(c, wf) for wf in wp_files):
+        logger.info("converge: field-provenance re-aim ABSTAINS — attribution %s is on the "
+                    "winning path (live executed datasource = omission site, not a name-decoy)",
+                    ad.get("file", ""))
+        return res
     # Richest producer P (most FE-bound fields) is the re-aim target.
     P = sorted(prod_fields.items(), key=lambda kv: (-len(kv[1]), kv[0]))[0][0]
     pfile, plines = prod_loc.get(P, (P, ""))
@@ -3194,7 +3209,8 @@ def _split_converge(seed_text: str, located: list[dict[str, Any]],
 def _build_lens_prompt(seed_text: str, attributed: dict[str, Any],
                        causal_check: dict[str, Any] | None, lens: str, lens_desc: str,
                        code_state_block: str, evidence: str,
-                       design_change_site: bool = False) -> str:
+                       design_change_site: bool = False,
+                       winning_path_site: bool = False) -> str:
     """One adversarial refutation prompt: break the attribution through ONE lens.
 
     ``design_change_site`` carries the converger's DESIGN-CHANGE carve-out into the
@@ -3206,6 +3222,19 @@ def _build_lens_prompt(seed_text: str, attributed: dict[str, Any],
     shadow / omission / reproduction failure classes still refute normally.
     """
     cc = causal_check or {}
+    winning_path_note = ""
+    if winning_path_site:
+        winning_path_note = (
+            "\n[WINNING-PATH grounding — READ FIRST] The attributed locus is on the "
+            "converge's registration-order-resolved WINNING PATH — the LIVE handler/"
+            "datasource actually executed for THIS request. A sibling that merely LOOKS "
+            "wired to the same route (e.g. a get_X_with_Y helper, or a same-named handler "
+            "in another router/module) may be SHADOWED / dead by registration order; the "
+            "winning-path resolution is STRONGER evidence than reading which function "
+            "appears connected. Do NOT refute by claiming a different sibling serves the "
+            "request or produces the field — that is the exact shadowed-decoy trap. Refute "
+            "ONLY with positive evidence that THIS locus is off the executed path, or a "
+            "concrete omission/reproduction failure of THIS locus itself.\n")
     design_change_note = ""
     if design_change_site:
         design_change_note = (
@@ -3227,7 +3256,7 @@ try to PROVE that attribution WRONG, strictly through the {lens} lens. You are a
 unless YOUR lens positively confirms the attribution holds, you REFUTE it. Default to \
 refuted=true when uncertain — a false "survives" ships a wrong fix to a human; a false \
 "refuted" only costs one more re-hunt. You have NO tools; decide from the evidence below.
-{design_change_note}
+{winning_path_note}{design_change_note}
 [The {lens} lens] {lens_desc}
 
 [Reported scenario / seed]
@@ -3313,6 +3342,19 @@ def _lens_refute(res: ConvergeResult, seed_text: str, located: list[dict[str, An
     if design_change_site:
         logger.info("converge: lens panel — DESIGN-CHANGE carve-out active "
                     "(refuters forbidden from spec-conformance refutation)")
+    # Winning-path carve-out: when the attribution is on the converge's registration-order-
+    # resolved winning path, the cheap refuters must not break it by citing a shadowed sibling
+    # as "the real handler/producer" (M036: the dead get_projects_with_modules chain refuting
+    # the live db/projects.py). The converge knows the resolved live path; the 120b refuter
+    # does not. Same alignment test as the field-provenance abstain. Liveness/shadowing
+    # refutation is softened on these loci; omission/reproduction with positive evidence still
+    # bites.
+    wp_files = {n.get("file", "") for n in (res.winning_path or []) if n.get("file")}
+    af = (attributed or {}).get("file", "")
+    winning_path_site = bool(af) and any(_aligns(af, wf) for wf in wp_files)
+    if winning_path_site:
+        logger.info("converge: lens panel — WINNING-PATH carve-out active for %s "
+                    "(refuters told not to cite shadowed siblings as the live path)", af)
     ev_lines: list[str] = []
     for w in (windows or [])[:_LENS_MAX_EVIDENCE]:
         ev_lines.append(f"--- {w.get('file')}:{w.get('lines')}")
@@ -3324,7 +3366,8 @@ def _lens_refute(res: ConvergeResult, seed_text: str, located: list[dict[str, An
         desc = _LENS_DEFINITIONS.get(lens) or \
             f"Try to refute the attribution on {lens} grounds; default to refuted when unsure."
         prompt = _build_lens_prompt(seed_text, attributed, res.causal_check, lens, desc,
-                                    code_state_block, evidence, design_change_site)
+                                    code_state_block, evidence, design_change_site,
+                                    winning_path_site)
         parsed = _lens_refute_once(prompt, provider, model, pk, ledger, timeout, lens)
         refuted = bool(parsed.get("refuted")) if isinstance(parsed, dict) else False
         why = str(parsed.get("why", "") or "") if isinstance(parsed, dict) else ""
@@ -3335,10 +3378,27 @@ def _lens_refute(res: ConvergeResult, seed_text: str, located: list[dict[str, An
     refutes = [v for v in votes if v["refuted"]]
     threshold = min_refute if (min_refute and min_refute > 0) else (n // 2 + 1)
     demoted = n > 0 and len(refutes) >= threshold
+    # Winning-path override (M036): the converge's registration-order resolution is STRONGER
+    # evidence of which datasource is live than a cheap 120b refuter panel — which is routinely
+    # fooled by a shadowed look-alike sibling (the dead get_projects_with_modules chain refuted
+    # the live db/projects.py 3/3, all three citing that sibling as "the real path"). When the
+    # attribution is on the winning path it CANNOT be demoted by the panel: the structural
+    # grounding outranks the adversarial vote. Prompt-level softening alone proved insufficient
+    # against the shadowing confusion (the refuters kept refuting), so the override is
+    # structural. Votes are still recorded for visibility, and a winning-path node remains
+    # subject to the omission / multi-root guards and the apply-side red→green backstop — so a
+    # genuinely incomplete fix is still caught, just not by this shadow-blind panel.
+    wp_override = demoted and winning_path_site
+    if wp_override:
+        logger.info("converge: lens panel demote OVERRIDDEN — %s is the winning-path live "
+                    "datasource; %d/%d refutation(s) (shadowed-sibling confusion) do not "
+                    "outrank registration-order grounding — held converged", af,
+                    len(refutes), n)
+        demoted = False
     # Borderline = the outcome would FLIP if a single lens had voted the other way (the
     # run-to-run wobble seen live on a genuinely-incomplete attribution). Surfaced so a
     # marginal demote/survive is visible rather than reading as a confident verdict.
-    borderline = n > 0 and len(refutes) in (threshold - 1, threshold)
+    borderline = (not wp_override) and n > 0 and len(refutes) in (threshold - 1, threshold)
     res.lens_check = {
         "lenses": [v["lens"] for v in votes],
         "votes": votes,
@@ -3346,6 +3406,7 @@ def _lens_refute(res: ConvergeResult, seed_text: str, located: list[dict[str, An
         "of": n,
         "threshold": threshold,
         "borderline": borderline,
+        "winning_path_override": wp_override,
         "verdict": "refuted" if demoted else "survived",
     }
     if borderline:
@@ -3750,6 +3811,12 @@ def run_converge(*, seed_text: str, verdicts: list[dict[str, Any]],
                   for s in ((b.get("code_snippets") or []) + (b.get("call_chain") or []))
                   if isinstance(s, dict) and s.get("via") == "field-producer"]
 
+    # Attach the winning path BEFORE the arbiter so the provenance guards can read it: the
+    # field-provenance re-aim uses it to refuse demoting a winning-path (live-executed)
+    # attribution as a name-decoy (the M036 omission case). The guards mutate ``res`` in
+    # place, so an early assignment is visible throughout the arbiter; the post-arbiter
+    # assignment below is kept as a defensive restore.
+    res.winning_path = winning_path
     # One causal/provenance decision surface. The arbiter preserves every existing stamp
     # and kill-switch while making precedence explicit and housing P0/P4 as facets.
     res = _causal_provenance_arbiter(
