@@ -623,5 +623,59 @@ class TestRunJudgeVotes(unittest.TestCase):
         self.assertEqual(seen, [2])
 
 
+class TestVerdictType(unittest.TestCase):
+    """M037 — the design_change verdict class (expectation-vs-design)."""
+
+    def test_located_defaults_to_bug(self):
+        v = J._verdict_from(json.loads(VERDICT_NO_NEED), "ax")
+        self.assertTrue(v.located)
+        self.assertEqual(v.verdict_type, "bug")
+
+    def test_design_change_parsed_and_located(self):
+        raw = json.dumps({"verdict": {"located": True, "type": "design_change",
+                                      "file": "client/StepStrip.vue", "lines": "40-50",
+                                      "reason": "matches StepState def but reporter wants blue"}})
+        v = J._verdict_from(json.loads(raw), "ax")
+        self.assertTrue(v.located)                       # stays a live change site
+        self.assertEqual(v.verdict_type, "design_change")
+
+    def test_unlocated_is_refuted(self):
+        raw = json.dumps({"verdict": {"located": False, "type": "bug", "reason": "off-path"}})
+        v = J._verdict_from(json.loads(raw), "ax")
+        self.assertEqual(v.verdict_type, "refuted")
+
+    def test_dash_and_spaces_normalised(self):
+        raw = json.dumps({"verdict": {"located": True, "type": "Design-Change",
+                                      "file": "a.vue", "lines": "1"}})
+        self.assertEqual(J._verdict_from(json.loads(raw), "ax").verdict_type, "design_change")
+
+    def test_unknown_type_falls_back_to_bug(self):
+        raw = json.dumps({"verdict": {"located": True, "type": "weird",
+                                      "file": "a.py", "lines": "1"}})
+        self.assertEqual(J._verdict_from(json.loads(raw), "ax").verdict_type, "bug")
+
+    def test_prompt_offers_design_change_option(self):
+        p = J.build_judge_prompt("ax", "symptom", "bundle", want_need=False)
+        self.assertIn("design_change", p)
+        self.assertIn("DESIGN-CHANGE", p)
+
+    def test_design_match_closure_flagged(self):
+        # an unlocated verdict closed on "matches the StepState definition" is flagged as a
+        # possible design-change site rather than accepted as a clean refute.
+        self.assertTrue(J._is_design_match_closure("the code matches the StepState definition"))
+        self.assertTrue(J._is_design_match_closure("this is working as intended"))
+        self.assertFalse(J._is_design_match_closure("this code path is never reached"))
+
+    def test_run_judge_flags_design_match_closure(self):
+        raw = json.dumps({"verdict": {"located": False, "file": "x.vue", "lines": "1-2",
+                                      "reason": "the visual matches its design, nothing wrong"}})
+        with mock.patch.object(J, "call_worker", return_value=_wr(raw)):
+            out = J.run_judge(plan_bundle=PLAN_BUNDLE, symptom="s", axis_globs=[],
+                              code_root=".", provider="p", model="m",
+                              judge_cfg=JudgeConfig(max_calls_per_axis=1))
+        self.assertFalse(out["verdict"].located)
+        self.assertIn("possible-design-change", out["verdict"].reason)
+
+
 if __name__ == "__main__":
     unittest.main()

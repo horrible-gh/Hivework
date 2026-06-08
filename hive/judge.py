@@ -85,6 +85,17 @@ class JudgeVerdict:
     file: str = ""
     lines: str = ""
     reason: str = ""
+    # Verdict CLASS (M037 — expectation-vs-design). A LOCATED finding is one of:
+    #   "bug"           — the code is objectively wrong on the executed path; OR
+    #   "design_change" — the code FAITHFULLY implements its own design/spec, yet the
+    #                     reporter declares the RESULTING behaviour wrong/unwanted, so the
+    #                     SITE that emits it still must change (a design decision, not a
+    #                     defect against the spec).
+    # An UNLOCATED verdict is "refuted". The split matters because closing a design-match
+    # as located=false ("the code matches its spec, nothing is wrong") buries the very
+    # site the change must land on — the T905 FE-visual-axis miss. A design_change is
+    # still ``located=True`` so it flows downstream as an actionable change site.
+    verdict_type: str = "bug"
     raw: dict[str, Any] = field(default_factory=dict)
 
 
@@ -214,7 +225,7 @@ def _verdict_contract(want_need: bool) -> str:
     return f"""{need_guidance}
 [Output contract] Output ONLY this JSON object. No prose outside the JSON.
 {{
-  "verdict": {{ "located": true, "file": "<repo-relative path>", "lines": "<start-end>", "reason": "<one line: why THIS is the bug>" }}{need_block}
+  "verdict": {{ "located": true, "type": "bug|design_change", "file": "<repo-relative path>", "lines": "<start-end>", "reason": "<one line: why THIS is the site>" }}{need_block}
 }}"""
 
 
@@ -250,9 +261,23 @@ you need is not shown, ask for it in ``need`` rather than trying to fetch it.
 
 [Ruling mandate] The axis brief is a HYPOTHESIS about where/whether this symptom's \
 defect lives — RULE on it. Return exactly one of:
-  - CONFIRM: located=true, naming the exact buggy file/lines, OR
-  - REFUTE: located=false with a concrete, evidence-based reason this code path is \
-correct / not the cause (cite what in the evidence disproves the hypothesis).
+  - CONFIRM (bug): located=true, type="bug", naming the exact buggy file/lines, OR
+  - DESIGN-CHANGE: located=true, type="design_change", when the code FAITHFULLY \
+implements its own design/spec but the reported scenario declares the RESULTING \
+behaviour wrong or unwanted. The code is not "buggy" against its spec — yet the SITE \
+that emits the rejected behaviour is exactly where a change must land. Name that \
+file/lines. Do NOT collapse this into a refute: "the code matches its StepState / \
+design definition, so nothing is wrong here" is the PRECISE miss this prevents. When \
+the reporter says the on-screen result is wrong, a faithful-to-design implementation is \
+a DESIGN-CHANGE candidate, NOT a non-finding. (The reporter sees only the SYMPTOM and \
+cannot know whether its cause is a bug or a design decision — that classification is \
+YOUR job, not theirs.) OR
+  - REFUTE: located=false, type="refuted", with a concrete, evidence-based reason this \
+code path is correct AND is NOT the site the reported behaviour originates from (cite \
+what in the evidence disproves the hypothesis). A refute means "this code does not \
+produce the reported behaviour" — it does NOT mean "this code matches its own design": \
+code can faithfully match its design and STILL be the design-change site, which is a \
+CONFIRM (design_change), not a refute.
 You may NOT decline to rule. A brief phrased as a question ("does X call the wrong \
 key?", "is the ORDER BY wrong?") still demands a confirm/refute answer about the \
 symptom — do NOT dismiss it as "merely an informational/lookup request", "not itself \
@@ -322,14 +347,29 @@ def _verdict_from(parsed: dict[str, Any] | None, axis_id: str) -> JudgeVerdict:
     v = parsed.get("verdict")
     if not isinstance(v, dict):
         return JudgeVerdict(axis_id=axis_id, raw=parsed)
+    located = bool(v.get("located", False))
     return JudgeVerdict(
         axis_id=axis_id,
-        located=bool(v.get("located", False)),
+        located=located,
         file=str(v.get("file", "")),
         lines=str(v.get("lines", "")),
         reason=str(v.get("reason", "")),
+        verdict_type=_coerce_verdict_type(v.get("type"), located),
         raw=parsed,
     )
+
+
+# Recognised LOCATED verdict classes (M037). An unlocated verdict is always "refuted";
+# a located one defaults to "bug" unless the judge explicitly tagged "design_change".
+_VERDICT_TYPES = ("bug", "design_change")
+
+
+def _coerce_verdict_type(raw: Any, located: bool) -> str:
+    """Normalise the verdict ``type`` enum. Unlocated → "refuted"; located → bug|design_change."""
+    if not located:
+        return "refuted"
+    t = str(raw or "").strip().lower().replace("-", "_").replace(" ", "_")
+    return t if t in _VERDICT_TYPES else "bug"
 
 
 def _need_from(parsed: dict[str, Any] | None, axis_id: str,
@@ -423,10 +463,39 @@ _DISMISSAL_MARKERS = (
 
 def _is_dismissal(reason: str) -> bool:
     """True when an unlocated reason DISMISSES the question instead of refuting it."""
+    norm = _dash_norm(reason)
+    return any(m in norm for m in _DISMISSAL_MARKERS)
+
+
+def _dash_norm(reason: str) -> str:
     norm = (reason or "").lower()
     for dash in ("‐", "‑", "‒", "–", "—"):
         norm = norm.replace(dash, "-")
-    return any(m in norm for m in _DISMISSAL_MARKERS)
+    return norm
+
+
+# Design-match closure markers (M037): a located=false verdict whose reason rejects the
+# hypothesis by asserting the code is CORRECT PER ITS OWN DESIGN/SPEC — "matches the
+# StepState definition", "behaves as designed", "intended behaviour" — rather than by
+# showing the code does not PRODUCE the reported behaviour. When the reporter has declared
+# the on-screen result wrong, a faithful-to-design implementation is a DESIGN-CHANGE site,
+# not a non-finding (the T905 FE-visual-axis miss). We do NOT flip the bit (auto-promoting
+# from seed natural-language is the N177 over-fire trap) — we SURFACE it so the non-ruling
+# is visible to the operator/honey and escalated for a seed-mandated axis. Dash-normalised.
+_DESIGN_MATCH_MARKERS = (
+    "matches the design", "matches its design", "matches the spec", "matches its spec",
+    "as designed", "by design", "intended behaviour", "intended behavior",
+    "working as intended", "matches the definition", "matches the stepstate",
+    "consistent with the design", "per the design", "per the spec", "correct per",
+    "nothing is wrong", "nothing wrong", "no defect because the code matches",
+)
+
+
+def _is_design_match_closure(reason: str) -> bool:
+    """True when an unlocated reason closes on "code matches its own design", not on
+    "code does not produce the reported behaviour"."""
+    norm = _dash_norm(reason)
+    return any(m in norm for m in _DESIGN_MATCH_MARKERS)
 
 
 def _cites_seed_file(cited: str, seed_files: set[str]) -> bool:
@@ -532,7 +601,7 @@ def run_judge(*, plan_bundle: dict[str, Any], symptom: str, axis_globs: list[str
                 axis_id=axis_id, located=False, file=verdict.file, lines=verdict.lines,
                 reason="ungrounded (cited file absent from evidence bundle): "
                        + (verdict.reason or ""),
-                raw=verdict.raw)
+                verdict_type="refuted", raw=verdict.raw)
 
     # ── Dismissal backstop (N170 axis E): an unlocated verdict whose reason rejects
     # the QUESTION ("informational request, not a code defect") instead of REFUTING
@@ -547,7 +616,28 @@ def run_judge(*, plan_bundle: dict[str, Any], symptom: str, axis_globs: list[str
             axis_id=axis_id, located=False, file=verdict.file, lines=verdict.lines,
             reason="[unruled-dismissal: question waved off, not refuted with evidence] "
                    + (verdict.reason or ""),
-            raw=verdict.raw)
+            verdict_type="refuted", raw=verdict.raw)
+
+    # ── Design-match-closure backstop (M037): an unlocated verdict that refuted the
+    # hypothesis by asserting the code is CORRECT PER ITS OWN DESIGN ("matches the
+    # StepState definition", "as designed") — rather than by showing the code does not
+    # PRODUCE the reported behaviour — may be a buried DESIGN-CHANGE site. We do not flip
+    # the bit (the code may genuinely be off-path; auto-promoting from the seed's prose is
+    # the N177 over-fire trap); we FLAG it so the possible design-change is visible in the
+    # report/honey and escalated for a seed-mandated axis. Skipped once already flagged.
+    if (not verdict.located and _is_design_match_closure(verdict.reason)
+            and not verdict.reason.startswith("[possible-design-change")):
+        logger.warning("judge: [%s]%s unlocated verdict closed on 'code matches its own "
+                       "design' rather than 'code does not produce the symptom' (reason=%r) "
+                       "— flagged as a possible design-change site, not a clean refute",
+                       axis_id, " SEED-MANDATED" if seed_axis else "", verdict.reason)
+        verdict = JudgeVerdict(
+            axis_id=axis_id, located=False, file=verdict.file, lines=verdict.lines,
+            reason="[possible-design-change: code matches its own design, but the reporter "
+                   "declared the result wrong — re-rule as type=design_change (located) if "
+                   "this site emits the rejected behaviour, do not bury it as a refute] "
+                   + (verdict.reason or ""),
+            verdict_type="refuted", raw=verdict.raw)
 
     return {
         "axis_id": axis_id,
