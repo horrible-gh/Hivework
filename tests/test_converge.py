@@ -314,7 +314,18 @@ def _seq(*outs):
 
 class TestLensRefutation(unittest.TestCase):
     """The lens panel adds exactly len(lenses) swarm calls on an actionable consistent
-    attribution, and a majority refutation demotes converged→False."""
+    attribution, and a majority refutation demotes converged→False.
+
+    Lever-1 redirect is disabled here (HIVE_NO_LENS_REDIRECT) so these tests measure the
+    PANEL in isolation; the redirect/omission re-aim is covered by TestLensRedirect below.
+    """
+
+    def setUp(self):
+        self._env = mock.patch.dict(os.environ, {"HIVE_NO_LENS_REDIRECT": "1"})
+        self._env.start()
+
+    def tearDown(self):
+        self._env.stop()
 
     def _run(self, *, lenses, scripted, **extra):
         with mock.patch.object(C, "call_worker",
@@ -396,6 +407,70 @@ class TestLensRefutation(unittest.TestCase):
         cw.assert_called_once()                        # not consistent → panel never runs
         self.assertFalse(res.converged)
         self.assertEqual(res.lens_check, {})
+
+
+# ── Lever 1: lens refutation → re-aim (redirect re-stitch, then omission fallback) ──
+# Redirect re-converge output: excludes the refuted db_fn and attributes to the OTHER located
+# fragment (the endpoint/handler), converged.
+_REDIRECT_OUT = json.dumps({
+    "converged": True,
+    "path": [{"node": "endpoint", "file": "api/workflow_head_routes.py", "lines": "93-102",
+              "symbol": "GET /workflow/{doc_id}/head"}],
+    "attributed_defect": {"node": "endpoint", "file": "api/workflow_head_routes.py",
+                          "lines": "93-102", "why": "handler returns the wrong slice"},
+    "causal_check": {"verdict": "consistent", "data_dependent": False,
+                     "data_state_assumptions": [], "trace": "re-aimed", "counterfactual": "x",
+                     "refuted_peers": [], "need_data_state": [], "data_reads": []},
+    "missing_link": None,
+})
+
+
+class TestLensRedirect(unittest.TestCase):
+    """Lever 1: a lens DEMOTION re-aims (redirect re-stitch excluding the refuted locus),
+    and falls through to the omission nominator when the re-stitch still cannot converge."""
+
+    def test_demotion_redirects_to_a_different_node(self):
+        # converge → db_fn (consistent); lens 2/2 refute → demote; redirect re-stitch
+        # (4th call) excludes db_fn and converges on the endpoint instead.
+        with mock.patch.object(C, "call_worker",
+                               side_effect=_seq(CONVERGED_OUT, _LENS_REFUTE, _LENS_REFUTE,
+                                                _REDIRECT_OUT)) as cw:
+            res = C.run_converge(seed_text="head off-by-one", verdicts=LOCATED_VERDICTS,
+                                 bundles=BUNDLES, provider="prem", model="premM",
+                                 lens_lenses=["datasource-liveness", "omission"],
+                                 lens_provider="swarm", lens_model="120b")
+        self.assertEqual(cw.call_count, 4)             # converge + 2 lenses + 1 redirect
+        self.assertTrue(res.converged)                 # re-aimed, not dead-ended
+        self.assertEqual(res.attributed_defect["file"], "api/workflow_head_routes.py")
+        self.assertEqual(res.lens_check["verdict"], "refuted")   # refutation record carried
+
+    def test_kill_switch_disables_redirect(self):
+        with mock.patch.dict(os.environ, {"HIVE_NO_LENS_REDIRECT": "1"}), \
+             mock.patch.object(C, "call_worker",
+                               side_effect=_seq(CONVERGED_OUT, _LENS_REFUTE, _LENS_REFUTE)) as cw:
+            res = C.run_converge(seed_text="s", verdicts=LOCATED_VERDICTS, bundles=BUNDLES,
+                                 provider="prem", model="premM",
+                                 lens_lenses=["a", "b"], lens_provider="swarm",
+                                 lens_model="120b")
+        self.assertEqual(cw.call_count, 3)             # no redirect call
+        self.assertFalse(res.converged)
+
+    def test_demotion_falls_through_to_omission_when_redirect_fails(self):
+        # lens demotes; redirect re-stitch can't converge; omission nominator (patched
+        # winning-path with an uncovered handler) names the gap as a missing_link lead.
+        wp = [{"url": "/api/x", "verb": "GET", "role": "handler", "file": "api/x_routes.py",
+               "lines": "10-20", "symbol": "get_x", "depth": 0}]
+        with mock.patch.object(C, "_winning_http_path_nodes", return_value=wp), \
+             mock.patch.object(C, "call_worker",
+                               side_effect=_seq(CONVERGED_OUT, _LENS_REFUTE, _LENS_REFUTE,
+                                                _NOT_CONVERGED_NO_LEAD)) as cw:
+            res = C.run_converge(seed_text="s", verdicts=LOCATED_VERDICTS, bundles=BUNDLES,
+                                 provider="prem", model="premM",
+                                 lens_lenses=["a", "b"], lens_provider="swarm",
+                                 lens_model="120b")  # code_root None → no omission re-retrieve
+        self.assertFalse(res.converged)
+        self.assertIsNotNone(res.missing_link)         # omission lead synthesized
+        self.assertEqual(res.missing_link["need"]["file_globs"], ["api/x_routes.py"])
 
 
 # ── Omission nominator: winning-path gap (① negative-space probe) ──────────────

@@ -3112,14 +3112,22 @@ def _lens_refute(res: ConvergeResult, seed_text: str, located: list[dict[str, An
     refutes = [v for v in votes if v["refuted"]]
     threshold = min_refute if (min_refute and min_refute > 0) else (n // 2 + 1)
     demoted = n > 0 and len(refutes) >= threshold
+    # Borderline = the outcome would FLIP if a single lens had voted the other way (the
+    # run-to-run wobble seen live on a genuinely-incomplete attribution). Surfaced so a
+    # marginal demote/survive is visible rather than reading as a confident verdict.
+    borderline = n > 0 and len(refutes) in (threshold - 1, threshold)
     res.lens_check = {
         "lenses": [v["lens"] for v in votes],
         "votes": votes,
         "refuted_votes": len(refutes),
         "of": n,
         "threshold": threshold,
+        "borderline": borderline,
         "verdict": "refuted" if demoted else "survived",
     }
+    if borderline:
+        logger.info("converge: lens panel BORDERLINE (%d/%d refuted, threshold %d) — "
+                    "one vote from flipping", len(refutes), n, threshold)
     if demoted:
         res.converged = False
         # Neutralize the causal verdict too: a refuted attribution must NOT keep a
@@ -3143,6 +3151,62 @@ def _lens_refute(res: ConvergeResult, seed_text: str, located: list[dict[str, An
     else:
         logger.info("converge: lens panel — attribution SURVIVED (%d/%d refuted, need %d)",
                     len(refutes), n, threshold)
+    return res
+
+
+def _apply_omission_lead(res: ConvergeResult, *, seed_text: str,
+                         winning_path: list[dict[str, Any]], located: list[dict[str, Any]],
+                         unlocated: list[dict[str, Any]], windows: list[dict[str, Any]],
+                         known: set[str], bundles: list[dict[str, Any]],
+                         code_root: str | None, provider: str, model: str,
+                         pk: dict[str, Any], ledger, timeout: int, max_calls: int,
+                         k: int, max_hops: int, data_block: str, db_available: bool,
+                         db_schema: str, code_state_block: str, http_binding_block: str,
+                         fragment_fact_block: str) -> ConvergeResult:
+    """Name the uncovered winning-path node as a missing_link lead, then (when a code_root is
+    given) run ONE free scoped re-retrieve + re-converge over it. The negative-space probe the
+    located-only stitch structurally cannot do (① winning_path − located). Adopts only on a
+    real convergence; else leaves the named lead. Caller gates on ``not converged and not
+    missing_link``. Reused by BOTH the pre-arbiter fallback and the post-lens redirect.
+    """
+    omission = _winning_path_omission(winning_path, located, known)
+    if not omission:
+        return res
+    res.missing_link = omission
+    need_d = omission.get("need") or {}
+    logger.info("converge: omission nominator — winning-path node %s uncovered by any "
+                "located fragment; synthesized missing_link lead", need_d.get("file_globs"))
+    if not (code_root and max_calls > 1):
+        return res
+    need = FollowupNeed(
+        axis_id="CONVERGE_OMISSION",
+        symbols=[str(s) for s in (need_d.get("symbols") or [])],
+        greps=[str(g) for g in (need_d.get("greps") or [])],
+        file_globs=[str(g) for g in (need_d.get("file_globs") or [])])
+    try:
+        fu = retrieve_followup(need, code_root, k=k, max_hops=max_hops)
+    except Exception as e:  # local retrieve must never crash converge
+        logger.warning("converge: omission follow-up retrieve failed: %s", e)
+        return res
+    if not fu:
+        return res
+    extra = list(fu.get("seeds") or []) + list(fu.get("call_chain") or [])
+    merged = _dedup_windows(extra + windows)
+    known2 = known | {_norm(w.get("file", "")) for w in extra if w.get("file")}
+    res2 = _converge_once(seed_text, located, unlocated, merged, known2,
+                          provider, model, pk, ledger, timeout,
+                          data_state_block=data_block,
+                          db_available=db_available, db_schema=db_schema,
+                          code_state_block=_lift_live_code(located, code_root)
+                          or code_state_block,
+                          http_binding_block=_http_binding_bridges(
+                              located, merged, code_root) or http_binding_block,
+                          fragment_fact_block=_fragment_fact_cards(
+                              located, merged, bundles, code_root) or fragment_fact_block)
+    logger.info("converge: omission re-pass → %s", res2.summary)
+    if res2.converged:
+        res2.winning_path = winning_path
+        res = res2
     return res
 
 
@@ -3435,42 +3499,14 @@ def run_converge(*, seed_text: str, verdicts: list[dict[str, Any]],
     # reinvestigation (better-aimed than a blank re-ask). Kill via HIVE_NO_OMISSION_LEAD.
     if (not res.converged and not res.missing_link
             and not os.environ.get("HIVE_NO_OMISSION_LEAD")):
-        omission = _winning_path_omission(winning_path, located, known)
-        if omission:
-            res.missing_link = omission
-            need_d = omission.get("need") or {}
-            logger.info("converge: omission nominator — winning-path node %s uncovered by any "
-                        "located fragment; synthesized missing_link lead",
-                        need_d.get("file_globs"))
-            if code_root and max_calls > 1:
-                need = FollowupNeed(
-                    axis_id="CONVERGE_OMISSION",
-                    symbols=[str(s) for s in (need_d.get("symbols") or [])],
-                    greps=[str(g) for g in (need_d.get("greps") or [])],
-                    file_globs=[str(g) for g in (need_d.get("file_globs") or [])])
-                try:
-                    fu = retrieve_followup(need, code_root, k=k, max_hops=max_hops)
-                except Exception as e:  # local retrieve must never crash converge
-                    logger.warning("converge: omission follow-up retrieve failed: %s", e)
-                    fu = None
-                if fu:
-                    extra = list(fu.get("seeds") or []) + list(fu.get("call_chain") or [])
-                    merged = _dedup_windows(extra + windows)
-                    known2 = known | {_norm(w.get("file", "")) for w in extra if w.get("file")}
-                    res2 = _converge_once(seed_text, located, unlocated, merged, known2,
-                                          provider, model, pk, ledger, timeout,
-                                          data_state_block=data_block,
-                                          db_available=db_available, db_schema=db_schema,
-                                          code_state_block=_lift_live_code(located, code_root)
-                                          or code_state_block,
-                                          http_binding_block=_http_binding_bridges(
-                                              located, merged, code_root) or http_binding_block,
-                                          fragment_fact_block=_fragment_fact_cards(
-                                              located, merged, bundles, code_root)
-                                          or fragment_fact_block)
-                    logger.info("converge: omission re-pass → %s", res2.summary)
-                    if res2.converged:
-                        res = res2
+        res = _apply_omission_lead(
+            res, seed_text=seed_text, winning_path=winning_path, located=located,
+            unlocated=unlocated, windows=windows, known=known, bundles=bundles,
+            code_root=code_root, provider=provider, model=model, pk=pk, ledger=ledger,
+            timeout=timeout, max_calls=max_calls, k=k, max_hops=max_hops,
+            data_block=data_block, db_available=db_available, db_schema=db_schema,
+            code_state_block=code_state_block, http_binding_block=http_binding_block,
+            fragment_fact_block=fragment_fact_block)
 
     # When the split pass produced this result, the holistic data loop above no-op'd, so
     # the local data_* vars are still their False defaults. Reflect the WINNER's actual
@@ -3538,5 +3574,45 @@ def run_converge(*, seed_text: str, verdicts: list[dict[str, Any]],
                                lenses, lp, lm, pk, ledger, timeout, lens_min_refute)
         except Exception as e:  # the adversarial layer must never crash converge
             logger.warning("converge: lens panel failed (kept attribution): %s", e)
+
+    # ── Lever 1: a lens refutation is a RE-AIM, not a dead end. When the panel DEMOTED the
+    # attribution, EXCLUDE the refuted locus and (a) re-stitch among the remaining located
+    # fragments (the M035 contradiction-redirect pattern), then (b) if still unstitched, fall
+    # to the omission nominator (① winning-path gap) — so "blocked a wrong fix" becomes
+    # "blocked AND re-pointed" instead of dead-ending at an honest-NR. Bounded: at most ONE
+    # redirect converge call + the omission nominator's one scoped re-retrieve, and ONLY when
+    # the panel demoted. The redirect attribution is NOT re-lensed (bounded — no recursion).
+    # The refuted locus is excluded only on a MAJORITY refutation (lens_min_refute governs the
+    # panel), so a correct attribution is not cheaply discarded. Kill via HIVE_NO_LENS_REDIRECT.
+    if (res.lens_check.get("verdict") == "refuted" and not res.converged and max_calls > 1
+            and not os.environ.get("HIVE_NO_LENS_REDIRECT")):
+        rfile = _norm((res.attributed_defect or {}).get("file", ""))
+        remaining = [v for v in located
+                     if not _aligns((v.get("verdict") or {}).get("file", ""), rfile)]
+        if rfile and remaining:
+            refuted_block = _render_refuted_block(res)
+            logger.info("converge: lens-refuted %s — redirect re-stitch with it EXCLUDED "
+                        "(%d remaining located)", rfile, len(remaining))
+            res2 = _converge_once(seed_text, remaining, unlocated, windows, known,
+                                  provider, model, pk, ledger, timeout,
+                                  data_state_block=data_block, db_available=db_available,
+                                  db_schema=db_schema, code_state_block=code_state_block,
+                                  http_binding_block=http_binding_block,
+                                  fragment_fact_block=fragment_fact_block,
+                                  refuted_block=refuted_block)
+            logger.info("converge: lens redirect re-stitch → %s", res2.summary)
+            if res2.converged:
+                res2.winning_path = winning_path
+                res2.lens_check = res.lens_check  # carry the refutation record forward
+                res = res2
+        if not res.converged and not res.missing_link:
+            res = _apply_omission_lead(
+                res, seed_text=seed_text, winning_path=winning_path, located=located,
+                unlocated=unlocated, windows=windows, known=known, bundles=bundles,
+                code_root=code_root, provider=provider, model=model, pk=pk, ledger=ledger,
+                timeout=timeout, max_calls=max_calls, k=k, max_hops=max_hops,
+                data_block=data_block, db_available=db_available, db_schema=db_schema,
+                code_state_block=code_state_block, http_binding_block=http_binding_block,
+                fragment_fact_block=fragment_fact_block)
 
     return res
