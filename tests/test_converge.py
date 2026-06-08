@@ -408,6 +408,72 @@ class TestLensRefutation(unittest.TestCase):
         self.assertFalse(res.converged)
         self.assertEqual(res.lens_check, {})
 
+    def test_design_change_fragment_activates_carveout_in_lens_prompt(self):
+        # M037/T905: a located DESIGN-CHANGE fragment must propagate the converger's
+        # carve-out into the refuter prompt, so the adversarial panel cannot shave a
+        # correct on-path attribution on spec-conformance grounds (the workflowViewState
+        # miss — #2/#3). The carve-out fires on ANY located design_change fragment.
+        # Keep the two grounded fragments (so CONVERGED_OUT's attribution holds and the
+        # panel runs) and ADD a located design_change FE fragment.
+        dc_verdicts = LOCATED_VERDICTS + [
+            {"axis_id": "FE", "title": "FE",
+             "verdict": {"located": True, "type": "design_change",
+                         "file": "client/src/workflow_view.ts", "lines": "160-170",
+                         "reason": "renders the displaced head by design"}},
+        ]
+        prompts = []
+
+        def fake(provider, model, prompt, cwd=None, timeout=300, **kw):
+            prompts.append(prompt)
+            return _wr(CONVERGED_OUT if len(prompts) == 1 else _LENS_SURVIVE)
+
+        with mock.patch.object(C, "call_worker", side_effect=fake):
+            C.run_converge(seed_text="head shows the wrong step", verdicts=dc_verdicts,
+                           bundles=BUNDLES, provider="prem", model="premM",
+                           lens_lenses=["reproduction"], lens_provider="swarm",
+                           lens_model="120b")
+        self.assertGreaterEqual(len(prompts), 2)       # 1 converge + 1 lens
+        self.assertIn("DESIGN-CHANGE carve-out", prompts[1])
+
+    def test_no_design_change_no_carveout_in_lens_prompt(self):
+        # The plain (all type="bug") case must NOT carry the carve-out — adversarial
+        # refutation stays full-strength when no design-change site is present.
+        prompts = []
+
+        def fake(provider, model, prompt, cwd=None, timeout=300, **kw):
+            prompts.append(prompt)
+            return _wr(CONVERGED_OUT if len(prompts) == 1 else _LENS_SURVIVE)
+
+        with mock.patch.object(C, "call_worker", side_effect=fake):
+            C.run_converge(seed_text="s", verdicts=LOCATED_VERDICTS, bundles=BUNDLES,
+                           provider="prem", model="premM", lens_lenses=["reproduction"],
+                           lens_provider="swarm", lens_model="120b")
+        self.assertGreaterEqual(len(prompts), 2)
+        self.assertNotIn("DESIGN-CHANGE carve-out", prompts[1])
+
+
+class TestLensDesignChangeCarveOutPrompt(unittest.TestCase):
+    """Unit-level: _build_lens_prompt injects the DESIGN-CHANGE carve-out only when the
+    site flag is set, and the carve-out forbids spec-conformance as a refutation reason."""
+
+    def _prompt(self, design_change_site):
+        return C._build_lens_prompt(
+            seed_text="the head shows the wrong step",
+            attributed={"file": "client/src/workflow_view.ts", "lines": "160-170",
+                        "why": "renders the displaced head"},
+            causal_check={"verdict": "consistent", "trace": "t", "counterfactual": "c"},
+            lens="reproduction", lens_desc=C._LENS_DEFINITIONS["reproduction"],
+            code_state_block="(code)", evidence="(ev)",
+            design_change_site=design_change_site)
+
+    def test_carveout_present_and_forbids_spec_conformance(self):
+        p = self._prompt(True)
+        self.assertIn("DESIGN-CHANGE carve-out", p)
+        self.assertIn("spec-conformance is NOT a valid refutation", p)
+
+    def test_carveout_absent_when_flag_false(self):
+        self.assertNotIn("DESIGN-CHANGE carve-out", self._prompt(False))
+
 
 # ── Lever 1: lens refutation → re-aim (redirect re-stitch, then omission fallback) ──
 # Redirect re-converge output: excludes the refuted db_fn and attributes to the OTHER located

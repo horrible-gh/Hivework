@@ -225,6 +225,7 @@ def run_pipeline(args: argparse.Namespace) -> None:
             provider=queen_role.provider,
             ledger=ldg,
             provider_kwargs=provider_kwargs,
+            timeout=queen_role.worker_timeout(),
         )
 
         # Save decompose result

@@ -3193,16 +3193,41 @@ def _split_converge(seed_text: str, located: list[dict[str, Any]],
 
 def _build_lens_prompt(seed_text: str, attributed: dict[str, Any],
                        causal_check: dict[str, Any] | None, lens: str, lens_desc: str,
-                       code_state_block: str, evidence: str) -> str:
-    """One adversarial refutation prompt: break the attribution through ONE lens."""
+                       code_state_block: str, evidence: str,
+                       design_change_site: bool = False) -> str:
+    """One adversarial refutation prompt: break the attribution through ONE lens.
+
+    ``design_change_site`` carries the converger's DESIGN-CHANGE carve-out into the
+    refuter (M037/T905). Without it the adversarial panel re-introduced the exact
+    design-match trap the design_change verdict class exists to prevent: a refuter
+    breaks a correct, on-path attribution with "the code matches its own design, so
+    nothing is wrong" — shaving a legitimate FE design-change site (the
+    workflowViewState miss). The carve-out forbids that one refutation reason; the
+    shadow / omission / reproduction failure classes still refute normally.
+    """
     cc = causal_check or {}
+    design_change_note = ""
+    if design_change_site:
+        design_change_note = (
+            "\n[DESIGN-CHANGE carve-out — READ FIRST] A located fragment here is a "
+            "DESIGN-CHANGE site: a judge ruled the code FAITHFULLY implements its own "
+            "design/spec, yet the reporter declared the RESULTING on-screen behaviour "
+            "wrong or unwanted. The reporter's stated expectation is GROUND TRUTH. You "
+            "must NOT refute this attribution merely because 'the code matches its own "
+            "design / spec / state definition' or 'it already produces its designed "
+            "output' — a design-change site produces the rejected result BY DESIGN, so "
+            "spec-conformance is NOT a valid refutation, and 'expected output' means the "
+            "REPORTER's expectation, not the code's designed output. Refute ONLY if the "
+            "locus is shadowed / dead / off the live path, the fix would be incomplete (a "
+            "real OMISSION elsewhere on the path), or it genuinely cannot influence the "
+            "reported behaviour at all.\n")
     return f"""[Role] You are a REFUTER auditing a Hivework converge result. Another model \
 attributed a reported defect to ONE code locus and ruled it the cause. Your ONLY job is to \
 try to PROVE that attribution WRONG, strictly through the {lens} lens. You are adversarial: \
 unless YOUR lens positively confirms the attribution holds, you REFUTE it. Default to \
 refuted=true when uncertain — a false "survives" ships a wrong fix to a human; a false \
 "refuted" only costs one more re-hunt. You have NO tools; decide from the evidence below.
-
+{design_change_note}
 [The {lens} lens] {lens_desc}
 
 [Reported scenario / seed]
@@ -3278,6 +3303,16 @@ def _lens_refute(res: ConvergeResult, seed_text: str, located: list[dict[str, An
     ``converged`` to False and stamps ``res.lens_check``. Never raises.
     """
     attributed = res.attributed_defect or {}
+    # Design-change carve-out (M037/T905): mirror the converger's own carve-out into the
+    # adversarial panel. When a located fragment is a DESIGN-CHANGE site, no refuter may
+    # break the attribution on spec-conformance grounds. Same trigger the converger uses
+    # (any located fragment tagged design_change) — verdict.type lives under ["verdict"].
+    design_change_site = any(
+        str((v.get("verdict") or {}).get("type", "")).strip().lower() == "design_change"
+        for v in (located or []))
+    if design_change_site:
+        logger.info("converge: lens panel — DESIGN-CHANGE carve-out active "
+                    "(refuters forbidden from spec-conformance refutation)")
     ev_lines: list[str] = []
     for w in (windows or [])[:_LENS_MAX_EVIDENCE]:
         ev_lines.append(f"--- {w.get('file')}:{w.get('lines')}")
@@ -3289,7 +3324,7 @@ def _lens_refute(res: ConvergeResult, seed_text: str, located: list[dict[str, An
         desc = _LENS_DEFINITIONS.get(lens) or \
             f"Try to refute the attribution on {lens} grounds; default to refuted when unsure."
         prompt = _build_lens_prompt(seed_text, attributed, res.causal_check, lens, desc,
-                                    code_state_block, evidence)
+                                    code_state_block, evidence, design_change_site)
         parsed = _lens_refute_once(prompt, provider, model, pk, ledger, timeout, lens)
         refuted = bool(parsed.get("refuted")) if isinstance(parsed, dict) else False
         why = str(parsed.get("why", "") or "") if isinstance(parsed, dict) else ""
