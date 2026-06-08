@@ -138,6 +138,27 @@ def _spec_path(out_path: str) -> str:
     return os.path.splitext(out_path)[0] + ".edit_spec.json"
 
 
+def _frozen_honey(m: dict) -> str:
+    """Resolve the FROZEN baseline honey that specify/review cells re-author from.
+
+    Module-only replay needs ONE fixed upstream honey shared by every specify/review
+    cell (down/base/up) so the swept variable is the stage's OWN model and nothing
+    upstream — that is the OFAT intent. Prefer an explicit matrix ``frozen_honey``;
+    else fall back to a baseline honey already on disk (a specify-base rep — that cell
+    IS the all-baseline config, so its honey is a valid baseline upstream).
+    """
+    explicit = m.get("frozen_honey")
+    if explicit:
+        return explicit if os.path.isabs(explicit) else os.path.join(HERE, explicit)
+    for rep in ("2", "1", "3"):
+        cand = os.path.join(RESULTS, "specify-base", rep, "verdict.honey.md")
+        if os.path.exists(cand):
+            return cand
+    raise SystemExit(
+        "ABORT: no frozen baseline honey for specify/review replay — set matrix "
+        "'frozen_honey' or run a specify-base cell first.")
+
+
 def cell_commands(m: dict, cell: dict, rep_dir: str) -> dict:
     """Build the pipeline command for one cell run."""
     tgt = m["target"]
@@ -145,12 +166,21 @@ def cell_commands(m: dict, cell: dict, rep_dir: str) -> dict:
     profile = f"perf-{cell['id']}"
     common = [sys.executable, HIVE, "--profile", profile]
     if cell["path"] == "investigate":
-        out = os.path.join(rep_dir, "verdict.json")
-        pipeline = common + [
-            "investigate", "--seed", m["seed"], "--codebase", codebase,
-            "--docs", m["docs"], "--out", out]
         if cell["stage"] in {"specify", "review"}:
-            pipeline.append("--specify")
+            # Module-only replay (the OFAT intent): swap ONLY the specify/review model
+            # via --profile and re-author off a FROZEN baseline honey, instead of
+            # re-running decompose→judge→converge for every cell. The seam is hive.py
+            # `specify --honey`; freezing one baseline honey holds the upstream fixed
+            # across down/base/up so the comparison isolates this stage's own model.
+            out = os.path.join(rep_dir, "verdict.edit_spec.json")
+            pipeline = common + [
+                "specify", "--honey", _frozen_honey(m), "--codebase", codebase,
+                "--out", out]
+        else:  # queen / judge / converge / scout → verdict.json from a fresh investigate
+            out = os.path.join(rep_dir, "verdict.json")
+            pipeline = common + [
+                "investigate", "--seed", m["seed"], "--codebase", codebase,
+                "--docs", m["docs"], "--out", out]
     else:  # run / swarm
         out = os.path.join(rep_dir, "honey.md")
         # --specify on the run path too: honey grep alone can't score swarm/assemble

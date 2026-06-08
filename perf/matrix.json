@@ -21,9 +21,9 @@
   ],
 
   "baseline_roles": {
-    "queen":    { "provider": "codex",   "model": "gpt-5.4-mini" },
+    "queen":    { "provider": "copilot", "model": "gpt-5-mini" },
     "swarm":    { "provider": "openai",  "model": "openai/gpt-oss-120b" },
-    "scout":    { "provider": "openai",  "model": "Qwen/Qwen3-VL-235B-A22B-Instruct" },
+    "scout":    { "provider": "openai",  "model": "openai/gpt-oss-120b" },
     "judge":    { "provider": "openai",  "model": "openai/gpt-oss-120b" },
     "converge": { "provider": "copilot", "model": "gpt-5-mini" },
     "assemble": { "provider": "copilot", "model": "gpt-5-mini" },
