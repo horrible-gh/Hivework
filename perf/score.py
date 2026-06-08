@@ -31,6 +31,7 @@ Golden loci (from golden/manifest.json), all basenames distinct so basename matc
 from __future__ import annotations
 
 import argparse
+import glob
 import json
 import os
 import re
@@ -52,6 +53,27 @@ def _load_json(path: str) -> dict | None:
             return json.load(f)
     except (OSError, json.JSONDecodeError):
         return None
+
+
+def _load_edit_spec(rep_dir: str, primary: str) -> dict | None:
+    """Load an edit-spec artifact, falling back to a resume-variant.
+
+    When specify re-anchors off the winning path (``off_winning_path`` →
+    terminate honestly), it emits the authored spec under a suffixed name such
+    as ``verdict.edit_spec.specify_resume.json`` instead of ``primary``. That
+    file IS the rep's authored output, so a scorer that only looks for
+    ``primary`` mis-reads the rep as 'no artifact'. Prefer ``primary``; else
+    take the first readable ``<stem>*.json`` sibling.
+    """
+    spec = _load_json(os.path.join(rep_dir, primary))
+    if spec is not None:
+        return spec
+    stem = primary[:-len(".json")]
+    for alt in sorted(glob.glob(os.path.join(rep_dir, stem + "*.json"))):
+        spec = _load_json(alt)
+        if spec is not None:
+            return spec
+    return None
 
 
 def _base(path: str) -> str:
@@ -184,7 +206,7 @@ def score_cell(stage: str, rep_dir: str, golden: dict) -> dict:
     artifact = None
 
     if kind == "edit_spec":
-        spec = _load_json(os.path.join(rep_dir, "verdict.edit_spec.json"))
+        spec = _load_edit_spec(rep_dir, "verdict.edit_spec.json")
         if spec is not None:
             artifact = "edit_spec"
             ls = loci_from_edit_spec(spec)
@@ -193,7 +215,7 @@ def score_cell(stage: str, rep_dir: str, golden: dict) -> dict:
     elif kind == "honey":
         text = _read(os.path.join(rep_dir, "honey.md"))
         # run path may also emit an edit_spec when --specify is on; prefer it if present.
-        spec = _load_json(os.path.join(rep_dir, "honey.edit_spec.json"))
+        spec = _load_edit_spec(rep_dir, "honey.edit_spec.json")
         if spec is not None:
             artifact = "edit_spec"
             ls = loci_from_edit_spec(spec)
