@@ -703,10 +703,14 @@ def build_converge_prompt(seed_text: str, located: list[dict[str, Any]],
     ``data_reads``/``undecidable`` so the glue can fetch the rows and re-ask on fact.
     """
     frag_lines = []
+    any_design_change = False
     for v in located:
         vd = v.get("verdict") or {}
+        dc = str(vd.get("type", "")).strip().lower() == "design_change"
+        any_design_change = any_design_change or dc
+        tag = " [DESIGN-CHANGE site]" if dc else ""
         frag_lines.append(
-            f"- axis {v.get('axis_id', '?')}: {vd.get('file', '')}:{vd.get('lines', '')} "
+            f"- axis {v.get('axis_id', '?')}: {vd.get('file', '')}:{vd.get('lines', '')}{tag} "
             f"— {_trunc(vd.get('reason', ''), _REASON_CHARS)}")
     frags = "\n".join(frag_lines) or "(none)"
 
@@ -850,6 +854,25 @@ def build_converge_prompt(seed_text: str, located: list[dict[str, Any]],
             "NOT re-attribute to a refuted node below.]\n"
             + refuted_block.strip() + "\n")
 
+    # Design-change carve-out (M037): when a judge tagged a fragment [DESIGN-CHANGE site],
+    # the converger must not refute it with a spec-conformance argument ("the code matches
+    # its own design, so nothing is wrong") — that is the exact T905 FE-visual-axis miss.
+    # The reporter's declared expectation is ground truth, so a faithful-to-design site CAN
+    # be the node a change lands on; it is checked the SAME way (does it EMIT the rejected
+    # behaviour?), not against its own spec.
+    design_change_note = ""
+    if any_design_change:
+        design_change_note = (
+            "\n[DESIGN-CHANGE sites among the fragments] One or more located fragments are "
+            "tagged [DESIGN-CHANGE site]: a judge ruled the code there FAITHFULLY implements "
+            "its own design/spec, yet the reporter declared the resulting behaviour wrong or "
+            "unwanted, so the SITE still must change. Treat such a fragment as a LEGITIMATE "
+            "attribution target — do NOT refute it merely because 'the code matches its own "
+            "design definition'. A design-change site produces the rejected on-screen result "
+            "BY DESIGN; the reporter's stated expectation is ground truth, so that site CAN be "
+            "the node a change must land on. Apply the SAME cause→symptom check (does this "
+            "site EMIT the rejected behaviour?), never a spec-conformance check.\n")
+
     schema_block = ""
     if db_available and db_schema.strip():
         schema_block = (
@@ -890,7 +913,7 @@ worker hallucination; it should be BLUE." A ``why`` of "the active step is not p
 yellow as intended" INVERTS the requirement: it re-crowns the seed-NEGATED value as the \
 goal.) If your ``why`` would re-assert a seed-negated value as the intent, you have read \
 the seed backwards — flip your reasoning before emitting.
-
+{design_change_note}
 [Reported scenario / seed]
 {_trunc(seed_text, 2000)}
 {confirmed_block}{db_avail_block}{schema_block}{code_state}{http_bindings}
@@ -999,7 +1022,14 @@ views of one call chain), put the PRIMARY one in ``attributed_defect`` and EACH 
 others in ``additional_defects`` with its own node/file/lines/why. Do NOT fold genuinely \
 separate defects into one node, and do NOT pad ``additional_defects`` with corroborating \
 context for a single defect — list a locus there only when LEAVING IT OUT would ship a \
-half-fix.
+half-fix. A strong tell for INDEPENDENCE: the broken outputs span DIFFERENT mechanisms / \
+layers (a wrong BACK-END value, a wrong FRONT-END colour or visual state, a status/badge \
+that never flips) or are produced by DIFFERENT response fields — outputs at different \
+layers or carried by different fields CANNOT all be the same call chain, so each is its \
+own root even though ONE reporter listed them together. Do NOT assume a multi-symptom \
+report reduces to a single shared cause: when several enumerated symptoms each have their \
+own producer among the fragments, attribute the primary and carry the rest as independent \
+defects rather than refuting them as "the same chain".
 
 [Gate] Only a "consistent" causal check is actionable downstream. When your check is \
 "contradicted" or "undecidable", STILL fill attributed_defect with the node you \
@@ -2463,6 +2493,72 @@ def _http_datasource_provenance_guard(res: ConvergeResult,
     return res
 
 
+def _field_provenance_reaim(res: ConvergeResult,
+                            prod_fields: dict[str, set[str]],
+                            prod_text: dict[str, str],
+                            prod_loc: dict[str, tuple[str, str]]) -> ConvergeResult:
+    """Block a NAME-DECOY attribution when the FE-bound field's producer exists but was not
+    located (M037 — the negative-space twin of :func:`_field_provenance_guard`).
+
+    field-producer grounding resolved a snake_case field the FE reads to the server code
+    that FILLS it, yet NO judge located that producer. The converger then anchored on a
+    file that merely SHARES a concept token with the symptom (``head`` → the head-route
+    serializer) but does NOT produce the field and is NOT on its production path — a name
+    decoy (T905: attributed ``workflow_head_routes.py``; the strip actually reads
+    ``workflow_head_type`` produced in ``documents.py``). We do not RE-POINT to the
+    unlocated producer (that would invent an unvetted edit target); we DEMOTE the
+    convergence and emit a ``missing_link`` aimed at the producer so the run re-investigates
+    THERE instead of locking the decoy. Left untouched when the attribution itself produces
+    an FE-bound field, lies on a producer's production path, or a lead is already named.
+    Disabled by ``HIVE_NO_FIELD_PROVENANCE`` / ``HIVE_NO_FIELD_PROVENANCE_REAIM``.
+    """
+    if os.environ.get("HIVE_NO_FIELD_PROVENANCE_REAIM"):
+        return res
+    ad = res.attributed_defect or {}
+    c = _norm(ad.get("file", ""))
+    if not c:
+        return res
+    if res.missing_link:                 # a better-aimed lead already exists — don't clobber
+        return res
+    if c in prod_fields:                 # C itself produces an FE-bound field → not a decoy
+        return res
+    c_stem = c.rsplit("/", 1)[-1].rsplit(".", 1)[0]
+    for txt in prod_text.values():       # C read by a producer (on its path) → upstream, leave
+        if c_stem and c_stem in (txt or "").lower():
+            return res
+    # Richest producer P (most FE-bound fields) is the re-aim target.
+    P = sorted(prod_fields.items(), key=lambda kv: (-len(kv[1]), kv[0]))[0][0]
+    pfile, plines = prod_loc.get(P, (P, ""))
+    fields = sorted(x for x in prod_fields.get(P, set()) if x)
+    old = {"file": ad.get("file", ""), "lines": ad.get("lines", "")}
+    res.converged = False
+    res.missing_link = {
+        "between": ["fe-binding", "field-producer"],
+        "need": {
+            "symbols": fields[:4],
+            "greps": fields[:4],
+            "file_globs": [pfile] if pfile else [],
+        },
+    }
+    cc = dict(res.causal_check or {})
+    cc["field_provenance_reaimed"] = {
+        "from": old, "toward": {"file": pfile, "lines": plines}, "fields": fields}
+    cc["trace"] = (cc.get("trace") or "") + (
+        f" [field-provenance re-aim] the symptom is a wrong FE-bound field value "
+        f"({', '.join(fields)}); that field is PRODUCED at {pfile}:{plines} (field-producer "
+        f"grounding), but the attribution {old['file']}:{old['lines']} neither produces it "
+        f"nor lies on its production path — a name-decoy. Demoted and re-aimed at the "
+        f"producer (not certified).")
+    res.causal_check = cc
+    res.summary = (
+        f"not converged (field-provenance re-aim): {old['file']}:{old['lines']} is a "
+        f"name-decoy; the FE-bound field is produced at {pfile}:{plines} (not located) — "
+        f"routed to reinvestigation toward the producer")
+    logger.info("converge: field-provenance guard re-aimed name-decoy %s:%s → producer "
+                "%s:%s (demoted, missing_link)", old["file"], old["lines"], pfile, plines)
+    return res
+
+
 def _field_provenance_guard(res: ConvergeResult,
                             located: list[dict[str, Any]],
                             fp_windows: list[dict[str, Any]]) -> ConvergeResult:
@@ -2502,6 +2598,7 @@ def _field_provenance_guard(res: ConvergeResult,
         return res
     prod_fields: dict[str, set[str]] = {}
     prod_text: dict[str, str] = {}
+    prod_loc: dict[str, tuple[str, str]] = {}
     for w in fp_windows or []:
         if w.get("via") != "field-producer":
             continue
@@ -2510,13 +2607,21 @@ def _field_provenance_guard(res: ConvergeResult,
             continue
         prod_fields.setdefault(f, set()).add(str(w.get("field", "")))
         prod_text[f] = prod_text.get(f, "") + "\n" + (w.get("text") or "")
+        prod_loc.setdefault(f, (str(w.get("file", "")), str(w.get("lines", ""))))
     if not prod_fields:
         return res
     # P = located producer filling the MOST FE-bound fields (vetted + symptom-rich).
     prod_located = [v for v in located
                     if _norm((v.get("verdict") or {}).get("file", "")) in prod_fields]
     if not prod_located:
-        return res
+        # The symptom's FE-bound field HAS a known producer, but no judge located it. A
+        # converged attribution to a file that neither produces that field nor lies on its
+        # production path is a NAME-DECOY — matched on a shared concept token, not on the
+        # executed FE→BE binding (the T905 ``workflow_head_routes.py`` miss). Don't certify
+        # it by default; demote and name the real producer as a lead so the run re-aims at
+        # it. We never RE-POINT to the unlocated producer (that would invent an unvetted
+        # edit target) — only emit the missing_link.
+        return _field_provenance_reaim(res, prod_fields, prod_text, prod_loc)
 
     def _rank(v: dict[str, Any]) -> tuple[int, str]:
         f = _norm((v.get("verdict") or {}).get("file", ""))
@@ -2593,6 +2698,86 @@ def _field_provenance_guard(res: ConvergeResult,
     return res
 
 
+def _multi_root_coverage_guard(res: ConvergeResult,
+                               located: list[dict[str, Any]],
+                               fp_windows: list[dict[str, Any]]) -> ConvergeResult:
+    """Surface INDEPENDENT roots that a single-path stitch collapsed (M037 / N179 reinforce).
+
+    A multi-mechanism scenario — e.g. a wrong BE value AND a wrong FE colour AND a status
+    badge that never flips — needs fixes at SEVERAL independent loci. The converger, built to
+    attribute ONE node on ONE path, sometimes folds them into a single defect and refutes the
+    peers as "the same chain", shipping a half-fix. This guard uses field-producer grounding
+    as a STRUCTURAL independence test: a located peer that PRODUCES a different FE-bound field
+    than the attributed locus (disjoint field sets, different files) cannot be a corroborating
+    view of the SAME chain — it is a distinct output with its own root. Such a vetted, dropped
+    peer is promoted into ``additional_defects`` so specify's converge-coverage gate refuses to
+    call the spec ready until each independent root is fixed.
+
+    Conservative: fires only on a CONVERGED result where BOTH the attribution and the peer are
+    judge-LOCATED field-producers with disjoint, non-empty field sets. Never demotes the
+    primary — it only ADDS missed roots. Disabled by ``HIVE_NO_MULTI_ROOT``.
+    """
+    if os.environ.get("HIVE_NO_MULTI_ROOT") or not res.converged:
+        return res
+    ad = res.attributed_defect or {}
+    af = _norm(ad.get("file", ""))
+    if not af:
+        return res
+    prod_fields: dict[str, set[str]] = {}
+    for w in fp_windows or []:
+        if w.get("via") != "field-producer":
+            continue
+        f = _norm(w.get("file", ""))
+        fld = str(w.get("field", "")).strip()
+        if not f or not fld:
+            continue
+        prod_fields.setdefault(f, set()).add(fld)
+    if af not in prod_fields:
+        return res                       # attribution is not a field-producer → don't guess
+    a_fields = prod_fields[af]
+    located_by_file: dict[str, dict[str, Any]] = {}
+    for v in located or []:
+        f = _norm((v.get("verdict") or {}).get("file", ""))
+        if f:
+            located_by_file.setdefault(f, v)
+    existing = {(_norm(d.get("file", "")), str(d.get("lines", "")))
+                for d in (res.additional_defects or [])}
+    existing.add((af, str(ad.get("lines", ""))))
+    added: list[dict[str, Any]] = []
+    for pf, pflds in sorted(prod_fields.items()):
+        if pf == af or pf not in located_by_file:
+            continue                     # only promote a VETTED (judge-located) producer
+        if a_fields & pflds:
+            continue                     # shares a field with the attribution → same output
+        vd = located_by_file[pf].get("verdict") or {}
+        key = (pf, str(vd.get("lines", "")))
+        if key in existing:
+            continue
+        existing.add(key)
+        added.append({
+            "node": "field-producer",
+            "file": vd.get("file", ""),
+            "lines": vd.get("lines", ""),
+            "why": (f"independent root: produces the distinct FE-bound field(s) "
+                    f"{', '.join(sorted(pflds))} — a SEPARATE output from the primary's "
+                    f"{', '.join(sorted(a_fields))}, so it cannot be the same chain and "
+                    f"needs its own fix"),
+        })
+    if not added:
+        return res
+    res.additional_defects = list(res.additional_defects or []) + added
+    cc = dict(res.causal_check or {})
+    cc["multi_root_candidates"] = [{"file": d["file"], "lines": d["lines"]} for d in added]
+    cc["trace"] = (cc.get("trace") or "") + (
+        f" [multi-root] {len(added)} located peer(s) produce DISTINCT FE-bound field(s) from "
+        f"the attributed locus — promoted to additional_defects as independent roots so the "
+        f"fix covers every reported output, not just one.")
+    res.causal_check = cc
+    logger.info("converge: multi-root guard promoted %d independent field-producer root(s) "
+                "to additional_defects", len(added))
+    return res
+
+
 def _causal_provenance_arbiter(
         res: ConvergeResult,
         located: list[dict[str, Any]],
@@ -2637,6 +2822,9 @@ def _causal_provenance_arbiter(
         res = _http_datasource_provenance_guard(
             res, located, http_ds_windows, code_root)
         res = _field_provenance_guard(res, located, fp_windows)
+        # Last: with the attribution settled, surface any INDEPENDENT roots (distinct
+        # FE-bound field producers) the single-path stitch collapsed (N179 reinforcement).
+        res = _multi_root_coverage_guard(res, located, fp_windows)
         return res
     except Exception as e:
         logger.warning("converge: causal provenance arbiter failed closed: %s", e)

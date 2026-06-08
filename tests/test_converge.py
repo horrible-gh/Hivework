@@ -2560,11 +2560,38 @@ class TestFieldProvenanceGuard(unittest.TestCase):
         self.assertEqual(C._norm(out.attributed_defect["file"]), C._norm(self.DOCS))
         self.assertTrue(out.converged)
 
-    def test_noop_when_producer_not_located(self):
-        # never invent a target: the producer must be a judge-located candidate.
+    def test_reaims_name_decoy_when_producer_not_located(self):
+        # M037: the FE-bound field's producer (DOCS) was found by field-producer grounding
+        # but NO judge located it; the attribution (DECOY) neither produces the field nor is
+        # on its production path → a name-decoy. The guard must NOT re-point to the unlocated
+        # producer (no invented edit target — attribution stays DECOY) but must DEMOTE and
+        # name the producer as a missing_link lead so the run re-aims there (the T905 miss).
         res = self._res_attr(self.DECOY)
         out = C._field_provenance_guard(res, self._located(self.DECOY), self._windows())
         self.assertEqual(C._norm(out.attributed_defect["file"]), C._norm(self.DECOY))
+        self.assertFalse(out.converged)
+        self.assertIsNotNone(out.missing_link)
+        self.assertIn("workflow_head_type", out.missing_link["need"]["greps"])
+        self.assertTrue(any(C._norm(self.DOCS) == C._norm(g)
+                            for g in out.missing_link["need"]["file_globs"]))
+        self.assertIn("field_provenance_reaimed", out.causal_check)
+
+    def test_reaim_noop_when_attribution_on_producer_path(self):
+        # the attribution's file stem appears in the producer's text (C is read by P) → C may
+        # be the upstream cause; do not demote.
+        res = self._res_attr("server/foo/head_helper.py")
+        out = C._field_provenance_guard(
+            res, self._located(self.DECOY),
+            self._windows(text='out["workflow_head_type"] = head_helper.compute()'))
+        self.assertTrue(out.converged)
+        self.assertIsNone(out.missing_link)
+
+    def test_reaim_disabled_by_env(self):
+        res = self._res_attr(self.DECOY)
+        with mock.patch.dict(os.environ, {"HIVE_NO_FIELD_PROVENANCE_REAIM": "1"}):
+            out = C._field_provenance_guard(res, self._located(self.DECOY), self._windows())
+        self.assertTrue(out.converged)
+        self.assertIsNone(out.missing_link)
 
     def test_noop_when_no_field_producer_evidence(self):
         res = self._res_attr(self.DECOY)
@@ -2591,6 +2618,78 @@ class TestFieldProvenanceGuard(unittest.TestCase):
             self.assertEqual(C._norm(out.attributed_defect["file"]), C._norm(self.DECOY))
         finally:
             del os.environ["HIVE_NO_FIELD_PROVENANCE"]
+
+
+class TestMultiRootCoverageGuard(unittest.TestCase):
+    """M037 / N179: a multi-mechanism scenario whose distinct FE-bound field producers were
+    located must not collapse to one defect — independent roots are promoted to additional."""
+
+    HEAD = "server/documents.py"
+    BADGE = "server/badge.py"
+
+    def _located(self, *files):
+        return [{"axis_id": f"AX{i}", "verdict": {"located": True, "file": f,
+                 "lines": "10-20", "reason": "r"}} for i, f in enumerate(files)]
+
+    def _fp(self, *pairs):
+        return [{"file": f, "lines": "10-20", "via": "field-producer", "field": fld,
+                 "text": f'out["{fld}"] = x'} for f, fld in pairs]
+
+    def _res(self, file, converged=True):
+        return C.ConvergeResult(
+            converged=converged,
+            attributed_defect={"node": "n", "file": file, "lines": "10-20"},
+            causal_check={"verdict": "consistent", "trace": "t"})
+
+    def test_promotes_distinct_field_producer_root(self):
+        # HEAD produces workflow_head_type; BADGE produces doc_status — disjoint fields at
+        # different files, both located → BADGE is an independent root, not the same chain.
+        res = self._res(self.HEAD)
+        out = C._multi_root_coverage_guard(
+            res, self._located(self.HEAD, self.BADGE),
+            self._fp((self.HEAD, "workflow_head_type"), (self.BADGE, "doc_status")))
+        self.assertTrue(out.converged)                       # primary stays
+        files = {C._norm(d["file"]) for d in out.additional_defects}
+        self.assertIn(C._norm(self.BADGE), files)
+        self.assertIn("multi_root_candidates", out.causal_check)
+
+    def test_noop_when_peer_shares_field(self):
+        # both produce the SAME field → corroborating views of one output, not independent.
+        res = self._res(self.HEAD)
+        out = C._multi_root_coverage_guard(
+            res, self._located(self.HEAD, self.BADGE),
+            self._fp((self.HEAD, "workflow_head_type"), (self.BADGE, "workflow_head_type")))
+        self.assertEqual(out.additional_defects, [])
+
+    def test_noop_when_peer_not_located(self):
+        # the distinct-field producer must be JUDGE-LOCATED to be promoted (no invention).
+        res = self._res(self.HEAD)
+        out = C._multi_root_coverage_guard(
+            res, self._located(self.HEAD),
+            self._fp((self.HEAD, "workflow_head_type"), (self.BADGE, "doc_status")))
+        self.assertEqual(out.additional_defects, [])
+
+    def test_noop_when_attribution_not_a_producer(self):
+        res = self._res("server/unrelated.py")
+        out = C._multi_root_coverage_guard(
+            res, self._located("server/unrelated.py", self.BADGE),
+            self._fp((self.HEAD, "workflow_head_type"), (self.BADGE, "doc_status")))
+        self.assertEqual(out.additional_defects, [])
+
+    def test_noop_when_not_converged(self):
+        res = self._res(self.HEAD, converged=False)
+        out = C._multi_root_coverage_guard(
+            res, self._located(self.HEAD, self.BADGE),
+            self._fp((self.HEAD, "workflow_head_type"), (self.BADGE, "doc_status")))
+        self.assertEqual(out.additional_defects, [])
+
+    def test_kill_switch_disables(self):
+        with mock.patch.dict(os.environ, {"HIVE_NO_MULTI_ROOT": "1"}):
+            res = self._res(self.HEAD)
+            out = C._multi_root_coverage_guard(
+                res, self._located(self.HEAD, self.BADGE),
+                self._fp((self.HEAD, "workflow_head_type"), (self.BADGE, "doc_status")))
+        self.assertEqual(out.additional_defects, [])
 
 
 class TestHttpDatasourceProvenanceGuard(unittest.TestCase):
