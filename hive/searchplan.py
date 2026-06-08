@@ -197,9 +197,7 @@ _VISIBILITY_SYMPTOM_RE = re.compile(
     r"|(?:isn'?t|aren'?t|doesn'?t|don'?t|won'?t|can'?t|no longer)\s+"
     r"(?:see|show|shown|render|rendered|appear|appears|display|displayed|visible)"
     r"|(?:greyed|grayed)\s*out|\bnot\s+enabled\b|\bgreyed\b|\bdisabled\b|\bhidden\b"
-    r"|\binvisible\b"
-    r"|안\s*보|보이지\s*않|표시되지\s*않|렌더(?:링)?\s*(?:안|되지\s*않)"
-    r"|나타나지\s*않|노출되지\s*않|비활성",
+    r"|\binvisible\b",
     re.IGNORECASE,
 )
 

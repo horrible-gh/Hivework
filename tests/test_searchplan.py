@@ -157,13 +157,6 @@ class TestVisibilityProbe(unittest.TestCase):
                   "options no longer appear in the picker"):
             self.assertTrue(is_visibility_symptom(s), s)
 
-    def test_detects_korean_visibility_symptoms(self):
-        for s in ("모듈 셀렉터가 화면에 안 보임",
-                  "컨트롤이 렌더링되지 않음",
-                  "옵션이 노출되지 않습니다",
-                  "버튼이 비활성 상태"):
-            self.assertTrue(is_visibility_symptom(s), s)
-
     def test_ignores_unrelated_symptoms(self):
         for s in ("the head doc sorts in the wrong order",
                   "the API returns a 500 on submit",
