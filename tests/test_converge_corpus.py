@@ -15,6 +15,7 @@ _KNOWN_STAMPS = {
     "field_provenance_confirmed",
     "http_datasource_provenance_repointed",
     "http_datasource_provenance_confirmed",
+    "design_change_preserved",
     "unrefuted_peer",
     "counterfactual_incomplete",
     "trace_ungrounded",

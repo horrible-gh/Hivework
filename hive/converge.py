@@ -2348,6 +2348,29 @@ def _clear_resolved_peer(cc: dict[str, Any] | None,
     return out
 
 
+def _attribution_is_design_change(attr_file: str,
+                                  located: list[dict[str, Any]]) -> bool:
+    """True when ``attr_file`` aligns to a judge-tagged ``design_change`` located site.
+
+    A ``design_change`` verdict means the judge vetted that locus as the node a change must
+    land on: the reporter's stated expectation is ground truth and the code is faithful to
+    its own design. That human-expectation signal outranks a *structural* re-point, so the
+    provenance guards must not silently move the attribution AWAY from it — mirroring the
+    lens-refutation design-change carve-out. Lexical/off-path decoys (M036) are never tagged
+    ``design_change``, so the datasource/field re-points they rely on stay unaffected.
+    """
+    c = _norm(attr_file)
+    if not c:
+        return False
+    for v in located or []:
+        vd = v.get("verdict") or {}
+        if str(vd.get("type", "")).strip().lower() != "design_change":
+            continue
+        if _aligns(c, _norm(vd.get("file", ""))):
+            return True
+    return False
+
+
 def _http_datasource_provenance_guard(res: ConvergeResult,
                                       located: list[dict[str, Any]],
                                       windows: list[dict[str, Any]],
@@ -2452,6 +2475,19 @@ def _http_datasource_provenance_guard(res: ConvergeResult,
                 f"converged (HTTP datasource provenance): defect at {ad.get('file', '')}:"
                 f"{ad.get('lines', '')} empties the field feeding the gated FE variable")
         res.causal_check = _clear_resolved_peer(res.causal_check, ad)
+        return res
+
+    # design-change carve-out: a judge-vetted design_change attribution is the node a change
+    # must land on (reporter expectation = ground truth); do not re-point it to a structural
+    # datasource. Off-path decoys are never design_change, so M036-style re-points stand.
+    if _attribution_is_design_change(ad.get("file", ""), located):
+        cc = dict(res.causal_check or {})
+        cc["design_change_preserved"] = {
+            "file": ad.get("file", ""), "lines": ad.get("lines", ""),
+            "guard": "http_datasource"}
+        res.causal_check = cc
+        logger.info("converge: HTTP datasource guard preserved design_change site %s:%s "
+                    "(re-point suppressed)", ad.get("file", ""), ad.get("lines", ""))
         return res
 
     old = {"file": ad.get("file", ""), "lines": ad.get("lines", "")}
@@ -2681,6 +2717,20 @@ def _field_provenance_guard(res: ConvergeResult,
         return res
     path_files = {_norm(n.get("file", "")) for n in (res.path or [])}
     if c in path_files and tf in path_files:
+        return res
+
+    # design-change carve-out: never re-point AWAY from a judge-vetted design_change site.
+    # The reporter's expectation is ground truth there and faithful-to-design code does not
+    # refute it (the lens panel still demotes via shadow/dead/omission). A merely-structural
+    # field-producer elsewhere must not silently override that human-expectation verdict.
+    if _attribution_is_design_change(ad.get("file", ""), located):
+        cc = dict(res.causal_check or {})
+        cc["design_change_preserved"] = {
+            "file": ad.get("file", ""), "lines": ad.get("lines", ""),
+            "guard": "field_provenance"}
+        res.causal_check = cc
+        logger.info("converge: field-provenance guard preserved design_change site %s:%s "
+                    "(re-point suppressed)", ad.get("file", ""), ad.get("lines", ""))
         return res
 
     # (job 1) RE-POINT a disconnected decoy to the field's real producer.

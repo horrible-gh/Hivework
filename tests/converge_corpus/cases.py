@@ -30,16 +30,20 @@ class CorpusCase:
     expect: dict[str, Any]
 
 
-def _located(axis_id: str, file: str, lines: str, reason: str) -> dict[str, Any]:
+def _located(axis_id: str, file: str, lines: str, reason: str,
+             vtype: str | None = None) -> dict[str, Any]:
+    verdict: dict[str, Any] = {
+        "located": True,
+        "file": file,
+        "lines": lines,
+        "reason": reason,
+    }
+    if vtype:
+        verdict["type"] = vtype
     return {
         "axis_id": axis_id,
         "title": axis_id.replace("_", " ").title(),
-        "verdict": {
-            "located": True,
-            "file": file,
-            "lines": lines,
-            "reason": reason,
-        },
+        "verdict": verdict,
         "votes": [],
         "candidates": [],
         "coverage": {},
@@ -238,6 +242,25 @@ N170_NEG_WINDOWS = [
             "    payload['display_status'] = status_store.lookup(record.id)\n"
             "    return payload\n"
         ),
+    }
+]
+
+
+# ── design_change carve-out loci ──
+# A design_change verdict means the judge vetted the locus as the node a change must land on
+# (reporter expectation = ground truth, code faithful-to-design). The provenance guards must
+# not re-point AWAY from it to a merely-structural producer/datasource. Here the rejected
+# design lives in head_policy.py while a separate serializer mechanically copies the field.
+DC_SITE = "server/app/head_policy.py"
+DC_PRODUCER = "server/app/response_serializer.py"
+DC_FIELD_WINDOWS = [
+    {
+        "file": DC_PRODUCER,
+        "lines": "20-31",
+        "via": "field-producer",
+        "field": "workflow_head_type",
+        "symbol": "serialize_document",
+        "text": "out['workflow_head_type'] = policy_result\n",
     }
 ]
 
@@ -610,6 +633,74 @@ CASES = [
             "attributed_file": P0_ATTR,
             "stamp": None,
             "outcome": "SILENT",
+        },
+    ),
+    # ── design_change carve-out (field-provenance must not re-point a vetted design site) ──
+    CorpusCase(
+        id="design-change-field",
+        summary="a judge-tagged design_change site is preserved, not re-pointed to the producer",
+        captured=False,
+        result=_result(
+            DC_SITE, "60-78",
+            trace="head_policy.py implements the head-selection design the reporter rejects",
+        ),
+        located=[
+            _located("HEAD_POLICY", DC_SITE, "60-78",
+                     "faithfully implements the rejected head-selection design",
+                     vtype="design_change"),
+            _located("SERIALIZER", DC_PRODUCER, "20-31",
+                     "mechanically serializes workflow_head_type into the response"),
+        ],
+        windows=DC_FIELD_WINDOWS,
+        guard="field_provenance",
+        expect={
+            "converged": True,
+            "attributed_file": DC_SITE,
+            "stamp": "design_change_preserved",
+            "outcome": "PRESERVE",
+        },
+    ),
+    CorpusCase(
+        id="design-change-field-neg",
+        summary="without the design_change tag the same site re-points (carve-out is narrow)",
+        captured=False,
+        result=_result(
+            DC_SITE, "60-78",
+            trace="head_policy.py looks relevant to the head value",
+        ),
+        located=[
+            _located("HEAD_POLICY", DC_SITE, "60-78", "looks relevant to the head value"),
+            _located("SERIALIZER", DC_PRODUCER, "20-31",
+                     "mechanically serializes workflow_head_type into the response"),
+        ],
+        windows=DC_FIELD_WINDOWS,
+        guard="field_provenance",
+        expect={
+            "converged": True,
+            "attributed_file": DC_PRODUCER,
+            "stamp": "field_provenance_repointed",
+            "outcome": "RE-POINT",
+        },
+    ),
+    # ── design_change carve-out (HTTP datasource must not re-point a vetted design site) ──
+    CorpusCase(
+        id="design-change-http",
+        summary="a design_change-tagged attribution is preserved, not re-pointed to the datasource",
+        captured=False,
+        result=_result(M036_DECOY, "101-144", trace="this route encodes the rejected design"),
+        located=[
+            _located("MODULE_ROUTE", M036_DECOY, "101-144",
+                     "faithfully encodes the module-listing design the reporter rejects",
+                     vtype="design_change"),
+            M036_LOCATED[1],
+        ],
+        windows=M036_WINDOWS,
+        guard="http_datasource",
+        expect={
+            "converged": True,
+            "attributed_file": M036_DECOY,
+            "stamp": "design_change_preserved",
+            "outcome": "PRESERVE",
         },
     ),
 ]
