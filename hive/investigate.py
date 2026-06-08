@@ -410,7 +410,8 @@ def _converge_fragments(verdicts: list[dict[str, Any]]) -> list[dict[str, Any]]:
                     "title": v.get("title", ""),
                     "verdict": {"located": True, "file": c.get("file", ""),
                                 "lines": c.get("lines", ""),
-                                "reason": c.get("reason", "")},
+                                "reason": c.get("reason", ""),
+                                "type": c.get("type", "bug")},
                 })
         else:
             out.append(v)
@@ -661,14 +662,15 @@ def run_investigate(
                             "doc_topics": sp.doc_topics},
             "calls_made": jr["calls_made"],
             "verdict": {"located": v.located, "file": v.file, "lines": v.lines,
-                        "reason": v.reason},
+                        "reason": v.reason, "type": v.verdict_type},
             # Best-of-N union: every distinct located locus across the votes. The
             # representative ``verdict`` above is one of these (the most-voted file);
             # the full set is expanded into converge fragments so the causal gate —
             # not a vote count — decides which survive. At votes_per_axis=1 this is
             # exactly the one representative locus (or empty when unlocated).
             "votes": {"n": jr.get("votes", 1), "located": jr.get("located_votes", 0)},
-            "candidates": [{"file": c.file, "lines": c.lines, "reason": c.reason}
+            "candidates": [{"file": c.file, "lines": c.lines, "reason": c.reason,
+                            "type": c.verdict_type}
                            for c in jr.get("candidates", [])],
             # (B2/#5) sufficiency tag: was this axis's evidence thin, and did the queen
             # flag it? Lets the honey/reaction tell a retrieval gap from a reasoning gap.
@@ -1279,8 +1281,18 @@ def render_local_honey(result: dict[str, Any], seed_text: str,
                     f"### {v.get('axis_id', '?')} — {v.get('title', '')}".rstrip(" —"),
                     f"- location: {vd.get('file', '')}:{vd.get('lines', '')}",
                     f"- why relevant: {vd.get('reason', '')}",
-                    "",
                 ]
+                # Design-change candidate (M037): the code matches its own design but the
+                # reporter declared the result wrong — the SITE still must change. Mark it so
+                # the author treats it as a legitimate change target, not a spec-conformance
+                # non-finding.
+                if str(vd.get("type", "")).strip().lower() == "design_change":
+                    out.append(
+                        "- DESIGN-CHANGE candidate: code here faithfully implements its own "
+                        "design/spec, but the requested change declares the resulting "
+                        "behaviour wrong/unwanted — this site is the place the design change "
+                        "must land (it is NOT a bug against the spec, and NOT a non-finding).")
+                out.append("")
     else:
         out += ["_No axis produced a grounded localisation. specify should defer "
                 "rather than fabricate an edit._", ""]

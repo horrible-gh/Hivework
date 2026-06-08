@@ -8,7 +8,7 @@
 [Depth contract — no shallow combs] You MUST do the following:
 1. **Execution reachability**: judge not that the code "exists" but whether it "actually runs." Check whether branch conditions, early returns, swallowed try/except, or **SQL WHERE gates** skip the block. (e.g. if the head-lookup query requires `result_doc_id IS NOT NULL`, that block does not run on the first insert.) Write "exists" and "reached" as distinct facts.
 2. **Call-chain trace**: connect file:line with `→` from entry point → … → the DB write.
-3. **Design contrast** (when possible): contrast the code's behavior against the spec intended by the design docs. A mismatch is the bug; a match is intended behavior.
+3. **Design contrast** (when possible): contrast the code's behavior against the spec intended by the design docs. A mismatch is the bug; a match is intended behavior — UNLESS the reporter declares that intended behavior itself wrong or unwanted, in which case the matching site is a DESIGN-CHANGE candidate (the site still must change), not a non-finding.
 4. **blame** (if the axis is about regression/history): use `git log` / `git blame` to pin the introducing/modifying commit (hash + title) for the relevant lines. Also check "is it already fixed."
 
 [Output contract — comb] Output ONLY the single JSON object below. No prose, no text outside the JSON.
