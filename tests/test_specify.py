@@ -1494,6 +1494,40 @@ class TestRunSpecifyGrounding(unittest.TestCase):
                     output_path=self.out, contract_path=self.contract,
                     review=False, author_retries=1)
 
+    def test_unparseable_output_is_retried(self):
+        # An exit-0, non-empty author turn whose output does not decode to JSON
+        # (malformed / prose-wrapped — a recurring copilot/codex defect) is a SOFT
+        # failure: retried on the remaining budget instead of crashing specify and
+        # discarding the paid-for investigate stage (#4 / A3).
+        bare = {"edits": [], "deferred": [], "gate": {"apply": False},
+                "termination": "needs_reinvestigation"}
+        calls = []
+
+        def fake(provider, model, prompt, cwd=None, timeout=300, **kw):
+            calls.append(1)
+            if len(calls) == 1:
+                return _wr("Sure! Here is the edit spec:\n(no json)")  # prose only
+            return _wr(json.dumps(bare))
+
+        with mock.patch.object(specify, "call_worker", side_effect=fake):
+            spec = specify.run_specify(
+                honey_path=self.honey, codebase_root=self.tmp,
+                output_path=self.out, contract_path=self.contract,
+                review=False, author_retries=1)
+        self.assertEqual(len(calls), 2)            # first unparseable, second valid
+        self.assertEqual(spec["termination"], "needs_reinvestigation")
+
+    def test_unparseable_output_reraises_after_retries_exhausted(self):
+        def fake(provider, model, prompt, cwd=None, timeout=300, **kw):
+            return _wr("no json here at all")  # exit 0, non-empty, undecodable
+
+        with mock.patch.object(specify, "call_worker", side_effect=fake):
+            with self.assertRaises(ValueError):
+                specify.run_specify(
+                    honey_path=self.honey, codebase_root=self.tmp,
+                    output_path=self.out, contract_path=self.contract,
+                    review=False, author_retries=1)
+
 
 class TestReviewerProvider(unittest.TestCase):
     """The effectiveness reviewer can run on a different provider than the author

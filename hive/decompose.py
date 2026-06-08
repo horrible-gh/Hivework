@@ -543,6 +543,7 @@ def run_decompose(
     ledger=None,
     provider_kwargs: dict | None = None,
     retries: int = 0,
+    timeout: int = 300,
 ) -> dict[str, Any]:
     """Run the decompose stage by calling a copilot worker.
 
@@ -551,6 +552,10 @@ def run_decompose(
         recipe_path: Path to recipe card (for extracting §1).
         codebase_root: Root path of target codebase.
         model: Model to use for copilot.
+        timeout: Per-call subprocess timeout (seconds) for the queen worker.
+            Callers pass the queen role's ``worker_timeout()`` so a slow codex
+            queen (150–290s under parallel load) gets its roomier 600s default
+            instead of being killed at a flat 300s wall and retried.
 
     Returns:
         Parsed decomposition JSON dict.
@@ -593,7 +598,7 @@ def run_decompose(
         call_id = ledger.begin_call("queen", "decompose", provider, model, prompt) \
             if ledger is not None else None
         try:
-            wr = call_worker(provider, model, prompt, cwd=codebase_root, timeout=300,
+            wr = call_worker(provider, model, prompt, cwd=codebase_root, timeout=timeout,
                              on_start=(lambda: ledger.mark_running(call_id))
                              if (ledger is not None and call_id is not None) else None,
                              **(provider_kwargs or {}))

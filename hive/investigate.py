@@ -453,6 +453,7 @@ def run_investigate(
         seed_text=seed_text, recipe_path=recipe_path, codebase_root=code_root,
         model=queen.model, provider=queen.provider, ledger=ledger,
         provider_kwargs=pk, retries=queen.retries,
+        timeout=queen.worker_timeout(),
     )
     tasks = decompose_result.get("tasks", []) or []
     leaves = _leaf_axes(tasks)

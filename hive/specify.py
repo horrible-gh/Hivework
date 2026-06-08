@@ -3064,6 +3064,7 @@ def run_specify(
     # timeout / provider hiccup so one slow call does not discard a completed
     # investigate stage (T892). Each attempt is recorded to the ledger (real spend).
     wr = None
+    spec: dict[str, Any] | None = None
     last_exc: Exception | None = None
     for attempt in range(author_retries + 1):
         call_id = ledger.begin_call("specify", "specify", provider, model, prompt) \
@@ -3096,9 +3097,29 @@ def run_specify(
                            "retrying (attempt %d/%d)", wr.exit_code, len(wr.stdout),
                            attempt + 2, author_retries + 1)
             continue
+        # Parsing is part of the call's success: a non-empty, exit-0 output that
+        # still fails to decode (malformed / prose-wrapped / truncated JSON — a
+        # recurring copilot/codex defect) is ALSO a soft failure. Retry on the
+        # remaining budget instead of crashing the whole specify here, which would
+        # discard a completed (paid-for) investigate stage over one flaky author
+        # turn. Only the last attempt's parse error propagates.
+        try:
+            spec = extract_first_json(wr.stdout)
+        except ValueError as e:
+            last_exc = e
+            if attempt < author_retries:
+                logger.warning("specify: author output did not parse as JSON (%s) — "
+                               "retrying (attempt %d/%d)", e, attempt + 2,
+                               author_retries + 1)
+                continue
+            raise
         break
 
-    spec = extract_first_json(wr.stdout)  # raises ValueError if no JSON found
+    if spec is None:
+        # Unreachable in practice — every loop path either set ``spec``, continued,
+        # or raised. Re-run the parse so the real, informative ValueError surfaces
+        # rather than an opaque NoneType downstream.
+        spec = extract_first_json(wr.stdout if wr is not None else "")
     # Rewrap BEFORE any edits[]-iterating pass: if the author flattened a single edit onto
     # the spec root (no edits[] envelope), wrap it so the fix is not silently dropped as
     # "0 edits, not ready" (N175). No-op for a well-formed spec.
