@@ -49,26 +49,18 @@ _FE_POSITION_RE = re.compile(
     r"|\b(?:current|active)\s+(?:step|stage).{0,20}"
     r"(?:color|highlight).{0,12}(?:wrong|incorrect)\b"
     r"|\b(?:view[- ]?state|derived\s+(?:step\s+)?state).{0,20}"
-    r"(?:wrong|incorrect|stale|mismatch)\b"
-    r"|한\s*(?:칸|단계)\s*(?:씩\s*)?(?:밀림|밀려|어긋|차이)"
-    r"|(?:현재|완료|다음)\s*(?:단계|스텝).{0,12}(?:밀림|어긋|잘못)"
-    r"|뷰\s*상태.{0,12}(?:잘못|오류|불일치|낡)"
-    r"|(?:앞|뒤)\s*(?:단계|스텝).{0,8}(?:표시|강조)",
+    r"(?:wrong|incorrect|stale|mismatch)\b",
     re.IGNORECASE,
 )
 _FE_PRESENTATION_RE = re.compile(
     r"\b(?:workflow|progress|step|stage)\s+(?:head|state|status|indicator|bar)\b"
     r"|\b(?:current|active)\s+(?:step|stage)\b"
     r"|\b(?:head|step|stage).{0,24}\b(?:color|highlight|current|active)\b"
-    r"|\bview[- ]?state\b"
-    r"|워크플로(?:우)?.{0,12}(?:헤드|head|단계|스텝|상태)"
-    r"|(?:현재|완료|다음)\s*(?:단계|스텝)"
-    r"|(?:단계|스텝).{0,12}(?:색|강조|상태)",
+    r"|\bview[- ]?state\b",
     re.IGNORECASE,
 )
 _FE_STATE_TRIO_RE = re.compile(
-    r"\b(?:done|completed).{0,20}(?:current|active).{0,20}(?:future|pending)\b"
-    r"|완료.{0,20}현재.{0,20}(?:미래|다음|예정)",
+    r"\b(?:done|completed).{0,20}(?:current|active).{0,20}(?:future|pending)\b",
     re.IGNORECASE,
 )
 

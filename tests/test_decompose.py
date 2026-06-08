@@ -342,14 +342,10 @@ def test_fe_axis_without_frontend_scope_stays_honestly_thin(tmp_path):
 def test_fe_symptom_gate_is_conservative():
     assert is_fe_derived_state_symptom(M035_SEED)
     assert is_fe_derived_state_symptom(
-        "워크플로 head가 한 칸 밀려 현재 단계 색이 잘못 표시된다")
-    assert is_fe_derived_state_symptom(
         "The current step highlight color is wrong in the workflow bar.")
     assert is_fe_derived_state_symptom(
         "The workflow view-state derivation is stale.")
     assert not is_fe_derived_state_symptom(M036_SEED)
-    assert not is_fe_derived_state_symptom(
-        "M036 HTTP 데이터소스 응답의 workflow_head_type 값이 비어 있다")
     assert not is_fe_derived_state_symptom(
         "The API returns done/current/future status values in its JSON payload.")
 
