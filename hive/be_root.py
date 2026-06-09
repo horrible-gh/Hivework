@@ -213,15 +213,16 @@ def be_root_axis(seed_text, leaves, code_root, cm=None, call_fn=None):
     cm = cm or _codemap
     if cm is None or not code_root:
         return None
-    if call_fn is not None:
-        cands = _gather_candidates(leaves, code_root, cm)
-        if cands:
-            globs = _trace_pick(pick_relevant_node(seed_text, cands, call_fn),
-                                code_root, cm)
-        else:
-            globs = []
-    else:
-        globs = discover_be_root_globs(seed_text, leaves, code_root, cm)
+    if call_fn is None:
+        # OFF by default. The broad trace (discover_be_root_globs, kept for
+        # analysis) fans out over every FE glob and was an e2e regression — it
+        # injects a noisy axis that costs a judge call without locating the root.
+        # The method only works with the node-pick step, so it is strict opt-in:
+        # a caller wires call_fn to enable it. No call_fn → no axis (true no-op).
+        return None
+    cands = _gather_candidates(leaves, code_root, cm)
+    globs = _trace_pick(pick_relevant_node(seed_text, cands, call_fn),
+                        code_root, cm) if cands else []
     if not globs:
         return None
     logger.info("Hook A: code-map traced backend root candidates → %s", globs)
