@@ -856,7 +856,10 @@ def run_decompose(
         raise ValueError("Decompose output missing 'tasks' key")
 
     ensure_fe_derived_state_axis(result, seed_text, codebase_root)
-    apply_provenance_grounding(result, codebase_root)
+    # apply_provenance_grounding REMOVED: bolting a code-READING result onto the
+    # blind queen's output was an e2e regression (inherits FE-axis errors + noise).
+    # The trace now lives in the reading loop via hive.be_root (Hook A, M028),
+    # consuming the queryable hive.codemap. Function kept below as reference.
     axes = result["tasks"]
     logger.info("Decompose produced %d axes: %s",
                 len(axes), [a.get("id", "?") for a in axes])

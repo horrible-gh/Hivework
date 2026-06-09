@@ -29,6 +29,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any
 
 from hive.converge import run_converge
+from hive.be_root import be_root_axis
 from hive.decompose import run_decompose
 from hive.fanout import ReinforceBudget, reinforce_thin_axis
 from hive.judge import run_judge_votes
@@ -469,6 +470,16 @@ def run_investigate(
     # axis, BEFORE the position-based max_axes truncation — so a scattered queen
     # cannot bury or skip the spot the seed explicitly points at.
     leaves = _prioritize_axes(leaves, seed_text)
+    # Hook A (M028): the queen is blind to the call graph and misses the backend
+    # root one hop past the name-matching file (measured: not fixable by model or
+    # prompt). The READING stage queries a static code-map (hive.codemap, M027) to
+    # trace FE symptom → live handler → service / field producer, and injects that
+    # locus as a front axis so it is judged and survives the max_axes cut. No-op
+    # until codemap lands or when nothing grounds — never blocks the pipeline.
+    _be_axis = be_root_axis(seed_text, leaves, code_root)
+    if _be_axis is not None:
+        leaves = [_be_axis] + [l for l in leaves
+                               if l.get("id") != "CODEMAP_BE_ROOT"]
     judged = leaves[: cfg.judge.max_axes]
     if judged and judged[0].get("id") == "SEED_ANCHOR":
         logger.info("seed-anchor: injected front axis for seed-named target(s) %s",
