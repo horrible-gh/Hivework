@@ -13,6 +13,7 @@ where search_plan = {keywords, file_globs, doc_topics} is the blind seed the
 local retriever (hive.searchplan bridge) lowers into a SearchPlan.
 """
 
+import fnmatch
 import json
 import logging
 import os
@@ -238,6 +239,208 @@ def ensure_fe_derived_state_axis(result: dict[str, Any], seed_text: str,
             steps.insert(0, [FE_DERIVED_AXIS_ID])
     logger.info("FE derived-state symptom: injected conditional axis %s "
                 "(frontend globs=%s)", FE_DERIVED_AXIS_ID, globs)
+    return result
+
+# ── Provenance grounding: bridge the queen's reliable FE file to the backend root
+#    it structurally cannot see (project: queen-be-root-localization-gap). The queen
+#    reads file NAMES + the tree, never the call graph, so it name-matches a backend
+#    file ("module" selector → module_routes) and misses the real gate/producer one
+#    hop away (project_settings, process_service, documents.py.workflow_head_type).
+#    Neither richer input, a prompt nudge, nor a stronger model (sonnet == gpt-5-mini,
+#    BE-root 1/6) closes it — the graph is invisible to a name reader. But it is
+#    STATICALLY traceable, free, from the FE file the queen always gets right:
+#      action-forward : FE '/api/...' string → the LIVE route handler (resolved by
+#                       include_router order, so a shadowed legacy handler loses) →
+#                       the *_service function that handler calls
+#      field-backward : a snake_case key the FE reads → the backend that builds it
+#    Traced backend paths are injected as one bounded axis the downstream FIND
+#    retrieves deterministically — no model, same class as build_repo_tree /
+#    build_literal_preview, and the GENERAL form of ensure_fe_derived_state_axis
+#    (traces real calls, not a hardcoded per-symptom regex). Best-effort: never
+#    raises, returns result unchanged when nothing grounds.
+_FE_EXTS = (".vue", ".ts", ".tsx", ".js", ".jsx")
+_FE_GLOB_FILE_CAP = 8          # skip an over-broad FE glob; bound files read
+_PROV_GLOB_CAP = 6             # bounded injected axis
+_GENERIC_SEG = frozenset({"create", "list", "get", "update", "delete", "new",
+                          "edit", "save", "fetch", "all", "index", "api",
+                          "v1", "v2", "flowgate", "outbox", "inbox"})
+_QUOTED_RE = re.compile(r"""['"`]([^'"`\s]{2,120})['"`]""")
+_SNAKE_RE = re.compile(r"\b([a-z][a-z0-9]*(?:_[a-z0-9]+)+)\b")
+_SERVICE_CALL_RE = re.compile(r"\b([a-z][a-z0-9]*_service)\.", re.IGNORECASE)
+_FE_NOISE_SNAKE = frozenset({"class_name", "data_testid", "aria_label",
+                             "inner_html", "scroll_top", "client_width"})
+
+
+def _resolve_fe_globs(globs: list, code_root: str) -> list[str]:
+    """Resolve search_plan file_globs to real FE files (bounded, never raises).
+
+    An over-broad glob (matching > cap files) carries no locating signal and
+    would balloon the read, so it is skipped — same discipline as the literal
+    pre-grep's file-spread cap.
+    """
+    files = _git_tracked_files(code_root) or _walk_files(code_root)
+    norm = [f.replace("\\", "/") for f in files]
+    out: list[str] = []
+    for g in globs or []:
+        g = str(g).replace("\\", "/")
+        is_file = any(g.lower().endswith(e) for e in _FE_EXTS) and "*" not in g
+        matched = [f for f in norm
+                   if (f == g or fnmatch.fnmatch(f, g))
+                   and any(f.lower().endswith(e) for e in _FE_EXTS)]
+        if not matched or (not is_file and len(matched) > _FE_GLOB_FILE_CAP):
+            continue
+        out.extend(matched)
+    return list(dict.fromkeys(out))[:_FE_GLOB_FILE_CAP]
+
+
+def _router_order(code_root: str) -> dict[str, int]:
+    """Map route-module basename → include_router registration index.
+
+    FastAPI dispatches the FIRST registered matching route, so a LOWER index wins
+    — this distinguishes a live handler from a shadowed legacy one (M036:
+    project_settings registered before legacy_misc_routes). {} on any failure →
+    callers then keep all candidates (degrades to no liveness filter, still adds
+    the real handler rather than missing it).
+    """
+    main_py = os.path.join(code_root, "server", "routers", "main.py")
+    try:
+        with open(main_py, encoding="utf-8", errors="replace") as f:
+            txt = f.read()
+    except OSError:
+        return {}
+    var2mod: dict[str, str] = {}
+    for m in re.finditer(r"from\s+([\w.]+)\s+import\s+router\s+as\s+(\w+)", txt):
+        var2mod[m.group(2)] = m.group(1).split(".")[-1]
+    order: dict[str, int] = {}
+    idx = 0
+    for m in re.finditer(r"^\s*app\.include_router\(\s*(\w+)", txt, re.MULTILINE):
+        mod = var2mod.get(m.group(1))
+        if mod and mod not in order:
+            order[mod] = idx
+            idx += 1
+    return order
+
+
+def _find_backend_file(code_root: str, basename: str) -> str | None:
+    """First repo file matching ``basename`` (e.g. process_service.py)."""
+    for f in (_git_tracked_files(code_root) or _walk_files(code_root)):
+        if os.path.basename(f.replace("\\", "/")) == basename:
+            return f.replace("\\", "/")
+    return None
+
+
+def _trace_endpoint(endpoint: str, code_root: str,
+                    order: dict[str, int]) -> set[str]:
+    """action-forward: '/api/...' → live route file → the *_service it calls."""
+    segs = [s for s in endpoint.split("/")
+            if s and not s.startswith("{") and s.lower() not in _GENERIC_SEG
+            and len(s) >= 4]
+    if not segs:
+        return set()
+    tail = segs[-1]
+    hits = _ripgrep(
+        rf"router\.(?:get|post|put|patch|delete)\([\"'][^\"']*{re.escape(tail)}",
+        ["*.py"], code_root, max_hits=20)
+    cand = list(dict.fromkeys(h["file"] for h in hits))
+    if not cand:
+        return set()
+    live = min(cand, key=lambda f: order.get(
+        os.path.splitext(os.path.basename(f))[0], 999))
+    traced = {live}
+    try:
+        with open(os.path.join(code_root, live), encoding="utf-8",
+                  errors="replace") as f:
+            body = f.read()
+    except OSError:
+        body = ""
+    for svc in set(_SERVICE_CALL_RE.findall(body)):
+        sf = _find_backend_file(code_root, f"{svc.lower()}.py")
+        if sf:
+            traced.add(sf)
+    return traced
+
+
+def _trace_field(field: str, code_root: str) -> set[str]:
+    """field-backward: a snake_case key the FE reads → backend that ASSIGNS it."""
+    hits = _ripgrep(rf"{re.escape(field)}[\"']?\s*\]?\s*[:=]",
+                    ["server/**/*.py"], code_root, max_hits=8)
+    return {h["file"] for h in hits
+            if h["file"].endswith(".py") and "/test" not in h["file"].lower()}
+
+
+def apply_provenance_grounding(result: dict[str, Any],
+                               code_root: str | None) -> dict[str, Any]:
+    """Inject backend root-cause paths traced from the queen's FE axes.
+
+    Mutates and returns ``result``. The queen reliably names the FE symptom file
+    but is blind to the call graph; we trace the missing hop statically and add it
+    as one bounded leaf axis the downstream FIND retrieves. No model.
+    """
+    if not code_root:
+        return result
+    tasks = result.get("tasks")
+    if not isinstance(tasks, list) or not tasks:
+        return result
+    try:
+        fe_globs: list = []
+        for t in tasks:
+            if isinstance(t, dict):
+                fe_globs += (t.get("search_plan") or {}).get("file_globs") or []
+        fe_files = _resolve_fe_globs(fe_globs, code_root)
+        if not fe_files:
+            return result
+        endpoints: set[str] = set()
+        fields: set[str] = set()
+        for rel in fe_files:
+            try:
+                with open(os.path.join(code_root, rel), encoding="utf-8",
+                          errors="replace") as f:
+                    txt = f.read()
+            except OSError:
+                continue
+            for s in _QUOTED_RE.findall(txt):
+                if "/api/" in s or "/flowgate/" in s:
+                    endpoints.add(s)
+            for fld in _SNAKE_RE.findall(txt):
+                if (fld.count("_") >= 2 or len(fld) >= 12) \
+                        and fld not in _FE_NOISE_SNAKE:
+                    fields.add(fld)
+        order = _router_order(code_root)
+        traced: set[str] = set()
+        for ep in list(endpoints)[:20]:
+            traced |= _trace_endpoint(ep, code_root, order)
+        for fld in list(fields)[:20]:
+            traced |= _trace_field(fld, code_root)
+        # backend python only, and not an FE file we started from
+        fe_set = set(fe_files)
+        norm = {p.removeprefix("./") for p in traced}
+        traced = sorted(p for p in norm if p.endswith(".py") and p not in fe_set
+                        )[:_PROV_GLOB_CAP]
+        if not traced:
+            return result
+        axis = {
+            "id": "PROVENANCE",
+            "title": "Backend root traced from FE symptom file (provenance)",
+            "brief": ("Statically traced from the frontend symptom file through "
+                      "its API call / read field to the LIVE backend handler and "
+                      "the service or producer it reaches (shadowed handlers "
+                      "excluded by router order). Confirm the gate or data source "
+                      "HERE — this is the root, not the FE surface."),
+            "depends_on": [],
+            "coverage_risk": "ok",
+            "search_plan": {"keywords": [], "file_globs": traced, "doc_topics": []},
+        }
+        tasks.insert(0, axis)
+        steps = result.get("steps")
+        if isinstance(steps, list):
+            if steps and isinstance(steps[0], list):
+                steps[0].insert(0, "PROVENANCE")
+            else:
+                steps.insert(0, ["PROVENANCE"])
+        logger.info("provenance grounding: %d FE file(s) → BE-root axis %s",
+                    len(fe_files), traced)
+    except Exception as e:  # provenance is a bonus; never break decompose
+        logger.warning("provenance grounding skipped (%s)", e)
     return result
 
 # ── Repo file tree given to the queen so axes anchor on REAL paths ─────────────
@@ -653,6 +856,7 @@ def run_decompose(
         raise ValueError("Decompose output missing 'tasks' key")
 
     ensure_fe_derived_state_axis(result, seed_text, codebase_root)
+    apply_provenance_grounding(result, codebase_root)
     axes = result["tasks"]
     logger.info("Decompose produced %d axes: %s",
                 len(axes), [a.get("id", "?") for a in axes])
