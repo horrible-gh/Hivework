@@ -30,6 +30,8 @@ from hive.reinvestigate import run_reinvestigation_loop
 from hive.apply import run_apply
 from hive.commit import run_propose, run_commit, render_commit_summary_lines
 from hive.converge import run_converge
+from hive.coordinator import run_coordinator
+from hive.coordinator.gapstate import open_store as open_gapstate_store
 from hive.investigate import (
     _converge_fragments,
     _rebuild_bundles,
@@ -209,6 +211,41 @@ def run_pipeline(args: argparse.Namespace) -> None:
             logger.info("Caller-supplied context: %d comment(s) folded into seed",
                         len(args.comment))
         logger.info("Seed loaded: %d chars", len(seed_text))
+
+        # ────────────────────────────────────────────────────────────
+        # STAGE L-01 coordinator (opt-in, pre-decompose seed enrichment)
+        # ────────────────────────────────────────────────────────────
+        # The queen's front-end interpreter (R0001): extracts the true `expected`
+        # and structures the symptom into the Caller-supplied context section the
+        # decompose stage already reads. Opt-in via --coordinator; when absent the
+        # seed flows to decompose byte-for-byte unchanged (CON / D-01 §4).
+        if getattr(args, "coordinator", False):
+            coord_role = cfg.role("coordinator")
+            logger.info("─" * 60)
+            logger.info("STAGE coordinator (%s/%s)", coord_role.provider, coord_role.model)
+            logger.info("─" * 60)
+            store = open_gapstate_store(cfg.ledger.db_path, cfg.apply.backup_ttl_hours,
+                                        enabled=cfg.ledger.enabled)
+            coord_result = run_coordinator(
+                seed_text=seed_text,
+                codebase_root=args.codebase,
+                recipe_path=args.recipe,
+                model=coord_role.model,
+                provider=coord_role.provider,
+                ledger=ldg,
+                provider_kwargs=provider_kwargs,
+                timeout=coord_role.worker_timeout(),
+                store=store,
+            )
+            if store is not None:
+                store.close()
+            seed_text = coord_result["enriched_seed"]
+            coord_path = os.path.join(workdir, "coordinator_result.json")
+            with open(coord_path, "w", encoding="utf-8") as f:
+                json.dump(coord_result, f, indent=2, ensure_ascii=False)
+            logger.info("Coordinator: status=%s, expected=%d axes, skipped=%d slots "
+                        "→ %s", coord_result["status"], len(coord_result["expected"]),
+                        len(coord_result["provenance"]["skipped_slots"]), coord_path)
 
         # ────────────────────────────────────────────────────────────
         # STAGE ① decompose
@@ -1056,6 +1093,13 @@ def main() -> None:
         "--comment", action="append", metavar="TEXT", default=None,
         help="Requester's direct input/hint, folded into the seed as authoritative "
              "intent (locations still verified). Repeatable; optional.",
+    )
+    run_parser.add_argument(
+        "--coordinator", action="store_true",
+        help="Enable the coordinator front-end (R0001): a Sonnet-tier pre-decompose "
+             "stage that extracts the true 'expected' and structures the symptom into "
+             "the Caller-supplied context section. Opt-in; absent, the pipeline is "
+             "unchanged.",
     )
     run_parser.add_argument(
         "--specify", action="store_true",

@@ -36,6 +36,11 @@ _DEFAULTS: dict[str, Any] = {
         # to one node. Same cost class / shape as judge, so it defaults to the same
         # provider/model; hive.config.json routes it to deepinfra like judge.
         "converge": {"provider": "copilot", "model": "claude-sonnet-4.5"},
+        # The COORDINATOR (hive.coordinator, R0001): the queen's front-end
+        # interpreter. Sonnet-tier by policy (D-03 §1) — it is the beginner's
+        # entry gate, so a low tier is forbidden; absolute cost is small (≈1 call
+        # per run, D-03 §3). Opt-in via `hive run --coordinator`.
+        "coordinator": {"provider": "copilot", "model": "claude-sonnet-4.5"},
     },
     "copilot": {"exe": None, "allow": "--allow-all", "timeout_sec": 300, "read_only": True},
     # OpenAI-compatible HTTP endpoint for the 'openai'/'deepinfra' provider. These
@@ -478,6 +483,9 @@ class Config:
         default_factory=lambda: RoleConfig(model="claude-sonnet-4.5"))
     converge_role: RoleConfig = field(
         default_factory=lambda: RoleConfig(model="claude-sonnet-4.5"))
+    # The COORDINATOR (R0001): queen front-end. Sonnet-tier by policy (D-03 §1).
+    coordinator: RoleConfig = field(
+        default_factory=lambda: RoleConfig(model="claude-sonnet-4.5"))
     copilot: CopilotConfig = field(default_factory=CopilotConfig)
     codex: CodexConfig = field(default_factory=CodexConfig)
     openai: OpenAiConfig = field(default_factory=OpenAiConfig)
@@ -853,6 +861,7 @@ def load_config(path: str | None = None, profile: str | None = None) -> Config:
         commit=_role("commit", default_model="claude-haiku-4.5"),
         judge_role=_role("judge", default_model="claude-sonnet-4.5"),
         converge_role=_role("converge", default_model="claude-sonnet-4.5"),
+        coordinator=_role("coordinator", default_model="claude-sonnet-4.5"),
         copilot=CopilotConfig(
             exe=copilot_raw.get("exe"),
             allow=copilot_raw.get("allow", "--allow-all"),
