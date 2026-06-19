@@ -13,6 +13,7 @@ from hive.decompose import (
     FE_DERIVED_AXIS_ID, build_repo_tree, build_decompose_prompt,
     build_literal_preview, ensure_fe_derived_state_axis,
     is_fe_derived_state_symptom, _frontend_source_globs, _tree_useful,
+    independent_axes,
 )
 from hive.retriever import retrieve
 from hive.searchplan import task_to_searchplan
@@ -357,3 +358,28 @@ def test_frontend_globs_are_derived_only_from_existing_frontend_roots(tmp_path):
         "client/src/main/workflow/workflowViewState.ts",
         "client/src/main/components/DocWorkflow.vue",
     ]
+
+
+# ── RC-B: only independent axes fan out to the swarm (NR 0008.0009) ────────────
+
+def test_independent_axes_drops_dependent_synthesis():
+    # The run-451 shape: 9 independent leaves + 1 synthesis task that depends on
+    # all of them. The synthesis task is NOT swarmable (a blind drone can't see the
+    # other combs) and must be excluded from the fan-out.
+    tasks = [
+        {"id": "A", "depends_on": []},
+        {"id": "B"},                       # absent depends_on == independent
+        {"id": "synthesis", "depends_on": ["A", "B"]},
+    ]
+    kept = independent_axes(tasks)
+    assert [t["id"] for t in kept] == ["A", "B"]
+
+
+def test_independent_axes_keeps_all_when_none_dependent():
+    tasks = [{"id": "A"}, {"id": "B", "depends_on": []}]
+    assert independent_axes(tasks) == tasks
+
+
+def test_independent_axes_preserves_order():
+    tasks = [{"id": "C"}, {"id": "syn", "depends_on": ["C"]}, {"id": "A"}, {"id": "B"}]
+    assert [t["id"] for t in independent_axes(tasks)] == ["C", "A", "B"]

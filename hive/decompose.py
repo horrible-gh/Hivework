@@ -175,6 +175,22 @@ def _task_covers_fe_derived_state(task: dict[str, Any]) -> bool:
     return has_fe_scope and has_derived_logic
 
 
+def independent_axes(tasks: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Return only the tasks that can run as blind parallel swarm drones.
+
+    RC-B (NR hivework.default.0008.0009): the swarm fans out one INDEPENDENT drone
+    per axis, and each drone sees only its own brief — never the other axes' combs.
+    A task that declares ``depends_on`` (a synthesis / comparison / integration
+    step) therefore cannot be a swarm drone: with no access to the evidence it
+    depends on, it can only return ``findings: []`` ("No prior investigation
+    evidence available; cannot synthesize…" — the literal run-451 output). decompose
+    already places such tasks in a LATER ``steps`` entry (rule #3); the fan-out
+    caller must honour that instead of flattening every task into the swarm. The
+    dependent tasks are an assemble/queen-stage job, not a drone. Preserves order;
+    a task with empty/absent ``depends_on`` is independent."""
+    return [t for t in tasks if not t.get("depends_on")]
+
+
 def ensure_fe_derived_state_axis(result: dict[str, Any], seed_text: str,
                                  code_root: str | None) -> dict[str, Any]:
     """Conditionally ensure one FE derived-state leaf exists in decomposition.
