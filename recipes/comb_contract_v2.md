@@ -11,6 +11,8 @@
 3. **Design contrast** (when possible): contrast the code's behavior against the spec intended by the design docs. A mismatch is the bug; a match is intended behavior — UNLESS the reporter declares that intended behavior itself wrong or unwanted, in which case the matching site is a DESIGN-CHANGE candidate (the site still must change), not a non-finding.
 4. **blame** (if the axis is about regression/history): use `git log` / `git blame` to pin the introducing/modifying commit (hash + title) for the relevant lines. Also check "is it already fixed."
 
+[Conclusion mandate — conclude, do NOT keep searching] Your job is to DELIVER A CONCLUSION, not to plan more searching. The moment you have opened the relevant files, STOP searching and synthesize what you found into `findings`. Do NOT emit your next search step — a tool-argument object such as {"path":"...","pattern":"...","glob":"..."} — or any prose as your answer. That is a search note, not a comb; it will be rejected and sent back to you. Even if your investigation genuinely turned up nothing, still CONCLUDE: return a well-formed comb with `findings`: [] and `termination` set. Decide with the evidence you already have.
+
 [Output contract — comb] Output ONLY the single JSON object below. No prose, no text outside the JSON.
 {
   "axis_id": "<axis id>",

@@ -1,58 +1,72 @@
 {
-  "_comment": "Reference profile. Copy to hive.config.default.json (or hive.config.<profile>.json) and hand-edit. All `_comment` keys are ignored by the loader. Groups, top to bottom: roles (edited most), stages, targets, ops, providers (set once).",
-  "roles": {
-    "_comment": "Each role = provider + model. provider: copilot | codex | openai. copilot ceiling is sonnet (no opus); openai is the OpenAI-compatible HTTP endpoint (see providers.openai).",
-    "queen":    { "provider": "copilot", "model": "gpt-5-mini" },
-    "swarm":    { "provider": "copilot", "model": "gpt-5-mini" },
-    "scout":    { "provider": "copilot", "model": "gpt-5-mini",
-                  "_comment": "Reinforcement worker; falls back to roles.swarm when omitted." },
-    "judge":    { "provider": "copilot", "model": "claude-sonnet-4.5" },
-    "converge": { "provider": "copilot", "model": "claude-sonnet-4.5" },
-    "assemble": { "provider": "copilot", "model": "gpt-5-mini" },
-    "specify":  { "provider": "copilot", "model": "gpt-5-mini", "timeout_sec": 900, "retries": 1 },
-    "review":   { "provider": "copilot", "model": "gpt-5-mini" },
-    "commit":   { "provider": "copilot", "model": "claude-haiku-4.5" }
+  "schema_version": 2,
+  "_comment": "Hivework pipeline config (schema_version 2). One ordered `pipeline` block, each stage carrying BOTH its provider/model AND its own tuning knobs, named after the run stage it drives (decompose / fanout / judge / ...). This replaces the v1 grouped layout (scattered roles + stages + ops); the loader still reads v1 files, so old profiles keep working. A `model` of `@stage` reuses that stage's model. The hive.config.default profile is what `hive run` loads with no --profile.",
+
+  "coordinator": {
+    "provider": "copilot", "model": "claude-sonnet-4.5", "timeout_sec": 600,
+    "_comment": "Opt-in queen front-end interpreter (R0001), enabled by `hive run --coordinator`. Sonnet-tier by policy (low tier forbidden — it is the beginner's entry gate; cost is small at ~1 call/run). Was roles.coordinator."
   },
-  "stages": {
-    "judge": {
-      "votes_per_axis": 1, "max_parallel": 2, "max_axes": 12,
-      "max_calls_per_axis": 2, "max_total_calls": 0,
-      "_comment": "votes_per_axis ~5 = best-of-N voting; max_total_calls 0 = unlimited. max_parallel = V, max_axes = 2 x V, max_total_calls = 0.8 x V x max_axes."
-    },
-    "converge": {
-      "split": { "enabled": false, "max_loci": 4, "_comment": "model omitted = reuse roles.converge." },
-      "lens": { "enabled": false, "lenses": ["datasource-liveness", "omission", "reproduction"], "min_refute": 0,
-                "_comment": "Adversarial best-of-N refutation of a CONSISTENT converge attribution. Each lens = ONE swarm call (provider/model omitted = reuse roles.swarm, the 120b tier); a majority refutation demotes converged->False (routes to reinvestigation). OFF by default; kill at runtime with HIVE_NO_LENS_REFUTE." }
-    },
-    "reinforce": { "enabled": false, "max_workers": 2, "max_total_calls": 4,
-                   "_comment": "Worker = roles.scout. OFF by default." },
-    "reinvestigation": { "live": false, "max_rounds": 2,
-                         "_comment": "Live re-run of a needs_reinvestigation; OFF by default (plan still logged for free)." },
-    "commit": { "filename_only_threshold": 50 }
+
+  "pipeline": {
+    "decompose":  { "provider": "copilot", "model": "gpt-5-mini", "retries": 2,
+                    "_comment": "Splits the seed into leaf axes. Was roles.queen. Single call; retries covers the occasional rc=0 blank reply (T905)." },
+
+    "fanout":     { "provider": "copilot", "model": "gpt-5-mini",
+                    "enabled": true, "parallel": 4, "retries": 1, "max_calls": 24,
+                    "_comment": "Source-mining swarm (was roles.swarm). enabled = old ops.swarm_run.allow; parallel = the previously-hidden max_workers; retries = the previously-hidden respecify retry; max_calls = new total ceiling. Actual calls = axes x (1 + retries)." },
+
+    "judge":      { "provider": "copilot", "model": "gpt-5-mini",
+                    "enabled": true, "jury_size": 5, "retries": 1, "parallel": 5, "max_axes": 10, "max_calls": 40,
+                    "_comment": "Post-decompose judgement (best-of-N). jury_size = old votes_per_axis; retries = old max_calls_per_axis - 1; max_calls = old max_total_calls; parallel = old max_parallel. (enabled is documentation only — judge has no off-switch in code.)" },
+
+    "reinforce":  { "provider": "copilot", "model": "gpt-5-mini",
+                    "enabled": true, "parallel": 4, "retries": 0, "max_calls": 8,
+                    "_comment": "Was roles.scout + stages.reinforce. parallel = old max_workers; max_calls = old max_total_calls. Fires only on a coverage_risk axis whose FIND came back empty. Raise THIS model, not parallel, for better reinforcement." },
+
+    "converge":   { "provider": "copilot", "model": "gpt-5-mini",
+                    "split": { "enabled": true, "max_loci": 4,
+                               "_comment": "Per-locus elimination pass. model omitted = reuse this stage's model (roles.converge)." },
+                    "lens":  { "enabled": true, "model": "@fanout", "lenses": ["datasource-liveness", "omission", "reproduction"], "min_refute": 0,
+                               "_comment": "Adversarial refutation of a CONSISTENT converge attribution. One call per lens, reusing the fanout model (@fanout); a majority refutation demotes converged->False (routes to reinvestigation). Disable at runtime with HIVE_NO_LENS_REFUTE." } },
+
+    "reinvestigate": { "model": "@judge", "enabled": true, "rounds": 2,
+                       "_comment": "Meta-stage: no dedicated model (re-runs @judge / converge / specify). enabled = old reinvestigation.live; rounds = old max_rounds. Stops early when the re-grounded honey is unchanged." },
+
+    "assemble":   { "provider": "copilot", "model": "gpt-5-mini", "_comment": "Stitches combs into the assembled finding. Single call." },
+
+    "specify":    { "provider": "copilot", "model": "gpt-5-mini", "timeout_sec": 600, "retries": 1,
+                    "_comment": "Authors the edit-spec. Single (slow) author call; roomier timeout + one retry for the occasional transient." },
+
+    "review":     { "provider": "copilot", "model": "gpt-5-mini", "_comment": "Effectiveness reviewer (specify's second pass). Single call." },
+
+    "commit":     { "provider": "copilot", "model": "gpt-5-mini", "filename_only_threshold": 20,
+                    "_comment": "Commit-plan author. Single call. Over filename_only_threshold changed paths, group by path/name only (do not open file contents)." }
   },
-  "targets": {
-    "_comment": "Per-codebase DB (converge data-read, read-only) + test runner (red->green verify). Key matches the --codebase leaf folder name (case-insensitive).",
-    "FlowGate": {
-      "db":    { "kind": "sqlite", "path": "C:\\path\\to\\FlowGate\\server\\flowgate.db" },
-      "tests": { "command": ["python", "-m", "pytest", "-q"], "cwd": "server", "timeout_sec": 120 }
-    }
-  },
-  "ops": {
-    "swarm_run": { "allow": false,
-                   "_comment": "true allows the expensive full-swarm run; false restricts to the cheap investigate path." },
-    "apply":     { "backup_dir": ".apply_backups", "backup_ttl_hours": 168 },
-    "ledger":    { "enabled": true, "db_path": "hive_ledger.db" }
-  },
+
   "providers": {
     "copilot": { "exe": null, "allow": "--allow-all", "timeout_sec": 300, "read_only": true,
-                 "_comment": "read_only=true => --deny-tool=write,shell on every copilot worker (denial wins over --allow-all): reads/grep stay live, writes/shell hard-blocked. Set false only to let a worker mutate the target." },
+                 "_comment": "read_only=true runs every copilot worker with --deny-tool=write --deny-tool=shell (denial wins over --allow-all): it can read/grep the target but never edit it or shell out. All Hive copilot roles are read-only by design." },
     "codex":   { "exe": null, "lock_timeout_sec": 1800,
-                 "_comment": "Codex CLI. lock_timeout_sec (seconds) = cross-process serialization mutex wait bound (how long a queued codex call waits before TimeoutError). Change the number here." },
+                 "_comment": "Codex CLI. lock_timeout_sec (seconds) = cross-process serialization mutex wait bound before a queued call gives up with TimeoutError." },
     "openai":  { "base_url": "https://api.deepinfra.com/v1/openai", "api_key_env": "DEEPINFRA_TOKEN",
-                 "_comment": "OpenAI-compatible endpoint. base_url = chat-completions root; api_key_env = NAME of the env var holding the key (the key lives in the out-of-repo secrets file)." }
+                 "_comment": "OpenAI-compatible HTTP endpoint shared by the 'openai'/'deepinfra' provider names. Point base_url + api_key_env at any vendor; the key itself lives in the out-of-repo secrets file." }
   },
-  "_openai_presets": {
-    "openai":    { "base_url": "https://api.openai.com/v1", "api_key_env": "OPENAI_API_KEY" },
-    "deepinfra": { "base_url": "https://api.deepinfra.com/v1/openai", "api_key_env": "DEEPINFRA_TOKEN" }
+
+  "targets": {
+    "Example": {
+      "db": { "kind": "sqlite", "path": "example.db",
+              "_comment": "Read-only DB connection for the converge data-state read (opened mode=ro)." },
+      "tests": { "command": ["python", "-m", "pytest", "-q", "-p", "no:cacheprovider"], "cwd": "server", "timeout_sec": 120,
+                 "_comment": "Test runner for the runtime red->green verify; cwd is relative to the --codebase root." },
+      "http_shape": { "test_dir": "server/tests", "app_fixture": "", "setup_block_file": "setup_block.py",
+                      "_comment": "Lever 7 HTTP-shape red-test harness. Set app_fixture to an EXISTING seeded TestClient fixture in server/tests, OR setup_block_file to a .py file (path relative to the codebase) holding imports + a @pytest.fixture that builds a seeded TestClient. Both empty = the lever stays a no-op." }
+    }
+  },
+
+  "ops": {
+    "apply":  { "backup_dir": ".apply_backups", "backup_ttl_hours": 168,
+                "_comment": "apply --write backup window; cleaned up after backup_ttl_hours." },
+    "ledger": { "enabled": true, "db_path": "hive_ledger.db",
+                "_comment": "Per-call cost/latency ledger (SQLite)." }
   }
 }

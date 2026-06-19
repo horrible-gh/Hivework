@@ -19,9 +19,11 @@ from datetime import datetime
 
 from hive.config import load_config
 from hive.ledger import open_ledger
-from hive.decompose import run_decompose
+from hive.decompose import run_decompose, independent_axes
+from hive.be_root import be_root_axis
+from hive.providers import call_worker
 from hive.fanout import run_fanout, load_comb_contract
-from hive.parse import parse_comb_file
+from hive.parse import partition_combs
 from hive.conflict_scan import scan_conflicts
 from hive.reconcile import run_reconcile_loop
 from hive.assemble import run_assemble
@@ -271,8 +273,47 @@ def run_pipeline(args: argparse.Namespace) -> None:
             json.dump(decompose_result, f, indent=2, ensure_ascii=False)
         logger.info("Decompose result saved to %s", decompose_path)
 
-        axes = decompose_result.get("tasks", [])
-        logger.info("Decompose produced %d axes", len(axes))
+        # RC-B (NR hivework.default.0008.0009): the swarm fans out INDEPENDENT leaf
+        # axes only. A task that declares depends_on — a synthesis / comparison /
+        # integration step — cannot be a blind parallel drone: it needs the OTHER
+        # axes' combs, which an independent swarm worker never sees, so it can only
+        # return findings:[] ("No prior investigation evidence available; cannot
+        # synthesize…" was the literal run-451 output). decompose's own rule #3
+        # already places such tasks in a LATER `steps` entry; this stage used to
+        # FLATTEN every task into the swarm and ignore that, drowning the run in a
+        # guaranteed-empty synthesis axis. Honour the dependency: dependent tasks are
+        # dropped from the fan-out (synthesis belongs to the assemble/queen stage).
+        all_tasks = decompose_result.get("tasks", [])
+        axes = independent_axes(all_tasks)
+        dropped_axes = [t.get("id", "?") for t in all_tasks if t.get("depends_on")]
+        if dropped_axes:
+            logger.info("RC-B: %d dependent axis(es) excluded from swarm fan-out "
+                        "(synthesis/integration is an assemble-stage job, not a blind "
+                        "drone): %s", len(dropped_axes), ", ".join(dropped_axes))
+        logger.info("Decompose produced %d axes (%d independent → fan-out)",
+                    len(all_tasks), len(axes))
+
+        # Hook A (M028 / NR hivework.default.0004.0003 §3): the be-root mitigation
+        # was only wired into `investigate`, so the swarm `run` path drove the queen's
+        # known call-graph blindness with NO mitigation (run 418's decompose carried
+        # no CODEMAP_BE_ROOT axis). Wire it here too: the code-map traces FE symptom →
+        # live handler → service/producer and injects it as a front swarm axis. Strict
+        # opt-in (--be-root): it adds one node-pick model call and is a true no-op when
+        # the code-map is absent or grounds nothing.
+        if getattr(args, "be_root", False):
+            def _be_pick(prompt: str) -> str:
+                wr = call_worker(queen_role.provider, queen_role.model, prompt,
+                                 cwd=None, timeout=queen_role.worker_timeout(),
+                                 **provider_kwargs)
+                return wr.stdout if wr.exit_code == 0 else ""
+            be_axis = be_root_axis(seed_text, axes, args.codebase, call_fn=_be_pick)
+            if be_axis is not None:
+                axes = [be_axis] + [a for a in axes
+                                    if a.get("id") != "CODEMAP_BE_ROOT"]
+                logger.info("Hook A: injected CODEMAP_BE_ROOT swarm axis → %s",
+                            be_axis["search_plan"]["file_globs"])
+            else:
+                logger.info("Hook A: code-map grounded no BE-root axis (no-op)")
 
         # ────────────────────────────────────────────────────────────
         # STAGE ② fan-out
@@ -297,6 +338,9 @@ def run_pipeline(args: argparse.Namespace) -> None:
             provider=swarm_role.provider,
             ledger=ldg,
             provider_kwargs=provider_kwargs,
+            max_workers=cfg.fanout.parallel,
+            respecify_retries=cfg.fanout.retries,
+            max_calls=cfg.fanout.max_calls,
         )
         logger.info("Fan-out complete: %d comb files", len(comb_files))
 
@@ -307,17 +351,25 @@ def run_pipeline(args: argparse.Namespace) -> None:
         logger.info("STAGE ③ parse")
         logger.info("─" * 60)
 
-        combs: list[dict] = []
-        for axis_id, comb_path in sorted(comb_files.items()):
-            try:
-                parsed = parse_comb_file(comb_path)
-                combs.append(parsed)
-                logger.info("  Parsed axis %s: termination=%s",
-                            parsed.get("axis_id", axis_id),
-                            parsed.get("termination", "?"))
-            except (ValueError, FileNotFoundError) as e:
-                parse_errors.append(f"{axis_id}: {e}")
-                logger.error("  PARSE FAIL axis %s: %s", axis_id, e)
+        # G1 (NR hivework.default.0005.0003 RC-2): partition_combs applies the SAME
+        # comb-shape gate the ledger uses to the pipeline INPUT. A tool-argument
+        # object ({"path":..,"pattern":..,"glob":..}) decodes as valid JSON, so it
+        # used to parse cleanly and flow through conflict-scan → reconcile →
+        # assemble as if it were evidence (fake "honey"). Now a parse with no
+        # `findings` list is excluded from the evidence set — recorded in
+        # parse_errors so the dropped axis stays visible in telemetry — so noise
+        # can never masquerade as honey evidence.
+        combs, excluded_notes, parse_fail_notes = partition_combs(comb_files)
+        for note in parse_fail_notes:
+            logger.error("  PARSE FAIL %s", note)
+        for note in excluded_notes:
+            logger.warning("  NON-COMB excluded %s", note)
+        parse_errors.extend(parse_fail_notes)
+        parse_errors.extend(excluded_notes)
+        for parsed in combs:
+            logger.info("  Parsed axis %s: termination=%s",
+                        parsed.get("axis_id", "?"),
+                        parsed.get("termination", "?"))
 
         # Save parsed combs
         parsed_path = os.path.join(workdir, "parsed_combs.json")
@@ -1100,6 +1152,14 @@ def main() -> None:
              "stage that extracts the true 'expected' and structures the symptom into "
              "the Caller-supplied context section. Opt-in; absent, the pipeline is "
              "unchanged.",
+    )
+    run_parser.add_argument(
+        "--be-root", dest="be_root", action="store_true",
+        help="Hook A (M028): wire the code-map BE-root axis into the swarm path. The "
+             "queen name-matches a frontend file and misses the live backend gate/"
+             "producer one hop away; the code-map traces it and injects a "
+             "CODEMAP_BE_ROOT axis the swarm reads. Opt-in (one node-pick model call); "
+             "no-op when the code-map is absent or grounds nothing.",
     )
     run_parser.add_argument(
         "--specify", action="store_true",
