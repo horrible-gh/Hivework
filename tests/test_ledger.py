@@ -278,6 +278,18 @@ class TestLedgerBeginFinishCall(unittest.TestCase):
         self.assertEqual(ok, 1)
         self.assertGreater(est, 0)             # prompt-est + output-est
 
+    def test_finish_call_empty_output_demoted_to_not_ok(self):
+        # NR 0004.0003 §2/§5.2: a 0-char comb is not a clean success even when the
+        # HTTP round-trip exited 0 — the ledger must not record it as ok=1.
+        call_id = self.ldg.begin_call("swarm", "T9", "deepinfra", "gpt-oss-120b",
+                                      prompt="p" * 100)
+        self.ldg.finish_call(call_id, output="", latency_s=1.0)  # ok defaults True
+        status, _s, _in, out_chars, _est, ok, err = self._row(call_id)
+        self.assertEqual(out_chars, 0)
+        self.assertEqual(ok, 0)                # demoted, not a fake success
+        self.assertEqual(status, "failed")
+        self.assertIn("empty output", err)
+
     def test_finish_call_failed_status(self):
         call_id = self.ldg.begin_call("converge", "converge", "codex", "gpt-5.4-mini",
                                       prompt="p" * 100)

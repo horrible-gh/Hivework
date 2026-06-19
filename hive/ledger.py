@@ -196,6 +196,15 @@ class Ledger:
         if self._conn is None or call_id is None:
             return
         out_chars = len(output)
+        # A worker call that returns ZERO output is not a clean success, even when
+        # the HTTP round-trip exited 0 (NR hivework.default.0004.0003 §2/§5.2: run
+        # 418 logged 9 empty combs as ok=1, so the swarm's 0% yield read as
+        # "healthy" and the bottleneck was mis-attributed). Demote empty output to
+        # ok=0 here so the ledger distinguishes a real answer from a blank one.
+        # Observability only — ok is never read to drive pipeline control flow.
+        if ok and out_chars == 0 and not err:
+            ok = False
+            err = "empty output (out_chars=0)"
         try:
             with self._lock:
                 pending = self._pending.pop(call_id, None)
