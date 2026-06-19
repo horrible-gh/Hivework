@@ -153,5 +153,109 @@ class TestReinforceThinAxis(unittest.TestCase):
         self.assertIsNone(out)
 
 
+class TestCombShape(unittest.TestCase):
+    """is_comb_shaped separates a conclusion (findings array) from a search-memo."""
+
+    def test_real_comb_is_shaped(self):
+        comb = json.dumps({"axis_id": "A", "findings": [{"claim": "x"}]})
+        self.assertTrue(fanout.is_comb_shaped(comb))
+
+    def test_empty_findings_is_still_shaped(self):
+        # A genuine "found nothing, concluded" comb is comb-SHAPED — shape != content.
+        self.assertTrue(fanout.is_comb_shaped(json.dumps({"axis_id": "A", "findings": []})))
+
+    def test_grep_arg_memo_is_not_shaped(self):
+        # The dominant run-424 failure: the drone's NEXT search returned as the answer.
+        memo = json.dumps({"path": "", "pattern": "create_button", "glob": "*.vue"})
+        self.assertFalse(fanout.is_comb_shaped(memo))
+
+    def test_empty_and_prose_are_not_shaped(self):
+        self.assertFalse(fanout.is_comb_shaped(""))
+        self.assertFalse(fanout.is_comb_shaped("ok"))
+        self.assertFalse(fanout.is_comb_shaped("I will now search for the handler."))
+
+    def test_findings_must_be_a_list(self):
+        self.assertFalse(fanout.is_comb_shaped(json.dumps({"axis_id": "A", "findings": "x"})))
+
+
+class _RecordingLedger:
+    """Minimal ledger double capturing finish_call(ok, err) per call."""
+    def __init__(self):
+        self.finished = []  # list of (ok, err)
+        self._n = 0
+    def begin_call(self, *a, **kw):
+        self._n += 1
+        return self._n
+    def mark_running(self, *a, **kw):
+        pass
+    def finish_call(self, call_id, output, latency_s, ok=True, err="", real_tokens=None):
+        self.finished.append((bool(ok), err))
+
+
+class TestShapeRejectRetry(unittest.TestCase):
+    """Fix ① (CH 0004.0008): a non-comb gets ONE re-specification turn; the ledger
+    records the search-memo as ok=0 even on exit 0."""
+
+    def setUp(self):
+        self.workdir = tempfile.mkdtemp(prefix="hive_fanout_respecify_")
+
+    def tearDown(self):
+        shutil.rmtree(self.workdir, ignore_errors=True)
+
+    def _comb(self):
+        return json.dumps({"axis_id": "A1", "findings": [{"claim": "real"}]})
+
+    def _memo(self):
+        return json.dumps({"path": "", "pattern": "create_button", "glob": "*.vue"})
+
+    def test_non_comb_triggers_respecify_and_adopts_real_comb(self):
+        axes = [{"id": "A1", "title": "t", "brief": "b"}]
+        calls = []
+        outs = iter([self._memo(), self._comb()])  # 1st: search-memo, 2nd (retry): real comb
+
+        def fake_call_worker(provider, model, prompt, cwd=None, timeout=600, **kw):
+            calls.append(prompt)
+            return WorkerResult(stdout=next(outs), stderr="", exit_code=0, latency_s=0.1)
+
+        ledger = _RecordingLedger()
+        with mock.patch.object(fanout, "call_worker", fake_call_worker):
+            comb_files = fanout.run_fanout(
+                axes=axes, seed_text="seed", codebase_root=self.workdir,
+                workdir=self.workdir, max_workers=1, ledger=ledger,
+            )
+
+        self.assertEqual(len(calls), 2, "non-comb must be re-specified exactly once")
+        self.assertIn("REJECTED", calls[1], "retry prompt must carry the rejection banner")
+        with open(comb_files["A1"], encoding="utf-8") as f:
+            self.assertEqual(f.read(), self._comb(), "the real comb (retry) must win")
+        # Ledger honesty: 1st call recorded ok=0 (search-memo), 2nd ok=1 (real comb).
+        self.assertEqual(ledger.finished[0][0], False)
+        self.assertEqual(ledger.finished[1][0], True)
+
+    def test_shaped_first_reply_skips_retry(self):
+        axes = [{"id": "A1", "title": "t", "brief": "b"}]
+        calls = []
+
+        def fake_call_worker(provider, model, prompt, cwd=None, timeout=600, **kw):
+            calls.append(prompt)
+            return WorkerResult(stdout=self._comb(), stderr="", exit_code=0, latency_s=0.1)
+
+        ledger = _RecordingLedger()
+        with mock.patch.object(fanout, "call_worker", fake_call_worker):
+            fanout.run_fanout(
+                axes=axes, seed_text="seed", codebase_root=self.workdir,
+                workdir=self.workdir, max_workers=1, ledger=ledger,
+            )
+
+        self.assertEqual(len(calls), 1, "a real comb on the first try is not retried")
+        self.assertEqual(ledger.finished[0][0], True)
+
+    def test_conclusion_mandate_in_default_contract(self):
+        # Fix ②: the static instruction ships in the contract every drone receives.
+        contract = fanout.load_comb_contract(None, self.workdir)
+        self.assertIn("Conclusion mandate", contract)
+        self.assertNotIn("{codebase_root}", contract)  # template fully substituted
+
+
 if __name__ == "__main__":
     unittest.main()
