@@ -63,6 +63,9 @@ _DEFAULTS: dict[str, Any] = {
     # Cost guard-rails. allow_swarm=false makes `hive.py run` refuse to launch the
     # open-ended swarm (fan-out + reconcile) and point at the cheap investigate path.
     "safety":  {"allow_swarm": True},
+    # Spend knobs for the fan-out swarm, previously hard-coded in run_fanout. Defaults
+    # reproduce today's behavior: 4 parallel drones, one respecify retry, no call cap.
+    "fanout":  {"parallel": 4, "retries": 1, "max_calls": 0},
     # (M013 B3) Capped per-axis REINFORCEMENT by a few quality SCOUT agents (roles.scout)
     # — NOT a swarm (the swarm pattern lives in judge's best-of-N vote). Distinct from the
     # legacy open-ended swarm above. Fires ONLY on an axis the queen flagged (coverage_risk)
@@ -464,6 +467,27 @@ class JudgeConfig:
 
 
 @dataclass
+class FanoutConfig:
+    """Tuning knobs for the source-mining fan-out swarm (pipeline.fanout / old roles.swarm).
+
+    These were previously HIDDEN — hard-coded in ``hive.fanout.run_fanout`` rather than
+    surfaced in the config — which is exactly the "who is this tuning data for?" gap the
+    schema_version 2 layout closes. The on/off gate stays in :class:`SafetyConfig`
+    (``allow_swarm``, fed by ``pipeline.fanout.enabled``); this block carries the spend
+    knobs:
+
+    - ``parallel``: max concurrent drones (was ``run_fanout``'s hard-coded ``max_workers=4``).
+    - ``retries``: extra respecify turns a non-comb reply gets before the axis gives up
+      (was the single, unconditional respecify pass). 1 preserves today's behaviour.
+    - ``max_calls``: a hard ceiling on TOTAL drone calls per run (0 = unlimited). When set,
+      the axis list is trimmed pre-launch so worst-case ``axes x (1 + retries) <= max_calls``.
+    """
+    parallel: int = 4
+    retries: int = 1
+    max_calls: int = 0
+
+
+@dataclass
 class Config:
     queen: RoleConfig = field(default_factory=RoleConfig)
     # The legacy blanket-fanout worker (one drone per axis, `hive run`) — a real swarm,
@@ -492,6 +516,7 @@ class Config:
     ledger: LedgerConfig = field(default_factory=LedgerConfig)
     apply: ApplyConfig = field(default_factory=ApplyConfig)
     judge: JudgeConfig = field(default_factory=JudgeConfig)
+    fanout: FanoutConfig = field(default_factory=FanoutConfig)
     safety: SafetyConfig = field(default_factory=SafetyConfig)
     reinforce: ReinforceConfig = field(default_factory=ReinforceConfig)
     reinvestigation: ReinvestigationConfig = field(
@@ -626,10 +651,151 @@ def _profile_path(profile: str | None) -> str:
     return os.path.join(_CONFIG_DIR, f"hive.config.{name}.json")
 
 
+# schema_version 2 (R0001): the unified pipeline layout. Each stage carries its own
+# provider/model AND its tuning knobs co-located, under one ordered ``pipeline`` block,
+# with names that match the run's stages (decompose / fanout / judge / …) instead of the
+# scattered roles + stages + ops of the v1 grouped layout. The map below is the single
+# source of truth for which pipeline stage backs which internal role.
+_PIPELINE_ROLE_STAGES = (
+    "decompose", "fanout", "judge", "reinforce", "converge",
+    "assemble", "specify", "review", "commit",
+)
+
+
+def _resolve_model_ref(value: Any, pipeline: dict) -> Any:
+    """Resolve a ``"@stage"`` model reference to that pipeline stage's model string.
+
+    A few stages reuse another stage's model rather than naming their own (e.g. the
+    converge lens reuses ``@fanout``); the config writes that intent literally as
+    ``"@fanout"``. Non-reference values pass through unchanged; a dangling reference
+    resolves to an empty string (the "reuse the owning role" sentinel downstream).
+    """
+    if isinstance(value, str) and value.startswith("@"):
+        ref = pipeline.get(value[1:])
+        return ref.get("model", "") if isinstance(ref, dict) else ""
+    return value
+
+
+def _expand_schema_v2(raw: dict) -> dict:
+    """Expand the schema_version 2 ``coordinator`` + ``pipeline`` layout onto the v1
+    grouped keys (roles / stages / safety / fanout), so :func:`_normalize` and every
+    downstream consumer keep working unchanged. A no-op when no ``pipeline`` block is
+    present (legacy grouped/flat configs fall straight through). Returns a new dict.
+    """
+    pipeline = raw.get("pipeline")
+    if not isinstance(pipeline, dict):
+        return raw
+    out = dict(raw)
+    roles = dict(raw.get("roles") or {})
+    stages = dict(raw.get("stages") or {})
+
+    def _role_pm(stage: dict, include_retries: bool = True) -> dict:
+        """Pull a stage's provider/model (+ optional timeout/retries) into a role dict."""
+        d: dict[str, Any] = {}
+        if "provider" in stage:
+            d["provider"] = stage["provider"]
+        if "model" in stage:
+            d["model"] = _resolve_model_ref(stage["model"], pipeline)
+        if "timeout_sec" in stage:
+            d["timeout_sec"] = stage["timeout_sec"]
+        # ``retries`` on decompose/specify is the role's transient-failure retry; on
+        # fanout/judge/reinforce it is a STAGE knob (respecify / re-judge depth) and must
+        # NOT leak into RoleConfig.retries, so those callers pass include_retries=False.
+        if include_retries and "retries" in stage:
+            d["retries"] = stage["retries"]
+        return d
+
+    coord = raw.get("coordinator")
+    if isinstance(coord, dict):
+        roles["coordinator"] = _role_pm(coord)
+
+    if isinstance(pipeline.get("decompose"), dict):
+        roles["queen"] = _role_pm(pipeline["decompose"])
+
+    fo = pipeline.get("fanout")
+    if isinstance(fo, dict):
+        roles["swarm"] = _role_pm(fo, include_retries=False)
+        out["safety"] = {**(raw.get("safety") or {}),
+                         "allow_swarm": bool(fo.get("enabled", True))}
+        out["fanout"] = {
+            "parallel": int(fo.get("parallel", 4)),
+            "retries": int(fo.get("retries", 1)),
+            "max_calls": int(fo.get("max_calls", 0)),
+        }
+
+    ju = pipeline.get("judge")
+    if isinstance(ju, dict):
+        roles["judge"] = _role_pm(ju, include_retries=False)
+        jstage: dict[str, Any] = {}
+        if "jury_size" in ju:
+            jstage["votes_per_axis"] = ju["jury_size"]
+        if "retries" in ju:
+            jstage["max_calls_per_axis"] = int(ju["retries"]) + 1
+        if "parallel" in ju:
+            jstage["max_parallel"] = ju["parallel"]
+        if "max_axes" in ju:
+            jstage["max_axes"] = ju["max_axes"]
+        if "max_calls" in ju:
+            jstage["max_total_calls"] = ju["max_calls"]
+        stages["judge"] = {**(stages.get("judge") or {}), **jstage}
+
+    re_ = pipeline.get("reinforce")
+    if isinstance(re_, dict):
+        roles["scout"] = _role_pm(re_, include_retries=False)
+        rstage: dict[str, Any] = {}
+        if "enabled" in re_:
+            rstage["enabled"] = re_["enabled"]
+        if "parallel" in re_:
+            rstage["max_workers"] = re_["parallel"]
+        if "max_calls" in re_:
+            rstage["max_total_calls"] = re_["max_calls"]
+        stages["reinforce"] = {**(stages.get("reinforce") or {}), **rstage}
+
+    co = pipeline.get("converge")
+    if isinstance(co, dict):
+        roles["converge"] = _role_pm(co)
+        cstage = dict(stages.get("converge") or {})
+        if isinstance(co.get("split"), dict):
+            cstage["split"] = {k: v for k, v in co["split"].items() if k != "_comment"}
+        if isinstance(co.get("lens"), dict):
+            lens = {k: v for k, v in co["lens"].items() if k != "_comment"}
+            if "model" in lens:
+                lens["model"] = _resolve_model_ref(lens["model"], pipeline)
+            cstage["lens"] = lens
+        stages["converge"] = cstage
+
+    ri = pipeline.get("reinvestigate")
+    if isinstance(ri, dict):
+        ristage: dict[str, Any] = {}
+        if "enabled" in ri:
+            ristage["live"] = ri["enabled"]
+        if "rounds" in ri:
+            ristage["max_rounds"] = ri["rounds"]
+        stages["reinvestigation"] = {**(stages.get("reinvestigation") or {}), **ristage}
+
+    for st in ("assemble", "specify", "review"):
+        if isinstance(pipeline.get(st), dict):
+            roles[st] = _role_pm(pipeline[st])
+
+    cm = pipeline.get("commit")
+    if isinstance(cm, dict):
+        roles["commit"] = _role_pm(cm)
+        if "filename_only_threshold" in cm:
+            stages["commit"] = {**(stages.get("commit") or {}),
+                                "filename_only_threshold": cm["filename_only_threshold"]}
+
+    out["roles"] = roles
+    out["stages"] = stages
+    return out
+
+
 def _normalize(raw: dict) -> dict:
     """Map the grouped layout (roles / stages / targets / ops / providers) onto the
     flat internal keys the extractor below reads, so BOTH the new config files and any
     legacy flat config load identically — no downstream module or test has to change.
+
+    The schema_version 2 ``coordinator`` + ``pipeline`` layout is expanded onto those
+    grouped keys first (:func:`_expand_schema_v2`), so all three layouts converge here.
 
     Grouped keys win when present. ``_comment`` keys ride along harmlessly: the
     extractor reads named fields only, so annotations need no stripping. Returns a new
@@ -637,6 +803,7 @@ def _normalize(raw: dict) -> dict:
     """
     if not isinstance(raw, dict):
         return {}
+    raw = _expand_schema_v2(raw)
     out = dict(raw)
 
     providers = raw.get("providers")
@@ -695,39 +862,62 @@ def _normalize(raw: dict) -> dict:
     return out
 
 
-def _grouped_default_dict() -> dict:
-    """Build the grouped-layout dict from the built-in NEUTRAL defaults — used only to
-    bootstrap a missing default-profile file (a fresh checkout that never ran setup).
-    These are code defaults, not the hand-tuned shipped values; on a normal checkout
-    ``config/hive.config.default.json`` already exists so this never fires."""
+def _schema_v2_default_dict() -> dict:
+    """Build the schema_version 2 (coordinator + pipeline) dict from the built-in NEUTRAL
+    defaults — used only to bootstrap a missing default-profile file (a fresh checkout that
+    never ran setup). These are code defaults, not the hand-tuned shipped values; on a
+    normal checkout ``config/hive.config.default.json`` already exists so this never fires.
+    Emitting the v2 layout keeps the bootstrap file in the SAME shape humans edit."""
     d = _DEFAULTS
+    roles = d["roles"]
+    j = d["judge"]
     return {
-        "roles": {k: dict(v) for k, v in d["roles"].items()},
-        "stages": {
-            "judge": dict(d["judge"]),
-            "converge": {"split": {"enabled": False, "max_loci": 4}},
-            "reinforce": dict(d["reinforce"]),
-            "reinvestigation": dict(d["reinvestigation"]),
-            "commit": {"filename_only_threshold": 50},
-        },
-        "targets": {},
-        "ops": {
-            "swarm_run": {"allow": d["safety"]["allow_swarm"]},
-            "apply": dict(d["apply"]),
-            "ledger": dict(d["ledger"]),
+        "schema_version": 2,
+        "coordinator": dict(roles["coordinator"]),
+        "pipeline": {
+            "decompose": dict(roles["queen"]),
+            "fanout": {**dict(roles["swarm"]),
+                       "enabled": d["safety"]["allow_swarm"],
+                       "parallel": d["fanout"]["parallel"],
+                       "retries": d["fanout"]["retries"],
+                       "max_calls": d["fanout"]["max_calls"]},
+            "judge": {**dict(roles["judge"]),
+                      "jury_size": j["votes_per_axis"],
+                      "retries": max(0, j["max_calls_per_axis"] - 1),
+                      "parallel": j["max_parallel"],
+                      "max_axes": j["max_axes"],
+                      "max_calls": j["max_total_calls"]},
+            "reinforce": {**dict(roles["swarm"]),
+                          "enabled": d["reinforce"]["enabled"],
+                          "parallel": d["reinforce"]["max_workers"],
+                          "max_calls": d["reinforce"]["max_total_calls"]},
+            "converge": {**dict(roles["converge"]),
+                         "split": {"enabled": False, "max_loci": 4}},
+            "reinvestigate": {"model": "@judge",
+                              "enabled": d["reinvestigation"]["live"],
+                              "rounds": d["reinvestigation"]["max_rounds"]},
+            "assemble": dict(roles["assemble"]),
+            "specify": dict(roles["specify"]),
+            "review": dict(roles["review"]),
+            "commit": {**dict(roles["commit"]), "filename_only_threshold": 50},
         },
         "providers": {
             "copilot": dict(d["copilot"]),
             "openai": dict(d["openai"]),
         },
+        "targets": {},
+        "ops": {
+            "apply": dict(d["apply"]),
+            "ledger": dict(d["ledger"]),
+        },
     }
 
 
 def _write_bootstrap_default(path: str) -> None:
-    """Write the neutral grouped-layout default file (bootstrap safety net)."""
+    """Write the neutral schema_version 2 default file (bootstrap safety net)."""
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
-        json.dump(_grouped_default_dict(), f, indent=2)
+        json.dump(_schema_v2_default_dict(), f, indent=2)
         f.write("\n")
     logger.info("Wrote bootstrap default config to %s", path)
 
@@ -777,6 +967,7 @@ def load_config(path: str | None = None, profile: str | None = None) -> Config:
     ledger_raw = merged.get("ledger", {})
     apply_raw = merged.get("apply", {})
     judge_raw = merged.get("judge", {})
+    fanout_raw = merged.get("fanout", {})
     safety_raw = merged.get("safety", {})
     reinforce_raw = merged.get("reinforce", {})
     reinvest_raw = merged.get("reinvestigation", {})
@@ -893,6 +1084,11 @@ def load_config(path: str | None = None, profile: str | None = None) -> Config:
             max_parallel=int(judge_raw.get("max_parallel", 2)),
             votes_per_axis=int(judge_raw.get("votes_per_axis", 1)),
             max_total_calls=int(judge_raw.get("max_total_calls", 0)),
+        ),
+        fanout=FanoutConfig(
+            parallel=int(fanout_raw.get("parallel", 4)),
+            retries=int(fanout_raw.get("retries", 1)),
+            max_calls=int(fanout_raw.get("max_calls", 0)),
         ),
         safety=SafetyConfig(
             allow_swarm=bool(safety_raw.get("allow_swarm", True)),

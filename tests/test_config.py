@@ -460,6 +460,115 @@ class TestGroupedLayout(unittest.TestCase):
         self.assertEqual(cfg.role("judge").model, "m")
 
 
+class TestFanoutDefaults(unittest.TestCase):
+    """The fan-out spend knobs (config.fanout), previously hidden in run_fanout."""
+
+    def test_defaults_preserve_today_behavior(self):
+        cfg = load_config(path="/nonexistent/hive.config.json")
+        self.assertEqual(cfg.fanout.parallel, 4)
+        self.assertEqual(cfg.fanout.retries, 1)
+        self.assertEqual(cfg.fanout.max_calls, 0)   # 0 = uncapped (today's behavior)
+
+
+class TestSchemaV2(unittest.TestCase):
+    """The schema_version 2 coordinator + pipeline layout maps onto the same internal
+    Config as the v1 grouped layout — so no downstream code or test has to change."""
+
+    def _load(self, raw):
+        tmpdir = tempfile.mkdtemp()
+        path = os.path.join(tmpdir, "hive.config.json")
+        with open(path, "w") as f:
+            json.dump(raw, f)
+        return load_config(path=path)
+
+    def test_coordinator_and_decompose_map_to_roles(self):
+        cfg = self._load({"schema_version": 2,
+                          "coordinator": {"provider": "copilot", "model": "claude-sonnet-4.5",
+                                          "timeout_sec": 600},
+                          "pipeline": {"decompose": {"provider": "codex", "model": "gpt-5.4-mini",
+                                                     "retries": 2}}})
+        self.assertEqual(cfg.role("coordinator").model, "claude-sonnet-4.5")
+        self.assertEqual(cfg.role("coordinator").timeout_sec, 600)
+        self.assertEqual(cfg.queen.provider, "codex")
+        self.assertEqual(cfg.queen.model, "gpt-5.4-mini")
+        self.assertEqual(cfg.queen.retries, 2)
+
+    def test_fanout_maps_to_swarm_role_safety_and_fanout_block(self):
+        cfg = self._load({"pipeline": {"fanout": {
+            "provider": "openai", "model": "m120", "enabled": True,
+            "parallel": 6, "retries": 2, "max_calls": 30}}})
+        self.assertEqual(cfg.swarm.provider, "openai")
+        self.assertEqual(cfg.swarm.model, "m120")
+        self.assertEqual(cfg.swarm.retries, 0)   # stage retries must NOT leak into the role
+        self.assertTrue(cfg.safety.allow_swarm)  # enabled drives the kill-switch
+        self.assertEqual(cfg.fanout.parallel, 6)
+        self.assertEqual(cfg.fanout.retries, 2)
+        self.assertEqual(cfg.fanout.max_calls, 30)
+
+    def test_fanout_disabled_drives_allow_swarm_false(self):
+        cfg = self._load({"pipeline": {"fanout": {"model": "m", "enabled": False}}})
+        self.assertFalse(cfg.safety.allow_swarm)
+
+    def test_judge_knobs_map_to_judge_caps(self):
+        cfg = self._load({"pipeline": {"judge": {
+            "provider": "openai", "model": "m120",
+            "jury_size": 5, "retries": 1, "parallel": 5, "max_axes": 10, "max_calls": 40}}})
+        self.assertEqual(cfg.role("judge").provider, "openai")
+        self.assertEqual(cfg.role("judge").retries, 0)         # NOT leaked into the role
+        self.assertEqual(cfg.judge.votes_per_axis, 5)
+        self.assertEqual(cfg.judge.max_calls_per_axis, 2)      # retries + 1
+        self.assertEqual(cfg.judge.max_parallel, 5)
+        self.assertEqual(cfg.judge.max_axes, 10)
+        self.assertEqual(cfg.judge.max_total_calls, 40)
+
+    def test_reinforce_knobs_map_to_scout_and_reinforce_stage(self):
+        cfg = self._load({"pipeline": {"reinforce": {
+            "provider": "openai", "model": "m120",
+            "enabled": True, "parallel": 4, "max_calls": 8}}})
+        self.assertEqual(cfg.scout.model, "m120")
+        self.assertTrue(cfg.reinforce.enabled)
+        self.assertEqual(cfg.reinforce.max_workers, 4)
+        self.assertEqual(cfg.reinforce.max_total_calls, 8)
+
+    def test_converge_split_and_lens_with_at_ref(self):
+        cfg = self._load({"pipeline": {
+            "fanout": {"provider": "openai", "model": "m120", "enabled": True},
+            "converge": {"provider": "copilot", "model": "gpt-5-mini",
+                         "split": {"enabled": True, "max_loci": 4},
+                         "lens": {"enabled": True, "model": "@fanout",
+                                  "lenses": ["omission"], "min_refute": 0}}}})
+        self.assertEqual(cfg.role("converge").model, "gpt-5-mini")
+        self.assertTrue(cfg.converge_split.enabled)
+        self.assertEqual(cfg.converge_split.max_loci, 4)
+        self.assertTrue(cfg.converge_lens.enabled)
+        # @fanout resolved to the fan-out stage's model
+        self.assertEqual(cfg.converge_lens.model, "m120")
+        self.assertEqual(cfg.converge_lens.lenses, ["omission"])
+
+    def test_reinvestigate_maps_to_reinvestigation_stage(self):
+        cfg = self._load({"pipeline": {"reinvestigate": {
+            "model": "@judge", "enabled": True, "rounds": 3}}})
+        self.assertTrue(cfg.reinvestigation.live)
+        self.assertEqual(cfg.reinvestigation.max_rounds, 3)
+
+    def test_commit_threshold_and_specify_timeout(self):
+        cfg = self._load({"pipeline": {
+            "specify": {"provider": "copilot", "model": "gpt-5-mini",
+                        "timeout_sec": 600, "retries": 1},
+            "commit": {"provider": "copilot", "model": "gpt-5-mini",
+                       "filename_only_threshold": 20}}})
+        self.assertEqual(cfg.specify.timeout_sec, 600)
+        self.assertEqual(cfg.specify.retries, 1)
+        self.assertEqual(cfg.commit_stage.filename_only_threshold, 20)
+
+    def test_partial_pipeline_keeps_other_defaults(self):
+        # Only naming decompose must leave every other stage at its built-in default.
+        cfg = self._load({"pipeline": {"decompose": {"model": "x"}}})
+        self.assertEqual(cfg.queen.model, "x")
+        self.assertEqual(cfg.role("judge").model, "claude-sonnet-4.5")
+        self.assertEqual(cfg.judge.max_axes, 12)
+
+
 class TestShippedDefaultProfile(unittest.TestCase):
     """The shipped config/hive.config.default.json loads via the default profile and
     preserves today's hand-tuned values (migration is value-preserving)."""
@@ -483,8 +592,16 @@ class TestShippedDefaultProfile(unittest.TestCase):
         self.assertEqual(self.cfg.judge.max_axes, 10)
         self.assertEqual(self.cfg.judge.votes_per_axis, 5)
 
-    def test_swarm_run_disabled(self):
-        self.assertFalse(self.cfg.safety.allow_swarm)
+    def test_swarm_run_enabled(self):
+        # The shipped default enables the source-mining swarm (pipeline.fanout.enabled
+        # = true, R0001). This maps onto safety.allow_swarm = True.
+        self.assertTrue(self.cfg.safety.allow_swarm)
+
+    def test_fanout_tuning_knobs_surfaced(self):
+        # The previously-hidden fan-out spend knobs are now read from config.
+        self.assertEqual(self.cfg.fanout.parallel, 4)
+        self.assertEqual(self.cfg.fanout.retries, 1)
+        self.assertEqual(self.cfg.fanout.max_calls, 24)
 
     def test_converge_split_enabled_without_placeholder_model(self):
         self.assertTrue(self.cfg.converge_split.enabled)
