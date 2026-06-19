@@ -62,6 +62,20 @@ def extract_first_json(raw: str) -> dict[str, Any]:
     raise ValueError("No complete top-level JSON object found in comb output")
 
 
+def is_comb_dict(obj: Any) -> bool:
+    """True iff ``obj`` is a comb-shaped dict — one carrying a ``findings`` list.
+
+    A comb is a CONCLUSION; its signature is a ``findings`` list. A drone that
+    emits its NEXT search step instead — a tool-argument object like
+    ``{"path":..,"pattern":..,"glob":..}`` — decodes to a dict with no
+    ``findings`` key. This predicate is the SINGLE SOURCE OF TRUTH for "is this a
+    comb", shared by the ledger honesty check (``fanout.is_comb_shaped``) and the
+    pipeline-input gate (``hive.py`` parse stage) so the SAME noise is judged the
+    same way in telemetry and in the evidence fed to assemble (NR
+    hivework.default.0005.0003 RC-2). Never raises."""
+    return isinstance(obj, dict) and isinstance(obj.get("findings"), list)
+
+
 def _best_object(raw: str) -> tuple[dict[str, Any] | None, json.JSONDecodeError | None]:
     """Return the largest top-level block that decodes to a dict (or None)."""
     best: dict[str, Any] | None = None
@@ -167,6 +181,43 @@ def _iter_top_level_objects(text: str) -> Iterator[str]:
                 if depth == 0 and start is not None:
                     yield text[start:i + 1]
                     start = None
+
+
+def partition_combs(
+    comb_files: dict[str, str],
+) -> tuple[list[dict[str, Any]], list[str], list[str]]:
+    """Parse each comb file and split comb-shaped conclusions from noise (G1).
+
+    The fan-out stage writes one ``comb_<axis>.txt`` per axis; some of them are
+    not combs at all but search-memos — a tool-argument object the drone printed
+    instead of concluding (NR hivework.default.0005.0003 RC-2). Such an object is
+    valid JSON, so ``parse_comb_file`` happily returns it; left ungated it would
+    flow through conflict-scan → reconcile → assemble as fake "honey" evidence.
+
+    This partitions the parsed files using the single comb-shape predicate
+    (:func:`is_comb_dict`), so the evidence set carries ONLY genuine conclusions
+    and excluded/failed axes stay visible to the caller for telemetry:
+
+    Returns ``(combs, excluded_notes, parse_fail_notes)`` where
+      - ``combs``        — comb-shaped dicts, in axis-id order (the evidence set);
+      - ``excluded_notes`` — ``"axis: …"`` notes for parsed-but-non-comb axes;
+      - ``parse_fail_notes`` — ``"axis: error"`` notes for files that did not parse.
+    """
+    combs: list[dict[str, Any]] = []
+    excluded_notes: list[str] = []
+    parse_fail_notes: list[str] = []
+    for axis_id, comb_path in sorted(comb_files.items()):
+        try:
+            parsed = parse_comb_file(comb_path)
+        except (ValueError, FileNotFoundError) as e:
+            parse_fail_notes.append(f"{axis_id}: {e}")
+            continue
+        if not is_comb_dict(parsed):
+            excluded_notes.append(
+                f"{axis_id}: non-comb output (no findings array) — excluded from evidence")
+            continue
+        combs.append(parsed)
+    return combs, excluded_notes, parse_fail_notes
 
 
 def parse_comb_file(filepath: str) -> dict[str, Any]:

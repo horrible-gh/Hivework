@@ -19,7 +19,13 @@ import unittest
 # Ensure project root is on path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from hive.parse import extract_first_json, parse_comb_file
+import json
+import shutil
+import tempfile
+
+from hive.parse import (
+    extract_first_json, parse_comb_file, is_comb_dict, partition_combs,
+)
 
 # Paths to real comb files
 COMBS_DIR = os.path.join(
@@ -329,6 +335,79 @@ class TestRepairStrayEscapes(unittest.TestCase):
     def test_unrecoverable_still_raises(self):
         with self.assertRaises(ValueError):
             extract_first_json('{"k": [\\"a\\", garbage notjson ]}')
+
+
+class TestIsCombDict(unittest.TestCase):
+    """is_comb_dict — the single comb-shape predicate (NR 0005.0003 RC-2)."""
+
+    def test_real_comb_is_comb(self):
+        self.assertTrue(is_comb_dict({"axis_id": "A", "findings": [{"claim": "x"}]}))
+
+    def test_empty_findings_is_still_comb(self):
+        # "found nothing, concluded" is comb-SHAPED — shape != content.
+        self.assertTrue(is_comb_dict({"axis_id": "A", "findings": []}))
+
+    def test_tool_arg_memo_is_not_comb(self):
+        # The run-449 noise shapes: a tool-argument object printed as the answer.
+        self.assertFalse(is_comb_dict({"path": "", "pattern": "x", "glob": "*.vue"}))
+        self.assertFalse(is_comb_dict({"path": "server"}))
+        self.assertFalse(is_comb_dict({"path": "x", "pattern": "y", "ignore_case": True}))
+
+    def test_findings_must_be_a_list(self):
+        self.assertFalse(is_comb_dict({"axis_id": "A", "findings": "x"}))
+
+    def test_non_dict_is_not_comb(self):
+        self.assertFalse(is_comb_dict("ok"))
+        self.assertFalse(is_comb_dict(None))
+        self.assertFalse(is_comb_dict(["findings"]))
+
+
+class TestPartitionCombs(unittest.TestCase):
+    """partition_combs — the G1 pipeline-input gate: comb-shaped conclusions are
+    kept as evidence; tool-arg search-memos are excluded (but stay visible)."""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp(prefix="hive_partition_test_")
+
+    def tearDown(self):
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+    def _write(self, axis_id, text):
+        path = os.path.join(self.dir, f"comb_{axis_id}.txt")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(text)
+        return path
+
+    def test_noise_excluded_combs_kept(self):
+        # Mirror run-449: some axes conclude (findings), others print tool-arg noise.
+        comb_files = {
+            "A1": self._write("A1", json.dumps({"axis_id": "A1", "findings": [{"claim": "real"}]})),
+            "A2": self._write("A2", json.dumps({"path": "", "pattern": "create_button", "glob": "*.vue"})),
+            "A3": self._write("A3", json.dumps({"axis_id": "A3", "findings": []})),
+            "A4": self._write("A4", json.dumps({"path": "server", "pattern": "create", "ignore_case": True})),
+        }
+        combs, excluded, parse_fail = partition_combs(comb_files)
+
+        kept = {c.get("axis_id") for c in combs}
+        self.assertEqual(kept, {"A1", "A3"}, "only comb-shaped conclusions are evidence")
+        self.assertEqual(len(combs), 2)
+        # The two tool-arg memos are excluded but recorded for telemetry.
+        self.assertEqual(len(excluded), 2)
+        self.assertTrue(any(n.startswith("A2:") for n in excluded))
+        self.assertTrue(any(n.startswith("A4:") for n in excluded))
+        self.assertTrue(all("no findings array" in n for n in excluded))
+        self.assertEqual(parse_fail, [])
+
+    def test_unparseable_file_is_a_parse_fail_not_an_exclusion(self):
+        comb_files = {
+            "A1": self._write("A1", json.dumps({"findings": []})),
+            "BAD": self._write("BAD", "not json at all, no braces here"),
+        }
+        combs, excluded, parse_fail = partition_combs(comb_files)
+        self.assertEqual(len(combs), 1)
+        self.assertEqual(excluded, [])
+        self.assertEqual(len(parse_fail), 1)
+        self.assertTrue(parse_fail[0].startswith("BAD:"))
 
 
 if __name__ == "__main__":
