@@ -147,7 +147,8 @@ def _shaped_by_axis(workdir: str | None) -> tuple[dict, int]:
 
 
 def build_record(db_path: str, run_id: int, workdir: str | None = None,
-                 golden: dict | None = None) -> dict | None:
+                 golden: dict | None = None,
+                 stage_golden: dict | None = None) -> dict | None:
     """Project ledger run ``run_id`` (+ optional workdir/golden) into a SCHEMA record."""
     prices, billing = _load_pricing()
     try:
@@ -257,13 +258,21 @@ def build_record(db_path: str, run_id: int, workdir: str | None = None,
     }
     if golden:  # golden requires the external scorer (NR0004 5-bug set); omit if absent
         record["golden"] = golden
+    # Per-stage golden-signal-survival slot (hivework.0017, T0006). No hive stage
+    # emits this yet — recall is scored once at the end — so it is omitted today
+    # and the report renders those waterfall cells as 미계측 (an honest blank,
+    # never 0%). The passthrough is the forward contract: once instrumentation
+    # produces a stage_golden block, it flows verbatim into the report's blanks.
+    if stage_golden:
+        record["stage_golden"] = stage_golden
     return record
 
 
 def emit(db_path: str, run_id: int, out_path: str, workdir: str | None = None,
-         golden: dict | None = None) -> bool:
+         golden: dict | None = None, stage_golden: dict | None = None) -> bool:
     """Append one record to ``out_path`` (JSON Lines). Best-effort, non-fatal."""
-    rec = build_record(db_path, run_id, workdir=workdir, golden=golden)
+    rec = build_record(db_path, run_id, workdir=workdir, golden=golden,
+                       stage_golden=stage_golden)
     if rec is None:
         return False
     try:
@@ -296,6 +305,9 @@ def main(argv=None) -> int:
     ap.add_argument("--out", default="runs.jsonl", help="append 대상 runs.jsonl")
     ap.add_argument("--golden-json", default=None,
                     help="골든셋 채점 블록(JSON 파일) — 있으면 record.golden 에 삽입")
+    ap.add_argument("--stage-golden-json", default=None,
+                    help="단계별 골든 생존 블록(JSON 파일) — 있으면 record.stage_golden 에 삽입 "
+                         "(T0006: 워터폴 미계측 칸을 실측 %로 채우는 적재 슬롯)")
     ap.add_argument("--print", action="store_true", dest="print_only",
                     help="append 하지 않고 record를 stdout으로만 출력")
     a = ap.parse_args(argv)
@@ -307,14 +319,20 @@ def main(argv=None) -> int:
     if a.golden_json:
         with open(a.golden_json, encoding="utf-8") as f:
             golden = json.load(f)
+    stage_golden = None
+    if a.stage_golden_json:
+        with open(a.stage_golden_json, encoding="utf-8") as f:
+            stage_golden = json.load(f)
 
     if a.print_only:
-        rec = build_record(a.db, run_id, workdir=a.workdir, golden=golden)
+        rec = build_record(a.db, run_id, workdir=a.workdir, golden=golden,
+                           stage_golden=stage_golden)
         if rec is None:
             return 1
         print(json.dumps(rec, ensure_ascii=False, indent=2))
         return 0
-    ok = emit(a.db, run_id, a.out, workdir=a.workdir, golden=golden)
+    ok = emit(a.db, run_id, a.out, workdir=a.workdir, golden=golden,
+              stage_golden=stage_golden)
     if ok:
         print(f"emit: run{run_id} → {a.out}")
     return 0 if ok else 1

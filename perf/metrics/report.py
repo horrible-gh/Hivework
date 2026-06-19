@@ -42,6 +42,35 @@ FUNNEL_STAGES = [
     ("passed", "통과"),
 ]
 
+# Honest blank. An UNMEASURED cell means "this signal isn't instrumented yet",
+# which is the OPPOSITE of a measured 0% ("signal died here"). CH0005 is explicit:
+# never paint 미계측 as 0% — that would let the report lie about where the
+# pipeline leaks. So unmeasured cells render this glyph (grey), and only become a
+# real number once instrumentation fills the slot.
+UNMEASURED = "—"
+
+# The canonical hive pipeline as a run-level waterfall (chat diagram, CH0005),
+# top → bottom. Each stage carries:
+#   funnel_key  — the measured comb count that survives to this stage, or None
+#                 (coordinator has no funnel counterpart → 미계측, not a fake 0).
+#   golden_attr — the per-stage golden-signal-survival slot. None for every
+#                 intermediate stage today: no stage emits a "골든 축 살아있음"
+#                 flag yet, so recall is only scored once at the end. Those cells
+#                 render 미계측 (honest blank). The two terminal scoring points
+#                 (honey=recall, apply=fixed) carry real numbers. When future
+#                 instrumentation lands a ``stage_golden`` block (SCHEMA.md), the
+#                 renderer fills real % into the blanks — same skeleton, data
+#                 flows in. This is "앞으로는 각 신호마다 볼수있게 측정" (T0006).
+WATERFALL_STAGES = [
+    ("coordinator", "coordinator · 기대 추출 (선택)",  None,                   None),
+    ("decompose",   "decompose · 축 분해",             "axes_attempted",       None),
+    ("retrieve",    "retrieve/fan-out · 증거 수집",     "comb_fired",           None),
+    ("judge",       "judge/gate · comb-형태 판정",      "comb_shaped",          None),
+    ("converge",    "converge · 봉합 + 인과검증",        "conclusion_converted", None),
+    ("honey",       "honey · 정본 조립 (재현율 채점)",   "submitted",            "recall"),
+    ("apply",       "specify/apply · 수정 → 통과",       "passed",               "fixed"),
+]
+
 
 def load_runs(path):
     """Read a JSONL file into a list of run dicts, sorted by timestamp.
@@ -91,6 +120,7 @@ def derive(run):
     seeded = float(golden.get("seeded", 0) or 0)
     recalled = float(golden.get("recalled", 0) or 0)
     fp = float(golden.get("false_positives", 0) or 0)
+    verified = float(golden.get("verified_fixed", 0) or 0)
 
     return {
         "yield": (shaped / axes) if axes else 0.0,
@@ -100,6 +130,7 @@ def derive(run):
         "cost_per_fix": (usd / landed) if landed else None,
         "recall": (recalled / seeded) if seeded else None,
         "precision": (recalled / (recalled + fp)) if (recalled + fp) else None,
+        "golden_fixed_rate": (verified / seeded) if seeded else None,
         "has_golden": bool(golden),
     }
 
@@ -379,6 +410,161 @@ def section_axes(latest):
         '<tbody>' + "".join(rows) + '</tbody></table></section>')
 
 
+def _run_label(run):
+    """Short human label for a run in pickers/tables (arm name if it has one)."""
+    arm = run.get("arm")
+    base = str(run.get("run_id", "?"))
+    return f"{base} · {arm}" if arm else base
+
+
+def section_run_table(runs, derived_all):
+    """Flat per-run comparison: one row per run so solo-5mini sits beside the
+    hybrid runs and "후지냐 좋냐" is answerable at a glance (CH0005).
+
+    This is the per-run breakdown the chat asked for — the rest of the report
+    details only the latest cycle, so without this table runs are invisible to
+    each other. Accuracy columns lead (R0014-D), cost trails.
+    """
+    rows = []
+    for run, d in zip(runs, derived_all):
+        cyc = run.get("cycle", {})
+        rows.append(
+            f'<tr><td>{escape(_run_label(run))}</td>'
+            f'<td class="muted-cell">{escape(str(run.get("codebase", "")))}</td>'
+            f'<td>{_fmt_pct(d["recall"])}</td>'
+            f'<td>{_fmt_pct(d["precision"])}</td>'
+            f'<td>{int(_num(cyc, "fixes_landed"))}/{int(_num(cyc, "fixes_total"))}</td>'
+            f'<td>{_fmt_usd(d["usd"])}</td></tr>')
+    return (
+        '<section><h2>런별 비교 — 한 줄에 한 런</h2>'
+        '<p class="muted">solo 단독 arm을 하이브리드 런 옆에 나란히. '
+        '재현율·정밀도가 메인, 비용은 뒤(R0014-D).</p>'
+        '<table class="grid-tbl"><thead><tr><th>런</th><th>대상</th>'
+        '<th>재현율</th><th>정밀도</th><th>통과</th><th>런당 $</th></tr></thead><tbody>'
+        + "".join(rows) + '</tbody></table></section>')
+
+
+def _stage_count_cell(run, funnel_key):
+    """Measured comb count surviving to a stage — or an honest blank when the
+    stage has no funnel counterpart (never a fabricated 0)."""
+    if funnel_key is None:
+        return f'<span class="unmeasured" title="아직 계측 안 됨">{UNMEASURED} 미계측</span>'
+    return f'<b>{int(_num(run.get("funnel", {}), funnel_key))}</b>'
+
+
+def _stage_golden_cell(run, stage_key, golden_attr, d):
+    """Per-stage golden-signal survival.
+
+    Precedence: (1) a ``stage_golden`` block if future instrumentation filled it
+    for this stage; (2) the two terminal scoring points (honey→recall,
+    apply→fixed); (3) otherwise an honest 미계측 blank. CRITICALLY this never
+    returns 0% for an unmeasured stage — 미계측 ≠ 0 (CH0005)."""
+    sg = (run.get("stage_golden") or {}).get(stage_key)
+    if isinstance(sg, dict) and sg.get("of"):
+        alive, of = int(sg.get("alive", 0) or 0), int(sg["of"])
+        rate = alive / of if of else None
+        return f'<span class="ok">{_fmt_pct(rate)}</span> <span class="muted">({alive}/{of})</span>'
+    if golden_attr == "recall" and d.get("recall") is not None:
+        return f'<span class="ok">{_fmt_pct(d["recall"])}</span> <span class="muted">(채점지점)</span>'
+    if golden_attr == "fixed" and d.get("golden_fixed_rate") is not None:
+        return f'<span class="ok">{_fmt_pct(d["golden_fixed_rate"])}</span> <span class="muted">(채점지점)</span>'
+    return f'<span class="unmeasured" title="아직 계측 안 됨 — 0%가 아님">{UNMEASURED} 미계측</span>'
+
+
+def section_waterfall_panel(run, d):
+    """One run's pipeline waterfall: where did the golden signal leak?
+
+    Two columns per stage: the MEASURED comb count (real, from the funnel) and
+    the per-stage golden survival (mostly 미계측 today — only the terminal
+    scoring points carry a real number). Below it, a per-signal × per-stage
+    matrix so each golden bug is tracked across the flow (T0006: "각 신호마다
+    보여주되 현재 없는 부분은 없음같이 표현").
+    """
+    wf_rows = []
+    for key, label, funnel_key, golden_attr in WATERFALL_STAGES:
+        wf_rows.append(
+            f'<tr><td class="wf-stage">{escape(label)}</td>'
+            f'<td class="wf-count">{_stage_count_cell(run, funnel_key)}</td>'
+            f'<td class="wf-gold">{_stage_golden_cell(run, key, golden_attr, d)}</td></tr>')
+    waterfall = (
+        '<table class="grid-tbl wf-tbl"><thead><tr><th>파이프라인 단계</th>'
+        '<th>살아남은 comb (실측)</th><th>골든 신호 생존</th></tr></thead><tbody>'
+        + "".join(wf_rows) + '</tbody></table>')
+
+    # Per-signal × per-stage matrix. Only the honey (scored) column has data per
+    # bug today; every earlier stage is an honest blank awaiting instrumentation.
+    matrix = ""
+    g = run.get("golden") or {}
+    per_bug = g.get("per_bug") or []
+    if per_bug:
+        head = "".join(f'<th>{escape(lbl.split(" · ")[0])}</th>'
+                       for _k, lbl, _f, _ga in WATERFALL_STAGES)
+        m_rows = []
+        sg = run.get("stage_golden") or {}
+        for b in per_bug:
+            cells = []
+            for key, _lbl, _fk, golden_attr in WATERFALL_STAGES:
+                per = (sg.get(key) or {}).get("per_bug") if isinstance(sg.get(key), dict) else None
+                if isinstance(per, dict) and b.get("id") in per:
+                    alive = per[b["id"]]
+                    cells.append(f'<td class="{"ok" if alive else "no"}">'
+                                 f'{"생존" if alive else "누락"}</td>')
+                elif golden_attr == "recall":
+                    found = b.get("found")
+                    cells.append(f'<td class="{"ok" if found else "no"}">'
+                                 f'{"찾음" if found else "놓침"}</td>')
+                elif golden_attr == "fixed":
+                    fixed = b.get("fixed")
+                    cells.append(f'<td class="{"ok" if fixed else "no"}">'
+                                 f'{"통과" if fixed else UNMEASURED}</td>')
+                else:
+                    cells.append(f'<td class="unmeasured">{UNMEASURED}</td>')
+            m_rows.append(
+                f'<tr><td class="lvl">Lv{b.get("level", "?")}</td>'
+                f'<td>{escape(str(b.get("id", "")))}</td>' + "".join(cells) + '</tr>')
+        matrix = (
+            '<p class="muted" style="margin-top:14px">신호별 × 단계별 — 각 골든 버그가 '
+            '어느 칸까지 살아남았나. 회색 칸은 0%가 아니라 <b>미계측</b>(아직 그 단계를 안 잼).</p>'
+            '<div class="wf-matrix-scroll"><table class="grid-tbl wf-matrix">'
+            f'<thead><tr><th>Lv</th><th>버그</th>{head}</tr></thead><tbody>'
+            + "".join(m_rows) + '</tbody></table></div>')
+    return waterfall + matrix
+
+
+def section_runs_tabbed(runs, derived_all):
+    """Clickable per-run waterfall. Zero-JS: radio inputs + ``:checked ~`` CSS
+    toggle which panel shows, so the report stays a self-contained static file
+    (CH0002 — no server, openable via file://). Latest run is selected by
+    default. "런 하나 누르면 저 플로가 그려진다" (CH0005)."""
+    if not runs:
+        return ""
+    n = len(runs)
+    sel = n - 1  # latest run open by default
+    inputs = "".join(
+        f'<input type="radio" name="runsel" id="rs-{i}" class="run-radio"'
+        f'{" checked" if i == sel else ""}>' for i in range(n))
+    tabs = "".join(
+        f'<label for="rs-{i}" class="run-tab">{escape(_run_label(r))}</label>'
+        for i, r in enumerate(runs))
+    panels = "".join(
+        f'<div class="run-panel" id="rp-{i}">{section_waterfall_panel(r, d)}</div>'
+        for i, (r, d) in enumerate(zip(runs, derived_all)))
+    # Per-index toggle rules generated for the actual run count (zero-JS).
+    css = "".join(
+        f"#rs-{i}:checked~.run-panels #rp-{i}{{display:block}}"
+        f"#rs-{i}:checked~.run-tabs label[for='rs-{i}']"
+        f"{{background:var(--ok);color:#0f1115;border-color:var(--ok)}}" for i in range(n))
+    return (
+        '<section class="runs-tabbed"><h2>런별 워터폴 — 어느 칸에서 새는지</h2>'
+        '<p class="muted">런을 누르면 그 런의 파이프라인(decompose→retrieve→judge→'
+        'converge→honey→apply)이 열린다. 실측 칸은 진짜 comb 수, '
+        '<b>회색 \'미계측\'</b>은 0%가 아니라 아직 그 칸을 안 잰 빈 슬롯이다 — '
+        '계측이 박히면 그 자리에 진짜 %가 흘러든다(CH0005·T0006).</p>'
+        f'<style>{css}</style>{inputs}'
+        f'<div class="run-tabs">{tabs}</div>'
+        f'<div class="run-panels">{panels}</div></section>')
+
+
 def render(runs):
     if not runs:
         body = '<section><p class="muted">runs.jsonl 에 레코드가 없습니다.</p></section>'
@@ -410,6 +596,8 @@ def render(runs):
         f'<p class="meta">최신 사이클: {meta}<br>'
         f'전체 {len(runs)}런 · 마지막 ts {escape(str(latest.get("ts", "")))}</p></header>'
         + section_summary(latest, d)
+        + section_run_table(runs, derived_all)
+        + section_runs_tabbed(runs, derived_all)
         + '<section><h2>수확 퍼널 — 이번 사이클은 어디서 무너졌나</h2>'
         + f'<p class="muted">축 시도에서 통과까지. 괄호 안은 직전 단계 대비 전환율. '
         f'수확 수율(comb-형태/축) = <b>{_fmt_pct(d["yield"])}</b> '
@@ -478,6 +666,21 @@ PAGE = """<!doctype html>
  .grid-tbl td.muted-cell {{ color:var(--muted); }}
  .grid-tbl tr.tot td {{ font-weight:700; border-top:1px solid var(--line); }}
  .lvl {{ color:var(--muted); }}
+ /* honest blank: 미계측 ≠ 0% (CH0005) — grey, never coloured like a score */
+ .unmeasured {{ color:var(--muted); opacity:.7; font-style:italic; }}
+ /* per-run waterfall: zero-JS radio tabs */
+ .run-radio {{ position:absolute; opacity:0; pointer-events:none; }}
+ .run-tabs {{ display:flex; flex-wrap:wrap; gap:6px; margin:10px 0 4px; }}
+ .run-tab {{ cursor:pointer; font-size:12px; color:var(--muted); padding:4px 10px;
+            border:1px solid var(--line); border-radius:14px; background:var(--bg);
+            user-select:none; }}
+ .run-tab:hover {{ color:var(--ink); }}
+ .run-panel {{ display:none; margin-top:10px; }}
+ .wf-tbl td.wf-stage {{ font-weight:600; }}
+ .wf-tbl td.wf-count {{ width:170px; }}
+ .wf-tbl td.wf-gold {{ width:170px; }}
+ .wf-matrix-scroll {{ overflow-x:auto; }}
+ .wf-matrix th, .wf-matrix td {{ white-space:nowrap; font-size:12px; padding:5px 7px; }}
  footer {{ color:var(--muted); font-size:11.5px; text-align:center; margin-top:24px; }}
 </style></head>
 <body><div class="wrap">{body}</div></body></html>
