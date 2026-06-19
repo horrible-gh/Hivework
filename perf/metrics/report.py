@@ -251,23 +251,30 @@ def card(value, label, sub=""):
 
 
 def section_summary(latest, d):
-    """North-star cards for the latest cycle, in priority order."""
-    f = latest.get("funnel", {})
+    """North-star cards for the latest cycle, in priority order.
+
+    R0014-D: the main accuracy metric is recall/precision (정확도), not yield.
+    Yield is demoted to an auxiliary signal living in the harvest funnel section
+    (section_funnel / section_axes) and no longer occupies a north-star card.
+    """
     cyc = latest.get("cycle", {})
     cards = [
         card(f'{int(_num(cyc, "fixes_landed"))}/{int(_num(cyc, "fixes_total"))}',
              "통과한 수정 (북극성)", f'통과율 {_fmt_pct(d["pass_rate"])}'),
-        card(_fmt_pct(d["yield"]),
-             "수확 수율", f'{int(_num(f, "comb_shaped"))} / {int(_num(f, "axes_attempted"))} 축'),
-        card(_fmt_usd(d["usd"]),
-             "런 비용", f'수율당 {_fmt_usd(d["cost_per_finding"])}'),
     ]
     if d["has_golden"]:
         g = latest["golden"]
+        recalled = int(g.get("recalled", 0))
+        seeded = int(g.get("seeded", 0))
+        fp = int(g.get("false_positives", 0))
         cards.append(card(
-            f'{int(g.get("recalled", 0))}/{int(g.get("seeded", 0))}',
-            "정확도: 심은 것 중 찾음",
-            f'헛다리 {int(g.get("false_positives", 0))} · 통과 {int(g.get("verified_fixed", 0))}'))
+            _fmt_pct(d["recall"]),
+            "재현율 (메인)", f'{recalled}/{seeded} 찾음'))
+        cards.append(card(
+            _fmt_pct(d["precision"]),
+            "정밀도 (메인)", f'헛다리 {fp}건'))
+    cards.append(card(_fmt_usd(d["usd"]),
+                      "런 비용", f'수율당 {_fmt_usd(d["cost_per_finding"])}'))
     return '<div class="cards">' + "".join(cards) + "</div>"
 
 
@@ -307,6 +314,47 @@ def section_golden(latest):
         + "".join(rows) + '</tbody></table></section>')
 
 
+def section_cost_table(latest):
+    """Per-provider cost table with the credit axis and the $ axis split out (R0001).
+
+    Credit-billed providers (copilot) show their credit consumption; token-billed
+    providers (deepinfra) show tokens. USD is the common bottom line so the two
+    billing paradigms remain comparable without conflating credits and tokens.
+    """
+    by_prov = (latest.get("cost", {}) or {}).get("by_provider", {}) or {}
+    if not by_prov:
+        return ""
+    rows = []
+    tot_credits = tot_usd = 0.0
+    for prov in sorted(by_prov):
+        v = by_prov[prov] or {}
+        credits = float(v.get("credits", 0) or 0)
+        usd = float(v.get("usd", 0) or 0)
+        calls = int(v.get("calls", 0) or 0)
+        tokens = int(v.get("tokens", 0) or 0)
+        tot_credits += credits
+        tot_usd += usd
+        # Billing paradigm is inferred from which axis carries the charge.
+        if credits > 0 or (usd == 0 and tokens and calls):
+            model, basis = "크레딧", f'{calls}회 호출'
+        else:
+            model, basis = "토큰", f'{tokens:,} tok'
+        rows.append(
+            f'<tr><td>{escape(prov)}</td><td class="muted-cell">{model}</td>'
+            f'<td>{basis}</td>'
+            f'<td>{credits:,.2f}</td>'
+            f'<td>{_fmt_usd(usd)}</td></tr>')
+    rows.append(
+        f'<tr class="tot"><td>합계</td><td></td><td></td>'
+        f'<td>{tot_credits:,.2f}</td><td>{_fmt_usd(tot_usd)}</td></tr>')
+    return (
+        '<table class="grid-tbl"><thead><tr><th>provider</th><th>과금</th>'
+        '<th>기준</th><th>크레딧 (1cr=$0.01)</th><th>$</th></tr></thead><tbody>'
+        + "".join(rows) + '</tbody></table>'
+        '<p class="muted">크레딧계(코파일럿)=호출수×크레딧단가 · '
+        '토큰계(deepinfra/openai호환)=실토큰×단가. 두 축은 분리 집계된다.</p>')
+
+
 def section_axes(latest):
     axes = latest.get("axes") or []
     if not axes:
@@ -340,11 +388,12 @@ def render(runs):
     d = derive(latest)
     derived_all = [derive(r) for r in runs]
 
-    # Trend series: yield% / pass-rate% on one axis, $/run on another (auto-scaled).
+    # Trend series (R0014-D): accuracy metrics lead — recall/precision/pass-rate.
+    # Yield is demoted to the funnel section and no longer drawn on the main trend.
     trend = svg_lines(runs, [
-        ("수율", lambda r: derive(r)["yield"], "#54c7a3", True),
-        ("통과율", lambda r: derive(r)["pass_rate"], "#7c9cff", True),
+        ("재현율", lambda r: derive(r)["recall"], "#54c7a3", True),
         ("정밀도", lambda r: derive(r)["precision"], "#d98cff", True),
+        ("통과율", lambda r: derive(r)["pass_rate"], "#7c9cff", True),
     ])
     cost_trend = svg_lines(runs, [
         ("런당 $", lambda r: derive(r)["usd"], "#f0a85f", False),
@@ -362,13 +411,17 @@ def render(runs):
         f'전체 {len(runs)}런 · 마지막 ts {escape(str(latest.get("ts", "")))}</p></header>'
         + section_summary(latest, d)
         + '<section><h2>수확 퍼널 — 이번 사이클은 어디서 무너졌나</h2>'
-        + '<p class="muted">축 시도에서 통과까지. 괄호 안은 직전 단계 대비 전환율.</p>'
+        + f'<p class="muted">축 시도에서 통과까지. 괄호 안은 직전 단계 대비 전환율. '
+        f'수확 수율(comb-형태/축) = <b>{_fmt_pct(d["yield"])}</b> '
+        f'({int(_num(latest.get("funnel", {}), "comb_shaped"))} / '
+        f'{int(_num(latest.get("funnel", {}), "axes_attempted"))} 축) — R0014-D로 메인 카드에서 이 퍼널 보조지표로 강등.</p>'
         + svg_funnel(latest.get("funnel", {})) + '</section>'
         + section_golden(latest)
         + '<section><h2>추세 — 런 누적</h2>'
-        + '<p class="muted">수율·통과율·정밀도(좌) / 각 시리즈는 자기 최대값 기준 정규화.</p>'
+        + '<p class="muted">재현율·정밀도·통과율(좌) / 각 시리즈는 자기 최대값 기준 정규화. (수율은 퍼널 섹션으로 이동 — R0014-D)</p>'
         + trend + '</section>'
-        + '<section><h2>비용 분해 — provider별</h2>'
+        + '<section><h2>비용 분해 — provider별 (크레딧계 / 토큰계 분리)</h2>'
+        + section_cost_table(latest)
         + svg_cost_bars(runs)
         + '<p class="muted">런당 총비용 추세:</p>' + cost_trend
         + f'<p class="muted">최신 런: 수율당 {_fmt_usd(d["cost_per_finding"])} · '
@@ -422,6 +475,8 @@ PAGE = """<!doctype html>
  .grid-tbl td.ok, .grid-tbl .ok {{ color:var(--ok); }}
  .grid-tbl td.no, .grid-tbl .no {{ color:var(--no); }}
  .grid-tbl td.zero, .grid-tbl .zero {{ color:var(--zero); }}
+ .grid-tbl td.muted-cell {{ color:var(--muted); }}
+ .grid-tbl tr.tot td {{ font-weight:700; border-top:1px solid var(--line); }}
  .lvl {{ color:var(--muted); }}
  footer {{ color:var(--muted); font-size:11.5px; text-align:center; margin-top:24px; }}
 </style></head>

@@ -36,13 +36,17 @@
     // ... 축마다 1개. ← worker_calls 의 axis_id/comb_path/latency_s 집계
   ],
 
-  // ── 비용: provider별 분리(copilot/deepinfra) ───────────────────────────
+  // ── 비용: provider별 분리 — 과금모델 2종(R0001) ────────────────────────
+  //   크레딧계(copilot)  = 호출수 × 크레딧단가(1cr=$0.01) 정액. 토큰 무관.
+  //   토큰계(deepinfra/openai호환) = 실토큰 × 단가(입력/출력 분리).
+  //   credits/usd 는 분리 축: 크레딧계는 credits 로, 토큰계는 tokens 로 과금.
   "cost": {
     "by_provider": {
-      "copilot":   { "tokens": 18910, "credits": 18.91, "usd": 0.181 },
-      "deepinfra": { "tokens": 32000, "credits": 0,     "usd": 0.076 }
+      "copilot":   { "tokens": 16928, "calls": 4, "credits": 0, "usd": 0.0 },
+      "deepinfra": { "tokens": 9740,  "calls": 6, "credits": 0, "usd": 0.117 }
     }
-    // tokens ← est_tokens 합, usd ← 단가표 적용(가격은 코드에 박지 않음)
+    // tokens ← est_tokens 합, calls ← worker_call 수, usd ← 과금모델별 산정.
+    // 단가·과금모델은 코드에 박지 않음 → prices.json(+_billing 블록).
   },
 
   // ── 사이클 결과 + 지연 ────────────────────────────────────────────────
@@ -62,7 +66,7 @@
     "per_bug": [                            // 버그별 채점(레벨 = 난이도 사다리)
       { "id": "0096", "level": 1, "found": true,  "fixed": false },
       { "id": "0077", "level": 2, "found": false, "fixed": false },
-      { "id": "0064", "level": 3, "found": false, "fixed": false },
+      { "id": "0082", "level": 3, "found": false, "fixed": false },  // R0014-B: 0064 폐기(정답 미합의·3회 재오픈→채점불가) → 0082(dispose FK·원인명확·교차레이어)로 교체
       { "id": "0062", "level": 4, "found": false, "fixed": false },
       { "id": "0059", "level": 5, "found": false, "fixed": false }
     ]
@@ -74,13 +78,13 @@
 
 | 지표 | 정의 | 의미 |
 |---|---|---|
-| 수율(yield) | `comb_shaped / axes_attempted` | 스웜 무수확률의 반대. 제일 중요한 건강지표 |
+| 재현율(recall) | `golden.recalled / golden.seeded` | **메인 정확도 지표(R0014-D)** — 심은 버그를 얼마나 꼼꼼히 찾나 |
+| 정밀도(precision) | `recalled / (recalled + false_positives)` | **메인 정확도 지표(R0014-D)** — 얼마나 믿을 만한가(헛다리 안 하나) |
 | 통과율(pass rate) | `fixes_landed / fixes_total` | **북극성** — 실제로 고쳐서 통과한 비율 |
+| 수율(yield) | `comb_shaped / axes_attempted` | 보조 지표(R0014-D 강등) — 수확 퍼널의 건강도. 메인 카드에서 내려 퍼널 섹션으로 |
 | 런당 비용 | `Σ provider.usd` | |
-| 수율당 비용 | `usd / comb_shaped` | 진짜 효율 지표($/finding) |
+| 수율당 비용 | `usd / comb_shaped` | 효율 지표($/finding) |
 | 수정당 비용 | `usd / fixes_landed` | $/fix |
-| 재현율(recall) | `golden.recalled / golden.seeded` | 얼마나 꼼꼼한가(놓친 것 포함) |
-| 정밀도(precision) | `recalled / (recalled + false_positives)` | 얼마나 믿을 만한가(헛다리 안 하나) |
 
 ## 견고성 규약
 
