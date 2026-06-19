@@ -276,7 +276,10 @@ def _call_openai_compatible(model, prompt, cwd=None, timeout=120, *, system=None
             resp = client.chat.completions.create(
                 model=model, messages=messages, temperature=temperature,
                 max_tokens=max_tokens, **extra)
-            content = resp.choices[0].message.content or ""
+            # Same reasoning-channel fallback as the tool loop: a single-shot
+            # judge/pick on gpt-oss-120b can also answer via `reasoning` with an
+            # empty `content` (NR 0004.0003 §2: judge empty-but-ok runs 69~87).
+            content = http_tools.message_text(resp.choices[0].message)
             usage = getattr(resp, "usage", None)
             real_tokens = (getattr(usage, "total_tokens", None)
                            if usage is not None else None)

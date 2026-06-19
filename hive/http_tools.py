@@ -29,6 +29,8 @@ import logging
 import os
 import re
 
+from hive.parse import extract_first_json, is_comb_dict
+
 logger = logging.getLogger("hive.http_tools")
 
 # ── Output budgets (cap a single tool result so the next prompt stays bounded) ──
@@ -283,6 +285,196 @@ def execute_tool(name: str, arguments: dict, root: str) -> str:
         return f"[error] {name} failed: {e}"
 
 
+def message_text(msg):
+    """Extract the assistant's answer, falling back to the reasoning channel.
+
+    A reasoning model (gpt-oss-120b on deepinfra) driven through the tool loop's
+    forced-answer turn (tool_choice='none') routinely emits the answer on the
+    ``reasoning`` / ``reasoning_content`` channel and leaves ``content`` empty
+    while still reporting finish_reason=stop with tokens spent (NR
+    hivework.default.0004.0003 §2: run 418 swarm returned 9/10 empty combs this
+    way). Reading only ``content`` discards that answer → empty comb → parse
+    failure, recorded downstream as a 0-char "successful" call. Fall back to the
+    reasoning channel so the work is not silently dropped.
+    """
+    txt = getattr(msg, "content", None)
+    if txt and txt.strip():
+        return txt
+    for attr in ("reasoning_content", "reasoning"):
+        alt = getattr(msg, attr, None)
+        if alt and str(alt).strip():
+            return str(alt)
+    return txt or ""
+
+
+def _tool_arg_param_names(tool_names) -> set[str]:
+    """Union of every parameter name across the given tools' schemas.
+
+    These are the keys a *legitimate* tool call would carry (path, pattern,
+    glob, ignore_case, start_line, end_line, …). Used to recognise when the
+    model printed a tool-call's arguments as plain text instead of issuing a
+    structured ``tool_calls`` request."""
+    names: set[str] = set()
+    for schema in schemas_for(tool_names):
+        props = (schema.get("function", {})
+                 .get("parameters", {}).get("properties", {}))
+        names.update(props)
+    return names
+
+
+# File-navigation keys a search/read memo carries. The real schema params
+# (path/pattern/…) PLUS the synonyms a reasoning drone routinely HALLUCINATES
+# for a search API it imagines (query/max_results/depth/line_start/…). The
+# anchor of the set — recognising "this object is navigating files" — is the
+# path-like group; the rest just widens recall.
+_PATH_KEYS = frozenset({"path", "file", "filename", "filepath", "dir",
+                        "directory", "paths", "files"})
+_NAV_SYNONYM_KEYS = frozenset({
+    "query", "q", "search", "regex", "max_results", "limit", "depth",
+    "line_start", "line_end", "context", "case_insensitive", "recursive",
+    "include", "exclude", "head", "tail", "lines",
+})
+
+
+def _is_scalar(v) -> bool:
+    return isinstance(v, (str, int, float, bool)) or v is None
+
+
+# How many times one agent loop will INTERPRET a printed tool-arg memo as a real
+# tool call and feed the result back (RC-C bridge, below). A small cap: it converts
+# a "blind drone" into a few real searches without letting a model that only ever
+# prints memos spin to the iteration bound. After the cap the loop falls through to
+# the forced-answer guard, which demands a conclusion.
+_MAX_TEXT_BRIDGES = 3
+
+# Synonym map: a hallucinated/aliased memo key -> the real grep/read_file param it
+# means. Lets the RC-C bridge execute a printed search even when the drone invented
+# its own field names (query/regex for pattern, line_start for start_line, …).
+_PATH_SYNONYMS = ("path", "file", "filename", "filepath", "dir", "directory")
+_PATTERN_SYNONYMS = ("pattern", "regex", "query", "q", "search")
+
+
+def _infer_tool_call_from_text(content: str, tool_names) -> tuple[str, dict] | None:
+    """Map a printed tool-arg memo to a concrete ``(tool_name, kwargs)`` to run.
+
+    The RC-C counterpart to :func:`_looks_like_tool_call_text` (NR
+    hivework.default.0008.0009 RC-A1/RC-C): when a reasoning drone PRINTS its next
+    search as text instead of issuing a structured ``tool_calls`` request, this
+    decides which local tool that text was asking for so the loop can execute it and
+    feed the evidence back — turning a blind, zero-tool drone into a real search.
+
+    Inference (first match wins), normalising hallucinated key names:
+      - a search ``pattern`` (or query/regex/…) + ``grep`` available  → ``grep``;
+      - a ``path`` plus line bounds + ``read_file`` available          → ``read_file``;
+      - a bare file-looking ``path`` (has an extension)                → ``read_file``;
+      - a bare dir-looking ``path``                                    → ``list_dir``.
+    Returns ``None`` when nothing sensible maps or the needed tool isn't offered —
+    the caller then falls through to break/forced-answer. Never raises."""
+    try:
+        obj = extract_first_json(content)
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(obj, dict):
+        return None
+
+    def _first_str(keys):
+        for k in keys:
+            v = obj.get(k)
+            if isinstance(v, str) and v.strip():
+                return v
+        return None
+
+    path = _first_str(_PATH_SYNONYMS)
+    pattern = _first_str(_PATTERN_SYNONYMS)
+    start = obj.get("start_line") if isinstance(obj.get("start_line"), int) \
+        else (obj.get("line_start") if isinstance(obj.get("line_start"), int) else None)
+    end = obj.get("end_line") if isinstance(obj.get("end_line"), int) \
+        else (obj.get("line_end") if isinstance(obj.get("line_end"), int) else None)
+    glob = obj.get("glob") if isinstance(obj.get("glob"), str) \
+        else (obj.get("include") if isinstance(obj.get("include"), str) else None)
+    ic = obj.get("ignore_case")
+    if not isinstance(ic, bool):
+        ic = obj.get("case_insensitive") if isinstance(obj.get("case_insensitive"), bool) else None
+
+    if pattern and "grep" in tool_names:
+        kw: dict = {"pattern": pattern}
+        if path:
+            kw["path"] = path
+        if glob:
+            kw["glob"] = glob
+        if ic is not None:
+            kw["ignore_case"] = ic
+        return "grep", kw
+    if path and (start is not None or end is not None) and "read_file" in tool_names:
+        kw = {"path": path}
+        if start is not None:
+            kw["start_line"] = start
+        if end is not None:
+            kw["end_line"] = end
+        return "read_file", kw
+    if path:
+        has_ext = bool(os.path.splitext(path)[1])
+        if has_ext and "read_file" in tool_names:
+            return "read_file", {"path": path}
+        if "list_dir" in tool_names:
+            return "list_dir", {"path": path}
+        if "read_file" in tool_names:
+            return "read_file", {"path": path}
+    return None
+
+
+def _looks_like_tool_call_text(content: str, tool_param_names: set[str]) -> bool:
+    """True iff ``content`` is a bare tool-call argument object emitted as text.
+
+    The pathology (NR hivework.default.0005.0003 RC-1): a reasoning drone ends
+    the loop by *printing* its next search step — e.g.
+    ``{"path":"x","pattern":"y","glob":"*.py"}`` — as its answer instead of
+    issuing a real ``tool_calls`` request or concluding. That object decodes as
+    valid JSON and is non-empty, so the empty-content guard waves it through and
+    it is accepted as a (0-finding) answer.
+
+    RC-2 (NR hivework.default.0007.0005): the original guard required the keys to
+    be a subset of the *exact* schema params, so it missed the dominant case —
+    the drone HALLUCINATES param names for a search API it imagines
+    (``{"path":..,"query":..,"max_results":..}``, ``{"path":..,"depth":..}``).
+    Empirically that exact-match check caught only 1/5 of a live run's noise.
+    The fix discriminates by what a memo is NOT rather than by exact key spelling:
+    a CONCLUSION is comb-shaped (carries a ``findings`` list — :func:`is_comb_dict`,
+    the SSOT); a search memo is a small FLAT object (all-scalar values) that is not
+    comb-shaped and is navigating files (carries a path-like key, or — preserving
+    the original behaviour — keys all within the schema params). Robust to new
+    hallucinated key names; still conservative — a real comb (has ``findings``),
+    prose (does not decode to a dict), and any structured/nested answer are left
+    alone. Never raises."""
+    # No tools were offered → the model had nothing to "call", so its output
+    # cannot be a tool-call memo. Preserves the original single-shot contract.
+    if not tool_param_names:
+        return False
+    try:
+        obj = extract_first_json(content)
+    except (ValueError, TypeError):
+        return False
+    if not isinstance(obj, dict) or not obj:
+        return False
+    # A conclusion is comb-shaped; never treat one as a memo.
+    if is_comb_dict(obj):
+        return False
+    keys = set(obj.keys())
+    # Original exact-schema-subset signal (kept for backward compatibility).
+    if tool_param_names and keys <= tool_param_names:
+        return True
+    # Generalised signal: a small flat object navigating files. Flat = every
+    # value is a scalar (a real answer object would nest). Navigating = carries a
+    # path-like key, and every key is a recognised navigation term (real param,
+    # path-like, or a known hallucinated synonym) — so a substantive object that
+    # merely mentions a "path" field is not swept up.
+    nav_vocab = _PATH_KEYS | _NAV_SYNONYM_KEYS | set(tool_param_names)
+    if (keys & _PATH_KEYS) and keys <= nav_vocab \
+            and all(_is_scalar(v) for v in obj.values()):
+        return True
+    return False
+
+
 def run_agent_loop(client, model, messages, *, root, tool_names,
                    temperature, max_tokens, extra, max_iterations=DEFAULT_MAX_ITERATIONS):
     """Drive the tool-calling loop against an OpenAI-compatible ``client``.
@@ -299,9 +491,11 @@ def run_agent_loop(client, model, messages, *, root, tool_names,
     to answer instead of requesting yet another call it has no budget to run.
     """
     tools = schemas_for(tool_names)
+    tool_param_names = _tool_arg_param_names(tool_names)
     total_tokens = 0
     saw_usage = False
     content = ""
+    bridges = 0
     for i in range(max_iterations):
         last = i == max_iterations - 1
         kwargs = dict(model=model, messages=messages, temperature=temperature,
@@ -317,8 +511,39 @@ def run_agent_loop(client, model, messages, *, root, tool_names,
             saw_usage = True
         msg = resp.choices[0].message
         tool_calls = getattr(msg, "tool_calls", None)
-        content = msg.content or ""
+        content = message_text(msg)
         if not tool_calls:
+            # RC-C bridge (NR hivework.default.0008.0009 RC-A1/RC-C): a reasoning
+            # drone (gpt-oss-120b) routinely PRINTS its next search as text —
+            # {"path":..,"pattern":..} — instead of issuing a structured tool_calls
+            # request. The loop used to break right here, so that drone executed ZERO
+            # tools and went blind (the dominant low-token swarm failure). Instead:
+            # if the plain answer is a tool-call memo and we still have iterations and
+            # bridge budget, INTERPRET it, run the tool locally, feed the result back
+            # as a user turn (a 'tool' role needs a preceding tool_calls turn, which we
+            # don't have), and CONTINUE — so the printed search becomes real evidence
+            # and the drone gets another turn to conclude. Bounded by _MAX_TEXT_BRIDGES
+            # and max_iterations; once exhausted it falls through to the forced-answer
+            # guard. Genuine answers (prose, real combs) don't match the memo predicate.
+            if (not last and bridges < _MAX_TEXT_BRIDGES
+                    and _looks_like_tool_call_text(content, tool_param_names)):
+                inferred = _infer_tool_call_from_text(content, tool_names)
+                if inferred is not None:
+                    name, args = inferred
+                    result = execute_tool(name, args, root)
+                    messages.append({"role": "assistant", "content": content})
+                    messages.append({
+                        "role": "user",
+                        "content": (
+                            f"[You printed a search instead of calling a tool, so it "
+                            f"was executed for you — {name}({json.dumps(args)})]\n"
+                            f"{result}\n\nNow CONCLUDE: output the single comb JSON "
+                            f"with a `findings` array. Do not print another search."),
+                    })
+                    bridges += 1
+                    logger.debug("agent loop: bridged a printed %s call (#%d)",
+                                 name, bridges)
+                    continue
             break
         # Echo the assistant's tool-call turn, then answer each call.
         messages.append({
@@ -340,4 +565,44 @@ def run_agent_loop(client, model, messages, *, root, tool_names,
             messages.append({"role": "tool", "tool_call_id": tc.id,
                              "content": result})
         logger.debug("agent loop round %d: %d tool call(s)", i + 1, len(tool_calls))
+    # Forced-answer guard. Two failure modes get ONE more forced-answer turn:
+    #   (1) Empty output (NR hivework.default.0004.0003 §2/§5.2): the loop ends with
+    #       BOTH content and reasoning empty (finish_reason=stop, tokens spent) → the
+    #       caller gets a 0-char comb that parses to nothing yet looks like a clean
+    #       success. (dominant run-418 mode.)
+    #   (2) A tool-call emitted as plain text (NR hivework.default.0005.0003 RC-1): the
+    #       model prints its next search's arguments — {"path":..,"pattern":..,"glob":..}
+    #       — instead of calling the tool or concluding. That is non-empty valid JSON,
+    #       so (1)'s empty trigger never fired and the noise was accepted as the answer
+    #       (and downstream became fake honey evidence). (dominant run-424/449 mode.)
+    # Both are the model failing to deliver a conclusion; one explicit forced-answer
+    # turn is cheap insurance. Skipped for genuine answers (prose or any object that
+    # carries a non-tool key, e.g. a real comb).
+    is_empty = not content.strip()
+    is_tool_arg_text = (not is_empty) and _looks_like_tool_call_text(
+        content, tool_param_names)
+    if is_empty or is_tool_arg_text:
+        logger.warning("agent loop ended with %s; retrying once with a forced answer",
+                       "empty output" if is_empty else "a tool-call emitted as plain text")
+        messages.append({
+            "role": "user",
+            "content": "Output your final answer now as plain message content — "
+                       "not a tool call, not a tool-argument JSON object (e.g. "
+                       "{\"path\":..,\"pattern\":..}), and not hidden reasoning. "
+                       "Conclude from the evidence you have already gathered. Do "
+                       "not return an empty message.",
+        })
+        kwargs = dict(model=model, messages=messages, temperature=temperature,
+                      max_tokens=max_tokens, **extra)
+        try:
+            resp = client.chat.completions.create(**kwargs)
+        except Exception as e:  # a failed retry must not lose the (empty) result
+            logger.warning("empty-comb retry failed: %s", e)
+        else:
+            usage = getattr(resp, "usage", None)
+            tot = getattr(usage, "total_tokens", None) if usage is not None else None
+            if tot is not None:
+                total_tokens += tot
+                saw_usage = True
+            content = message_text(resp.choices[0].message)
     return content, (total_tokens if saw_usage else None)
