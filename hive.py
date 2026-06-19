@@ -536,6 +536,37 @@ def run_pipeline(args: argparse.Namespace) -> None:
     logger.info("  Parse errors: %d", len(parse_errors))
     logger.info("=" * 60)
 
+    # Best-effort: project this finished cycle into perf/metrics/runs.jsonl so the
+    # performance report has fresh input without a hand-authored line (closes
+    # NR0005 §2 — the hive is the producer, report.py the consumer).
+    _emit_runs_jsonl(ldg.run_id, workdir, cfg.ledger.db_path, logger)
+
+
+def _emit_runs_jsonl(run_id, workdir, db_path, logger) -> None:
+    """Append this run's telemetry to ``perf/metrics/runs.jsonl`` (best-effort).
+
+    Inverse of ``perf/metrics/report.py``: ledger → jsonl. Before this hook the
+    report's input had to be authored by hand each cycle (NR0005 §2). Any failure
+    is swallowed — a telemetry write must never break a completed run. comb_shaped
+    is derived from the workdir's ``final_combs.json`` (no ledger column for it);
+    the golden block is omitted (it needs the external NR0004 scorer).
+    """
+    if run_id is None:
+        return
+    try:
+        import importlib.util
+        metrics_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                   "perf", "metrics")
+        emit_path = os.path.join(metrics_dir, "emit.py")
+        out_path = os.path.join(metrics_dir, "runs.jsonl")
+        spec = importlib.util.spec_from_file_location("_hive_runs_emit", emit_path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        if mod.emit(db_path, run_id, out_path, workdir=workdir):
+            logger.info("  Telemetry: appended run%s → %s", run_id, out_path)
+    except Exception as e:  # best-effort: never fatal
+        logger.warning("Telemetry emit skipped (%s)", e)
+
 
 def _write_specify_resume(honey_path, spec_out, specify_role, review_role, args,
                           error: str) -> str:

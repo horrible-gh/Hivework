@@ -104,6 +104,12 @@ class Ledger:
             logger.warning("Ledger: failed to connect/init %s: %s", self._db_path, e)
             self._conn = None
 
+    @property
+    def run_id(self) -> int | None:
+        """The current run's ledger id (set by start_run), or None. Lets a caller
+        (e.g. the runs.jsonl emit hook) reference the row after finish_run."""
+        return self._run_id
+
     def start_run(self, seed: str, codebase: str, model_queen: str, model_swarm: str,
                   ts: str | None = None) -> None:
         """Insert a runs row with status='running'."""
