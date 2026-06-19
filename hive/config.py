@@ -426,7 +426,7 @@ class ConvergeLensConfig:
     """
     enabled: bool = False
     lenses: list[str] = field(default_factory=lambda: [
-        "datasource-liveness", "omission", "reproduction"])
+        "datasource-liveness", "omission", "reproduction", "wiring"])
     provider: str = ""
     model: str = ""
     min_refute: int = 0
@@ -1111,7 +1111,7 @@ def load_config(path: str | None = None, profile: str | None = None) -> Config:
         converge_lens=ConvergeLensConfig(
             enabled=bool(lens_raw.get("enabled", False)),
             lenses=[str(x) for x in (lens_raw.get("lenses") or [
-                "datasource-liveness", "omission", "reproduction"]) if str(x).strip()],
+                "datasource-liveness", "omission", "reproduction", "wiring"]) if str(x).strip()],
             provider=str(lens_raw.get("provider", "") or ""),
             model=str(lens_raw.get("model", "") or ""),
             min_refute=int(lens_raw.get("min_refute", 0)),

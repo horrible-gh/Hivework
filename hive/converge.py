@@ -119,6 +119,22 @@ _LENS_DEFINITIONS: dict[str, str] = {
         "code already yields the EXPECTED output under the only state the scenario allows "
         "(e.g. the rows tie so a later branch never decides), the cause contradicts the "
         "symptom — REFUTE."),
+    # R0015 RC-3: the other three lenses refute the WINNING (positive) attribution; none
+    # challenge the EXCLUSIONARY premise ("component X is correct, so the cause is Y") that
+    # silently removed the true locus before converge ever weighed it. A regression that
+    # leaves a correct-looking helper/definition in place but DISCONNECTS its call site
+    # (definition present, not wired) makes "X is correct" true-by-reading yet false-in-effect,
+    # diverting blame (run462: backend helper intact → blamed the frontend). This lens hunts it.
+    "wiring": (
+        "Does this attribution rest on treating some OTHER component as correct-and-therefore-"
+        "EXCLUDED (e.g. 'the backend sort key is right, so the cause must be the frontend')? For "
+        "EACH component declared correct/healthy in order to shift blame to the attributed locus, "
+        "verify it is ACTUALLY INVOKED on the symptom path: a function/helper whose DEFINITION is "
+        "correct but whose CALL SITE is missing, renamed, or bypassed (definition present, not "
+        "wired) is ITSELF the defect — and a passing UNIT test that exercises that helper in "
+        "ISOLATION proves nothing about whether it is wired end-to-end. If the real locus is a "
+        "disconnected/absent call site rather than the attributed node, REFUTE — name the "
+        "correct-but-uninvoked component and the call site that fails to use it."),
 }
 
 
