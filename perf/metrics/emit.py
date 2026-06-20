@@ -63,6 +63,22 @@ _FALLBACK_BILLING = {
 # surface under the SCHEMA's "deepinfra" cost bucket (same HTTP endpoint).
 _PROVIDER_LABEL = {"openai": "deepinfra"}
 
+# The per-axis breakdown reports the SOURCE-MINING axes — the steps that run a
+# retrieval/fan-out worker against the codebase and can carry a comb. It must
+# EXCLUDE the orchestration/verdict stages (decompose, judge, converge) and the
+# converge refutation lenses; otherwise the table reports the wrong axes. We
+# exclude by a NEGATIVE set (not a positive allowlist) so a future rename of a
+# mining stage is included by default rather than silently dropped. (That stale
+# positive allowlist {swarm,fanout,reinforce} was the "측정 불가" root cause —
+# NR hivework.0029.0003: investigate's mining moved to stage 'retrieve' and
+# 'swarm' got repurposed for the converge lenses, so the old filter picked up
+# the comb-less lenses and missed every retrieve axis that actually fired.)
+_NON_MINING_STAGES = frozenset({
+    "queen", "decompose", "coordinator", "expected", "reconcile",
+    "judge", "judge1", "judge2",
+    "converge", "converge-locus", "lens", "db_read", "commit", "assemble",
+})
+
 
 def _load_pricing() -> tuple[dict, dict]:
     """Load ``(prices, billing)`` from prices.json, else the built-in fallbacks.
@@ -189,14 +205,18 @@ def build_record(db_path: str, run_id: int, workdir: str | None = None,
     submitted = conclusion_converted
     fixes_landed = 0  # investigate-only; a future run/apply path can override
 
-    # Per-axis breakdown from the source-mining swarm (+ reinforce) calls.
+    # Per-axis breakdown over the source-mining axes (see _NON_MINING_STAGES).
+    # An axis qualifies if it has any call in a mining stage; converge refutation
+    # lenses (axis_id 'lens:*', historically recorded under the now-repurposed
+    # stage 'swarm') are excluded by id too, so a renamed lens stage can't leak
+    # back in. This keeps Σ axes.fired consistent with funnel.comb_fired.
     axes_out = []
     seen = set()
     for c in calls:
-        if c.get("stage") not in ("swarm", "fanout", "reinforce"):
+        if c.get("stage") in _NON_MINING_STAGES:
             continue
         aid = c.get("axis_id") or "?"
-        if aid in seen:
+        if aid in seen or aid.startswith("lens:"):
             continue
         seen.add(aid)
         lat = max((cc.get("latency_s") or 0.0) for cc in calls if cc.get("axis_id") == aid)
