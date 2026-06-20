@@ -2289,6 +2289,35 @@ def _read_locus_text(code_root: str | None, file: str, lines: str) -> str:
     return "".join(all_lines[max(1, lo) - 1:min(len(all_lines), hi)])
 
 
+# Positive datasource-shape evidence: code that actually PRODUCES collection/row data — a SQL
+# SELECT…FROM, a cursor/ORM fetch, or a returned/comprehended collection. Used to distinguish a
+# real datasource (which can legitimately OMIT a field) from generic plumbing (a get_store /
+# get_connection accessor that produces NO business data at all). Deliberately conservative
+# (low false-positive): the bare SQL words that double as Python keywords (``from``/``where``/
+# ``update``/``delete``) are matched only in their SQL pairing, not alone.
+_DATASOURCE_SHAPE_RE = re.compile(
+    r"(?ix)"
+    r"\.(?:execute|executemany|fetchall|fetchone|fetchmany|query|all|filter|scalars|mappings)\s*\("
+    r"|\bcursor\b"
+    r"|\breturn\s*[\[{]"                        # returns a list/dict collection literal
+    r"|[\[{][^\]}\n]*\bfor\b[^\]}\n]*\bin\b")   # list/dict comprehension building rows
+
+
+def _looks_like_datasource(text: str) -> bool:
+    """True iff the producer code shows positive evidence it produces collection/row data.
+
+    Distinguishes a genuine datasource (a query/fetch/returned-collection — which CAN
+    legitimately omit a field, the M036 omission case) from generic infrastructure plumbing
+    (``get_store``/``get_connection``: produces no business data, so "does not mention the
+    field" is trivially true and re-pointing a non-data symptom there is a false positive —
+    0030 NR0005 / 0082). Conservative: SQL ``SELECT`` only counts paired with ``FROM``.
+    """
+    t = text or ""
+    if _DATASOURCE_SHAPE_RE.search(t):
+        return True
+    return bool(re.search(r"(?i)\bselect\b", t) and re.search(r"(?i)\bfrom\b", t))
+
+
 def _winningpath_ds_targets(edges: list[dict[str, Any]],
                             located: list[dict[str, Any]],
                             code_root: str | None) -> list[dict[str, Any]]:
@@ -2304,9 +2333,14 @@ def _winningpath_ds_targets(edges: list[dict[str, Any]],
     producer (already lifted into ``located`` as ``HTTP_WINNING_PATH:<url>``) is the
     deterministic producer of the URL the gated FE variable is filled from; re-pointing there
     is structural grounding, not seed parsing or a guess. Fires only when (a) the gated FE
-    edge's URL has such a producer locus AND (b) that producer's live code does NOT mention
-    the field (true omission) — if it emits the field, the emptiness is elsewhere and we
-    abstain. The apply-side red→green backstop is the final check on any re-point.
+    edge's URL has such a producer locus, (b) that producer's live code does NOT mention the
+    field (true omission) — if it emits the field, the emptiness is elsewhere and we abstain —
+    AND (c) when the producer code IS readable, it shows positive datasource-shape evidence
+    (:func:`_looks_like_datasource`): a query/fetch/returned-collection, not generic plumbing.
+    Condition (c) closes the 0082 false positive (0030 NR0005): a ``get_store`` accessor
+    satisfies (b) trivially because it produces no business data at all, so without (c) a
+    non-data symptom (a dispose-FK 500) was re-pointed onto it. The apply-side red→green
+    backstop is the final check on any re-point.
     """
     wp_by_url: dict[str, dict[str, Any]] = {}
     for v in located or []:
@@ -2331,6 +2365,28 @@ def _winningpath_ds_targets(edges: list[dict[str, Any]],
             if ptext and stems and any(
                     re.search(rf"\b{re.escape(s)}\b", ptext, re.I) for s in stems):
                 continue  # producer DOES emit the field → emptiness is not here; abstain
+            # Datasource-shape gate (0030 NR0005 / 0082): "(b) does not mention the field" is
+            # trivially TRUE for generic plumbing that produces NO business data at all (a
+            # get_store/get_connection accessor mentions no field because it is not a datasource,
+            # not because it omits one). Re-pointing a NON-data symptom (e.g. a dispose-FK 500)
+            # onto such plumbing is the false positive that held a wrong locus converged and
+            # blocked 0082 Lv3 recall 0→1. So when we CAN read the producer's live code, require
+            # positive evidence it actually PRODUCES collection/row data; a producer that shows
+            # none is plumbing, not the datasource that empties the field → abstain. When the
+            # producer code is unreadable (no code_root → ptext==""), keep the deterministic-
+            # grounding behaviour unchanged (the omission case re-points as before).
+            if ptext and not _looks_like_datasource(ptext):
+                # Abstain because the producer is plumbing, not a datasource (condition (c)).
+                # Logged so a run can POSITIVELY confirm the gate considered this candidate and
+                # declined it on datasource-shape grounds — without this line the abstain is
+                # silent and can only be inferred from the absence of the re-point log (0031
+                # NR0005 §3-1 / §5: "log-absence inference, not direct evidence").
+                logger.info(
+                    "converge: HTTP datasource guard abstained (plumbing, not datasource) "
+                    "%s:%s — candidate left un-repointed",
+                    vd.get("file", ""), vd.get("lines", ""),
+                )
+                continue
             seen.add(key)
             targets.append({
                 "edge": edge, "binding": {"url": str(url).rstrip("/")},

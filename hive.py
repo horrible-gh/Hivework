@@ -915,6 +915,66 @@ def run_specify_command(args: argparse.Namespace) -> None:
     logger.info("=" * 60)
 
 
+def _resolve_repair_honey(spec_path: str, explicit: str | None) -> str | None:
+    """Locate the investigate honey a spec was authored from, for the repair loop.
+
+    An explicit ``--honey`` always wins. Otherwise try the siblings specify's naming
+    produces: the spec is ``<base>.edit_spec.json`` (so the honey is ``<base>`` or
+    ``<base>.honey.md``) or just ``<spec>.honey.md``. Returns the first that exists,
+    else None — the caller then falls back to plain verify (still monotonic).
+    """
+    if explicit:
+        return explicit if os.path.exists(explicit) else None
+    candidates = []
+    if spec_path.endswith(".edit_spec.json"):
+        base = spec_path[: -len(".edit_spec.json")]
+        candidates += [base, base + ".honey.md", base + ".md"]
+    root = os.path.splitext(spec_path)[0]
+    candidates += [root, root + ".honey.md", spec_path + ".honey.md"]
+    for c in candidates:
+        if c and os.path.exists(c) and os.path.isfile(c):
+            return c
+    return None
+
+
+def _build_repair_regenerator(args: argparse.Namespace, cfg, logger):
+    """Build the specify-backed regenerate callback for ``apply --repair`` (or None).
+
+    Mirrors the chained-specify wiring (roles, provider_kwargs, http-shape, db_conn)
+    so a re-authored fix is produced by the SAME author the spec came from, only with
+    the failing test output appended as evidence. Returns None when the source honey
+    cannot be located — the apply path then degrades to single-shot verify, never an
+    error, keeping the feature monotonic.
+    """
+    honey_path = _resolve_repair_honey(args.spec, getattr(args, "honey", None))
+    if not honey_path:
+        logger.warning("apply: --repair set but the source honey could not be located "
+                       "(pass --honey) — falling back to single-shot verify")
+        return None
+    from hive.repair import make_specify_regenerator
+    specify_role = cfg.role("specify")
+    review_role = cfg.role("review")
+    specify_kwargs = dict(author_retries=specify_role.retries)
+    if specify_role.timeout_sec is not None:
+        specify_kwargs["author_timeout"] = specify_role.timeout_sec
+    specify_kwargs.update(http_shape_specify_kwargs(cfg, args.codebase))
+    spec_out = os.path.splitext(args.spec)[0] + ".repair"
+    logger.info("apply: --repair will re-author fixes via specify (%s/%s) from honey %s",
+                specify_role.provider, specify_role.model, honey_path)
+    return make_specify_regenerator(
+        honey_path=honey_path,
+        codebase_root=args.codebase,
+        spec_out=spec_out,
+        model=specify_role.model,
+        provider=specify_role.provider,
+        review_model=review_role.model,
+        review_provider=review_role.provider,
+        provider_kwargs=build_provider_kwargs(cfg),
+        db_conn=cfg.db_for_codebase(args.codebase),
+        **specify_kwargs,
+    )
+
+
 def run_apply_command(args: argparse.Namespace) -> None:
     """Execute the standalone apply stage: edit-spec JSON → proposal (+ optional write).
 
@@ -933,11 +993,14 @@ def run_apply_command(args: argparse.Namespace) -> None:
 
     # Runtime red→green verify (the closed loop): opt-in (--verify) and only fires when
     # the run's codebase has a configured test_runner AND the spec carries a verify block.
-    verify = getattr(args, "verify", False)
+    # --repair implies --verify and adds the self-repair loop on top of it.
+    do_repair = getattr(args, "repair", False)
+    verify = getattr(args, "verify", False) or do_repair
     runner = cfg.test_runner_for_codebase(args.codebase) if verify else None
     if verify and runner is None:
         logger.warning("apply: --verify set but no test_runner configured for "
                        "codebase %r — runtime verify will be skipped", args.codebase)
+    repair = _build_repair_regenerator(args, cfg, logger) if (do_repair and runner) else None
 
     mode = "WRITE (apply to live code)" if args.write else "propose only"
     logger.info("=" * 60)
@@ -961,6 +1024,8 @@ def run_apply_command(args: argparse.Namespace) -> None:
         partial=getattr(args, "partial", False),
         verify=verify,
         runner=runner,
+        repair=repair,
+        repair_max_iters=getattr(args, "repair_max_iters", 2),
     )
 
     logger.info("=" * 60)
@@ -1348,6 +1413,25 @@ def main() -> None:
              "before declaring READY: apply the test edit only (must fail), then the "
              "source fix (must pass), then restore. A fix unconfirmed by execution is "
              "held NOT READY. No-op when the codebase has no test_runner configured.",
+    )
+    apply_parser.add_argument(
+        "--repair", action="store_true",
+        help="Self-repair loop (implies --verify): when the red test stays RED after "
+             "the fix, feed its failing output back to specify and re-author the fix, "
+             "up to --repair-max-iters times. Monotonic — it can only turn a still_red "
+             "into a verified green, never make a fix worse. Needs the source honey "
+             "(--honey, else derived from the spec path) to re-author.",
+    )
+    apply_parser.add_argument(
+        "--repair-max-iters", type=int, default=2,
+        help="Max repair iterations (regenerate→verify rounds, excludes the initial "
+             "verify). Default 2.",
+    )
+    apply_parser.add_argument(
+        "--honey", default=None,
+        help="Path to the investigate honey the spec was authored from. Used by "
+             "--repair to re-author the fix. Defaults to a sibling of --spec "
+             "(<spec-without-.edit_spec.json> or <spec>.honey.md).",
     )
     apply_parser.add_argument(
         "-v", "--verbose", action="store_true",

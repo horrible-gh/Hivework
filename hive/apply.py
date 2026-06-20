@@ -817,6 +817,8 @@ def run_apply(
     partial: bool = False,
     verify: bool = False,
     runner: Any = None,
+    repair: Any = None,
+    repair_max_iters: int = 2,
 ) -> dict[str, Any]:
     """Run the apply stage: edit-spec JSON + live code → proposal (and optional write).
 
@@ -881,7 +883,25 @@ def run_apply(
         if not backup_root:
             raise ValueError("verify=True requires a backup_root (the dry-run snapshot)")
         from hive import verify as verify_mod  # lazy: verify imports apply
-        rv = verify_mod.verify_red_green(spec, root, runner, backup_root, ttl_hours)
+        if repair is not None:
+            # Self-repair loop: on a still_red, feed the failing test output back to
+            # `repair` (a regenerate callback) and re-verify, up to repair_max_iters.
+            # Monotonic — the worst case is the same single-shot verdict below.
+            from hive.repair import repair_red_green
+            rv = repair_red_green(spec, root, runner, backup_root, repair,
+                                  max_iters=repair_max_iters, ttl_hours=ttl_hours)
+            # If the loop verified a DIFFERENT fix, the proposal (diffs + what would be
+            # written) must be rebuilt from THAT spec — otherwise apply would ship the
+            # original inert edit, not the one execution just certified.
+            if rv.get("repair_iterations") and isinstance(rv.get("spec"), dict) \
+                    and rv["spec"] is not spec:
+                spec = rv["spec"]
+                spec["_spec_path"] = spec_path
+                proposal = build_proposal(spec, root)
+                logger.info("apply: repair loop adopted a re-authored fix after %d "
+                            "iteration(s) — proposal rebuilt", rv["repair_iterations"])
+        else:
+            rv = verify_mod.verify_red_green(spec, root, runner, backup_root, ttl_hours)
         proposal["runtime_verify"] = rv
         if rv["transition"] not in verify_mod.VERIFIED_TRANSITIONS:
             proposal["ready"] = False

@@ -3002,6 +3002,78 @@ class TestHttpDatasourceProvenanceGuard(unittest.TestCase):
         self.assertNotIn("http_datasource_provenance_repointed",
                          out.causal_check or {})
 
+    def test_winningpath_abstains_on_nondatasource_plumbing(self):
+        # 0030 NR0005 / 0082: the winning-path producer is generic infrastructure plumbing
+        # (a get_store accessor) that produces NO business data — so "(b) does not mention the
+        # field" is trivially true. Re-pointing a non-data symptom onto it is the false positive
+        # that held a wrong locus converged. With the producer code READABLE, the datasource-
+        # shape gate sees no query/fetch/collection → abstain (no re-point).
+        import tempfile
+        with tempfile.TemporaryDirectory() as root:
+            rel = self.DBPROJ.replace("/", os.sep)
+            abspath = os.path.join(root, rel)
+            os.makedirs(os.path.dirname(abspath), exist_ok=True)
+            with open(abspath, "w", encoding="utf-8") as fh:
+                fh.write("def get_store():\n"
+                         "    if _store is None:\n"
+                         "        raise RuntimeError('not initialised')\n"
+                         "    return _store\n")
+            res = self._res_attr(self.NEXT, lines="293-311")
+            out = C._http_datasource_provenance_guard(
+                res, self._wp_located(self.DBPROJ, lines="1-4"),
+                self._fe_only_windows(), code_root=root)
+        self.assertEqual(C._norm(out.attributed_defect["file"]), C._norm(self.NEXT))
+        self.assertNotIn("http_datasource_provenance_repointed", out.causal_check or {})
+
+    def test_winningpath_abstain_emits_log(self):
+        # 0031 T0006: the abstain path now LOGS so a run can positively confirm the gate
+        # considered the candidate and declined it on datasource-shape grounds (turns the
+        # 0031 NR0005 §3-1 log-absence inference into direct evidence).
+        import tempfile, logging
+        with tempfile.TemporaryDirectory() as root:
+            rel = self.DBPROJ.replace("/", os.sep)
+            abspath = os.path.join(root, rel)
+            os.makedirs(os.path.dirname(abspath), exist_ok=True)
+            with open(abspath, "w", encoding="utf-8") as fh:
+                fh.write("def get_store():\n    return _store\n")
+            res = self._res_attr(self.NEXT, lines="293-311")
+            with self.assertLogs("hive.converge", level=logging.INFO) as cm:
+                C._http_datasource_provenance_guard(
+                    res, self._wp_located(self.DBPROJ, lines="1-2"),
+                    self._fe_only_windows(), code_root=root)
+        self.assertTrue(any("guard abstained (plumbing" in m for m in cm.output),
+                        cm.output)
+
+    def test_winningpath_repoints_on_real_datasource_omission(self):
+        # The gate does NOT over-suppress: a producer that genuinely PRODUCES collection data
+        # (a query / returned-collection) but OMITS the field is the legitimate M036 omission
+        # datasource — it still re-points. Confirms (c) admits real datasources.
+        import tempfile
+        with tempfile.TemporaryDirectory() as root:
+            rel = self.DBPROJ.replace("/", os.sep)
+            abspath = os.path.join(root, rel)
+            os.makedirs(os.path.dirname(abspath), exist_ok=True)
+            with open(abspath, "w", encoding="utf-8") as fh:
+                fh.write("def list_projects(conn):\n"
+                         "    rows = conn.execute('SELECT project_id FROM projects')\n"
+                         "    return [{'project_id': r[0]} for r in rows]\n")
+            res = self._res_attr(self.NEXT, lines="293-311")
+            out = C._http_datasource_provenance_guard(
+                res, self._wp_located(self.DBPROJ, lines="1-3"),
+                self._fe_only_windows(), code_root=root)
+        self.assertEqual(C._norm(out.attributed_defect["file"]), C._norm(self.DBPROJ))
+        self.assertTrue(out.converged)
+        self.assertIn("http_datasource_provenance_repointed", out.causal_check)
+
+    def test_looks_like_datasource_discriminates(self):
+        # Unit: plumbing accessors are rejected; query/fetch/collection shapes are admitted.
+        self.assertFalse(C._looks_like_datasource("    return _store\n"))
+        self.assertFalse(C._looks_like_datasource("def get_conn():\n    return self._c\n"))
+        self.assertTrue(C._looks_like_datasource("rows = cur.execute('SELECT a FROM t')"))
+        self.assertTrue(C._looks_like_datasource("return [r for r in rows]"))
+        self.assertTrue(C._looks_like_datasource("return {'x': 1}"))
+        self.assertTrue(C._looks_like_datasource("q = sess.query(M).all()"))
+
     def test_winningpath_noop_without_winningpath_locus(self):
         # No HTTP_WINNING_PATH locus among located → fallback yields nothing → no-op.
         located = [{"axis_id": "AX0", "verdict": {"located": True, "file": self.NEXT,
