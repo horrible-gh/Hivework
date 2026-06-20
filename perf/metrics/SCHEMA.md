@@ -15,7 +15,7 @@
   "work_type": "investigate",               // investigate | run ← runs.work_type
   "codebase": "FlowGate-dev",               // 대상 레포 ← runs.codebase
   "models": { "queen": "gpt-5-mini",        // ← runs.model_queen
-              "swarm": "gpt-oss-120b" },    // ← runs.model_swarm
+              "fanout": "gpt-oss-120b" },   // ← runs.model_fanout (was "swarm"/model_swarm; B0001)
 
   // ── 수확 퍼널: 위에서 아래로 단조 감소하는 6단계 카운트 ──────────────
   //    채팅 합의: 축 시도 → comb 발화 → comb-형태(진짜 finding)
@@ -44,8 +44,17 @@
     "by_provider": {
       "copilot":   { "tokens": 16928, "calls": 4, "credits": 0, "usd": 0.0 },
       "deepinfra": { "tokens": 9740,  "calls": 6, "credits": 0, "usd": 0.117 }
-    }
-    // tokens ← est_tokens 합, calls ← worker_call 수, usd ← 과금모델별 산정.
+    },
+    // ── 실청구 비용 (R0021-2, 선택) ──────────────────────────────────────
+    //   by_provider.usd 는 토큰/크레딧 *추정*이라 관리화면 청구와 "전혀
+    //   일치하지 않는다"(copilot premium-request 배수 비공개·가변,
+    //   gpt-5-mini=0x → 주력 모델이 $0). 그래서 레포트는 이 추정을 비용으로
+    //   쓰지 않고, 운영자가 관리화면에서 읽어 입력한 actual_usd 를 비용으로
+    //   표시한다. 없으면 레포트는 비용을 미계측(—)으로 렌더(0%/$0 위장 금지).
+    //   적재: emit.py --actual-usd 0.42 --actual-source "copilot dashboard 2026-06-20"
+    "actual_usd": 0.42,                          // 선택. 운영자 입력 실청구 USD.
+    "actual_source": "copilot dashboard 2026-06-20" // 선택. 출처 메모.
+    // tokens ← est_tokens 합, calls ← worker_call 수, usd ← 과금모델별 *추정*.
     // 단가·과금모델은 코드에 박지 않음 → prices.json(+_billing 블록).
   },
 
@@ -115,9 +124,9 @@
 | 정밀도(precision) | `recalled / (recalled + false_positives)` | **메인 정확도 지표(R0014-D)** — 얼마나 믿을 만한가(헛다리 안 하나) |
 | 통과율(pass rate) | `fixes_landed / fixes_total` | **북극성** — 실제로 고쳐서 통과한 비율 |
 | 수율(yield) | `comb_shaped / axes_attempted` | 보조 지표(R0014-D 강등) — 수확 퍼널의 건강도. 메인 카드에서 내려 퍼널 섹션으로 |
-| 런당 비용 | `Σ provider.usd` | |
-| 수율당 비용 | `usd / comb_shaped` | 효율 지표($/finding) |
-| 수정당 비용 | `usd / fixes_landed` | $/fix |
+| 런당 비용 | `cost.actual_usd` (운영자 입력) · 없으면 **미계측(—)** | R0021-2: 추정 `Σ provider.usd` 는 청구와 불일치라 비용으로 쓰지 않음 |
+| 수율당 비용 | `actual_usd / comb_shaped` (actual 있을 때만) | 효율 지표($/finding) |
+| 수정당 비용 | `actual_usd / fixes_landed` (actual 있을 때만) | $/fix |
 
 ## 견고성 규약
 

@@ -49,6 +49,13 @@ FUNNEL_STAGES = [
 # real number once instrumentation fills the slot.
 UNMEASURED = "—"
 
+# R0021-1: as runs accumulate the per-run table / tab strip / trend / cost bars
+# all grow unbounded and the report becomes unreadable. Cap the per-run views to
+# the latest N runs. The header still reports the TRUE total (전체 N런) and, when
+# the views are truncated, says so explicitly — silent truncation would read as
+# "this is everything" when it isn't (same honesty rule as 미계측 ≠ 0%).
+RECENT_RUNS_LIMIT = 10
+
 # The canonical hive pipeline as a run-level waterfall (chat diagram, CH0005),
 # top → bottom. Each stage carries:
 #   funnel_key  — the measured comb count that survives to this stage, or None
@@ -112,9 +119,19 @@ def derive(run):
     landed = _num(run, "cycle", "fixes_landed")
     total_fix = _num(run, "cycle", "fixes_total")
 
-    usd = 0.0
-    for prov in (run.get("cost", {}).get("by_provider", {}) or {}).values():
-        usd += float(prov.get("usd", 0) or 0)
+    # Cost (R0021-2): the local per-provider USD is a *token/credit estimate* that
+    # never reconciles with the provider management screen (copilot bills opaque,
+    # time-varying premium-request multipliers; gpt-5-mini=0x makes the main model
+    # show as $0). Presenting it as the run's cost is the same kind of lie as
+    # painting 미계측 as 0%. So the DISPLAYED cost (``usd``) is the operator-entered
+    # actual (``cost.actual_usd``) or None(미계측); the fabricated estimate is kept
+    # separately as ``est_usd`` and is NOT shown as the bottom-line cost.
+    cost_blk = run.get("cost", {}) or {}
+    est_usd = 0.0
+    for prov in (cost_blk.get("by_provider", {}) or {}).values():
+        est_usd += float(prov.get("usd", 0) or 0)
+    actual = cost_blk.get("actual_usd", None)
+    actual_usd = float(actual) if isinstance(actual, (int, float)) else None
 
     golden = run.get("golden") or {}
     seeded = float(golden.get("seeded", 0) or 0)
@@ -125,9 +142,11 @@ def derive(run):
     return {
         "yield": (shaped / axes) if axes else 0.0,
         "pass_rate": (landed / total_fix) if total_fix else 0.0,
-        "usd": usd,
-        "cost_per_finding": (usd / shaped) if shaped else None,
-        "cost_per_fix": (usd / landed) if landed else None,
+        "est_usd": est_usd,
+        "usd": actual_usd,  # displayed cost: operator-entered actual, else None(미계측)
+        "actual_source": cost_blk.get("actual_source") or "",
+        "cost_per_finding": (actual_usd / shaped) if (actual_usd is not None and shaped) else None,
+        "cost_per_fix": (actual_usd / landed) if (actual_usd is not None and landed) else None,
         "recall": (recalled / seeded) if seeded else None,
         "precision": (recalled / (recalled + fp)) if (recalled + fp) else None,
         "golden_fixed_rate": (verified / seeded) if seeded else None,
@@ -178,9 +197,14 @@ def svg_lines(runs, series, height=200):
     n = len(runs)
     if n == 0:
         return '<p class="muted">데이터 없음</p>'
-    w, h = 640, height
-    pad_l, pad_b, pad_t, pad_r = 44, 28, 14, 14
-    plot_w, plot_h = w - pad_l - pad_r, h - pad_t - pad_b
+    w = 640
+    pad_l, pad_t, pad_r = 44, 14, 14
+    # R0025: x labels are drawn on a diagonal, so reserve a gutter below the plot
+    # for them; the plot area keeps roughly its original height.
+    lab_gutter = 64
+    plot_h = height - pad_t - 18
+    plot_w = w - pad_l - pad_r
+    h = pad_t + plot_h + lab_gutter
 
     # Each series is normalised independently against its own max so percentage
     # and dollar series share one frame without one flattening the other.
@@ -213,39 +237,44 @@ def svg_lines(runs, series, height=200):
             legend.append(f'<span class="lg"><i style="background:{color}"></i>{escape(label)} '
                           f'<b>{tip}</b></span>')
 
-    # x labels (run ids)
+    # x labels (run ids) — drawn on a diagonal so long arm-ids no longer overlap;
+    # runxxx stays verbatim, solo- arm-ids are trimmed to the recognisable core
+    # (R0025). text-anchor:end pins each label's right edge under its data point.
+    base_y = pad_t + plot_h + 14
     for i, r in enumerate(runs):
         x = xpos(i)
-        parts.append(f'<text x="{x:.1f}" y="{h - 8}" class="x-lab">'
-                     f'{escape(str(r.get("run_id", i)))}</text>')
+        parts.append(
+            f'<text x="{x:.1f}" y="{base_y:.1f}" class="x-rot" '
+            f'transform="rotate(-32 {x:.1f} {base_y:.1f})">'
+            f'{escape(_short_run_id(r))}</text>')
 
     svg = f'<svg viewBox="0 0 {w} {h}" class="chart" role="img">{"".join(parts)}</svg>'
     return svg + f'<div class="legend">{"".join(legend)}</div>'
 
 
-def svg_cost_bars(runs, height=180):
-    """Grouped per-run stacked bars: copilot + deepinfra (+ any other) USD."""
+def svg_cost_bars(runs, derived, height=180):
+    """Per-run bars of the ACTUAL billed USD (operator-entered, R0021-2).
+
+    Replaces the old fabricated per-provider stacked estimate. Bars are drawn only
+    for runs that carry an entered ``actual_usd``; runs without one are labelled
+    미계측 under the axis (never a faked $0 bar). When no run has an actual cost,
+    the whole chart degrades to an honest 미계측 note rather than an empty frame.
+    """
     n = len(runs)
     if n == 0:
         return '<p class="muted">데이터 없음</p>'
-    # collect provider set + palette
-    palette = {"copilot": "#7c9cff", "deepinfra": "#54c7a3", "local": "#888"}
-    extra = ["#d98cff", "#f0a85f", "#e06c75"]
-    provs = []
-    for r in runs:
-        for p in (r.get("cost", {}).get("by_provider", {}) or {}):
-            if p not in provs:
-                provs.append(p)
-    for p in provs:
-        palette.setdefault(p, extra[provs.index(p) % len(extra)])
-
-    w, h = 640, height
-    pad_l, pad_b, pad_t, pad_r = 44, 28, 14, 14
-    plot_w, plot_h = w - pad_l - pad_r, h - pad_t - pad_b
-    totals = [sum(float(pp.get("usd", 0) or 0)
-                  for pp in (r.get("cost", {}).get("by_provider", {}) or {}).values())
-              for r in runs]
-    vmax = max(totals + [0.0001])
+    totals = [d["usd"] for d in derived]  # actual billed USD, or None(미계측)
+    if not any(v is not None for v in totals):
+        return ('<p class="muted">실청구 USD <span class="unmeasured">'
+                f'{UNMEASURED} 미계측</span> — 관리화면 실청구액이 입력된 런이 없다. '
+                '<code>emit.py --actual-usd</code> 로 적재하면 막대가 그려진다.</p>')
+    w = 640
+    pad_l, pad_t, pad_r = 44, 14, 14
+    lab_gutter = 64  # R0025: room for the diagonal x labels below the bars
+    plot_h = height - pad_t - 18
+    plot_w = w - pad_l - pad_r
+    h = pad_t + plot_h + lab_gutter
+    vmax = max([v for v in totals if v is not None] + [0.0001])
     bw = min(48, plot_w / n * 0.6)
     parts = []
     for g in range(5):
@@ -253,20 +282,24 @@ def svg_cost_bars(runs, height=180):
         parts.append(f'<line x1="{pad_l}" y1="{gy:.1f}" x2="{w - pad_r}" y2="{gy:.1f}" class="grid"/>')
     for i, r in enumerate(runs):
         cx = pad_l + plot_w * (i + 0.5) / n
-        by = r.get("cost", {}).get("by_provider", {}) or {}
-        y = pad_t + plot_h
-        for p in provs:
-            v = float((by.get(p) or {}).get("usd", 0) or 0)
+        v = totals[i]
+        if v is not None:
             bh = plot_h * v / vmax
-            y -= bh
+            y = pad_t + plot_h - bh
             parts.append(f'<rect x="{cx - bw/2:.1f}" y="{y:.1f}" width="{bw:.1f}" '
-                         f'height="{bh:.1f}" fill="{palette[p]}"/>')
-        parts.append(f'<text x="{cx:.1f}" y="{pad_t + plot_h + 16}" class="x-lab">'
-                     f'{escape(str(r.get("run_id", i)))}</text>')
-        parts.append(f'<text x="{cx:.1f}" y="{y - 4:.1f}" class="bar-val">'
-                     f'{_fmt_usd(totals[i])}</text>')
-    legend = "".join(f'<span class="lg"><i style="background:{palette[p]}"></i>{escape(p)}</span>'
-                     for p in provs)
+                         f'height="{bh:.1f}" fill="#f0a85f"/>')
+            parts.append(f'<text x="{cx:.1f}" y="{y - 4:.1f}" class="bar-val">'
+                         f'{_fmt_usd(v)}</text>')
+        else:
+            parts.append(f'<text x="{cx:.1f}" y="{pad_t + plot_h - 4:.1f}" '
+                         f'class="bar-val">{UNMEASURED}</text>')
+        # diagonal, trimmed x label (R0025) — matches the trend chart's axis.
+        bx = pad_t + plot_h + 14
+        parts.append(f'<text x="{cx:.1f}" y="{bx:.1f}" class="x-rot" '
+                     f'transform="rotate(-32 {cx:.1f} {bx:.1f})">'
+                     f'{escape(_short_run_id(r))}</text>')
+    legend = ('<span class="lg"><i style="background:#f0a85f"></i>실청구 $</span>'
+              f'<span class="lg"><i style="background:#8b93a3"></i>{UNMEASURED} 미입력</span>')
     svg = f'<svg viewBox="0 0 {w} {h}" class="chart" role="img">{"".join(parts)}</svg>'
     return svg + f'<div class="legend">{legend}</div>'
 
@@ -304,8 +337,14 @@ def section_summary(latest, d):
         cards.append(card(
             _fmt_pct(d["precision"]),
             "정밀도 (메인)", f'헛다리 {fp}건'))
-    cards.append(card(_fmt_usd(d["usd"]),
-                      "런 비용", f'수율당 {_fmt_usd(d["cost_per_finding"])}'))
+    # Cost card: operator-entered actual, or an honest 미계측 blank (R0021-2). Never
+    # the fabricated local estimate, which "전혀 일치하지 않는다" with the screen.
+    if d["usd"] is not None:
+        cards.append(card(_fmt_usd(d["usd"]),
+                          "런 비용 (실청구)", f'수율당 {_fmt_usd(d["cost_per_finding"])}'))
+    else:
+        cards.append(card(f'<span class="unmeasured">{UNMEASURED} 미계측</span>',
+                          "런 비용", "관리화면 실청구액 미입력"))
     return '<div class="cards">' + "".join(cards) + "</div>"
 
 
@@ -345,18 +384,22 @@ def section_golden(latest):
         + "".join(rows) + '</tbody></table></section>')
 
 
-def section_cost_table(latest):
-    """Per-provider cost table with the credit axis and the $ axis split out (R0001).
+def section_cost_table(latest, d):
+    """Per-provider cost table — MEASURED units only (R0021-2).
 
-    Credit-billed providers (copilot) show their credit consumption; token-billed
-    providers (deepinfra) show tokens. USD is the common bottom line so the two
-    billing paradigms remain comparable without conflating credits and tokens.
+    Shows what is actually measured per provider: call count, credits, and tokens.
+    The fabricated USD estimate is deliberately NOT a column here: the local
+    token/credit estimate "전혀 일치하지 않는다" with the management screen (copilot
+    premium-request multipliers are opaque and time-varying; gpt-5-mini=0x zeroes
+    the main model). The bottom line is the operator-entered actual billed USD, or
+    an honest 미계측 blank when none was supplied (R0001: "없애고 사용자 입력을 받든가").
     """
     by_prov = (latest.get("cost", {}) or {}).get("by_provider", {}) or {}
     if not by_prov:
         return ""
     rows = []
-    tot_credits = tot_usd = 0.0
+    tot_credits = 0
+    tot_calls = tot_tokens = 0
     for prov in sorted(by_prov):
         v = by_prov[prov] or {}
         credits = float(v.get("credits", 0) or 0)
@@ -364,7 +407,8 @@ def section_cost_table(latest):
         calls = int(v.get("calls", 0) or 0)
         tokens = int(v.get("tokens", 0) or 0)
         tot_credits += credits
-        tot_usd += usd
+        tot_calls += calls
+        tot_tokens += tokens
         # Billing paradigm is inferred from which axis carries the charge.
         if credits > 0 or (usd == 0 and tokens and calls):
             model, basis = "크레딧", f'{calls}회 호출'
@@ -374,16 +418,28 @@ def section_cost_table(latest):
             f'<tr><td>{escape(prov)}</td><td class="muted-cell">{model}</td>'
             f'<td>{basis}</td>'
             f'<td>{credits:,.2f}</td>'
-            f'<td>{_fmt_usd(usd)}</td></tr>')
+            f'<td>{calls}</td>'
+            f'<td>{tokens:,}</td></tr>')
     rows.append(
         f'<tr class="tot"><td>합계</td><td></td><td></td>'
-        f'<td>{tot_credits:,.2f}</td><td>{_fmt_usd(tot_usd)}</td></tr>')
+        f'<td>{tot_credits:,.2f}</td><td>{tot_calls}</td><td>{tot_tokens:,}</td></tr>')
+    # Bottom line: operator-entered actual billed USD, else honest 미계측.
+    if d["usd"] is not None:
+        src = f' · {escape(d["actual_source"])}' if d.get("actual_source") else ""
+        actual_line = (f'<p class="muted">실청구 USD (관리화면 입력): '
+                       f'<b>{_fmt_usd(d["usd"])}</b>{src}</p>')
+    else:
+        actual_line = ('<p class="muted">실청구 USD: '
+                       f'<span class="unmeasured">{UNMEASURED} 미계측</span> — '
+                       '로컬 토큰추정은 관리화면 청구와 일치하지 않아 표시하지 않는다. '
+                       '<code>emit.py --actual-usd</code> 로 실청구액을 적재하면 여기에 표시된다.</p>')
     return (
         '<table class="grid-tbl"><thead><tr><th>provider</th><th>과금</th>'
-        '<th>기준</th><th>크레딧 (1cr=$0.01)</th><th>$</th></tr></thead><tbody>'
+        '<th>기준</th><th>크레딧 (1cr=$0.01)</th><th>호출</th><th>토큰</th></tr></thead><tbody>'
         + "".join(rows) + '</tbody></table>'
-        '<p class="muted">크레딧계(코파일럿)=호출수×크레딧단가 · '
-        '토큰계(deepinfra/openai호환)=실토큰×단가. 두 축은 분리 집계된다.</p>')
+        + actual_line
+        + '<p class="muted">호출수·크레딧·토큰은 실측값. 크레딧계(코파일럿) 배수는 '
+          '관리화면 청구와 달라 $ 환산은 표시하지 않는다(R0021).</p>')
 
 
 def section_axes(latest):
@@ -410,11 +466,31 @@ def section_axes(latest):
         '<tbody>' + "".join(rows) + '</tbody></table></section>')
 
 
+def _short_run_id(run):
+    """Compact run id for chart axes / tabs (R0025).
+
+    Packed x-axes overlap when run ids are long (e.g. ``solo-gpt54mini-0082``,
+    18 chars × 10 runs in a 640px frame). The chat is explicit: ``runxxx`` ids
+    stay verbatim (already short and canonical), everything else is trimmed to
+    its recognisable core — the redundant ``solo-`` arm prefix is dropped because
+    ``sonnet45-0077`` 이런식으로 해도 잘 알아본다 (R0001)."""
+    rid = str(run.get("run_id", "?"))
+    if rid.startswith("solo-"):
+        return rid[len("solo-"):]
+    return rid
+
+
 def _run_label(run):
-    """Short human label for a run in pickers/tables (arm name if it has one)."""
+    """Short human label for a run in pickers/tables. Builds on _short_run_id and
+    only re-appends the arm when it isn't already encoded in the (trimmed) id, so
+    solo runs don't carry their arm twice (R0025)."""
+    short = _short_run_id(run)
     arm = run.get("arm")
-    base = str(run.get("run_id", "?"))
-    return f"{base} · {arm}" if arm else base
+    if arm:
+        core = arm[len("solo-"):] if arm.startswith("solo-") else arm
+        if core not in short:
+            return f"{short} · {arm}"
+    return short
 
 
 def section_run_table(runs, derived_all):
@@ -440,7 +516,7 @@ def section_run_table(runs, derived_all):
         '<p class="muted">solo 단독 arm을 하이브리드 런 옆에 나란히. '
         '재현율·정밀도가 메인, 비용은 뒤(R0014-D).</p>'
         '<table class="grid-tbl"><thead><tr><th>런</th><th>대상</th>'
-        '<th>재현율</th><th>정밀도</th><th>통과</th><th>런당 $</th></tr></thead><tbody>'
+        '<th>재현율</th><th>정밀도</th><th>통과</th><th>런당 실청구 $</th></tr></thead><tbody>'
         + "".join(rows) + '</tbody></table></section>')
 
 
@@ -572,32 +648,41 @@ def render(runs):
 
     latest = runs[-1]
     d = derive(latest)
-    derived_all = [derive(r) for r in runs]
+
+    # R0021-1: cap the per-run views (table / tabs / trend / cost bars) to the
+    # latest N runs so the report stays readable as runs accumulate. The header
+    # keeps the true total and flags the truncation; the latest cycle is unchanged.
+    total_runs = len(runs)
+    recent = runs[-RECENT_RUNS_LIMIT:]
+    recent_derived = [derive(r) for r in recent]
+    truncated = total_runs > len(recent)
 
     # Trend series (R0014-D): accuracy metrics lead — recall/precision/pass-rate.
     # Yield is demoted to the funnel section and no longer drawn on the main trend.
-    trend = svg_lines(runs, [
+    trend = svg_lines(recent, [
         ("재현율", lambda r: derive(r)["recall"], "#54c7a3", True),
         ("정밀도", lambda r: derive(r)["precision"], "#d98cff", True),
         ("통과율", lambda r: derive(r)["pass_rate"], "#7c9cff", True),
     ])
-    cost_trend = svg_lines(runs, [
-        ("런당 $", lambda r: derive(r)["usd"], "#f0a85f", False),
+    cost_trend = svg_lines(recent, [
+        ("런당 실청구 $", lambda r: derive(r)["usd"], "#f0a85f", False),
     ], height=160)
 
     meta = (f'{escape(str(latest.get("run_id", "")))} · '
             f'{escape(str(latest.get("seed", "")))} · '
             f'{escape(str(latest.get("codebase", "")))} · '
             f'queen={escape(str(_num({"_": latest.get("models", {})}, "_", "queen") or latest.get("models", {}).get("queen", "")))} '
-            f'swarm={escape(str(latest.get("models", {}).get("swarm", "")))}')
+            f'fanout={escape(str(latest.get("models", {}).get("fanout", latest.get("models", {}).get("swarm", ""))))}')
 
+    shown_note = (f' · 최신 {len(recent)}런만 표시'
+                  if truncated else "")
     body = (
         f'<header><h1>Hive 성능지표 레포트</h1>'
         f'<p class="meta">최신 사이클: {meta}<br>'
-        f'전체 {len(runs)}런 · 마지막 ts {escape(str(latest.get("ts", "")))}</p></header>'
+        f'전체 {total_runs}런{shown_note} · 마지막 ts {escape(str(latest.get("ts", "")))}</p></header>'
         + section_summary(latest, d)
-        + section_run_table(runs, derived_all)
-        + section_runs_tabbed(runs, derived_all)
+        + section_run_table(recent, recent_derived)
+        + section_runs_tabbed(recent, recent_derived)
         + '<section><h2>수확 퍼널 — 이번 사이클은 어디서 무너졌나</h2>'
         + f'<p class="muted">축 시도에서 통과까지. 괄호 안은 직전 단계 대비 전환율. '
         f'수확 수율(comb-형태/축) = <b>{_fmt_pct(d["yield"])}</b> '
@@ -608,10 +693,13 @@ def render(runs):
         + '<section><h2>추세 — 런 누적</h2>'
         + '<p class="muted">재현율·정밀도·통과율(좌) / 각 시리즈는 자기 최대값 기준 정규화. (수율은 퍼널 섹션으로 이동 — R0014-D)</p>'
         + trend + '</section>'
-        + '<section><h2>비용 분해 — provider별 (크레딧계 / 토큰계 분리)</h2>'
-        + section_cost_table(latest)
-        + svg_cost_bars(runs)
-        + '<p class="muted">런당 총비용 추세:</p>' + cost_trend
+        + '<section><h2>비용 — 실측 단위(호출·크레딧·토큰) + 실청구 USD</h2>'
+        + '<p class="muted">로컬 토큰추정 USD는 관리화면 청구와 "전혀 일치하지 않아" 비용으로 '
+        '표시하지 않는다. 실측 가능한 호출수·크레딧·토큰만 보여주고, $ 는 관리화면 실청구액을 '
+        '입력했을 때만 표시한다(R0021 — 없애고 사용자 입력).</p>'
+        + section_cost_table(latest, d)
+        + svg_cost_bars(recent, recent_derived)
+        + '<p class="muted">런당 실청구 $ 추세 (입력된 런만):</p>' + cost_trend
         + f'<p class="muted">최신 런: 수율당 {_fmt_usd(d["cost_per_finding"])} · '
         f'수정당 {_fmt_usd(d["cost_per_fix"])}</p></section>'
         + section_axes(latest)
@@ -650,6 +738,9 @@ PAGE = """<!doctype html>
  .fn-lab {{ fill:var(--muted); font-size:12px; text-anchor:end; }}
  .fn-val {{ fill:var(--ink); font-size:12px; }}
  .x-lab {{ fill:var(--muted); font-size:10.5px; text-anchor:middle; }}
+ /* R0025: diagonal x-axis labels — end-anchored so the right edge sits under the
+    data point, tilted down-left so long run ids no longer collide. */
+ .x-rot {{ fill:var(--muted); font-size:10.5px; text-anchor:end; }}
  .bar-val {{ fill:var(--muted); font-size:10px; text-anchor:middle; }}
  .legend {{ display:flex; gap:16px; flex-wrap:wrap; margin-top:8px; }}
  .lg {{ color:var(--muted); font-size:12px; }}

@@ -32,7 +32,7 @@ MATRIX_PATH = os.path.join(HERE, "matrix.json")
 # Role name in the matrix -> the roles.<key> the config loader reads. (1:1 today,
 # but kept explicit so a future rename of an internal role key is a one-line change.)
 ROLE_KEY = {
-    "queen": "queen", "swarm": "swarm", "scout": "scout", "judge": "judge",
+    "queen": "queen", "swarm": "fanout", "scout": "scout", "judge": "judge",
     "converge": "converge", "assemble": "assemble", "specify": "specify",
     "review": "review",
 }

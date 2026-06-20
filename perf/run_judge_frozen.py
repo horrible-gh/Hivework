@@ -125,7 +125,7 @@ def main():
             out = os.path.join(rep_dir, "verdict.json")
             ldg = open_ledger(cfg.ledger.enabled, cfg.ledger.db_path)
             ldg.start_run(seed=seed_path, codebase=cb,
-                          model_queen=cfg.queen.model, model_swarm=cfg.role("judge").model)
+                          model_queen=cfg.queen.model, model_fanout=cfg.role("judge").model)
             try:
                 inv.run_investigate(
                     seed_text=seed_text, recipe_path=None, code_root=cb, docs_root=docs,

@@ -148,8 +148,17 @@ def _shaped_by_axis(workdir: str | None) -> tuple[dict, int]:
 
 def build_record(db_path: str, run_id: int, workdir: str | None = None,
                  golden: dict | None = None,
-                 stage_golden: dict | None = None) -> dict | None:
-    """Project ledger run ``run_id`` (+ optional workdir/golden) into a SCHEMA record."""
+                 stage_golden: dict | None = None,
+                 actual_usd: float | None = None,
+                 actual_source: str | None = None) -> dict | None:
+    """Project ledger run ``run_id`` (+ optional workdir/golden) into a SCHEMA record.
+
+    ``actual_usd`` (R0021-2): the operator-entered billed cost read off the
+    provider management screen. The local per-provider USD is a token/credit
+    *estimate* that never reconciles with that screen (copilot premium-request
+    multipliers are opaque), so the report treats this entered actual — not the
+    estimate — as the bottom-line cost, and renders 미계측 when it is absent.
+    """
     prices, billing = _load_pricing()
     try:
         conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
@@ -232,6 +241,12 @@ def build_record(db_path: str, run_id: int, workdir: str | None = None,
         }
         for prov in sorted(by_prov_tok)
     }}
+    # R0021-2: operator-entered actual billed USD (management screen). This — not
+    # the per-provider estimate above — is what the report shows as the cost.
+    if actual_usd is not None:
+        cost["actual_usd"] = round(float(actual_usd), 5)
+        if actual_source:
+            cost["actual_source"] = actual_source
 
     record = {
         "run_id": f"run{run['id']}",
@@ -239,7 +254,10 @@ def build_record(db_path: str, run_id: int, workdir: str | None = None,
         "seed": run.get("seed"),
         "work_type": run.get("work_type"),
         "codebase": os.path.basename(str(run.get("codebase") or "").rstrip("\\/")),
-        "models": {"queen": run.get("model_queen"), "swarm": run.get("model_swarm")},
+        "models": {"queen": run.get("model_queen"),
+                   # B0001: column renamed model_swarm -> model_fanout; fall back to the
+                   # old column so historical ledger DBs still emit a model here.
+                   "fanout": run.get("model_fanout") or run.get("model_swarm")},
         "funnel": {
             "axes_attempted": run.get("axes_n") or 0,
             "comb_fired": comb_fired,
@@ -269,10 +287,12 @@ def build_record(db_path: str, run_id: int, workdir: str | None = None,
 
 
 def emit(db_path: str, run_id: int, out_path: str, workdir: str | None = None,
-         golden: dict | None = None, stage_golden: dict | None = None) -> bool:
+         golden: dict | None = None, stage_golden: dict | None = None,
+         actual_usd: float | None = None, actual_source: str | None = None) -> bool:
     """Append one record to ``out_path`` (JSON Lines). Best-effort, non-fatal."""
     rec = build_record(db_path, run_id, workdir=workdir, golden=golden,
-                       stage_golden=stage_golden)
+                       stage_golden=stage_golden, actual_usd=actual_usd,
+                       actual_source=actual_source)
     if rec is None:
         return False
     try:
@@ -307,7 +327,12 @@ def main(argv=None) -> int:
                     help="골든셋 채점 블록(JSON 파일) — 있으면 record.golden 에 삽입")
     ap.add_argument("--stage-golden-json", default=None,
                     help="단계별 골든 생존 블록(JSON 파일) — 있으면 record.stage_golden 에 삽입 "
-                         "(T0006: 워터폴 미계측 칸을 실측 %로 채우는 적재 슬롯)")
+                         "(T0006: 워터폴 미계측 칸을 실측 퍼센트로 채우는 적재 슬롯)")
+    ap.add_argument("--actual-usd", type=float, default=None,
+                    help="관리화면 실청구액(USD) — 있으면 record.cost.actual_usd 에 적재. "
+                         "로컬 토큰추정 USD는 청구와 불일치하므로 이 값이 레포트의 비용으로 표시됨(R0021)")
+    ap.add_argument("--actual-source", default=None,
+                    help="실청구액 출처 메모(예: 'copilot dashboard 2026-06-20')")
     ap.add_argument("--print", action="store_true", dest="print_only",
                     help="append 하지 않고 record를 stdout으로만 출력")
     a = ap.parse_args(argv)
@@ -326,13 +351,15 @@ def main(argv=None) -> int:
 
     if a.print_only:
         rec = build_record(a.db, run_id, workdir=a.workdir, golden=golden,
-                           stage_golden=stage_golden)
+                           stage_golden=stage_golden, actual_usd=a.actual_usd,
+                           actual_source=a.actual_source)
         if rec is None:
             return 1
         print(json.dumps(rec, ensure_ascii=False, indent=2))
         return 0
     ok = emit(a.db, run_id, a.out, workdir=a.workdir, golden=golden,
-              stage_golden=stage_golden)
+              stage_golden=stage_golden, actual_usd=a.actual_usd,
+              actual_source=a.actual_source)
     if ok:
         print(f"emit: run{run_id} → {a.out}")
     return 0 if ok else 1

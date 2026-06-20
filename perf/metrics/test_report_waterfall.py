@@ -114,6 +114,118 @@ def test_full_render_has_no_unmeasured_zero_percent():
         assert "0%" not in span
 
 
+# ── R0021-1: latest-N cap ───────────────────────────────────────────────────
+
+def test_per_run_views_capped_to_latest_n():
+    """With more runs than the limit, the per-run table/tabs show only the latest
+    N — older runs drop out so the report stays readable (R0021-1)."""
+    n_total = report.RECENT_RUNS_LIMIT + 6
+    runs = [dict(_RUN, run_id=f"run{i}") for i in range(n_total)]
+    html = report.render(runs)
+    # one tab per shown run, capped at the limit (not n_total)
+    assert html.count('class="run-tab"') == report.RECENT_RUNS_LIMIT
+    # the oldest runs are gone, the newest are present
+    assert ">run0 " not in html and "run0<" not in html
+    assert f"run{n_total - 1}" in html
+
+
+def test_header_keeps_true_total_and_flags_truncation():
+    """The header reports the TRUE total run count and says it truncated — silent
+    truncation would read as 'this is everything' (R0021-1 honesty rule)."""
+    n_total = report.RECENT_RUNS_LIMIT + 3
+    runs = [dict(_RUN, run_id=f"run{i}") for i in range(n_total)]
+    html = report.render(runs)
+    assert f"전체 {n_total}런" in html
+    assert f"최신 {report.RECENT_RUNS_LIMIT}런만 표시" in html
+
+
+def test_no_truncation_note_when_within_limit():
+    """At or below the limit there is no truncation and no '최신 N런만' note."""
+    runs = [dict(_RUN, run_id=f"run{i}") for i in range(3)]
+    html = report.render(runs)
+    assert "전체 3런" in html
+    assert "런만 표시" not in html
+
+
+# ── R0021-2: cost = operator actual or 미계측, never the fabricated estimate ──
+
+def test_cost_unmeasured_without_actual():
+    """No ``cost.actual_usd`` → the run cost is 미계측, and the fabricated local
+    estimate is NOT presented as the bottom-line cost (R0021-2)."""
+    # _RUN's by_provider usd is 0.0 (fabricated). Without an actual, the summary
+    # cost card must read 미계측, not a $ figure.
+    d = report.derive(_RUN)
+    assert d["usd"] is None
+    summary = report.section_summary(_RUN, d)
+    assert "미계측" in summary
+    # the cost table bottom line is 미계측 too, and tells the operator how to fill it
+    tbl = report.section_cost_table(_RUN, d)
+    assert "미계측" in tbl and "--actual-usd" in tbl
+
+
+def test_cost_actual_is_shown_when_entered():
+    """When ``cost.actual_usd`` is present it becomes the displayed cost, with its
+    source, across the summary card and cost table (R0021-2)."""
+    run = dict(_RUN, cost={
+        "by_provider": {"copilot": {"tokens": 100, "calls": 1, "credits": 0, "usd": 0.0}},
+        "actual_usd": 0.42, "actual_source": "copilot dashboard 2026-06-20",
+    })
+    d = report.derive(run)
+    assert d["usd"] == 0.42
+    summary = report.section_summary(run, d)
+    assert "$0.420" in summary
+    tbl = report.section_cost_table(run, d)
+    assert "$0.420" in tbl and "copilot dashboard 2026-06-20" in tbl
+
+
+def test_cost_bars_degrade_to_unmeasured_note():
+    """The cost-bars chart never fakes $0 bars: with no actual cost on any run it
+    degrades to an honest 미계측 note (R0021-2)."""
+    runs = [dict(_RUN, run_id=f"run{i}") for i in range(3)]
+    derived = [report.derive(r) for r in runs]
+    out = report.svg_cost_bars(runs, derived)
+    assert "미계측" in out and "<rect" not in out
+
+
+# ── R0025: chart labels — diagonal + trimmed (no overlap) ────────────────────
+
+def test_short_run_id_keeps_runxxx_trims_solo():
+    """runxxx ids stay verbatim; solo- arm-ids drop the redundant prefix to the
+    recognisable core (R0001: 'sonnet45-0077 이런식으로 해도 잘 알아본다')."""
+    assert report._short_run_id({"run_id": "run475"}) == "run475"
+    assert report._short_run_id({"run_id": "solo-sonnet45-0077"}) == "sonnet45-0077"
+    assert report._short_run_id({"run_id": "solo-gpt54mini-0082"}) == "gpt54mini-0082"
+
+
+def test_run_label_does_not_duplicate_arm():
+    """A solo run already encodes its arm in the (trimmed) id, so the label must
+    not append it a second time (R0025)."""
+    run = {"run_id": "solo-sonnet45-0077", "arm": "solo-sonnet45"}
+    assert report._run_label(run) == "sonnet45-0077"
+
+
+def test_chart_x_labels_are_diagonal_and_trimmed():
+    """The trend chart draws each x label on a diagonal (rotate transform) using
+    the trimmed id — never the long raw run_id horizontally (R0001 overlap fix)."""
+    runs = [{"run_id": "solo-gpt54mini-0082", "arm": "solo-gpt54mini",
+             "golden": {"seeded": 1, "recalled": 1}, "cost": {}, "cycle": {},
+             "funnel": {}}]
+    out = report.svg_lines(runs, [("재현율", lambda r: 1.0, "#54c7a3", True)])
+    assert 'class="x-rot"' in out and "rotate(-32" in out
+    # the trimmed core is shown, not the long raw id
+    assert ">gpt54mini-0082<" in out and "solo-gpt54mini-0082" not in out
+
+
+def test_cost_bars_x_labels_are_diagonal():
+    """Cost bars share the same diagonal, trimmed axis as the trend chart."""
+    runs = [{"run_id": "solo-sonnet45-0077",
+             "cost": {"actual_usd": 0.01}, "cycle": {}, "golden": {}, "funnel": {}}]
+    derived = [report.derive(r) for r in runs]
+    out = report.svg_cost_bars(runs, derived)
+    assert 'class="x-rot"' in out and "rotate(-32" in out
+    assert ">sonnet45-0077<" in out
+
+
 if __name__ == "__main__":
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for fn in fns:

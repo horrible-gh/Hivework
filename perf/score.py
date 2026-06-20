@@ -181,7 +181,8 @@ _STAGE_PROJECTION = {
     "converge": ("verdict",  "converge_attributed"),
     "specify":  ("edit_spec", "authored"),
     "review":   ("edit_spec", "surviving"),
-    "swarm":    ("honey",    "honey"),
+    "fanout":   ("honey",    "honey"),
+    "swarm":    ("honey",    "honey"),   # back-compat: old ledgers labelled drones "swarm"
     "assemble": ("honey",    "honey"),
 }
 
