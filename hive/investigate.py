@@ -137,6 +137,116 @@ def _leaf_axes(tasks: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return [t for t in tasks if not (t.get("depends_on") or [])]
 
 
+def _axis_id(task: dict[str, Any]) -> str:
+    """The axis identifier the DAG's depends_on edges reference (id, else name)."""
+    return str(task.get("id") or task.get("name") or "")
+
+
+# A SCAFFOLDING axis is not a diagnostic conclusion: it is a "go search the repo
+# and produce a list of hits for follow-up" funnel stage. The queen sometimes emits
+# a staircase DAG — steps=[[T0],[T1..T8],[T9]] — where this single global-search
+# step T0 is the ONLY leaf and every real diagnostic axis declares depends_on=[T0].
+# The cheap investigate path judges leaves only, so it judges T0 alone (which can
+# never locate a bug — gpt-oss reads it as "just a list request, not a malfunction")
+# and STARVES the 9 diagnostic axes (incl. the FK-constraint one that pins the bug).
+# They are never judged → MISS. (TSR hivework.0024.0003: 0082 Lv3, run475, recall 0/1.)
+#
+# DETECTOR PRECISION (TSR hivework.0024.0005 live re-test, run2): a GOOD diagnostic
+# brief routinely says "produce exact file:line locations" or "follow the call chain"
+# because the seed asks for file:line — so matching bare "file:line" / "produce a
+# list" FALSE-FLAGS a real trace axis (e.g. "Trace the dispose endpoint … produce
+# file:line", "FK constraints … file:line"), which combined with the gates-dependents
+# rule below could dissolve a legitimate axis. The markers kept here are the ones a
+# FUNNEL uses that a single-axis diagnosis does NOT: an explicit downstream HANDOFF
+# ("for follow-ups"), a LIST-OF-MANY-hits enumeration, a GLOBAL/whole-repo sweep, or
+# an enumerate/catalog/inventory verb. "produce a list" and bare "file:line" are
+# deliberately excluded as too common in honest diagnostic axes.
+_SCAFFOLDING_RE = re.compile(
+    r"\bfor\s+follow[-\s]?ups?\b"
+    r"|\bhits\s+for\s+follow"
+    r"|\blist\s+of\s+(?:all\s+)?(?:hits|occurrences|matches|"
+    r"call\s*sites|callsites|references|usages)\b"
+    r"|\b(?:global|codebase|repo(?:sitory)?[-\s]?wide|whole[-\s]?repo)\s+"
+    r"(?:code\s+)?(?:search|grep|scan)\b"
+    r"|\benumerate\b|\bcatalog(?:ue)?\b|\binventory\b"
+    r"|\bfind\s+all\s+(?:occurrences|usages|references|call\s*sites|callsites)\b"
+    r"|\bgrep\s+(?:the\s+)?(?:repo|codebase|code)\b"
+    r"|\blocate\s+all\s+(?:occurrences|usages|references|call\s*sites|callsites)\b",
+    re.IGNORECASE,
+)
+
+
+def _is_scaffolding_axis(task: dict[str, Any]) -> bool:
+    """Whether an axis is a search-and-list FUNNEL rather than a diagnostic axis.
+
+    Tuned to the FUNNEL's distinctive language (downstream handoff / list-of-many /
+    global sweep / enumerate) — NOT generic "file:line"/"produce a list", which an
+    honest diagnostic trace also uses (TSR hivework.0024.0005 live re-test).
+    """
+    blob = f"{task.get('title', '')} {task.get('brief', '')}"
+    return bool(_SCAFFOLDING_RE.search(blob))
+
+
+def dissolve_scaffolding_leaves(
+        tasks: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Un-starve the leaf-only judge when a scaffolding step gates every real axis.
+
+    Symptom (TSR hivework.0024.0003): a decompose staircase whose sole leaf is a
+    non-diagnostic global-search step gates all diagnostic axes behind it, so the
+    cheap path judges the funnel and never the axes that would localise the bug.
+
+    Fix A (the TSR's recommended direction): a leaf that BOTH reads as scaffolding
+    AND gates dependents is dissolved — dropped from the task set and removed from
+    every other axis's ``depends_on`` — which promotes its (now-ungated) dependents
+    to leaves so they reach the judge. Pure, deterministic, never raises.
+
+    Guarded to stay a no-op outside the degenerate funnel:
+      - only dissolves leaves that gate at least one dependent (a real lone
+        diagnostic leaf has no dependents → untouched);
+      - aborts if dissolving would leave NO leaf at all (better to judge the
+        funnel than nothing).
+    Returns the (possibly new) task list; the input is not mutated.
+    """
+    if not tasks:
+        return tasks
+    leaves = _leaf_axes(tasks)
+    leaf_ids = {_axis_id(t) for t in leaves}
+    # A leaf is a dissolve target only if some OTHER axis depends on it (it is a
+    # funnel root, not a terminal diagnostic axis) and it reads as scaffolding.
+    gated_by: dict[str, int] = {}
+    for t in tasks:
+        for dep in (t.get("depends_on") or []):
+            gated_by[str(dep)] = gated_by.get(str(dep), 0) + 1
+    scaffold_ids = {
+        lid for t in leaves
+        if (lid := _axis_id(t)) and gated_by.get(lid, 0) > 0
+        and _is_scaffolding_axis(t)
+    }
+    if not scaffold_ids:
+        return tasks
+
+    new_tasks: list[dict[str, Any]] = []
+    for t in tasks:
+        if _axis_id(t) in scaffold_ids:
+            continue  # the funnel step is skipped (no judge call)
+        dep = [d for d in (t.get("depends_on") or []) if str(d) not in scaffold_ids]
+        nt = dict(t)
+        nt["depends_on"] = dep
+        new_tasks.append(nt)
+
+    if not _leaf_axes(new_tasks):
+        # Dissolving stranded everything — keep the funnel rather than judge nothing.
+        logger.warning("scaffolding-leaf guard: dissolving %s would leave no leaf "
+                       "— keeping funnel axis", sorted(scaffold_ids))
+        return tasks
+
+    before = sorted(leaf_ids)
+    after = sorted(_axis_id(t) for t in _leaf_axes(new_tasks))
+    logger.info("scaffolding-leaf guard: dissolved funnel leaf(es) %s → promoted "
+                "leaves %s (was %s)", sorted(scaffold_ids), after, before)
+    return new_tasks
+
+
 # A repo-relative path token the seed names AS A CONCRETE FILE (has an extension,
 # no wildcard) — e.g. ``client/src/.../DocWorkflow.vue``. Directory scopes and
 # ``**`` globs are not concrete-file anchors.
@@ -453,6 +563,11 @@ def run_investigate(
         timeout=queen.worker_timeout(),
     )
     tasks = decompose_result.get("tasks", []) or []
+    # Scaffolding-leaf guard (TSR hivework.0024.0003, Fix A): when the queen funnels
+    # every diagnostic axis behind a single global-search/list leaf, that funnel is
+    # the only leaf the cheap path would judge — and it can never locate a bug. Drop
+    # it and promote its ungated dependents to leaves so the real axes get judged.
+    tasks = dissolve_scaffolding_leaves(tasks)
     leaves = _leaf_axes(tasks)
     # depends_on pruning is silent by default, yet in EDIT mode the queen routinely
     # makes the very edit-target axes (BE_EDIT, FE_TEST_EDIT…) depend on the
@@ -739,7 +854,7 @@ def run_investigate(
         # by itself trigger converge.
         split_cfg = cfg.converge_split
         lens_cfg = cfg.converge_lens
-        swarm_role = cfg.role("swarm")
+        fanout_role = cfg.role("fanout")
         cres = run_converge(
             seed_text=seed_text, verdicts=_converge_fragments(verdicts),
             bundles=bundles,
@@ -749,8 +864,8 @@ def run_investigate(
             split_enabled=split_cfg.enabled, split_max_loci=split_cfg.max_loci,
             split_provider=split_cfg.provider, split_model=split_cfg.model,
             lens_lenses=(lens_cfg.lenses if lens_cfg.enabled else []),
-            lens_provider=(lens_cfg.provider or swarm_role.provider),
-            lens_model=(lens_cfg.model or swarm_role.model),
+            lens_provider=(lens_cfg.provider or fanout_role.provider),
+            lens_model=(lens_cfg.model or fanout_role.model),
             lens_min_refute=lens_cfg.min_refute)
         converge_dict = cres.as_dict()
         cc = cres.causal_check or {}
@@ -1418,15 +1533,15 @@ def _rerun_converge(result: dict[str, Any], seed_text: str, *, code_root: str | 
                 "evidence (%s/%s)", len(located), conv_role.provider, conv_role.model)
     pk = dict(provider_kwargs or {})
     lens_cfg = cfg.converge_lens
-    swarm_role = cfg.role("swarm")
+    fanout_role = cfg.role("fanout")
     cres = run_converge(
         seed_text=seed_text, verdicts=_converge_fragments(verdicts), bundles=bundles,
         provider=conv_role.provider, model=conv_role.model, code_root=code_root,
         ledger=ledger, provider_kwargs=pk, k=6, max_hops=2, db_conn=db_conn,
         timeout=conv_role.worker_timeout(),
         lens_lenses=(lens_cfg.lenses if lens_cfg.enabled else []),
-        lens_provider=(lens_cfg.provider or swarm_role.provider),
-        lens_model=(lens_cfg.model or swarm_role.model),
+        lens_provider=(lens_cfg.provider or fanout_role.provider),
+        lens_model=(lens_cfg.model or fanout_role.model),
         lens_min_refute=lens_cfg.min_refute)
     result["converge"] = cres.as_dict()
     if honey_out:

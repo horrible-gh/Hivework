@@ -19,7 +19,8 @@ from hive.config import load_config
 from hive.providers import WorkerResult
 from hive.investigate import (
     render_local_honey, _prioritize_axes, _axis_coverage, _coverage_phrase,
-    rerun_reinvestigation,
+    rerun_reinvestigation, dissolve_scaffolding_leaves, _leaf_axes,
+    _is_scaffolding_axis,
 )
 from hive.reinvestigate import (
     ReinvestPlan, ACTION_RE_CONVERGE, ACTION_RE_RETRIEVE,
@@ -985,6 +986,125 @@ class TestRerunReinvestigation(unittest.TestCase):
                 docs_root=None, cfg=self.cfg, honey_out=self.honey)
         self.assertIsNone(out)
         rc.assert_not_called()
+
+
+class TestScaffoldingLeafGuard(unittest.TestCase):
+    """TSR hivework.0024.0003 (0082 Lv3, run475): a staircase DAG whose only leaf
+    is a global-search/list funnel starves every diagnostic axis behind it. Fix A:
+    dissolve the funnel leaf and promote its ungated dependents to leaves."""
+
+    def _ids(self, tasks):
+        return sorted(t.get("id") for t in tasks)
+
+    def _leaf_ids(self, tasks):
+        return sorted(t.get("id") for t in _leaf_axes(tasks))
+
+    def test_promotes_dependents_when_sole_leaf_is_scaffolding(self):
+        # The exact run475 shape: T0 = global search → list of file:line hits for
+        # follow-ups; T1..T3 depend on it (incl. the FK axis); T4 synthesises.
+        tasks = [
+            {"id": "T0", "title": "Global code search for 'dispose'",
+             "brief": "Search the codebase and produce a list of file:line hits "
+                      "for follow-ups.", "depends_on": []},
+            {"id": "T1", "title": "dispose handler", "brief": "inspect dispose",
+             "depends_on": ["T0"]},
+            {"id": "T2", "title": "close handler", "brief": "inspect close",
+             "depends_on": ["T0"]},
+            {"id": "T3", "title": "DB schema & constraints",
+             "brief": "inspect group table, FOREIGN KEY and triggers",
+             "depends_on": ["T0"]},
+            {"id": "T4", "title": "synthesis", "brief": "combine",
+             "depends_on": ["T1", "T2", "T3"]},
+        ]
+        # Before: the only leaf is the scaffolding funnel.
+        self.assertEqual(self._leaf_ids(tasks), ["T0"])
+        out = dissolve_scaffolding_leaves(tasks)
+        # After: the funnel is gone and the 3 diagnostic axes became leaves; the
+        # synthesis axis still depends on them and is NOT promoted.
+        self.assertEqual(self._leaf_ids(out), ["T1", "T2", "T3"])
+        self.assertNotIn("T0", self._ids(out))
+        t4 = next(t for t in out if t["id"] == "T4")
+        self.assertEqual(sorted(t4["depends_on"]), ["T1", "T2", "T3"])
+
+    def test_noop_when_leaf_is_diagnostic(self):
+        # A normal cut: independent diagnostic leaves + a synthesis dependent.
+        tasks = [
+            {"id": "A", "title": "sql gate", "brief": "inspect ORDER BY",
+             "depends_on": []},
+            {"id": "B", "title": "endpoint", "brief": "trace the handler",
+             "depends_on": []},
+            {"id": "C", "title": "synthesis", "brief": "combine A and B",
+             "depends_on": ["A", "B"]},
+        ]
+        out = dissolve_scaffolding_leaves(tasks)
+        self.assertIs(out, tasks)  # untouched
+        self.assertEqual(self._leaf_ids(out), ["A", "B"])
+
+    def test_noop_when_scaffolding_axis_has_no_dependents(self):
+        # A lone scaffolding-worded leaf that gates nothing must NOT be dissolved
+        # away — that would leave the run with nothing to judge.
+        tasks = [
+            {"id": "S", "title": "enumerate call sites",
+             "brief": "find all occurrences of insert_event", "depends_on": []},
+        ]
+        out = dissolve_scaffolding_leaves(tasks)
+        self.assertIs(out, tasks)
+        self.assertEqual(self._leaf_ids(out), ["S"])
+
+    def test_keeps_funnel_when_dissolving_strands_everything(self):
+        # Scaffolding leaf gates a dependent that ALSO depends on a second
+        # (non-existent-as-leaf) axis — guard never empties the leaf set.
+        tasks = [
+            {"id": "T0", "title": "global search",
+             "brief": "produce a list of file:line hits for follow-ups",
+             "depends_on": []},
+            {"id": "T1", "title": "synth", "brief": "x",
+             "depends_on": ["T0", "T1"]},  # self-cycle keeps T1 non-leaf
+        ]
+        out = dissolve_scaffolding_leaves(tasks)
+        self.assertIs(out, tasks)  # kept the funnel rather than judge nothing
+
+    def test_detector_matches_search_list_language_only(self):
+        self.assertTrue(_is_scaffolding_axis(
+            {"title": "Global code search", "brief": "produce a list of "
+             "file:line hits for follow-ups"}))
+        self.assertTrue(_is_scaffolding_axis(
+            {"title": "enumerate", "brief": "find all occurrences of foo"}))
+        self.assertFalse(_is_scaffolding_axis(
+            {"title": "DB schema & constraints",
+             "brief": "inspect the group table FOREIGN KEY and triggers"}))
+        self.assertFalse(_is_scaffolding_axis(
+            {"title": "dispose handler", "brief": "trace insert_event in dispose"}))
+
+    def test_detector_does_not_flag_diagnostic_trace_with_fileline(self):
+        # TSR hivework.0024.0005 live re-test (run2): an honest diagnostic TRACE
+        # axis says "produce exact file:line locations" and "follow all internal
+        # calls" because the seed asks for file:line. Matching that as scaffolding
+        # would false-dissolve a real axis, so the detector must NOT flag it.
+        self.assertFalse(_is_scaffolding_axis({
+            "title": "Trace backend POST /groups/{id}/dispose endpoint",
+            "brief": "follow all internal calls to the first thrown exception that "
+                     "results in a 500. Produce exact file:line locations along the "
+                     "call chain and a minimal call-path map (caller -> callee)."}))
+        self.assertFalse(_is_scaffolding_axis({
+            "title": "Locate DB/SQL gates that block disposal",
+            "brief": "Report the exact SQL or ORM call, file:line, and highlight "
+                     "predicates (NULL checks, FK constraints) that could throw."}))
+
+    def test_diagnostic_trace_gating_synth_is_not_dissolved(self):
+        # The same diagnostic trace, now gating a synthesis axis: the gates-dependents
+        # rule alone is NOT enough — the detector precision is what prevents the real
+        # trace axis from being dissolved and replaced by its synthesis dependent.
+        tasks = [
+            {"id": "TRACE", "title": "Trace dispose endpoint",
+             "brief": "follow all internal calls; produce exact file:line locations "
+                      "along the call chain to the 500.", "depends_on": []},
+            {"id": "SYNTH", "title": "synthesis",
+             "brief": "combine", "depends_on": ["TRACE"]},
+        ]
+        out = dissolve_scaffolding_leaves(tasks)
+        self.assertIs(out, tasks)  # untouched — TRACE is diagnostic, not a funnel
+        self.assertEqual(self._leaf_ids(out), ["TRACE"])
 
 
 if __name__ == "__main__":
