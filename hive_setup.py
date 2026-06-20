@@ -365,7 +365,7 @@ _MODEL_PRESETS: dict[str, list[str]] = {
 _ROLES: list[tuple[str, str]] = [
     ("queen",    "tool-ON  : decompose / explore the tree"),
     ("specify",  "tool-ON  : author the edit spec"),
-    ("swarm",    "tool-ON  : fan-out drones (swarm path)"),
+    ("fanout",   "tool-ON  : fan-out drones (fanout path)"),
     ("assemble", "tool-ON  : stitch drone combs"),
     ("commit",   "tool-ON  : group changes into commits"),
     ("judge",    "tool-OFF : single-shot ruling on a bundle"),
@@ -445,7 +445,7 @@ _MODEL_TIERS: dict[str, dict[str, str]] = {
 # tool-ON roles re-open live files: today only an agentic CLI (copilot/codex) runs the
 # tool loop, so the tool-OFF HTTP provider can't take them YET (the agent loop is
 # unbuilt, not impossible - see providers.py). tool-OFF roles are single-shot rulings.
-_TOOL_ON_ROLES = {"queen", "specify", "swarm", "assemble", "commit"}
+_TOOL_ON_ROLES = {"queen", "specify", "fanout", "assemble", "commit"}
 
 # Provider preference PER ROLE (first available wins). Distinct per role so that with
 # several providers available the layout MIXES across them instead of piling onto one:
@@ -456,7 +456,7 @@ _TOOL_ON_ROLES = {"queen", "specify", "swarm", "assemble", "commit"}
 _ROLE_PROVIDER_PREF: dict[str, list[str]] = {
     "queen":    ["codex", "copilot"],
     "specify":  ["codex", "copilot"],
-    "swarm":    ["copilot", "codex"],
+    "fanout":   ["copilot", "codex"],
     "assemble": ["copilot", "codex"],
     "commit":   ["copilot", "codex"],
     "judge":    ["openai", "copilot", "codex"],

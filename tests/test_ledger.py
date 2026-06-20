@@ -50,7 +50,7 @@ class TestLedgerInsertAndAggregate(unittest.TestCase):
         self.db_path = os.path.join(self.tmpdir, "test_ledger.db")
         self.ldg = Ledger(self.db_path)
         self.ldg.start_run(seed="test_seed.md", codebase="/repo",
-                           model_queen="gpt-5-mini", model_swarm="gpt-5-mini")
+                           model_queen="gpt-5-mini", model_fanout="gpt-5-mini")
 
     def tearDown(self):
         self.ldg.close()
@@ -217,7 +217,7 @@ class TestLedgerBeginFinishCall(unittest.TestCase):
         self.db_path = os.path.join(self.tmpdir, "test_ledger.db")
         self.ldg = Ledger(self.db_path)
         self.ldg.start_run(seed="s.md", codebase="/r",
-                           model_queen="gpt-5-mini", model_swarm="gpt-5-mini")
+                           model_queen="gpt-5-mini", model_fanout="gpt-5-mini")
 
     def tearDown(self):
         self.ldg.close()
@@ -344,7 +344,7 @@ class TestLedgerMigration(unittest.TestCase):
         conn.close()
         # Opening the Ledger should ALTER in the missing columns without error.
         ldg = Ledger(db_path)
-        ldg.start_run(seed="s", codebase="/r", model_queen="m", model_swarm="m")
+        ldg.start_run(seed="s", codebase="/r", model_queen="m", model_fanout="m")
         cid = ldg.begin_call("queen", "decompose", "copilot", "m", prompt="x" * 10)
         ldg.finish_call(cid, output="y" * 5, latency_s=1.0)
         ldg.close()

@@ -15,7 +15,7 @@ logger = logging.getLogger("hive.config")
 _DEFAULTS: dict[str, Any] = {
     "roles": {
         "queen":    {"provider": "copilot", "model": "gpt-5-mini"},
-        "swarm":    {"provider": "copilot", "model": "gpt-5-mini"},
+        "fanout":   {"provider": "copilot", "model": "gpt-5-mini"},
         "assemble": {"provider": "copilot", "model": "gpt-5-mini"},
         "specify":  {"provider": "copilot", "model": "gpt-5-mini"},
         # Effectiveness reviewer (specify's second pass). A tool-OFF single-shot
@@ -490,9 +490,11 @@ class FanoutConfig:
 @dataclass
 class Config:
     queen: RoleConfig = field(default_factory=RoleConfig)
-    # The legacy blanket-fanout worker (one drone per axis, `hive run`) — a real swarm,
-    # gated off by safety.allow_swarm. Distinct from `scout` below.
-    swarm: RoleConfig = field(default_factory=RoleConfig)
+    # The blanket fan-out worker (one drone per axis, `hive run`) — a real swarm,
+    # gated off by safety.allow_swarm. Named `fanout_role` to match the config
+    # (pipeline.fanout) and the ledger (B0001); reached via cfg.role("fanout").
+    # Distinct from `scout` below.
+    fanout_role: RoleConfig = field(default_factory=RoleConfig)
     # The B3 reinforcement worker: a FEW quality agents sent to dig up the evidence a
     # thin axis's blind grep missed — NOT a swarm (the swarm pattern lives in judge's
     # best-of-N voting). Named `scout` so the model is the obvious reinforcement-quality
@@ -605,20 +607,24 @@ class Config:
         return None
 
     def role(self, name: str) -> RoleConfig:
-        """Return the RoleConfig for a role ('queen', 'swarm', 'scout', 'assemble', 'specify', 'review', 'commit', 'judge')."""
+        """Return the RoleConfig for a role ('queen', 'fanout', 'scout', 'assemble', 'specify', 'review', 'commit', 'judge')."""
         if name == "assemble":
             return self.assemble_role
         if name == "judge":
             return self.judge_role
         if name == "converge":
             return self.converge_role
+        # "fanout" is the canonical name (config pipeline.fanout); "swarm" stays a
+        # back-compat alias for any caller / legacy config still using the old word.
+        if name in ("fanout", "swarm"):
+            return self.fanout_role
         return getattr(self, name, RoleConfig())
 
     def apply_cli_model(self, model: str | None) -> None:
         """Apply a CLI --model override to all roles (preserves --model semantics)."""
         if model is None:
             return
-        for role in (self.queen, self.swarm, self.scout, self.assemble_role,
+        for role in (self.queen, self.fanout_role, self.scout, self.assemble_role,
                      self.specify, self.review, self.commit, self.judge_role,
                      self.converge_role):
             role.model = model
@@ -714,7 +720,7 @@ def _expand_schema_v2(raw: dict) -> dict:
 
     fo = pipeline.get("fanout")
     if isinstance(fo, dict):
-        roles["swarm"] = _role_pm(fo, include_retries=False)
+        roles["fanout"] = _role_pm(fo, include_retries=False)
         out["safety"] = {**(raw.get("safety") or {}),
                          "allow_swarm": bool(fo.get("enabled", True))}
         out["fanout"] = {
@@ -806,6 +812,15 @@ def _normalize(raw: dict) -> dict:
     raw = _expand_schema_v2(raw)
     out = dict(raw)
 
+    # swarm -> fanout rename (B0001): the role is now keyed `fanout` (matching
+    # config pipeline.fanout + the ledger). A legacy v1 file that still writes
+    # `roles.swarm` is aliased here so it keeps feeding the fanout role unchanged.
+    nroles = out.get("roles")
+    if isinstance(nroles, dict) and "swarm" in nroles and "fanout" not in nroles:
+        nroles = dict(nroles)
+        nroles["fanout"] = nroles["swarm"]
+        out["roles"] = nroles
+
     providers = raw.get("providers")
     if isinstance(providers, dict):
         if isinstance(providers.get("copilot"), dict):
@@ -876,7 +891,7 @@ def _schema_v2_default_dict() -> dict:
         "coordinator": dict(roles["coordinator"]),
         "pipeline": {
             "decompose": dict(roles["queen"]),
-            "fanout": {**dict(roles["swarm"]),
+            "fanout": {**dict(roles["fanout"]),
                        "enabled": d["safety"]["allow_swarm"],
                        "parallel": d["fanout"]["parallel"],
                        "retries": d["fanout"]["retries"],
@@ -887,7 +902,7 @@ def _schema_v2_default_dict() -> dict:
                       "parallel": j["max_parallel"],
                       "max_axes": j["max_axes"],
                       "max_calls": j["max_total_calls"]},
-            "reinforce": {**dict(roles["swarm"]),
+            "reinforce": {**dict(roles["fanout"]),
                           "enabled": d["reinforce"]["enabled"],
                           "parallel": d["reinforce"]["max_workers"],
                           "max_calls": d["reinforce"]["max_total_calls"]},
@@ -1038,13 +1053,14 @@ def load_config(path: str | None = None, profile: str | None = None) -> Config:
                           timeout_sec=int(timeout) if timeout is not None else None,
                           retries=int(r.get("retries", 0)))
 
-    # `scout` (B3 reinforcement worker) defaults to the `swarm` role's model when the
-    # config does not name it, so an existing roles.swarm carries over unchanged.
-    swarm_role = _role("swarm")
-    scout_role = _role("scout") if "scout" in roles else swarm_role
+    # `scout` (B3 reinforcement worker) defaults to the `fanout` role's model when the
+    # config does not name it, so an existing roles.fanout (or legacy roles.swarm,
+    # aliased in _normalize) carries over unchanged.
+    fanout_role = _role("fanout")
+    scout_role = _role("scout") if "scout" in roles else fanout_role
     return Config(
         queen=_role("queen"),
-        swarm=swarm_role,
+        fanout_role=fanout_role,
         scout=scout_role,
         assemble_role=_role("assemble"),
         specify=_role("specify"),

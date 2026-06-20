@@ -3350,13 +3350,16 @@ def _lens_refute_once(prompt: str, provider: str, model: str, pk: dict[str, Any]
                       ledger, timeout: int, lens: str) -> dict[str, Any] | None:
     """One refuter model call (with a JSON-only reparse). Never raises; None on no JSON.
 
-    Recorded to the ledger under the ``swarm`` role so the cost lands in the cheap-tier
-    accounting (these are swarm-tier 120b calls, not the premium converge call).
+    Recorded to the ledger under the ``lens`` stage (NOT ``fanout``): these reuse the
+    fanout model SLOT (the cheap 120b tier) but are converge-stage refuters, not
+    source-mining fan-out drones. A distinct stage keeps "fanout disabled" honest in
+    the ledger — disabling pipeline.fanout silences the drones, while the lens panel
+    has its OWN gate (converge.lens.enabled) and shows up under its own name (B0001).
     """
     attempt_prompt = prompt
     parsed: dict[str, Any] | None = None
     for attempt in range(2):
-        call_id = ledger.begin_call("swarm", f"lens:{lens}", provider, model,
+        call_id = ledger.begin_call("lens", f"lens:{lens}", provider, model,
                                     attempt_prompt) if ledger is not None else None
         try:
             wr = call_worker(provider, model, attempt_prompt, cwd=None, timeout=timeout,

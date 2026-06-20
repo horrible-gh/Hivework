@@ -234,7 +234,7 @@ def run_fanout(
             (CH 0004.0008): a non-empty reply that is not comb-shaped — a search-memo —
             is recorded ok=0 even on exit 0, so comb-yield telemetry stops counting
             noise as success."""
-            cid = ledger.begin_call("swarm", stage_axis, provider, model, the_prompt,
+            cid = ledger.begin_call("fanout", stage_axis, provider, model, the_prompt,
                                     comb_path) if ledger is not None else None
             try:
                 result = call_worker(provider, model, the_prompt, cwd=codebase_root,

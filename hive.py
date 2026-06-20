@@ -167,7 +167,7 @@ def run_pipeline(args: argparse.Namespace) -> None:
     provider_kwargs = build_provider_kwargs(cfg)
 
     queen_role = cfg.queen
-    swarm_role = cfg.swarm
+    fanout_role = cfg.role("fanout")
     assemble_role = cfg.role("assemble")
     specify_role = cfg.role("specify")
 
@@ -186,7 +186,7 @@ def run_pipeline(args: argparse.Namespace) -> None:
     logger.info("  workdir:  %s", workdir)
     logger.info("  round-cap: %d", args.round_cap)
     logger.info("  queen:    %s/%s", queen_role.provider, queen_role.model)
-    logger.info("  swarm:    %s/%s", swarm_role.provider, swarm_role.model)
+    logger.info("  fanout:   %s/%s", fanout_role.provider, fanout_role.model)
     logger.info("  assemble: %s/%s", assemble_role.provider, assemble_role.model)
     if args.specify:
         logger.info("  specify:  %s/%s (chained)", specify_role.provider, specify_role.model)
@@ -194,7 +194,7 @@ def run_pipeline(args: argparse.Namespace) -> None:
 
     ldg = open_ledger(cfg.ledger.enabled, cfg.ledger.db_path)
     ldg.start_run(seed=args.seed, codebase=args.codebase,
-                  model_queen=queen_role.model, model_swarm=swarm_role.model)
+                  model_queen=queen_role.model, model_fanout=fanout_role.model)
 
     honey_path = ""
     final_combs: list[dict] = []
@@ -334,8 +334,8 @@ def run_pipeline(args: argparse.Namespace) -> None:
             codebase_root=args.codebase,
             workdir=workdir,
             contract_path=contract_path,
-            model=swarm_role.model,
-            provider=swarm_role.provider,
+            model=fanout_role.model,
+            provider=fanout_role.provider,
             ledger=ldg,
             provider_kwargs=provider_kwargs,
             max_workers=cfg.fanout.parallel,
@@ -647,7 +647,7 @@ def run_investigate_command(args: argparse.Namespace) -> None:
 
     ldg = open_ledger(cfg.ledger.enabled, cfg.ledger.db_path)
     ldg.start_run(seed=args.seed, codebase=args.codebase,
-                  model_queen=queen.model, model_swarm=judge_role.model)
+                  model_queen=queen.model, model_fanout=judge_role.model)
     result: dict = {}
     try:
         result = run_investigate(
@@ -700,7 +700,7 @@ def run_investigate_command(args: argparse.Namespace) -> None:
         # and the chained specify worker calls leave NO rows. Start a run here so
         # the post-converge worker shows up in the configured ledger DB.
         ldg2.start_run(seed=args.seed, codebase=args.codebase,
-                       model_queen=specify_role.model, model_swarm=specify_role.model)
+                       model_queen=specify_role.model, model_fanout=specify_role.model)
         try:
             review_role = cfg.role("review")
             specify_kwargs = dict(author_retries=specify_role.retries)
@@ -800,12 +800,12 @@ def run_reconverge_command(args: argparse.Namespace) -> None:
 
     ldg = open_ledger(cfg.ledger.enabled, cfg.ledger.db_path)
     ldg.start_run(seed=args.seed, codebase=args.codebase,
-                  model_queen=conv_role.model, model_swarm=conv_role.model)
+                  model_queen=conv_role.model, model_fanout=conv_role.model)
     try:
         bundles = _rebuild_bundles(verdicts, args.codebase, args.docs)
         split_cfg = cfg.converge_split
         lens_cfg = cfg.converge_lens
-        swarm_role = cfg.role("swarm")
+        fanout_role = cfg.role("fanout")
         cres = run_converge(
             seed_text=seed_text, verdicts=_converge_fragments(verdicts), bundles=bundles,
             provider=conv_role.provider, model=conv_role.model, code_root=args.codebase,
@@ -813,8 +813,8 @@ def run_reconverge_command(args: argparse.Namespace) -> None:
             split_enabled=split_cfg.enabled, split_max_loci=split_cfg.max_loci,
             split_provider=split_cfg.provider, split_model=split_cfg.model,
             lens_lenses=(lens_cfg.lenses if lens_cfg.enabled else []),
-            lens_provider=(lens_cfg.provider or swarm_role.provider),
-            lens_model=(lens_cfg.model or swarm_role.model),
+            lens_provider=(lens_cfg.provider or fanout_role.provider),
+            lens_model=(lens_cfg.model or fanout_role.model),
             lens_min_refute=lens_cfg.min_refute)
         ldg.finish_run(status="done")
     except Exception:
@@ -877,7 +877,7 @@ def run_specify_command(args: argparse.Namespace) -> None:
 
     ldg = open_ledger(cfg.ledger.enabled, cfg.ledger.db_path)
     ldg.start_run(seed=args.honey, codebase=args.codebase,
-                  model_queen=role.model, model_swarm=role.model)
+                  model_queen=role.model, model_fanout=role.model)
     specify_kwargs = dict(author_retries=role.retries)
     if role.timeout_sec is not None:
         specify_kwargs["author_timeout"] = role.timeout_sec
@@ -1023,7 +1023,7 @@ def run_commit_plan_command(args: argparse.Namespace) -> None:
 
     ldg = open_ledger(cfg.ledger.enabled, cfg.ledger.db_path)
     ldg.start_run(seed=args.repo, codebase=args.repo,
-                  model_queen=role.model, model_swarm=role.model)
+                  model_queen=role.model, model_fanout=role.model)
     plan: dict = {}
     try:
         plan = run_propose(

@@ -49,10 +49,10 @@ class TestConfigDefaults(unittest.TestCase):
         self.assertEqual(self.cfg.queen.model, "gpt-5-mini")
 
     def test_swarm_provider_copilot(self):
-        self.assertEqual(self.cfg.swarm.provider, "copilot")
+        self.assertEqual(self.cfg.role("fanout").provider, "copilot")
 
     def test_swarm_model_gpt5mini(self):
-        self.assertEqual(self.cfg.swarm.model, "gpt-5-mini")
+        self.assertEqual(self.cfg.role("fanout").model, "gpt-5-mini")
 
     def test_assemble_provider_copilot(self):
         self.assertEqual(self.cfg.role("assemble").provider, "copilot")
@@ -153,7 +153,7 @@ class TestConfigSafety(unittest.TestCase):
                                     "scout": {"provider": "copilot",
                                               "model": "claude-sonnet-4.5"}}})
         self.assertEqual(cfg.scout.model, "claude-sonnet-4.5")   # the reinforcement lever
-        self.assertEqual(cfg.swarm.model, "m120")                # legacy swarm untouched
+        self.assertEqual(cfg.role("fanout").model, "m120")                # legacy swarm untouched
 
 
 class TestTestRunners(unittest.TestCase):
@@ -285,7 +285,7 @@ class TestConfigPartialFile(unittest.TestCase):
         self.cfg = load_config(path=self.config_path)
 
     def test_swarm_model_overridden(self):
-        self.assertEqual(self.cfg.swarm.model, "claude-sonnet-4.6")
+        self.assertEqual(self.cfg.role("fanout").model, "claude-sonnet-4.6")
 
     def test_queen_model_still_default(self):
         self.assertEqual(self.cfg.queen.model, "gpt-5-mini")
@@ -345,7 +345,7 @@ class TestConfigCliOverride(unittest.TestCase):
         cfg = load_config(path="/nonexistent/hive.config.json")
         cfg.apply_cli_model("claude-opus-4.7")
         self.assertEqual(cfg.queen.model, "claude-opus-4.7")
-        self.assertEqual(cfg.swarm.model, "claude-opus-4.7")
+        self.assertEqual(cfg.role("fanout").model, "claude-opus-4.7")
         self.assertEqual(cfg.role("assemble").model, "claude-opus-4.7")
         self.assertEqual(cfg.role("judge").model, "claude-opus-4.7")
 
@@ -497,9 +497,9 @@ class TestSchemaV2(unittest.TestCase):
         cfg = self._load({"pipeline": {"fanout": {
             "provider": "openai", "model": "m120", "enabled": True,
             "parallel": 6, "retries": 2, "max_calls": 30}}})
-        self.assertEqual(cfg.swarm.provider, "openai")
-        self.assertEqual(cfg.swarm.model, "m120")
-        self.assertEqual(cfg.swarm.retries, 0)   # stage retries must NOT leak into the role
+        self.assertEqual(cfg.role("fanout").provider, "openai")
+        self.assertEqual(cfg.role("fanout").model, "m120")
+        self.assertEqual(cfg.role("fanout").retries, 0)   # stage retries must NOT leak into the role
         self.assertTrue(cfg.safety.allow_swarm)  # enabled drives the kill-switch
         self.assertEqual(cfg.fanout.parallel, 6)
         self.assertEqual(cfg.fanout.retries, 2)

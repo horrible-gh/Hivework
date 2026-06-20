@@ -23,7 +23,7 @@ logger = logging.getLogger("hive.ledger")
 _DDL = """
 CREATE TABLE IF NOT EXISTS runs (
     id INTEGER PRIMARY KEY, ts TEXT, seed TEXT, work_type TEXT, codebase TEXT,
-    model_queen TEXT, model_swarm TEXT,
+    model_queen TEXT, model_fanout TEXT,
     axes_n INTEGER, rounds INTEGER, conflicts_n INTEGER, remaining_n INTEGER, parse_errs INTEGER,
     total_in_chars INTEGER, total_out_chars INTEGER,
     total_est_tokens INTEGER, total_real_tokens INTEGER,
@@ -45,6 +45,11 @@ CREATE TABLE IF NOT EXISTS worker_calls (
 _MIGRATIONS = (
     "ALTER TABLE worker_calls ADD COLUMN status TEXT",
     "ALTER TABLE worker_calls ADD COLUMN started_at TEXT",
+    # swarm -> fanout rename (B0001): unify the ledger name with the config
+    # (pipeline.fanout). On a historical DB this renames the column in place;
+    # on a fresh DB created with the new DDL the column is already `model_fanout`
+    # so this RENAME raises "no such column: model_swarm" and is swallowed below.
+    "ALTER TABLE runs RENAME COLUMN model_swarm TO model_fanout",
 )
 
 
@@ -110,7 +115,7 @@ class Ledger:
         (e.g. the runs.jsonl emit hook) reference the row after finish_run."""
         return self._run_id
 
-    def start_run(self, seed: str, codebase: str, model_queen: str, model_swarm: str,
+    def start_run(self, seed: str, codebase: str, model_queen: str, model_fanout: str,
                   ts: str | None = None) -> None:
         """Insert a runs row with status='running'."""
         if self._conn is None:
@@ -119,9 +124,9 @@ class Ledger:
         try:
             with self._lock:
                 cur = self._conn.execute(
-                    "INSERT INTO runs (ts, seed, work_type, codebase, model_queen, model_swarm, status)"
+                    "INSERT INTO runs (ts, seed, work_type, codebase, model_queen, model_fanout, status)"
                     " VALUES (?,?,?,?,?,?,?)",
-                    (ts, seed, "investigate", codebase, model_queen, model_swarm, "running"))
+                    (ts, seed, "investigate", codebase, model_queen, model_fanout, "running"))
                 self._conn.commit()
                 self._run_id = cur.lastrowid
         except Exception as e:

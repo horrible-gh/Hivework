@@ -65,7 +65,7 @@ class TestGuidedPresetGenerator(unittest.TestCase):
         # tool-OFF rulings->HTTP.
         rm = hive_setup.build_tier_preset({"codex", "copilot", "openai"}, "mix")
         self.assertEqual(rm["queen"][0], "codex")       # heavy author
-        self.assertEqual(rm["swarm"][0], "copilot")     # light agentic
+        self.assertEqual(rm["fanout"][0], "copilot")    # light agentic
         self.assertEqual(rm["judge"][0], "openai")      # tool-OFF ruling
         self.assertEqual({p for p, _m in rm.values()}, {"codex", "copilot", "openai"})
 
