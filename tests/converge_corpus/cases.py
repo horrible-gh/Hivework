@@ -1,6 +1,8 @@
 """Hermetic inputs for converge's deterministic causal/provenance guards."""
 from __future__ import annotations
 
+import os
+import tempfile
 from copy import deepcopy
 from dataclasses import dataclass
 from typing import Any
@@ -28,6 +30,13 @@ class CorpusCase:
     windows: list[dict[str, Any]]
     guard: str
     expect: dict[str, Any]
+    # Live producer source to materialize under a temp ``code_root`` before the guard runs
+    # (relpath -> source). Needed by the HTTP-datasource plumbing-abstain path, whose gate
+    # (``_looks_like_datasource``) only fires when the winning-path producer's code is
+    # READABLE — ``if ptext and not _looks_like_datasource(ptext)``. The permanent corpus
+    # otherwise calls the guard with ``code_root=None`` (empty ``ptext``), which silently
+    # BYPASSES the gate (0032 NR0003 §3). None → keep the historical ``code_root=None`` call.
+    producer_files: dict[str, str] | None = None
 
 
 def _located(axis_id: str, file: str, lines: str, reason: str,
@@ -269,6 +278,81 @@ DC_FIELD_WINDOWS = [
 # correct but clearly fake; no real coordinates are documented for these shapes.
 P0_ATTR = "server/app/query.py"
 P0_PEER = "client/app/render.ts"
+
+
+# ── R0001 / group 0032: forced winning-path PLUMBING-decoy injection ──────────────
+# DETERMINISTIC regression net for the converge HTTP-datasource gate's plumbing-abstain
+# (``_winningpath_ds_targets`` + ``_looks_like_datasource``, committed ab057a4). Source
+# material is CAPTURED VERBATIM from real swarm-OFF runs — NOT hand-authored — to remove the
+# teaching-to-the-test bias R0001 #2 warns about:
+#   • ``get_store`` @ db/connection.py:229-234 — run 480 (smoke/0030_ts0002); the decoy the
+#     pre-gate guard re-pointed onto and held converged (golden_0082 _result_note: headline
+#     locus = db/connection.py != dispose_group event-write → found=false).
+#   • the decoy SHIFTED from db/projects.py (run 477) to db/connection.py (run 480) — golden
+#     calls the residual "robust and locus-independent", so a POSITION variant is grounded in
+#     real data, not invention (R0001 #4 family: getter/store/connection location/shape).
+# The committed gate abstains on these pure accessors so the attribution STAYS on the correct
+# dispose_group handler (golden _found_rule). Disabling the gate re-points onto the decoy —
+# the firing/removal asymmetry the meta test asserts (R0001 #3: gate無력화 → RED).
+DISPOSE_HANDLER = "server/modules/flow_gate/process_service.py"  # golden _found_rule locus
+
+# Verbatim: FlowGate-dev/FlowGate/server/modules/flow_gate/db/connection.py:229-234 (run 480).
+_CAP_GET_STORE = (
+    "def get_store() -> FlowGateStore:\n"
+    '    """Return the singleton FlowGateStore."""\n'
+    "    global STORE\n"
+    "    if STORE is None:\n"
+    "        STORE = FlowGateStore()\n"
+    "    return STORE\n"
+)
+# Sibling accessor shapes in the same family (connection/getter variants). Each is pure
+# plumbing: it returns a handle, produces NO collection/row data, so _looks_like_datasource
+# is False and the gate must abstain exactly as for get_store.
+_CAP_GET_CONNECTION = "def get_connection():\n    return self._conn\n"
+_CAP_GET_CONN = "def get_conn():\n    return _POOL.handle\n"
+
+# The forced FE edge: a gated collection (``length > 0``) filled from an HTTP URL whose
+# winning-path producer is the injected plumbing decoy. Field stems {types, type} are absent
+# from every accessor body above, so condition (b) "producer omits the field" holds and the
+# verdict turns purely on condition (c), the datasource-shape gate.
+FORCED_FE = "client/src/main/components/DesignTypePicker.vue"
+FORCED_URL = "/api/v1/q"
+
+
+def _forced_fe_windows() -> list[dict[str, Any]]:
+    return [{
+        "file": FORCED_FE, "lines": "30-44",
+        "text": (
+            "const res = await getRequest('/api/v1/q')\n"
+            "designTypes.value = res.data.types ?? []\n"
+            "if (designTypes.length > 0) renderTypes()\n"
+        ),
+    }]
+
+
+def _forced_inject_located(decoy_file: str, decoy_lines: str) -> list[dict[str, Any]]:
+    """Correct dispose_group handler + a forced HTTP_WINNING_PATH plumbing decoy on the URL."""
+    return [
+        _located("DISPOSE_ROUTE", DISPOSE_HANDLER, "2091-2150",
+                 "winning HTTP path reaches dispose_group (correct handler)"),
+        {
+            "axis_id": f"HTTP_WINNING_PATH:{FORCED_URL}",
+            "title": f"winning HTTP response producer for {FORCED_URL}",
+            "verdict": {"located": True, "file": decoy_file, "lines": decoy_lines,
+                        "reason": "deterministic winning request-path producer (plumbing decoy)"},
+            "votes": [], "candidates": [], "coverage": {},
+        },
+    ]
+
+
+def _forced_inject_result() -> ConvergeResult:
+    return _result(DISPOSE_HANDLER, "2091-2150",
+                   trace="dispose_group is on the executed path and produces the 500")
+
+
+DECOY_CONN = "server/modules/flow_gate/db/connection.py"
+DECOY_PROJ = "server/modules/flow_gate/db/projects.py"   # run-477 position variant
+DECOY_STORE = "server/modules/flow_gate/db/store.py"
 
 
 CASES = [
@@ -703,6 +787,99 @@ CASES = [
             "outcome": "PRESERVE",
         },
     ),
+    # ── R0001 forced winning-path plumbing-decoy family (captured, code_root-backed) ──
+    # ABSTAIN cases (R0001 #3 GREEN): readable captured plumbing → gate abstains → the
+    # attribution STAYS on dispose_group, NO re-point. The meta test proves each flips to a
+    # re-point when the gate is disabled (gate無력화 → RED).
+    CorpusCase(
+        id="plumbing-get_store-connection",
+        summary="captured run-480 get_store decoy on the winning path → gate abstains, "
+                "attribution stays on dispose_group",
+        captured=True,
+        result=_forced_inject_result(),
+        located=_forced_inject_located(DECOY_CONN, "1-6"),
+        windows=_forced_fe_windows(),
+        guard="http_datasource",
+        producer_files={DECOY_CONN: _CAP_GET_STORE},
+        expect={
+            "converged": True,
+            "attributed_file": DISPOSE_HANDLER,
+            "stamp": None,
+            "outcome": "ABSTAIN",
+        },
+    ),
+    CorpusCase(
+        id="plumbing-get_store-projects",
+        summary="same get_store plumbing shape at the run-477 position (db/projects.py) → "
+                "abstain holds (locus-independent, R0001 #4)",
+        captured=True,
+        result=_forced_inject_result(),
+        located=_forced_inject_located(DECOY_PROJ, "1-6"),
+        windows=_forced_fe_windows(),
+        guard="http_datasource",
+        producer_files={DECOY_PROJ: _CAP_GET_STORE},
+        expect={
+            "converged": True,
+            "attributed_file": DISPOSE_HANDLER,
+            "stamp": None,
+            "outcome": "ABSTAIN",
+        },
+    ),
+    CorpusCase(
+        id="plumbing-get_connection",
+        summary="get_connection accessor variant (shape variation, R0001 #4) → abstain",
+        captured=False,
+        result=_forced_inject_result(),
+        located=_forced_inject_located(DECOY_CONN, "1-2"),
+        windows=_forced_fe_windows(),
+        guard="http_datasource",
+        producer_files={DECOY_CONN: _CAP_GET_CONNECTION},
+        expect={
+            "converged": True,
+            "attributed_file": DISPOSE_HANDLER,
+            "stamp": None,
+            "outcome": "ABSTAIN",
+        },
+    ),
+    CorpusCase(
+        id="plumbing-get_conn-store",
+        summary="get_conn accessor at db/store.py (getter+location variation) → abstain",
+        captured=False,
+        result=_forced_inject_result(),
+        located=_forced_inject_located(DECOY_STORE, "1-2"),
+        windows=_forced_fe_windows(),
+        guard="http_datasource",
+        producer_files={DECOY_STORE: _CAP_GET_CONN},
+        expect={
+            "converged": True,
+            "attributed_file": DISPOSE_HANDLER,
+            "stamp": None,
+            "outcome": "ABSTAIN",
+        },
+    ),
+    # EMPTY-PTEXT FAIL-OPEN lock (R0001 NR0003 §3/§7-4): the SAME injection with NO readable
+    # producer code (producer_files=None → code_root=None → ptext=="") BYPASSES the gate and
+    # re-points onto the plumbing decoy. This is the latent hole the live run-480 miss rode
+    # (the gate predates the run, but the bypass survives it). Pinned here so the current
+    # fail-open is explicit and a future corpus author cannot add a code_root-less plumbing
+    # case and mistake the resulting bypass for a passing abstain.
+    CorpusCase(
+        id="plumbing-empty-ptext-failopen",
+        summary="no readable producer code → gate bypassed → re-points onto the decoy "
+                "(documents the empty-ptext fail-open; NOT a desired outcome)",
+        captured=False,
+        result=_forced_inject_result(),
+        located=_forced_inject_located(DECOY_CONN, "1-6"),
+        windows=_forced_fe_windows(),
+        guard="http_datasource",
+        producer_files=None,
+        expect={
+            "converged": True,
+            "attributed_file": DECOY_CONN,
+            "stamp": "http_datasource_provenance_repointed",
+            "outcome": "RE-POINT (fail-open)",
+        },
+    ),
 ]
 
 
@@ -723,6 +900,19 @@ def run_case(case: CorpusCase) -> ConvergeResult:
             chain_broke=bool(inputs.get("chain_broke")),
         )
     if case.guard == "http_datasource":
+        if case.producer_files:
+            # Materialize the captured producer source so the gate's _looks_like_datasource
+            # check has readable ``ptext`` (the plumbing-abstain path is dead under
+            # code_root=None — 0032 NR0003 §3). The temp tree lives only for the guard call.
+            with tempfile.TemporaryDirectory() as root:
+                for rel, src in case.producer_files.items():
+                    path = os.path.join(root, rel.replace("/", os.sep))
+                    os.makedirs(os.path.dirname(path), exist_ok=True)
+                    with open(path, "w", encoding="utf-8") as fh:
+                        fh.write(src)
+                return _http_datasource_provenance_guard(
+                    res, located, windows, code_root=root
+                )
         return _http_datasource_provenance_guard(
             res, located, windows, code_root=None
         )
