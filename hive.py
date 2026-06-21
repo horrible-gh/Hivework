@@ -648,7 +648,9 @@ def run_investigate_command(args: argparse.Namespace) -> None:
     ldg = open_ledger(cfg.ledger.enabled, cfg.ledger.db_path)
     ldg.start_run(seed=args.seed, codebase=args.codebase,
                   model_queen=queen.model, model_fanout=judge_role.model)
+    run_id = ldg.run_id
     result: dict = {}
+    investigate_ok = False
     try:
         result = run_investigate(
             seed_text=seed_text, recipe_path=args.recipe, code_root=args.codebase,
@@ -657,11 +659,23 @@ def run_investigate_command(args: argparse.Namespace) -> None:
         )
         ldg.finish_run(honey_path=args.out, axes_n=result.get("axes_judged", 0),
                        status="done")
+        investigate_ok = True
     except Exception:
         ldg.finish_run(status="failed")
         raise
     finally:
         ldg.close()
+
+    # Best-effort telemetry: project this finished investigate cycle into
+    # perf/metrics/runs.jsonl, mirroring the swarm run path (see _emit_runs_jsonl
+    # call above). Before this hook the investigate path wrote the ledger but never
+    # the report's input, so every investigate run was invisible in runs.html until
+    # a manual emit.py (hivework.0035.0014-T "실행 레포트가 안보인다"). The golden
+    # block is omitted here (it needs the external scorer); an operator splices it
+    # later via `emit.py --golden-json`, which report.load_runs dedups last-wins.
+    if investigate_ok:
+        _emit_runs_jsonl(run_id, os.path.dirname(os.path.abspath(args.out)),
+                         cfg.ledger.db_path, logger)
 
     located = sum(1 for v in result.get("verdicts", []) if v["verdict"]["located"])
     logger.info("=" * 60)

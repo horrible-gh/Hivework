@@ -327,6 +327,270 @@ def _prioritize_axes(leaves: list[dict[str, Any]], seed_text: str,
     return [seed_axis] + ranked
 
 
+# ── Mutation-path guard (NR hivework.0034.0006) ────────────────────────────────
+# A FK/constraint/persistence bug fails on a DATA WRITE the symptom never
+# advertises: the failing write sits in a mid-layer service (run500:
+# ``process_service.dispose_group``'s ``insert_event(group_id, …)`` → ``events.doc_id``
+# FK) while the SURFACE signal points at the DB error class and the FE caller. So the
+# queen's write-path axis scores LOW on surface relevance, and the position-based
+# ``max_axes`` cut (``judged = leaves[:max_axes]``) drops it before the judge ever
+# sees it — run500: 10 axes, judge cap 3, the dispose write-path axis never judged →
+# recall 0/1, converge skipped. Worse, SQLite's bare ``FOREIGN KEY constraint failed``
+# names NO table/column, so the axis cannot be re-ranked by table text either.
+#
+# This guard pins the write-path axis ahead of the cut whenever the symptom is a
+# persistence-class failure — the SEED_ANCHOR / scaffolding-leaf / be_root family
+# (deterministic axis injection BEFORE the ``max_axes`` truncation), applied to data
+# mutations. It is a no-op outside the persistence class (over-fire gate) and a no-op
+# when no axis covers a mutation path. Pure, free, deterministic; never raises.
+_RESERVED_MUTATION_SEATS = 2
+
+# (a) The symptom is a persistence/constraint failure. A constraint/integrity cue
+#     PLUS a write-or-failure cue — both required so a plain HTTP/FE report does not
+#     trip it (dash/case-insensitive).
+_FK_PERSISTENCE_RE = re.compile(
+    r"foreign\s*key|foreignkey|\bfk\b|integrity\s*error|integrityerror|"
+    r"unique\s+constraint|not\s*null\s+constraint|check\s+constraint|"
+    r"constraint\s+(?:failed|violat)|\bconstraint\b[^\n]{0,40}\bviolat|"
+    r"\borphan(?:ed)?\b|\bcascade\b",
+    re.IGNORECASE)
+_WRITE_OR_FAIL_RE = re.compile(
+    r"\binsert\b|\bupdate\b|\bdelete\b|\bcommit\b|\btransaction\b|\brollback\b|"
+    r"\bwrite\b|\bpersist|\bmigrat|\b5\d\d\b|exception|error|fail|raise|traceback",
+    re.IGNORECASE)
+
+# (b) A DB write/mutation signature, as a ripgrep regex run over an axis's real
+#     globbed files (and matched against its brief/keywords text). Covers raw SQL DML,
+#     write-helper calls (``insert_event(``, ``update_group(``), and ORM mutations.
+_MUTATION_CODE_PATTERN = (
+    r"insert\s+into|update\s+\w+\s+set|delete\s+from|"
+    r"\b(?:insert|update|delete|upsert|save)_\w*\s*\(|"
+    r"\.(?:add|commit|delete|merge|bulk_save\w*)\s*\(|"
+    r"\.execute\s*\(\s*[\"'`]?\s*(?:insert|update|delete)")
+_MUTATION_CODE_RE = re.compile(_MUTATION_CODE_PATTERN, re.IGNORECASE)
+# Text route (axis brief/keywords): keywords are bare symbol names without a call
+# paren (``insert_event``, not ``insert_event(``), so the brief/keyword scan matches
+# write-helper IDENTIFIERS and raw SQL DML — the paren-bound form above is for the
+# real-code grep where precision matters.
+_MUTATION_TEXT_RE = re.compile(
+    r"insert\s+into|update\s+\w+\s+set|delete\s+from|"
+    r"\b(?:insert|update|delete|upsert)_\w+\b|"
+    r"\.(?:add|commit|merge)\s*\(",
+    re.IGNORECASE)
+
+# snake_case / table.column tokens that are too generic to disambiguate a write axis.
+_HINT_NOISE = frozenset({
+    "doc_id", "group_id", "user_id", "created_at", "updated_at", "id", "name",
+    "type", "status", "value", "data", "result", "error", "code", "self",
+})
+
+
+def _fk_persistence_seed(seed_text: str) -> bool:
+    """Whether the symptom is a persistence/constraint-class failure (over-fire gated).
+
+    Requires a constraint/integrity cue AND a write-or-failure cue, so an ordinary
+    HTTP / FE / data-source report does not arm the guard. Deterministic, free.
+    """
+    text = seed_text or ""
+    return bool(_FK_PERSISTENCE_RE.search(text) and _WRITE_OR_FAIL_RE.search(text))
+
+
+# (c) Broadened mutation-symptom arming (NR hivework.0035.0003). The realistic
+#     reporter never writes "FOREIGN KEY" — they write "discarding a group returns
+#     500" (run502 seed). _fk_persistence_seed then stays False and the mutation
+#     guards sleep, so the answer write-path axis is never rescued. A 5xx/error cue
+#     PLUS a data-mutation VERB (dispose/delete/close/insert… EN+KO) arms the guard
+#     WITHOUT the seed advertising an FK word. Precision is NOT carried by these
+#     words — it is carried downstream by _is_mutation_path_axis's strict real-file
+#     write-signature gate: a broadened arm that finds no writing axis is a no-op.
+_MUTATION_VERB_RE = re.compile(
+    r"\bdispose\b|\bdiscard(?:ed|ing|s)?\b|\bdelete\b|\bremov(?:e|ed|ing|al)\b|"
+    r"\bdrop\b|\bclose\b|\bclosing\b|\binsert\b|\bupdate\b|\bsave\b|\bpersist|"
+    r"\bcommit\b|\bwrite\b|\bmutat|"
+    r"폐기|마감|삭제|제거|저장|기록|등록",
+    re.IGNORECASE)
+_SERVER_ERROR_RE = re.compile(
+    r"\b5\d\d\b|internal\s+server\s+error|integrity\s*error|integrityerror|"
+    r"\bexception\b|traceback|\braise[sd]?\b|\bfail(?:ed|s|ure)?\b|에러|오류|실패",
+    re.IGNORECASE)
+
+
+def _mutation_symptom_seed(seed_text: str) -> bool:
+    """Whether the symptom is a data-mutation failure (broadened arm, NR 0035.0003).
+
+    Fires on the original FK/constraint class (:func:`_fk_persistence_seed`) OR on a
+    server-error + mutation-verb symptom that does NOT advertise an FK word — the
+    realistic case ("dispose returns 500"). This only ARMS the mutation guards;
+    whether any axis is actually promoted / pinned is decided by the strict real-file
+    write-signature gate in :func:`_is_mutation_path_axis`, so a broadened arm can
+    never localise a non-write bug. Deterministic, free, never raises.
+    """
+    text = seed_text or ""
+    if _fk_persistence_seed(text):
+        return True
+    return bool(_SERVER_ERROR_RE.search(text) and _MUTATION_VERB_RE.search(text))
+
+
+def _extract_table_hints(seed_text: str) -> set[str]:
+    """Best-effort table/write-symbol tokens the seed names (for precision, not gating).
+
+    SQLite's ``FOREIGN KEY constraint failed`` carries no table — so these hints are
+    optional. When the seed DOES write a concrete symbol (``insert_event``,
+    ``group_events``, ``events.doc_id``), they disambiguate WHICH axis is the write
+    path; when it names none, the write-signature scan (b) still fires unaided.
+    """
+    text = seed_text or ""
+    hints: set[str] = set()
+    # snake_case write symbols / table names — lowercase by convention, so NO
+    # IGNORECASE (else ``sqlite3.IntegrityError`` leaks "sqlite3" and over-restricts).
+    for m in re.finditer(r"\b([a-z][a-z0-9]*_[a-z0-9_]+)\b", text):
+        hints.add(m.group(1))
+    # table.column access — both sides lowercase (a real column), excludes
+    # ``Module.ClassError`` and other PascalCase attribute references.
+    for m in re.finditer(r"\b([a-z][a-z0-9_]{2,})\.[a-z][a-z0-9_]*\b", text):
+        hints.add(m.group(1))
+    for m in re.finditer(
+            r"\b(?:table|relation|into|references)\s+[\"'`]?([a-z][a-z0-9_]{2,})",
+            text, re.IGNORECASE):
+        hints.add(m.group(1).lower())
+    return {h for h in hints if len(h) >= 4 and h not in _HINT_NOISE}
+
+
+def _axis_blob(axis: dict[str, Any]) -> str:
+    sp = axis.get("search_plan") or {}
+    parts = [str(axis.get("title", "")), str(axis.get("brief", ""))]
+    parts += [str(k) for k in (sp.get("keywords") or [])]
+    return " ".join(parts).lower()
+
+
+def _grep_mutation_hits(globs: list[str], code_root: str) -> list[dict[str, Any]]:
+    """Non-test code lines under ``globs`` that carry a write/mutation signature."""
+    if not code_root or not globs:
+        return []
+    try:
+        hits = _ripgrep(_MUTATION_CODE_PATTERN, [str(g) for g in globs],
+                        code_root, max_hits=12)
+    except (OSError, ValueError):
+        return []
+    return [h for h in hits if not _is_test_path(h.get("file", ""))]
+
+
+def _is_test_path(rel: str) -> bool:
+    p = (rel or "").replace("\\", "/").lower()
+    return ("/test" in p or p.startswith("test")
+            or os.path.basename(p).startswith("test_") or "/tests/" in p)
+
+
+def _is_mutation_path_axis(axis: dict[str, Any], table_hints: set[str],
+                           code_root: str | None) -> bool:
+    """Whether an axis covers a DB write/mutation path (the write-path the FK bug rides).
+
+    Two evidence routes (OR): the axis's brief/keywords already name a write, OR its
+    real globbed files contain a write signature. When the seed supplied concrete
+    table/symbol hints, the axis must ALSO reference one (text or file) — this raises
+    precision; with no hints (bare SQLite) the write signature alone qualifies. Pure,
+    never raises; a read-only (SELECT/get_/list_) axis simply shows no signature.
+    """
+    blob = _axis_blob(axis)
+    sp = axis.get("search_plan") or {}
+    globs = [str(g) for g in (sp.get("file_globs") or [])]
+    text_write = bool(_MUTATION_TEXT_RE.search(blob))
+    file_hits = _grep_mutation_hits(globs, code_root or "")
+    if not (text_write or file_hits):
+        return False
+    if not table_hints:
+        return True
+    if any(h in blob for h in table_hints):
+        return True
+    # Require a hint to appear in the SAME globbed files that carry the write.
+    if file_hits and code_root:
+        try:
+            hint_re = "|".join(re.escape(h) for h in sorted(table_hints))
+            hint_hits = _ripgrep(hint_re, globs, code_root, max_hits=8)
+        except (OSError, ValueError):
+            hint_hits = []
+        if any(not _is_test_path(h.get("file", "")) for h in hint_hits):
+            return True
+    return False
+
+
+def ensure_mutation_path_axis(leaves: list[dict[str, Any]], seed_text: str,
+                              code_root: str | None) -> list[dict[str, Any]]:
+    """Pin write-path axes ahead of the ``max_axes`` cut for persistence-class bugs.
+
+    Reorders ``leaves`` so up to ``_RESERVED_MUTATION_SEATS`` mutation-path axes ride
+    at the front (their relative order preserved); the rest follow unchanged. The
+    actual truncation still happens at ``leaves[:max_axes]`` downstream — this guard
+    only guarantees the write-path axis is INSIDE the cut, so the judge always rules
+    on it. No-op when the symptom is not persistence-class or no axis covers a write.
+    """
+    if not leaves or not _mutation_symptom_seed(seed_text):
+        return leaves
+    table_hints = _extract_table_hints(seed_text)
+    pinned = [a for a in leaves
+              if _is_mutation_path_axis(a, table_hints, code_root)]
+    if not pinned:
+        return leaves
+    pinned = pinned[:_RESERVED_MUTATION_SEATS]
+    pinned_ids = {id(a) for a in pinned}
+    rest = [a for a in leaves if id(a) not in pinned_ids]
+    logger.info("mutation-path guard: persistence-class symptom — pinned %d "
+                "write-path axis(es) %s ahead of max_axes cut (table_hints=%s)",
+                len(pinned), [a.get("id") or a.get("name") or "?" for a in pinned],
+                sorted(table_hints) or "(none — bare-message fallback)")
+    return pinned + rest
+
+
+def promote_mutation_path_axes(
+        tasks: list[dict[str, Any]], seed_text: str,
+        code_root: str | None) -> list[dict[str, Any]]:
+    """Promote buried NON-leaf write-path axes to leaves (NR hivework.0035.0003).
+
+    LEAF STARVATION (TSR hivework.0034.0012, live run502): the queen routinely emits
+    the answer write-path axis (run502: ``service_logic``, ``db_queries``) as a
+    NON-leaf — it declares ``depends_on`` to express a narrative "investigate the
+    route, THEN the service it calls, THEN the table it writes" ordering, not a true
+    data dependency. :func:`_leaf_axes` then drops every dependent axis before the
+    judge, and every downstream guard (:func:`ensure_mutation_path_axis`,
+    :func:`_prioritize_axes`) only reorders WITHIN the leaf set — so the write-path
+    axis is unreachable and the bug is never localised (recall 0/1 MISS).
+
+    This guard runs on the FULL task set (like :func:`dissolve_scaffolding_leaves`,
+    BEFORE ``_leaf_axes``) and clears the ``depends_on`` of up to
+    ``_RESERVED_MUTATION_SEATS`` non-leaf axes that carry a real write signature,
+    promoting them to leaves so the judge rules on them. The narrative ordering is
+    dropped only for the write-path axis — every other dependent axis is untouched.
+
+    No-op unless the symptom is mutation-class (:func:`_mutation_symptom_seed`,
+    over-fire gate) AND some non-leaf axis actually writes (:func:`_is_mutation_path_axis`,
+    real-file signature gate). Pure, deterministic, never raises; input not mutated.
+    """
+    if not tasks or not _mutation_symptom_seed(seed_text):
+        return tasks
+    table_hints = _extract_table_hints(seed_text)
+    nonleaf = [t for t in tasks if (t.get("depends_on") or [])]
+    targets = [t for t in nonleaf
+               if _is_mutation_path_axis(t, table_hints, code_root)]
+    if not targets:
+        return tasks
+    promote_ids = {id(t) for t in targets[:_RESERVED_MUTATION_SEATS]}
+    new_tasks: list[dict[str, Any]] = []
+    for t in tasks:
+        if id(t) in promote_ids:
+            nt = dict(t)
+            nt["depends_on"] = []
+            new_tasks.append(nt)
+        else:
+            new_tasks.append(t)
+    logger.info("mutation-path promotion: mutation-class symptom — promoted %d "
+                "buried non-leaf write-path axis(es) %s to leaves (table_hints=%s)",
+                len(promote_ids),
+                [t.get("id") or t.get("name") or "?"
+                 for t in targets[:_RESERVED_MUTATION_SEATS]],
+                sorted(table_hints) or "(none — bare-message fallback)")
+    return new_tasks
+
+
 # A repo-relative ``path.ext`` optionally followed by ``:line`` / ``:lo-hi`` as the
 # seed writes it — used to honour an explicit line the seed already pinned.
 _SEED_CITE_RE = re.compile(
@@ -568,6 +832,15 @@ def run_investigate(
     # the only leaf the cheap path would judge — and it can never locate a bug. Drop
     # it and promote its ungated dependents to leaves so the real axes get judged.
     tasks = dissolve_scaffolding_leaves(tasks)
+    # Mutation-path promotion (NR hivework.0035.0003): the queen buries the answer
+    # write-path axis as a NON-leaf (run502: service_logic / db_queries depend on the
+    # route axis as a narrative "investigate route THEN service" ordering, not a true
+    # data dependency), so _leaf_axes drops it before the judge and the leaf-only
+    # guards below can never rescue it (leaf starvation, TSR hivework.0034.0012).
+    # Promote up to _RESERVED_MUTATION_SEATS non-leaf axes that carry a real write
+    # signature to leaves, for persistence/mutation-class symptoms only. Runs on the
+    # FULL task set BEFORE _leaf_axes — deterministic, free, no-op otherwise.
+    tasks = promote_mutation_path_axes(tasks, seed_text, code_root)
     leaves = _leaf_axes(tasks)
     # depends_on pruning is silent by default, yet in EDIT mode the queen routinely
     # makes the very edit-target axes (BE_EDIT, FE_TEST_EDIT…) depend on the
@@ -585,6 +858,13 @@ def run_investigate(
     # axis, BEFORE the position-based max_axes truncation — so a scattered queen
     # cannot bury or skip the spot the seed explicitly points at.
     leaves = _prioritize_axes(leaves, seed_text)
+    # Mutation-path guard (NR hivework.0034.0006): a persistence/constraint failure
+    # fails on a data WRITE the symptom never advertises (run500: dispose_group's
+    # insert_event → events.doc_id FK), so the write-path axis scores low on surface
+    # relevance and the position-based max_axes cut drops it before the judge. Pin it
+    # ahead of the cut for persistence-class symptoms — deterministic, free, no-op
+    # otherwise. Runs after _prioritize_axes so it overrides surface ranking.
+    leaves = ensure_mutation_path_axis(leaves, seed_text, code_root)
     # Hook A (M028): the queen is blind to the call graph and misses the backend
     # root one hop past the name-matching file (measured: not fixable by model or
     # prompt). The READING stage queries a static code-map (hive.codemap, M027) to
@@ -866,7 +1146,12 @@ def run_investigate(
             lens_lenses=(lens_cfg.lenses if lens_cfg.enabled else []),
             lens_provider=(lens_cfg.provider or fanout_role.provider),
             lens_model=(lens_cfg.model or fanout_role.model),
-            lens_min_refute=lens_cfg.min_refute)
+            lens_min_refute=lens_cfg.min_refute,
+            # NR hivework.0035.0009: tell converge this is a write-failure (mutation)
+            # symptom so its HTTP-datasource provenance guard — which exists for FE
+            # field-emptiness omissions — abstains instead of tugging the write locus
+            # onto an auth/read datasource decoy (run503 auth_outbound re-point).
+            is_mutation_symptom=_mutation_symptom_seed(seed_text))
         converge_dict = cres.as_dict()
         cc = cres.causal_check or {}
         if cres.converged and cres.attributed_defect:
@@ -1542,7 +1827,8 @@ def _rerun_converge(result: dict[str, Any], seed_text: str, *, code_root: str | 
         lens_lenses=(lens_cfg.lenses if lens_cfg.enabled else []),
         lens_provider=(lens_cfg.provider or fanout_role.provider),
         lens_model=(lens_cfg.model or fanout_role.model),
-        lens_min_refute=lens_cfg.min_refute)
+        lens_min_refute=lens_cfg.min_refute,
+        is_mutation_symptom=_mutation_symptom_seed(seed_text))
     result["converge"] = cres.as_dict()
     if honey_out:
         with open(honey_out, "w", encoding="utf-8") as f:

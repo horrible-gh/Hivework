@@ -7,6 +7,7 @@ without spending or touching ripgrep.
 """
 import json
 import os
+import re
 import sys
 import tempfile
 import unittest
@@ -20,7 +21,9 @@ from hive.providers import WorkerResult
 from hive.investigate import (
     render_local_honey, _prioritize_axes, _axis_coverage, _coverage_phrase,
     rerun_reinvestigation, dissolve_scaffolding_leaves, _leaf_axes,
-    _is_scaffolding_axis,
+    _is_scaffolding_axis, ensure_mutation_path_axis, _fk_persistence_seed,
+    _extract_table_hints, _is_mutation_path_axis, _RESERVED_MUTATION_SEATS,
+    _mutation_symptom_seed, promote_mutation_path_axes,
 )
 from hive.reinvestigate import (
     ReinvestPlan, ACTION_RE_CONVERGE, ACTION_RE_RETRIEVE,
@@ -1105,6 +1108,359 @@ class TestScaffoldingLeafGuard(unittest.TestCase):
         out = dissolve_scaffolding_leaves(tasks)
         self.assertIs(out, tasks)  # untouched — TRACE is diagnostic, not a funnel
         self.assertEqual(self._leaf_ids(out), ["TRACE"])
+
+
+class TestMutationPathGuard(unittest.TestCase):
+    """NR hivework.0034.0006 — pin write-path axes ahead of the max_axes cut for
+    persistence-class (FK/constraint) bugs (run500 MISS root fix)."""
+
+    # A run500-shaped FK symptom (bare SQLite message names no table).
+    FK_SEED = ("POST /groups/{id}/dispose returns 500: sqlite3.IntegrityError: "
+               "FOREIGN KEY constraint failed. The dispose event write fails.")
+    # The same symptom but naming concrete write symbols (richer message).
+    FK_SEED_NAMED = (
+        "dispose 500: insert_event(group_id, ...) violates the events.doc_id "
+        "FOREIGN KEY into documents; should use insert_group_event / group_events.")
+
+    def _srv_axis(self):
+        return {"id": "T3_srv_write", "title": "dispose service write path",
+                "brief": "trace dispose_group event write to the events table",
+                "search_plan": {"keywords": ["insert_event", "dispose_group"],
+                                "file_globs": ["server/modules/**/*.py"]}}
+
+    # ── seed classifier (a) ────────────────────────────────────────────────
+    def test_fk_seed_is_persistence_class(self):
+        self.assertTrue(_fk_persistence_seed(self.FK_SEED))
+        self.assertTrue(_fk_persistence_seed(self.FK_SEED_NAMED))
+
+    def test_plain_http_or_fe_seed_is_not_persistence_class(self):
+        self.assertFalse(_fk_persistence_seed(
+            "the workflow head badge shows the wrong colour in DocHeader.vue"))
+        self.assertFalse(_fk_persistence_seed(
+            "GET /api/list returns items in the wrong sort order"))
+
+    def test_constraint_word_without_failure_cue_does_not_fire(self):
+        # A constraint cue alone (no write/failure cue) must not arm the guard.
+        self.assertFalse(_fk_persistence_seed(
+            "document the foreign key relationships in the schema diagram"))
+
+    # ── table hints (precision aid, optional) ──────────────────────────────
+    def test_table_hints_extracted_and_noise_dropped(self):
+        hints = _extract_table_hints(self.FK_SEED_NAMED)
+        self.assertIn("insert_event", hints)
+        self.assertIn("group_events", hints)
+        self.assertIn("events", hints)          # from events.doc_id
+        self.assertNotIn("group_id", hints)     # generic noise dropped
+        self.assertNotIn("doc_id", hints)
+
+    def test_bare_message_yields_no_table_hints(self):
+        # SQLite bare message names no symbol → empty hints → grep fallback path.
+        self.assertEqual(_extract_table_hints("FOREIGN KEY constraint failed"),
+                         set())
+
+    # ── axis classifier (b) — text route ───────────────────────────────────
+    def test_axis_with_write_helper_in_text_is_mutation_path(self):
+        self.assertTrue(_is_mutation_path_axis(
+            {"id": "x", "title": "t", "brief": "calls insert_event(...) on dispose",
+             "search_plan": {"keywords": [], "file_globs": []}},
+            set(), None))
+
+    def test_readonly_axis_is_not_mutation_path(self):
+        self.assertFalse(_is_mutation_path_axis(
+            {"id": "r", "title": "reader", "brief": "get_group / list rows via SELECT",
+             "search_plan": {"keywords": ["get_group"], "file_globs": []}},
+            set(), None))
+
+    # ── axis classifier (b) — real-file grep route ─────────────────────────
+    def test_grep_detects_write_in_globbed_file(self):
+        with tempfile.TemporaryDirectory() as td:
+            d = os.path.join(td, "server", "modules")
+            os.makedirs(d)
+            with open(os.path.join(d, "process_service.py"), "w",
+                      encoding="utf-8") as f:
+                f.write("def dispose_group(gid):\n"
+                        "    db.insert_event(gid, 'group_disposed')\n")
+            axis = {"id": "srv", "title": "service",
+                    "brief": "dispose path",      # no write word in text
+                    "search_plan": {"keywords": [],
+                                    "file_globs": ["server/modules/**/*.py"]}}
+            self.assertTrue(_is_mutation_path_axis(axis, set(), td))
+
+    def test_grep_skips_test_files(self):
+        with tempfile.TemporaryDirectory() as td:
+            d = os.path.join(td, "tests")
+            os.makedirs(d)
+            with open(os.path.join(d, "test_x.py"), "w", encoding="utf-8") as f:
+                f.write("db.insert_event(1, 'x')\n")
+            axis = {"id": "t", "title": "t", "brief": "p",
+                    "search_plan": {"keywords": [],
+                                    "file_globs": ["tests/**/*.py"]}}
+            self.assertFalse(_is_mutation_path_axis(axis, set(), td))
+
+    # ── the guard: ordering / determinism ──────────────────────────────────
+    def _run500_leaves(self):
+        # 10 leaves with the SRV write-path axis buried at the back (low surface
+        # relevance), mirroring run500's decompose where it lost the cap race.
+        leaves = [{"id": f"N{i}", "title": f"noise {i}",
+                   "brief": "unrelated read/list axis",
+                   "search_plan": {"keywords": ["get_x"],
+                                   "file_globs": ["client/**/*.vue"]}}
+                  for i in range(9)]
+        leaves.append(self._srv_axis())
+        return leaves
+
+    def test_srv_write_axis_pinned_inside_cap(self):
+        # The core determinism guarantee: the write-path axis, last of 10, lands
+        # INSIDE the max_axes=3 cut after the guard.
+        leaves = self._run500_leaves()
+        out = ensure_mutation_path_axis(leaves, self.FK_SEED, None)
+        self.assertEqual(out[0]["id"], "T3_srv_write")
+        self.assertIn("T3_srv_write", [a["id"] for a in out[:3]])
+
+    def test_reserved_seats_bounded(self):
+        # Even with many write axes, only _RESERVED_MUTATION_SEATS are pinned.
+        leaves = [dict(self._srv_axis(), id=f"W{i}") for i in range(5)]
+        out = ensure_mutation_path_axis(leaves, self.FK_SEED, None)
+        # order preserved among the rest; pinned count is bounded.
+        self.assertLessEqual(_RESERVED_MUTATION_SEATS, 2)
+        self.assertEqual(len(out), len(leaves))   # reorder only, never adds/drops
+
+    def test_noop_on_non_persistence_seed(self):
+        leaves = self._run500_leaves()
+        out = ensure_mutation_path_axis(leaves, "wrong sort order in the list", None)
+        self.assertEqual([a["id"] for a in out], [a["id"] for a in leaves])
+
+    def test_noop_when_no_mutation_axis(self):
+        leaves = [{"id": f"N{i}", "title": "r", "brief": "read only get_x",
+                   "search_plan": {"keywords": ["get_x"], "file_globs": []}}
+                  for i in range(3)]
+        out = ensure_mutation_path_axis(leaves, self.FK_SEED, None)
+        self.assertEqual([a["id"] for a in out], [a["id"] for a in leaves])
+
+    def test_bare_message_fallback_still_pins_via_text(self):
+        # No table hints (bare SQLite) — the write signature alone qualifies.
+        leaves = self._run500_leaves()
+        out = ensure_mutation_path_axis(
+            leaves, "FOREIGN KEY constraint failed during insert on dispose 500",
+            None)
+        self.assertEqual(out[0]["id"], "T3_srv_write")
+
+    # ── end-to-end through the REAL pipeline (run500 reproduction) ──────────
+    def _run500_decompose(self):
+        # 10 leaves, SRV write-path axis LAST (lowest surface relevance — exactly
+        # how run500 lost the cap race), plus a dependent synthesis axis.
+        tasks = [{"id": f"N{i}", "title": f"reader {i}",
+                  "brief": "list rows via get_x / SELECT for display",
+                  "depends_on": [],
+                  "search_plan": {"keywords": ["get_x"],
+                                  "file_globs": ["client/**/*.vue"],
+                                  "doc_topics": []}}
+                 for i in range(9)]
+        tasks.append({
+            "id": "T3_srv_write", "title": "dispose service write",
+            "brief": "trace dispose_group event write that hits the FK",
+            "depends_on": [],
+            "search_plan": {"keywords": ["insert_event", "dispose_group"],
+                            "file_globs": ["server/**/*.py"], "doc_topics": []}})
+        return json.dumps({"fanout_decision": "fanout", "reason": "x",
+                           "steps": [[t["id"] for t in tasks]], "tasks": tasks})
+
+    FK_SEED_E2E = ("POST /groups/{id}/dispose returns 500: "
+                   "sqlite3.IntegrityError: FOREIGN KEY constraint failed.")
+
+    def _judged_ids_for(self, seed):
+        cfg = load_config()
+        cfg.judge.max_calls_per_axis = 1
+        cfg.judge.votes_per_axis = 1
+        cfg.judge.max_axes = 3                      # run500's cap
+        seen = []
+
+        def _record(_provider, _model, prompt, **_k):
+            # axis id appears in the judge prompt's [Role] line ("for Hivework axis ...")
+            m = re.search(r'axis "([^"]+)"', prompt)
+            if m:
+                seen.append(m.group(1))
+            return _wr(VERDICT_OUT)
+
+        with tempfile.TemporaryDirectory() as td:
+            out = os.path.join(td, "v.json")
+            with mock.patch("hive.decompose.call_worker",
+                            return_value=_wr(self._run500_decompose())), \
+                 mock.patch("hive.judge.call_worker", side_effect=_record), \
+                 mock.patch("hive.converge.call_worker",
+                            return_value=_wr(CONVERGE_OUT)), \
+                 mock.patch("hive.investigate.retrieve", side_effect=_fake_retrieve):
+                INV.run_investigate(seed_text=seed, recipe_path=None, code_root=td,
+                                    docs_root=None, output_path=out, cfg=cfg,
+                                    ledger=None)
+        return seen
+
+    def test_e2e_srv_axis_judged_with_guard_on_fk_seed(self):
+        # The fix: with an FK seed, the buried SRV write axis is judged despite cap=3.
+        judged = self._judged_ids_for(self.FK_SEED_E2E)
+        self.assertIn("T3_srv_write", judged)
+        self.assertLessEqual(len(judged), 3)
+
+    def test_e2e_srv_axis_cut_without_guard_on_plain_seed(self):
+        # Negative control: a non-persistence seed → guard no-op → the SRV axis
+        # stays last and is cut by max_axes=3 (run500's original MISS reproduced).
+        judged = self._judged_ids_for("the list shows items in the wrong sort order")
+        self.assertNotIn("T3_srv_write", judged)
+
+
+class TestMutationPathPromotion(unittest.TestCase):
+    """NR hivework.0035.0003 — promote buried NON-leaf write-path axes to leaves and
+    broaden the mutation-symptom arm so a realistic seed (no FK word) arms the guard.
+    Fixes leaf starvation (TSR hivework.0034.0012 / live run502 MISS)."""
+
+    # The realistic run502 seed: "discard returns 500", NO FK/constraint word.
+    REAL_SEED = ("Discarding a workflow group fails: POST /groups/{id}/dispose "
+                 "returns 500 Internal Server Error. The close path fails too.")
+    REAL_SEED_KO = ("그룹을 폐기하면 POST /groups/{id}/dispose 요청이 500 에러로 "
+                    "떨어집니다. 마감 경로에서도 비슷하게 실패합니다.")
+    FK_SEED = ("POST /groups/{id}/dispose returns 500: sqlite3.IntegrityError: "
+               "FOREIGN KEY constraint failed.")
+
+    # ── broadened arm (c) ──────────────────────────────────────────────────
+    def test_realistic_dispose_500_seed_arms_without_fk_word(self):
+        # The crux: the live seed carries NO FK word, so the OLD predicate slept.
+        self.assertFalse(_fk_persistence_seed(self.REAL_SEED))
+        self.assertTrue(_mutation_symptom_seed(self.REAL_SEED))
+
+    def test_korean_dispose_seed_arms(self):
+        self.assertTrue(_mutation_symptom_seed(self.REAL_SEED_KO))
+
+    def test_fk_seed_still_arms(self):
+        self.assertTrue(_mutation_symptom_seed(self.FK_SEED))
+
+    def test_plain_read_seed_does_not_arm(self):
+        # No mutation verb + no server error → no arm (over-fire gate holds).
+        self.assertFalse(_mutation_symptom_seed(
+            "GET /api/list returns items in the wrong sort order"))
+        self.assertFalse(_mutation_symptom_seed(
+            "the head badge shows the wrong colour in DocHeader.vue"))
+
+    def test_error_without_mutation_verb_does_not_arm(self):
+        # A 500 on a read path (no mutation verb) must NOT arm the broadened path.
+        self.assertFalse(_mutation_symptom_seed(
+            "GET /api/report returns 500 when rendering the chart"))
+
+    # ── promotion guard ────────────────────────────────────────────────────
+    def _run502_tasks(self):
+        # run502's real shape: surface axes are leaves; the answer write-path axes
+        # (service_logic, db_queries) are NON-leaf, buried behind the route axis.
+        return [
+            {"id": "api_route", "title": "route registration",
+             "brief": "where POST /groups/{id}/dispose is registered",
+             "depends_on": [],
+             "search_plan": {"keywords": ["dispose"],
+                             "file_globs": ["server/**/routes/*.py"]}},
+            {"id": "frontend_ui", "title": "FE handler",
+             "brief": "the dispose button handler", "depends_on": [],
+             "search_plan": {"keywords": ["dispose"], "file_globs": ["client/**/*.vue"]}},
+            {"id": "service_logic", "title": "dispose service write",
+             "brief": "dispose_group calls insert_event(group_id, ...) on the events table",
+             "depends_on": ["api_route"],
+             "search_plan": {"keywords": ["insert_event", "dispose_group"],
+                             "file_globs": ["server/**/*.py"]}},
+            {"id": "db_queries", "title": "db write layer",
+             "brief": "the insert_event helper that writes the dispose event row",
+             "depends_on": ["service_logic"],
+             "search_plan": {"keywords": ["insert_event"], "file_globs": ["server/**/*.py"]}},
+            {"id": "synthesis_report", "title": "synthesise",
+             "brief": "summarise findings for the report", "depends_on": ["db_queries"],
+             "search_plan": {"keywords": [], "file_globs": []}},
+        ]
+
+    def test_buried_nonleaf_write_axis_promoted_to_leaf(self):
+        tasks = self._run502_tasks()
+        self.assertEqual([t["id"] for t in _leaf_axes(tasks)],
+                         ["api_route", "frontend_ui"])   # writes buried
+        out = promote_mutation_path_axes(tasks, self.REAL_SEED, None)
+        leaf_ids = [t["id"] for t in _leaf_axes(out)]
+        self.assertIn("service_logic", leaf_ids)         # rescued
+        self.assertIn("db_queries", leaf_ids)
+        self.assertNotIn("synthesis_report", leaf_ids)   # meta axis NOT promoted
+
+    def test_promotion_bounded_by_reserved_seats(self):
+        tasks = self._run502_tasks()
+        out = promote_mutation_path_axes(tasks, self.REAL_SEED, None)
+        # at most _RESERVED_MUTATION_SEATS newly-promoted (was 2 leaves).
+        promoted = len(_leaf_axes(out)) - 2
+        self.assertLessEqual(promoted, _RESERVED_MUTATION_SEATS)
+
+    def test_promotion_is_noop_on_read_seed(self):
+        tasks = self._run502_tasks()
+        out = promote_mutation_path_axes(tasks, "wrong sort order in the list", None)
+        self.assertEqual([t["id"] for t in _leaf_axes(out)],
+                         ["api_route", "frontend_ui"])
+
+    def test_promotion_is_noop_when_no_nonleaf_writes(self):
+        # mutation-class seed but the only non-leaf axis is a read/synthesis axis.
+        tasks = [
+            {"id": "api_route", "title": "route", "brief": "dispose route",
+             "depends_on": [], "search_plan": {"keywords": [], "file_globs": []}},
+            {"id": "reader", "title": "reader", "brief": "list rows via get_x SELECT",
+             "depends_on": ["api_route"],
+             "search_plan": {"keywords": ["get_x"], "file_globs": []}},
+        ]
+        out = promote_mutation_path_axes(tasks, self.REAL_SEED, None)
+        self.assertIs(out, tasks)                         # untouched (no-op)
+
+    def test_promotion_does_not_mutate_input(self):
+        tasks = self._run502_tasks()
+        before = [dict(t) for t in tasks]
+        promote_mutation_path_axes(tasks, self.REAL_SEED, None)
+        self.assertEqual([t["depends_on"] for t in tasks],
+                         [t["depends_on"] for t in before])
+
+    # ── end-to-end: run502 reproduction through the real pipeline ───────────
+    def _run502_decompose(self):
+        return json.dumps({"fanout_decision": "fanout", "reason": "x",
+                           "steps": [["api_route", "frontend_ui"],
+                                     ["service_logic", "db_queries"],
+                                     ["synthesis_report"]],
+                           "tasks": self._run502_tasks()})
+
+    def _judged_ids_for(self, seed):
+        cfg = load_config()
+        cfg.judge.max_calls_per_axis = 1
+        cfg.judge.votes_per_axis = 1
+        cfg.judge.max_axes = 10                     # run502's cap (10 ≫ leaves)
+        seen = []
+
+        def _record(_provider, _model, prompt, **_k):
+            m = re.search(r'axis "([^"]+)"', prompt)
+            if m:
+                seen.append(m.group(1))
+            return _wr(VERDICT_OUT)
+
+        with tempfile.TemporaryDirectory() as td:
+            out = os.path.join(td, "v.json")
+            with mock.patch("hive.decompose.call_worker",
+                            return_value=_wr(self._run502_decompose())), \
+                 mock.patch("hive.judge.call_worker", side_effect=_record), \
+                 mock.patch("hive.converge.call_worker",
+                            return_value=_wr(CONVERGE_OUT)), \
+                 mock.patch("hive.investigate.retrieve", side_effect=_fake_retrieve):
+                INV.run_investigate(seed_text=seed, recipe_path=None, code_root=td,
+                                    docs_root=None, output_path=out, cfg=cfg,
+                                    ledger=None)
+        return seen
+
+    def test_e2e_buried_write_axis_judged_on_realistic_seed(self):
+        # The fix end-to-end: the NON-leaf service_logic / db_queries axes are
+        # promoted and judged despite carrying depends_on — run502 MISS resolved.
+        judged = self._judged_ids_for(self.REAL_SEED)
+        self.assertIn("service_logic", judged)
+        self.assertIn("db_queries", judged)
+
+    def test_e2e_buried_write_axis_cut_without_arm_on_read_seed(self):
+        # Negative control: a read-only seed never arms promotion, so the buried
+        # write axes stay non-leaf and unjudged (original starvation reproduced).
+        judged = self._judged_ids_for("the list shows items in the wrong sort order")
+        self.assertNotIn("service_logic", judged)
+        self.assertNotIn("db_queries", judged)
 
 
 if __name__ == "__main__":
