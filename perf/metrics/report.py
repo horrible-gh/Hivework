@@ -97,7 +97,24 @@ def load_runs(path):
                 print(f"warning: {path}:{lineno}: skipping malformed line ({exc})",
                       file=sys.stderr)
     runs.sort(key=lambda r: str(r.get("ts", "")))
-    return runs
+    # Dedup by run_id, last-wins. The auto-emit hook (hive.py) appends a golden-less
+    # line when an investigate/run cycle finishes; an operator later splices the
+    # golden score via ``emit.py --golden-json``, appending a SECOND line for the
+    # same run_id. Without dedup both render — the run shows twice and the headline
+    # (latest cycle) could land on the golden-less stub. Keeping the LAST occurrence
+    # lets the richer, later line supersede the earlier one. Records with no run_id
+    # are all kept (no key to collapse on).
+    by_id = {}
+    no_id = []
+    for r in runs:
+        rid = r.get("run_id")
+        if rid is None:
+            no_id.append(r)
+        else:
+            by_id[rid] = r  # last-wins
+    deduped = list(by_id.values()) + no_id
+    deduped.sort(key=lambda r: str(r.get("ts", "")))
+    return deduped
 
 
 def _num(d, *keys, default=0):

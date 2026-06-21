@@ -17,6 +17,7 @@ Run with: python -m pytest perf/metrics/test_report_waterfall.py
 """
 from __future__ import annotations
 
+import json
 import os
 import re
 import sys
@@ -226,9 +227,52 @@ def test_cost_bars_x_labels_are_diagonal():
     assert ">sonnet45-0077<" in out
 
 
+# ── load_runs dedup: auto-emit stub + later golden splice must not duplicate ──
+
+def _write_jsonl(tmp_path, *records):
+    p = os.path.join(str(tmp_path), "runs.jsonl")
+    with open(p, "w", encoding="utf-8") as fh:
+        for r in records:
+            fh.write(json.dumps(r) + "\n")
+    return p
+
+
+def test_load_runs_dedups_run_id_last_wins(tmp_path):
+    """The auto-emit hook (hive.py) appends a golden-less line when a cycle
+    finishes; an operator later splices the golden score via ``emit.py
+    --golden-json``, appending a SECOND line for the same run_id. load_runs must
+    keep only the LAST occurrence so the run renders once with the richer line —
+    otherwise the run shows twice and the headline could pick the golden-less stub
+    (hivework.0035.0014-T)."""
+    stub = dict(_RUN, run_id="run504", golden={})            # auto-emit: no golden
+    scored = dict(_RUN, run_id="run504")                       # later golden splice
+    other = dict(_RUN, run_id="run503", ts="2026-06-20T00:00:00+09:00")
+    runs = report.load_runs(_write_jsonl(tmp_path, other, stub, scored))
+    ids = [r["run_id"] for r in runs]
+    assert ids.count("run504") == 1, "duplicate run_id survived dedup"
+    assert len(runs) == 2
+    survivor = [r for r in runs if r["run_id"] == "run504"][0]
+    assert survivor["golden"], "last-wins should keep the golden-scored line"
+
+
+def test_load_runs_keeps_records_without_run_id(tmp_path):
+    """Records lacking a run_id have no key to collapse on, so all are kept."""
+    a = {"ts": "2026-06-20T00:00:00+09:00", "funnel": {}}
+    b = {"ts": "2026-06-20T01:00:00+09:00", "funnel": {}}
+    runs = report.load_runs(_write_jsonl(tmp_path, a, b))
+    assert len(runs) == 2
+
+
 if __name__ == "__main__":
+    import inspect
+    import tempfile
+
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
-    for fn in fns:
-        fn()
-        print(f"ok  {fn.__name__}")
+    with tempfile.TemporaryDirectory() as td:
+        for fn in fns:
+            if "tmp_path" in inspect.signature(fn).parameters:
+                fn(td)
+            else:
+                fn()
+            print(f"ok  {fn.__name__}")
     print(f"\n{len(fns)} passed")
