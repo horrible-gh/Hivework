@@ -580,6 +580,188 @@ def _http_binding_bridges(located: list[dict[str, Any]],
     return "\n".join(lines)
 
 
+# ── FK-misrouting write-arg check (rec B — hivework.default.0033.0013-T) ──────────
+# The per-axis judges and the holistic stitch reason over PROSE evidence: a write call
+# wrapped in a "fixed via group_events / atomic txn" comment reads as healthy even after
+# the code was reverted to the buggy form (0033 run491/492: the converger reached the right
+# function but NEVER articulated the FK mechanism — recall 0/1, the failure mode shifting
+# from wrong-facet to no-mechanism). This check ignores prose entirely. It reads the live
+# migration DDL (schema_ground) for the REAL foreign keys, then flags a write call that
+# routes a typed ``<entity>_id`` OWNER argument into a writer whose target table has NO
+# foreign key to where that id points — e.g. a ``group_id`` (FK→groups) handed to
+# ``insert_event(...)`` whose ``events`` table is FK'd only to ``documents``/``users``, so
+# a group id in its ``doc_id`` slot violates the constraint at runtime. It fires ONLY on a
+# provable cross-FK swap: the argument is itself a known FK column elsewhere, is NOT a
+# column of the target table, and points to a table the target has no FK relationship with.
+# A legal ``insert_group_event(group_id, ...)`` — arg == the table's own FK column — never
+# trips it; nor does a non-owner FK column of the SAME table (it is a real column, so it is
+# skipped). Schema-grounded, comment-blind, leaf-starvation-blind (it scans the pooled
+# evidence files, not only the judged leaves) and converge-oscillation-blind (the facet is
+# injected into ``located`` deterministically). Kill-switch: HIVE_NO_FK_MISROUTE=1.
+_FK_WRITER_RE = re.compile(
+    r"\b((?:insert|add|create|save|store|write|log|record|put|new)_[a-z][a-z0-9_]*)\s*\(")
+_FK_WRITER_PREFIX_RE = re.compile(
+    r"^(?:insert|add|create|save|store|write|log|record|put|new)_(?P<noun>[a-z][a-z0-9_]*)$")
+_FK_ARG_ID_RE = re.compile(r"^[a-z][a-z0-9_]*_id$")
+_FK_BARE_ID_RE = re.compile(r"^[a-z][a-z0-9_]*$")
+_FK_MISROUTE_MAX_FILES = 24    # distinct evidence/located files scanned for write calls
+
+
+def _resolve_writer_table(noun: str, table_keys: set[str]) -> str | None:
+    """Map an ``insert_<noun>`` writer to its schema table key (event→events …)."""
+    noun = (noun or "").lower()
+    for cand in (noun, noun + "s", noun + "es"):
+        if cand in table_keys:
+            return cand
+    return None
+
+
+def _fk_misrouting_facets(located: list[dict[str, Any]],
+                          winning_path: list[dict[str, Any]],
+                          bundles: list[dict[str, Any]],
+                          code_root: str | None) -> list[dict[str, Any]]:
+    """Schema-grounded write-arg/FK check → deterministic ``fk-misrouting`` located facets.
+
+    Reads the codebase's migration DDL for real foreign keys, scans the pooled evidence /
+    located files for ``insert_<table>(...)`` write calls, and flags an owner ``<entity>_id``
+    argument that points to a table the writer's target has no FK to. Pure, deterministic,
+    bounded, fail-open (any error / no schema / no code_root → ``[]``). Never raises.
+    """
+    if not code_root or os.environ.get("HIVE_NO_FK_MISROUTE"):
+        return []
+    try:
+        from hive.schema_ground import (
+            _matching_paren, _split_top_level, load_migration_schema,
+        )
+        schema = load_migration_schema(code_root)
+    except Exception as e:  # pragma: no cover - import / parse guard, never blocks converge
+        logger.warning("converge: FK-misrouting schema load failed: %s", e)
+        return []
+    if not schema:
+        return []
+
+    # Per-table single-column FKs (owner = first declared) + the global map of every column
+    # name that is a single-col FK anywhere → the table(s) it references. The latter is what
+    # proves an argument "belongs to a different table".
+    table_keys = set(schema)
+    cols_by_table: dict[str, set[str]] = {}
+    single_fks: dict[str, list[tuple[str, str]]] = {}
+    fk_col_refs: dict[str, set[str]] = {}
+    for tname, tc in schema.items():
+        cols_by_table[tname] = {c.lower() for c in tc.columns}
+        singles: list[tuple[str, str]] = []
+        for fk in tc.foreign_keys:
+            if len(fk.columns) == 1 and fk.referenced_table:
+                col = fk.columns[0].lower()
+                ref = fk.referenced_table.lower()
+                singles.append((col, ref))
+                fk_col_refs.setdefault(col, set()).add(ref)
+        if singles:
+            single_fks[tname] = singles
+
+    # Candidate files: located loci + winning-path nodes + every pooled evidence window.
+    files: list[str] = []
+
+    def _add(rel: str) -> None:
+        rel = (rel or "").replace("\\", "/").strip().lstrip("./")
+        if rel and rel.endswith(".py") and rel not in files:
+            files.append(rel)
+
+    for v in located or []:
+        _add((v.get("verdict") or {}).get("file", ""))
+    for n in winning_path or []:
+        _add(n.get("file", ""))
+    for b in bundles or []:
+        if not isinstance(b, dict):
+            continue
+        for w in (b.get("code_snippets") or []) + (b.get("call_chain") or []):
+            if isinstance(w, dict):
+                _add(w.get("file", ""))
+    if not files:
+        return []
+
+    facets: list[dict[str, Any]] = []
+    seen: set[tuple[str, int, str]] = set()
+    for rel in files[:_FK_MISROUTE_MAX_FILES]:
+        try:
+            with open(os.path.join(code_root, rel), "r",
+                      encoding="utf-8", errors="replace") as fh:
+                text = fh.read()
+        except OSError:
+            continue
+        for m in _FK_WRITER_RE.finditer(text):
+            fn = m.group(1).lower()
+            pm = _FK_WRITER_PREFIX_RE.match(fn)
+            if not pm:
+                continue
+            table = _resolve_writer_table(pm.group("noun"), table_keys)
+            if not table or table not in single_fks:
+                continue
+            t_fk_cols = dict(single_fks[table])      # col -> ref
+            t_refs = set(t_fk_cols.values())
+            owner_col, owner_ref = single_fks[table][0]
+            open_paren = m.end() - 1
+            close = _matching_paren(text, open_paren)
+            if close is None:
+                continue
+            args = _split_top_level(text[open_paren + 1:close])
+
+            # (cand, target_col, target_ref) tuples worth checking: the FIRST positional
+            # (the conventional owner/FK slot) and any explicit ``<fk_col>=<value>`` kwarg.
+            checks: list[tuple[str, str, str]] = []
+            positional_taken = False
+            for raw in args:
+                a = raw.strip()
+                if not a:
+                    continue
+                eq = re.search(r"(?<![=!<>])=(?!=)", a)   # a single '=' (not ==,!=,<=,>=)
+                if eq:
+                    lhs = a[:eq.start()].strip().lower()
+                    rhs = a[eq.end():].strip()
+                    if lhs in t_fk_cols and _FK_BARE_ID_RE.match(rhs):
+                        checks.append((rhs, lhs, t_fk_cols[lhs]))
+                    continue
+                if not positional_taken:
+                    positional_taken = True
+                    if _FK_BARE_ID_RE.match(a):
+                        checks.append((a, owner_col, owner_ref))
+                # later positionals are ignored (tight: only the owner slot)
+
+            for cand, target_col, target_ref in checks:
+                cand = cand.lower()
+                if not _FK_ARG_ID_RE.match(cand):
+                    continue
+                if cand == target_col or cand in cols_by_table.get(table, set()):
+                    continue
+                refs = fk_col_refs.get(cand)
+                if not refs or (refs & t_refs):
+                    continue   # unknown id, or it legitimately matches a FK of this table
+                lineno = text.count("\n", 0, m.start()) + 1
+                key = (rel.lower(), lineno, cand)
+                if key in seen:
+                    continue
+                seen.add(key)
+                ref_str = "/".join(sorted(refs))
+                facets.append({
+                    "axis_id": f"FK_MISROUTE:{table}.{target_col}",
+                    "title": f"FK-misrouting write into {table}.{target_col}",
+                    "verdict": {
+                        "located": True,
+                        "file": rel,
+                        "lines": str(lineno),
+                        "symbol": fn,
+                        "via": "fk-misrouting",
+                        "reason": (
+                            f"{fn}(...) routes `{cand}` (a FOREIGN KEY → {ref_str}) into "
+                            f"{table}.{target_col}, which is FOREIGN KEY → {target_ref}. "
+                            f"{table} has NO foreign key to {ref_str}, so a {ref_str} id in "
+                            f"this slot violates the {table}.{target_col} → {target_ref} "
+                            f"constraint at runtime (FK-misrouting)."),
+                    },
+                })
+    return facets
+
+
 def _coerce_refuted_peers(raw: Any) -> list[dict[str, str]]:
     """Normalize explicit peer refutations; malformed entries are ignored."""
     out: list[dict[str, str]] = []
@@ -684,9 +866,40 @@ def _fragment_fact_cards(located: list[dict[str, Any]],
             ])
         if not cards:
             return ""
-        return (
+        block = (
             "[Fragment facts — deterministic annotations computed by the pipeline; "
             "treat as FACT]\n" + "\n".join(cards))
+
+        # FK-misrouting directive (rec B): any located facet flagged by the deterministic
+        # schema/FK check is a PROVABLE runtime constraint violation read straight from the
+        # migration DDL — not a prose inference. Tell the converger to attribute the defect
+        # there and articulate the FK mechanism, and to ignore comment/atomicity narratives
+        # that would otherwise bury it. Only live code showing the argument IS the correct
+        # FK value may override it.
+        fk_loci = [
+            v for v in located
+            if isinstance(v, dict)
+            and (v.get("verdict") or {}).get("via") == "fk-misrouting"
+        ]
+        if fk_loci:
+            fk_lines = [
+                "[FK-MISROUTING — deterministic schema-grounded write-argument check "
+                "(reads the live migration DDL for the REAL foreign keys; comment text was "
+                "NOT consulted). Each locus below routes an id-typed argument into a writer "
+                "whose target table has NO foreign key to where that id points — a provable "
+                "runtime FK constraint violation. This IS the executed defect: ATTRIBUTE the "
+                "failure to this write-call locus and state the FK mechanism (which id goes "
+                "into which FK column, and the table it wrongly references). Do NOT refute it "
+                "on comment/atomicity/'already-fixed' grounds; only live code showing the "
+                "argument actually IS the correct FK value for that column overrides it.]",
+            ]
+            for v in fk_loci:
+                vd = v.get("verdict") or {}
+                fk_lines.append(
+                    f"- {vd.get('file', '')}:{vd.get('lines', '')} "
+                    f"({vd.get('symbol', '')}): {vd.get('reason', '')}")
+            block = block + "\n\n" + "\n".join(fk_lines)
+        return block
     except Exception as e:  # deterministic prompt scaffolding must never block converge
         logger.warning("converge: fragment fact-card build failed: %s", e)
         return ""
@@ -3660,6 +3873,22 @@ def run_converge(*, seed_text: str, verdicts: list[dict[str, Any]],
                     len(winning_path),
                     sum(1 for item in located
                         if str(item.get("axis_id", "")).startswith("HTTP_WINNING_PATH:")))
+
+    # FK-misrouting facet (rec B): deterministically surface a schema-violating write call
+    # (e.g. group_id → events.doc_id) as a located fragment carrying the FK mechanism, so a
+    # comment decoy / leaf-starved write-path / wobbly converge cannot bury it. Added BEFORE
+    # the min_located gate so the facet also counts toward stitching.
+    for facet in _fk_misrouting_facets(located, winning_path, bundles, code_root):
+        ff = (facet.get("verdict") or {}).get("file", "")
+        fl = (facet.get("verdict") or {}).get("lines", "")
+        if not any(
+            _aligns(ff, (item.get("verdict") or {}).get("file", ""))
+            and str((item.get("verdict") or {}).get("lines", "")) == str(fl)
+            for item in located
+        ):
+            located.append(facet)
+            logger.info("converge: FK-misrouting facet located at %s:%s", ff, fl)
+
     if len(located) < min_located:
         return ConvergeResult(
             summary=f"skipped: {len(located)} located verdict(s) < min_located={min_located}",

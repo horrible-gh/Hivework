@@ -3296,5 +3296,181 @@ class TestSplitConverge(unittest.TestCase):
         self.assertNotIn("dropped_peer", res.causal_check)
 
 
+_FK_MIGRATION_SQL = """
+CREATE TABLE documents (doc_id TEXT PRIMARY KEY);
+CREATE TABLE groups (group_id TEXT PRIMARY KEY);
+CREATE TABLE users (user_id TEXT PRIMARY KEY);
+CREATE TABLE events (
+    event_id          INTEGER PRIMARY KEY,
+    doc_id            TEXT NOT NULL REFERENCES documents(doc_id),
+    actor_user_id     TEXT REFERENCES users(user_id),
+    related_doc_id    TEXT REFERENCES documents(doc_id),
+    note              TEXT
+);
+CREATE TABLE group_events (
+    event_id    INTEGER PRIMARY KEY,
+    group_id    TEXT NOT NULL REFERENCES groups(group_id),
+    note        TEXT
+);
+"""
+
+
+def _fk_repo(tmp, source: str, *, rel="server/svc.py", sql=_FK_MIGRATION_SQL):
+    """Write a throwaway repo with migration DDL + one source file; return (root, rel)."""
+    mig = os.path.join(tmp, "server", "sql", "migrations")
+    os.makedirs(mig, exist_ok=True)
+    with open(os.path.join(mig, "001_schema.sql"), "w", encoding="utf-8") as fh:
+        fh.write(sql)
+    src = os.path.join(tmp, rel.replace("/", os.sep))
+    os.makedirs(os.path.dirname(src), exist_ok=True)
+    with open(src, "w", encoding="utf-8") as fh:
+        fh.write(source)
+    return tmp, rel
+
+
+class TestFKMisrouting(unittest.TestCase):
+    """rec B — deterministic schema-grounded write-arg/FK-column misrouting check."""
+
+    def setUp(self):
+        import tempfile
+        self._tmp = tempfile.mkdtemp(prefix="fkmis_")
+        self.addCleanup(lambda: __import__("shutil").rmtree(self._tmp, ignore_errors=True))
+        os.environ.pop("HIVE_NO_FK_MISROUTE", None)
+
+    def _located(self, rel):
+        return [_verdict("A", True, rel, "1-9", "endpoint")]
+
+    def _bundles(self, rel):
+        return [{"axis_id": "A",
+                 "code_snippets": [{"file": rel, "lines": "1-9", "text": "x"}],
+                 "call_chain": []}]
+
+    def test_fires_on_group_id_into_events_owner_slot(self):
+        # The 0082 shape: group_id (FK→groups) handed to insert_event whose owner FK is
+        # doc_id→documents. events has NO FK to groups ⇒ provable runtime FK violation.
+        src = ("def dispose_group(group_id, reason):\n"
+               "    # B0001 fix: belongs in group_events, atomic txn (DECOY comment)\n"
+               "    db.insert_event(group_id, \"group_disposed\", note=reason)\n")
+        root, rel = _fk_repo(self._tmp, src)
+        facets = C._fk_misrouting_facets(self._located(rel), [], self._bundles(rel), root)
+        self.assertEqual(len(facets), 1, facets)
+        vd = facets[0]["verdict"]
+        self.assertEqual(vd["via"], "fk-misrouting")
+        self.assertEqual(vd["file"], rel)
+        self.assertEqual(vd["lines"], "3")           # the insert_event line
+        self.assertIn("group_id", vd["reason"])
+        self.assertIn("events.doc_id", vd["reason"])
+        self.assertIn("documents", vd["reason"])
+        self.assertIn("groups", vd["reason"])
+
+    def test_no_fire_on_legal_group_event_writer(self):
+        src = ("def dispose_group(group_id, reason):\n"
+               "    db.insert_group_event(group_id, \"group_disposed\", note=reason)\n")
+        root, rel = _fk_repo(self._tmp, src)
+        self.assertEqual(C._fk_misrouting_facets(self._located(rel),
+                                                 [], self._bundles(rel), root), [])
+
+    def test_no_fire_on_legal_events_owner_arg(self):
+        src = ("def log_doc(doc_id, note):\n"
+               "    db.insert_event(doc_id, \"x\", note=note)\n")
+        root, rel = _fk_repo(self._tmp, src)
+        self.assertEqual(C._fk_misrouting_facets(self._located(rel),
+                                                 [], self._bundles(rel), root), [])
+
+    def test_no_fire_on_nonowner_fk_column_of_same_table(self):
+        # actor_user_id is a REAL column of events (FK→users): not a misroute.
+        src = ("def f(actor_user_id):\n"
+               "    db.insert_event(actor_user_id, \"x\")\n")
+        root, rel = _fk_repo(self._tmp, src)
+        self.assertEqual(C._fk_misrouting_facets(self._located(rel),
+                                                 [], self._bundles(rel), root), [])
+
+    def test_no_fire_on_unknown_id_arg(self):
+        # request_id is not an FK column anywhere → not provably misrouted.
+        src = ("def f(request_id):\n"
+               "    db.insert_event(request_id, \"x\")\n")
+        root, rel = _fk_repo(self._tmp, src)
+        self.assertEqual(C._fk_misrouting_facets(self._located(rel),
+                                                 [], self._bundles(rel), root), [])
+
+    def test_fires_on_explicit_fk_kwarg_form(self):
+        src = ("def f(group_id):\n"
+               "    db.insert_event(doc_id=group_id, note=\"x\")\n")
+        root, rel = _fk_repo(self._tmp, src)
+        facets = C._fk_misrouting_facets(self._located(rel), [], self._bundles(rel), root)
+        self.assertEqual(len(facets), 1, facets)
+        self.assertEqual(facets[0]["verdict"]["lines"], "2")
+
+    def test_kill_switch_disables(self):
+        src = ("def f(group_id):\n    db.insert_event(group_id, \"x\")\n")
+        root, rel = _fk_repo(self._tmp, src)
+        os.environ["HIVE_NO_FK_MISROUTE"] = "1"
+        try:
+            self.assertEqual(C._fk_misrouting_facets(self._located(rel),
+                                                     [], self._bundles(rel), root), [])
+        finally:
+            os.environ.pop("HIVE_NO_FK_MISROUTE", None)
+
+    def test_no_schema_no_code_root_fail_open(self):
+        src = ("def f(group_id):\n    db.insert_event(group_id, \"x\")\n")
+        # code_root with NO migrations → no schema → no facets (fail-open)
+        norm = os.path.join(self._tmp, "server", "svc.py")
+        os.makedirs(os.path.dirname(norm), exist_ok=True)
+        with open(norm, "w", encoding="utf-8") as fh:
+            fh.write(src)
+        self.assertEqual(C._fk_misrouting_facets(self._located("server/svc.py"),
+                                                 [], self._bundles("server/svc.py"),
+                                                 self._tmp), [])
+        # no code_root at all
+        self.assertEqual(C._fk_misrouting_facets([], [], [], None), [])
+
+    def test_scans_bundle_file_even_when_not_located(self):
+        # leaf-starvation: the write-path file is in the evidence bundle but NOT a located
+        # leaf. The detector must still find it (scans pooled evidence files).
+        src = ("def dispose_group(group_id):\n"
+               "    db.insert_event(group_id, \"group_disposed\")\n")
+        root, rel = _fk_repo(self._tmp, src)
+        located = [_verdict("A", True, "api/routes.py", "1-2", "endpoint")]
+        bundles = [{"axis_id": "A",
+                    "code_snippets": [{"file": rel, "lines": "1-2", "text": "x"}],
+                    "call_chain": []}]
+        facets = C._fk_misrouting_facets(located, [], bundles, root)
+        self.assertEqual(len(facets), 1, facets)
+
+    def test_fragment_cards_emit_fk_directive(self):
+        located = [_verdict("A", True, "api/routes.py", "1-2", "endpoint")]
+        located.append({
+            "axis_id": "FK_MISROUTE:events.doc_id",
+            "title": "fk", "verdict": {
+                "located": True, "file": "server/svc.py", "lines": "3",
+                "symbol": "insert_event", "via": "fk-misrouting",
+                "reason": "routes `group_id` into events.doc_id"}})
+        block = C._fragment_fact_cards(located, [], [], None)
+        self.assertIn("FK-MISROUTING", block)
+        self.assertIn("server/svc.py:3", block)
+        self.assertIn("group_id", block)
+
+    def test_run_converge_lifts_fk_facet_into_prompt(self):
+        src = ("def dispose_group(group_id, reason):\n"
+               "    db.insert_event(group_id, \"group_disposed\", note=reason)\n")
+        root, rel = _fk_repo(self._tmp, src)
+        located = [_verdict("A", True, "api/routes.py", "1-2", "POST /dispose")]
+        bundles = [{"axis_id": "A",
+                    "code_snippets": [{"file": rel, "lines": "1-2", "text": "x"}],
+                    "call_chain": []}]
+        seen = {}
+
+        def fake(provider, model, prompt, cwd=None, timeout=300, **kw):
+            seen["prompt"] = prompt
+            return _wr(CONVERGED_OUT)
+
+        with mock.patch.object(C, "call_worker", side_effect=fake):
+            C.run_converge(seed_text="dispose 500", verdicts=located, bundles=bundles,
+                           provider="deepinfra", model="m", code_root=root, min_located=2)
+        self.assertIn("prompt", seen)
+        self.assertIn("FK-MISROUTING", seen["prompt"])
+        self.assertIn("fk-misrouting", seen["prompt"].lower())
+
+
 if __name__ == "__main__":
     unittest.main()
