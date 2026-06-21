@@ -2889,6 +2889,28 @@ class TestHttpDatasourceProvenanceGuard(unittest.TestCase):
         self.assertEqual(C._norm(out.attributed_defect["file"]), C._norm(self.DECOY))
         self.assertNotIn("http_datasource_provenance_repointed", out.causal_check)
 
+    def test_mutation_class_symptom_abstains(self):
+        # NR hivework.0035.0009: a write-failure (mutation-class) symptom is NOT a gated
+        # FE field-emptiness omission. The guard must abstain so it never tugs the write
+        # locus onto an auth/read datasource decoy (run503 auth_outbound re-point). Same
+        # inputs that WOULD re-point (proven by test_repoints_...), but the flag is set.
+        res = self._res_attr(self.DECOY)
+        out = C._http_datasource_provenance_guard(
+            res, self._located(self.DECOY, self.STORE), self._windows(),
+            is_mutation_symptom=True)
+        self.assertEqual(C._norm(out.attributed_defect["file"]), C._norm(self.DECOY))
+        self.assertNotIn("http_datasource_provenance_repointed", out.causal_check)
+
+    def test_omission_symptom_still_repoints_when_not_mutation(self):
+        # The carve-out is tight: with is_mutation_symptom=False (an omission symptom),
+        # the guard re-points exactly as before — no behaviour change for M036.
+        res = self._res_attr(self.DECOY)
+        out = C._http_datasource_provenance_guard(
+            res, self._located(self.DECOY, self.STORE), self._windows(),
+            is_mutation_symptom=False)
+        self.assertEqual(C._norm(out.attributed_defect["file"]), C._norm(self.STORE))
+        self.assertIn("http_datasource_provenance_repointed", out.causal_check)
+
     def test_noop_when_already_at_datasource(self):
         res = self._res_attr(self.STORE, lines="1021-1035")
         out = C._http_datasource_provenance_guard(

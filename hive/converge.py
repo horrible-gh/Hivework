@@ -2659,7 +2659,9 @@ def _attribution_is_design_change(attr_file: str,
 def _http_datasource_provenance_guard(res: ConvergeResult,
                                       located: list[dict[str, Any]],
                                       windows: list[dict[str, Any]],
-                                      code_root: str | None = None) -> ConvergeResult:
+                                      code_root: str | None = None,
+                                      *,
+                                      is_mutation_symptom: bool = False) -> ConvergeResult:
     """Re-point off-path HTTP decoys to the datasource that empties a gated FE field.
 
     Fires only when all grounding lines up:
@@ -2678,8 +2680,23 @@ def _http_datasource_provenance_guard(res: ConvergeResult,
     Disabled by ``HIVE_NO_HTTP_DATASOURCE_PROVENANCE``. This is a re-point/confirm guard
     only; it never invents an edit target, and the apply-side red→green backstop is the final
     execution check on any re-point.
+
+    Mutation-class carve-out (NR hivework.0035.0009): this guard exists for a FE
+    FIELD-EMPTINESS (omission) symptom — a collection gated by ``length > 0`` that renders
+    empty because its datasource omits the field. A persistence/MUTATION-class symptom (a
+    write-failure 500 — dispose-FK) is a different animal: the bug is the failing WRITE, not
+    an emptied read field. On run503 this guard mis-fired on a dispose-FK 500 and re-pointed
+    the correct db-write line (process_service.py:2156) onto ``auth_outbound.verify_bearer``
+    (an auth function whose ``return {…}`` trips the datasource-shape gate) — exactly the
+    "NOT auth/routing" decoy the golden warns of; only the next field-provenance guard
+    happened to undo it. When the symptom is mutation-class, abstain so the write locus is
+    never tugged onto an auth/read datasource in the first place.
     """
     if os.environ.get("HIVE_NO_HTTP_DATASOURCE_PROVENANCE"):
+        return res
+    if is_mutation_symptom:
+        logger.info("converge: HTTP datasource guard abstained (mutation-class symptom — "
+                    "write-failure, not a gated FE field-emptiness omission)")
         return res
     edges = _http_ds_fe_edges(windows, code_root)
     if not edges:
@@ -3141,7 +3158,8 @@ def _causal_provenance_arbiter(
         windows: list[dict[str, Any]],
         min_located: int,
         split_origin: bool = False,
-        stability_comparison: ConvergeResult | None = None) -> ConvergeResult:
+        stability_comparison: ConvergeResult | None = None,
+        is_mutation_symptom: bool = False) -> ConvergeResult:
     """Apply all causal/provenance decisions through one fail-closed entry point.
 
     Precedence is explicit. Demotion facets first collect negative evidence: incomplete
@@ -3170,7 +3188,8 @@ def _causal_provenance_arbiter(
                 res, located, windows, min_located=min_located, data_backed=data_backed)
         res = _attribution_stability_guard(res, stability_comparison)
         res = _http_datasource_provenance_guard(
-            res, located, http_ds_windows, code_root)
+            res, located, http_ds_windows, code_root,
+            is_mutation_symptom=is_mutation_symptom)
         res = _field_provenance_guard(res, located, fp_windows)
         # Last: with the attribution settled, surface any INDEPENDENT roots (distinct
         # FE-bound field producers) the single-path stitch collapsed (N179 reinforcement).
@@ -3841,7 +3860,8 @@ def run_converge(*, seed_text: str, verdicts: list[dict[str, Any]],
                  split_enabled: bool = False, split_max_loci: int = 4,
                  split_provider: str = "", split_model: str = "",
                  lens_lenses: list[str] | None = None, lens_provider: str = "",
-                 lens_model: str = "", lens_min_refute: int = 0) -> ConvergeResult:
+                 lens_model: str = "", lens_min_refute: int = 0,
+                 is_mutation_symptom: bool = False) -> ConvergeResult:
     """Stitch the per-axis verdicts into one path. Tool-OFF; never raises.
 
     Budget (mirrors judge's retrieve→re-judge): ONE converge call, plus — ONLY when
@@ -4184,7 +4204,8 @@ def run_converge(*, seed_text: str, verdicts: list[dict[str, Any]],
         windows=http_ds_windows,
         min_located=min_located,
         split_origin=split_res is not None,
-        stability_comparison=split_res if split_res is not res else None)
+        stability_comparison=split_res if split_res is not res else None,
+        is_mutation_symptom=is_mutation_symptom)
 
     # Carry the live-DB read onto whichever result we return so the honey can PASTE the
     # real rows (or honestly report that the read was attempted but returned nothing).
