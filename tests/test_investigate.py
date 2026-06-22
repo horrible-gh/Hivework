@@ -24,6 +24,7 @@ from hive.investigate import (
     _is_scaffolding_axis, ensure_mutation_path_axis, _fk_persistence_seed,
     _extract_table_hints, _is_mutation_path_axis, _RESERVED_MUTATION_SEATS,
     _mutation_symptom_seed, promote_mutation_path_axes,
+    inject_mutation_path_anchor, _writer_layer_hits,
 )
 from hive.reinvestigate import (
     ReinvestPlan, ACTION_RE_CONVERGE, ACTION_RE_RETRIEVE,
@@ -1461,6 +1462,343 @@ class TestMutationPathPromotion(unittest.TestCase):
         judged = self._judged_ids_for("the list shows items in the wrong sort order")
         self.assertNotIn("service_logic", judged)
         self.assertNotIn("db_queries", judged)
+
+
+class TestMutationPathInjection(unittest.TestCase):
+    """NR hivework.0037.0007 — the GENERATION gap: when a stochastic decompose emits
+    NO write-path axis at all (live run506/507/508/509), the reorder guards are no-ops
+    (nothing to select) and recall stays 0/1. inject_mutation_path_anchor synthesises
+    the missing candidate from a real-file grep — the recall lever the reorder guards
+    cannot be."""
+
+    FK_SEED = ("POST /groups/{id}/dispose returns 500: sqlite3.IntegrityError: "
+               "FOREIGN KEY constraint failed.")
+    REAL_SEED = ("Discarding a workflow group fails: POST /groups/{id}/dispose "
+                 "returns 500 Internal Server Error.")
+
+    def _mk_repo(self, td):
+        # A realistic write site in a service layer + a noise reader.
+        svc = os.path.join(td, "server", "modules")
+        os.makedirs(svc)
+        with open(os.path.join(svc, "process_service.py"), "w",
+                  encoding="utf-8") as f:
+            f.write("def dispose_group(group_id, reason):\n"
+                    "    db.insert_event(group_id, 'group_disposed', note=reason)\n")
+        with open(os.path.join(svc, "reader.py"), "w", encoding="utf-8") as f:
+            f.write("def list_groups():\n    return db.get_all('SELECT * FROM groups')\n")
+
+    def _read_only_leaves(self):
+        # The exact failure mode: every leaf is a read/FE axis — NO write-path axis.
+        return [{"id": f"N{i}", "title": f"reader {i}",
+                 "brief": "list rows via get_x / SELECT for display",
+                 "search_plan": {"keywords": ["get_x"],
+                                 "file_globs": ["client/**/*.vue"], "doc_topics": []}}
+                for i in range(4)]
+
+    def test_injects_anchor_when_no_write_axis_exists(self):
+        with tempfile.TemporaryDirectory() as td:
+            self._mk_repo(td)
+            out = inject_mutation_path_anchor(self._read_only_leaves(),
+                                              self.FK_SEED, td)
+            self.assertEqual(out[0]["id"], "MUTATION_ANCHOR")
+            # scoped to the REAL write site, not the reader.
+            globs = out[0]["search_plan"]["file_globs"]
+            self.assertTrue(any("process_service.py" in g for g in globs))
+            self.assertFalse(any("reader.py" in g for g in globs))
+
+    def test_injects_on_realistic_seed_without_fk_word(self):
+        with tempfile.TemporaryDirectory() as td:
+            self._mk_repo(td)
+            out = inject_mutation_path_anchor(self._read_only_leaves(),
+                                              self.REAL_SEED, td)
+            self.assertEqual(out[0]["id"], "MUTATION_ANCHOR")
+
+    def test_noop_when_a_write_axis_already_exists(self):
+        # The queen DID emit a write-path leaf → reorder guards own it, never duplicate.
+        with tempfile.TemporaryDirectory() as td:
+            self._mk_repo(td)
+            leaves = self._read_only_leaves() + [
+                {"id": "srv", "title": "service write",
+                 "brief": "dispose_group insert_event write",
+                 "search_plan": {"keywords": ["insert_event"],
+                                 "file_globs": ["server/modules/**/*.py"],
+                                 "doc_topics": []}}]
+            out = inject_mutation_path_anchor(leaves, self.FK_SEED, td)
+            self.assertIs(out, leaves)
+            self.assertNotIn("MUTATION_ANCHOR", [a["id"] for a in out])
+
+    def test_noop_on_non_mutation_seed(self):
+        with tempfile.TemporaryDirectory() as td:
+            self._mk_repo(td)
+            out = inject_mutation_path_anchor(
+                self._read_only_leaves(),
+                "the list shows items in the wrong sort order", td)
+            self.assertNotIn("MUTATION_ANCHOR", [a["id"] for a in out])
+
+    def test_noop_when_repo_has_no_write_site(self):
+        with tempfile.TemporaryDirectory() as td:
+            d = os.path.join(td, "server")
+            os.makedirs(d)
+            with open(os.path.join(d, "reader.py"), "w", encoding="utf-8") as f:
+                f.write("def list_groups():\n    return get_all('SELECT 1')\n")
+            out = inject_mutation_path_anchor(self._read_only_leaves(),
+                                              self.FK_SEED, td)
+            self.assertNotIn("MUTATION_ANCHOR", [a["id"] for a in out])
+
+    def test_noop_without_code_root(self):
+        out = inject_mutation_path_anchor(self._read_only_leaves(),
+                                          self.FK_SEED, None)
+        self.assertNotIn("MUTATION_ANCHOR", [a["id"] for a in out])
+
+    def test_writer_layer_hits_skip_test_files(self):
+        with tempfile.TemporaryDirectory() as td:
+            d = os.path.join(td, "tests")
+            os.makedirs(d)
+            with open(os.path.join(d, "test_dispose.py"), "w",
+                      encoding="utf-8") as f:
+                f.write("db.insert_event(1, 'x')\n")
+            self.assertEqual(_writer_layer_hits(td, set()), [])
+
+    # ── end-to-end: the run506/509 GENERATION gap, judged after injection ────
+    def _decompose_no_write_axis(self):
+        # Mirrors run509: decompose emits ONLY read/FE axes — the write site absent.
+        tasks = [{"id": f"N{i}", "title": f"reader {i}",
+                  "brief": "list rows via get_x / SELECT for display",
+                  "depends_on": [],
+                  "search_plan": {"keywords": ["get_x"],
+                                  "file_globs": ["client/**/*.vue"],
+                                  "doc_topics": []}}
+                 for i in range(4)]
+        return json.dumps({"fanout_decision": "fanout", "reason": "x",
+                           "steps": [[t["id"] for t in tasks]], "tasks": tasks})
+
+    def _judged_ids_for(self, seed, repo_builder):
+        cfg = load_config()
+        cfg.judge.max_calls_per_axis = 1
+        cfg.judge.votes_per_axis = 1
+        cfg.judge.max_axes = 10
+        seen = []
+
+        def _record(_provider, _model, prompt, **_k):
+            m = re.search(r'axis "([^"]+)"', prompt)
+            if m:
+                seen.append(m.group(1))
+            return _wr(VERDICT_OUT)
+
+        with tempfile.TemporaryDirectory() as td:
+            repo_builder(td)
+            out = os.path.join(td, "v.json")
+            with mock.patch("hive.decompose.call_worker",
+                            return_value=_wr(self._decompose_no_write_axis())), \
+                 mock.patch("hive.judge.call_worker", side_effect=_record), \
+                 mock.patch("hive.converge.call_worker",
+                            return_value=_wr(CONVERGE_OUT)), \
+                 mock.patch("hive.investigate.retrieve", side_effect=_fake_retrieve):
+                INV.run_investigate(seed_text=seed, recipe_path=None, code_root=td,
+                                    docs_root=None, output_path=out, cfg=cfg,
+                                    ledger=None)
+        return seen
+
+    def test_e2e_injected_anchor_is_judged_on_fk_seed(self):
+        # The whole point: with NO write axis in the decompose, the answer locus
+        # STILL reaches the judge because the anchor was injected (recall 0→1 path).
+        judged = self._judged_ids_for(self.FK_SEED, self._mk_repo)
+        self.assertIn("MUTATION_ANCHOR", judged)
+
+    def test_e2e_no_injection_on_read_seed(self):
+        # Negative control: a read-only seed never arms injection — original MISS.
+        judged = self._judged_ids_for(
+            "the list shows items in the wrong sort order", self._mk_repo)
+        self.assertNotIn("MUTATION_ANCHOR", judged)
+
+
+class TestGateIndependentFKMisrouting(unittest.TestCase):
+    """Lever A (hivework.default.0036.0005-NR): the deterministic FK-misrouting check
+    must fire at investigate level even when the judge dismisses the real write-path
+    axis (located=False) so converge is skipped (located_n < 2) — the run506 0082 MISS.
+    """
+
+    _MIG = (
+        "CREATE TABLE documents (doc_id TEXT PRIMARY KEY);\n"
+        "CREATE TABLE groups (group_id TEXT PRIMARY KEY);\n"
+        "CREATE TABLE events (\n"
+        "  event_id INTEGER PRIMARY KEY,\n"
+        "  doc_id TEXT NOT NULL REFERENCES documents(doc_id),\n"
+        "  note TEXT);\n"
+        "CREATE TABLE group_events (\n"
+        "  event_id INTEGER PRIMARY KEY,\n"
+        "  group_id TEXT NOT NULL REFERENCES groups(group_id),\n"
+        "  note TEXT);\n"
+    )
+    # The 0082 regression: group_id (FK→groups) routed into events.doc_id (FK→documents).
+    _BUG_SRC = (
+        "def dispose_group(group_id, reason):\n"
+        "    db.insert_event(group_id, \"group_disposed\", note=reason)\n"
+    )
+    _LEGAL_SRC = (
+        "def dispose_group(group_id, reason):\n"
+        "    db.insert_group_event(group_id, \"group_disposed\", note=reason)\n"
+    )
+    # One leaf axis whose retrieve will surface the write-path file.
+    _DECOMPOSE = json.dumps({
+        "fanout_decision": "fanout", "reason": "x",
+        "steps": [["B"]],
+        "tasks": [
+            {"id": "B", "title": "dispose service", "depends_on": [],
+             "brief": "trace server/x.py dispose_group event write",
+             "search_plan": {"keywords": ["dispose_group"],
+                             "file_globs": ["server/x.py"], "doc_topics": []}},
+        ],
+    })
+    # The judge dismisses it — exactly run506's "functions as designed" refute.
+    _REFUTE = json.dumps({"verdict": {"located": False, "type": "refuted",
+                                      "reason": "code functions as designed"}})
+
+    def _repo(self, td, src):
+        mig = os.path.join(td, "server", "sql", "migrations")
+        os.makedirs(mig, exist_ok=True)
+        with open(os.path.join(mig, "001.sql"), "w", encoding="utf-8") as fh:
+            fh.write(self._MIG)
+        with open(os.path.join(td, "server", "x.py"), "w", encoding="utf-8") as fh:
+            fh.write(src)
+
+    @staticmethod
+    def _retrieve(plan, code_root, docs_root=None, **kwargs):
+        # Surface server/x.py in the bundle so the FK check has it to scan, even
+        # though the judge will refute the axis (bundles are kept regardless).
+        return {
+            "axis_id": plan.axis_id,
+            "code_snippets": [{"file": "server/x.py", "lines": "1-3",
+                               "text": "def dispose_group(): ...", "hits": []}],
+            "call_chain": [], "call_sites": [],
+            "git_history": [], "design_excerpts": [],
+            "stats": {"raw_hits": 2, "snippets": 1, "call_chain": 0},
+        }
+
+    def _run(self, src):
+        cfg = load_config()
+        cfg.judge.max_calls_per_axis = 1
+        cfg.judge.votes_per_axis = 1
+        cfg.judge.max_axes = 5
+        with tempfile.TemporaryDirectory() as td:
+            self._repo(td, src)
+            out = os.path.join(td, "verdicts.json")
+            with mock.patch("hive.decompose.call_worker", return_value=_wr(self._DECOMPOSE)), \
+                 mock.patch("hive.judge.call_worker", return_value=_wr(self._REFUTE)), \
+                 mock.patch("hive.investigate.retrieve", side_effect=self._retrieve):
+                return INV.run_investigate(
+                    seed_text="disposing a group returns 500", recipe_path=None,
+                    code_root=td, docs_root=None, output_path=out, cfg=cfg, ledger=None,
+                )
+
+    def setUp(self):
+        os.environ.pop("HIVE_NO_FK_MISROUTE", None)
+
+    def _fk_verdicts(self, result):
+        return [v for v in result["verdicts"]
+                if (v.get("verdict") or {}).get("via") == "fk-misrouting"]
+
+    def test_fk_facet_injected_despite_judge_refute_and_converge_skip(self):
+        result = self._run(self._BUG_SRC)
+        # No real axis located → converge skipped; the gate-independent check still fires.
+        fk = self._fk_verdicts(result)
+        self.assertEqual(len(fk), 1, [v["verdict"] for v in result["verdicts"]])
+        vd = fk[0]["verdict"]
+        self.assertTrue(vd["located"])
+        self.assertEqual(_norm(vd["file"]), "server/x.py")
+        self.assertEqual(vd["lines"], "2")            # the insert_event line
+        self.assertIn("group_id", vd["reason"])
+        self.assertIn("events.doc_id", vd["reason"])
+        # converge gate: facet lifted located_n to ≥1 deterministically (found restored).
+        self.assertTrue(any(v["verdict"]["located"] for v in result["verdicts"]))
+
+    def test_no_facet_on_legal_group_event_writer(self):
+        # The fixed code (insert_group_event) must NOT trip the check (no false positive).
+        result = self._run(self._LEGAL_SRC)
+        self.assertEqual(self._fk_verdicts(result), [])
+
+    def test_kill_switch_disables_gate_independent_check(self):
+        os.environ["HIVE_NO_FK_MISROUTE"] = "1"
+        try:
+            result = self._run(self._BUG_SRC)
+        finally:
+            os.environ.pop("HIVE_NO_FK_MISROUTE", None)
+        self.assertEqual(self._fk_verdicts(result), [])
+
+    # ── Lever B (NR0011): post-convergence re-scan ─────────────────────────────
+    _DECOMPOSE2 = json.dumps({
+        "fanout_decision": "fanout", "reason": "x",
+        "steps": [["P", "Q"]],
+        "tasks": [
+            {"id": "P", "title": "close path", "depends_on": [],
+             "brief": "server/decoy.py close transition",
+             "search_plan": {"keywords": ["close"], "file_globs": ["server/decoy.py"],
+                             "doc_topics": []}},
+            {"id": "Q", "title": "500 site", "depends_on": [],
+             "brief": "server/decoy.py fail500",
+             "search_plan": {"keywords": ["_fail"], "file_globs": ["server/decoy.py"],
+                             "doc_topics": []}},
+        ],
+    })
+    # The judge locates only the DECOY (grounded by retrieve) — never the real write file,
+    # exactly run507: process_service.py never reaches a pre-converge bundle.
+    _DECOY_LOCATED = json.dumps({"verdict": {"located": True, "file": "server/decoy.py",
+                                             "lines": "1-2", "reason": "decoy 500 site"}})
+
+    @staticmethod
+    def _retrieve_decoy(plan, code_root, docs_root=None, **kwargs):
+        return {
+            "axis_id": plan.axis_id,
+            "code_snippets": [{"file": "server/decoy.py", "lines": "1-2",
+                               "text": "def close_group(): ...", "hits": []}],
+            "call_chain": [], "call_sites": [],
+            "git_history": [], "design_excerpts": [],
+            "stats": {"raw_hits": 1, "snippets": 1, "call_chain": 0},
+        }
+
+    def test_lever_b_post_converge_rescan_promotes_fk_locus(self):
+        # run507 shape: judge locates 2 decoys (converge runs), and converge's path-tracing
+        # REACHES the real write file (server/x.py) as its generic attributed_defect — but
+        # only AFTER the pre-converge FK checks ran. Lever B re-scans converge's final path
+        # and promotes the proven FK locus.
+        cfg = load_config()
+        cfg.judge.max_calls_per_axis = 1
+        cfg.judge.votes_per_axis = 1
+        cfg.judge.max_axes = 5
+        with tempfile.TemporaryDirectory() as td:
+            self._repo(td, self._BUG_SRC)        # migration + server/x.py (the bug @ line 2)
+            with open(os.path.join(td, "server", "decoy.py"), "w", encoding="utf-8") as fh:
+                fh.write("def close_group():\n    return 500\n")
+            cres = mock.Mock(converged=True,
+                             attributed_defect={"file": "server/x.py", "lines": "1-2"},
+                             causal_check={"verdict": "consistent"}, missing_link=None)
+            cres.as_dict.return_value = {
+                "converged": True,
+                "attributed_defect": {"file": "server/x.py", "lines": "1-2"},
+                "winning_path": [{"file": "server/x.py", "lines": "1-2"}],
+            }
+            out = os.path.join(td, "verdicts.json")
+            with mock.patch("hive.decompose.call_worker", return_value=_wr(self._DECOMPOSE2)), \
+                 mock.patch("hive.judge.call_worker", return_value=_wr(self._DECOY_LOCATED)), \
+                 mock.patch("hive.investigate.retrieve", side_effect=self._retrieve_decoy), \
+                 mock.patch.object(INV, "run_converge", return_value=cres):
+                result = INV.run_investigate(
+                    seed_text="disposing a group returns 500", recipe_path=None,
+                    code_root=td, docs_root=None, output_path=out, cfg=cfg, ledger=None)
+        # Lever A could not fire (server/x.py never in a pre-converge bundle); lever B did.
+        fk = self._fk_verdicts(result)
+        self.assertEqual(len(fk), 1, [v["verdict"] for v in result["verdicts"]])
+        self.assertEqual(fk[0]["verdict"]["lines"], "2")     # the insert_event line
+        self.assertEqual(_norm(fk[0]["verdict"]["file"]), "server/x.py")
+        # Promoted to THE converge attribution, carrying the FK mechanism.
+        ad = result["converge"]["attributed_defect"]
+        self.assertEqual(ad.get("via"), "fk-misrouting")
+        self.assertEqual(_norm(ad["file"]), "server/x.py")
+        self.assertEqual(ad["lines"], "2")
+
+
+def _norm(p: str) -> str:
+    return (p or "").replace("\\", "/")
 
 
 if __name__ == "__main__":

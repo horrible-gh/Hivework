@@ -16,6 +16,8 @@ from hive.retriever import (
     _resolve_peer_patterns, _stacking_profile,
     _harvest_inscope_fetch_urls, _covered_ranges, _follow_calls,
     _resolve_field_producers, _resolve_http_producer_paths,
+    _resolve_mutation_writers, _fk_annotation, _writer_table_for,
+    _mutation_cue_present, _anchor_mutation_writer_defs,
 )
 
 ROOT = "C:/workspace/projects/Documents/projects/FlowGate"
@@ -1086,3 +1088,338 @@ def test_field_producer_drops_overcommon_key(tmp_path):
     (tmp_path / "many.py").write_text(lines, encoding="utf-8")
     snippets = [{"file": "x.vue", "lines": "1", "text": "project_id_field"}]
     assert _resolve_field_producers(snippets, str(tmp_path)) == []
+
+
+# ── write-path / FK grounding (0038 NR0003 → TR; continues 0037 TSR0011) ──────────
+# The 0082 dispose-FK MISS: a mutation-class defect's writer (`insert_event(group_id, …)`)
+# sits DEEP in a disposal service, invisible to every read/response resolver. This resolver
+# follows callees to the write site and attaches migration FK facts so the JUDGE sees the
+# write+constraint AND the writer file enters the bundle for converge's FK check to fire.
+
+_MUT_MIGRATION_SQL = """
+CREATE TABLE documents (doc_id TEXT PRIMARY KEY);
+CREATE TABLE groups (group_id TEXT PRIMARY KEY);
+CREATE TABLE users (user_id TEXT PRIMARY KEY);
+CREATE TABLE events (
+    event_id       INTEGER PRIMARY KEY,
+    doc_id         TEXT NOT NULL REFERENCES documents(doc_id),
+    actor_user_id  TEXT REFERENCES users(user_id),
+    note           TEXT
+);
+CREATE TABLE group_events (
+    event_id  INTEGER PRIMARY KEY,
+    group_id  TEXT NOT NULL REFERENCES groups(group_id),
+    note      TEXT
+);
+"""
+
+# process_service.py: the deep write path (handler → dispose_group → _apply_… → insert_event).
+# group_id (FK→groups) is handed to insert_event whose owner FK is doc_id→documents; events has
+# NO FK to groups ⇒ a provable runtime FK violation, but the call sits ~3 hops below the handler.
+_MUT_SERVICE_SRC = """\
+def dispose_group(group_id, reason):
+    return _apply_group_terminal_action(group_id, reason)
+
+
+def _apply_group_terminal_action(group_id, reason):
+    # B0001 fix: dispose terminal action, atomic txn (DECOY fix comment)
+    db.insert_event(group_id, "group_disposed", note=reason)
+    return True
+"""
+
+
+def _mk_mutation_repo(tmp_path, sql=_MUT_MIGRATION_SQL, service=_MUT_SERVICE_SRC):
+    """0082-shaped repo: migration DDL + a disposal service holding the deep writer."""
+    mig = tmp_path / "server" / "sql" / "migrations"
+    mig.mkdir(parents=True, exist_ok=True)
+    (mig / "001_schema.sql").write_text(sql, encoding="utf-8")
+    svc = tmp_path / "server" / "services" / "process_service.py"
+    svc.parent.mkdir(parents=True, exist_ok=True)
+    svc.write_text(service, encoding="utf-8")
+    return str(tmp_path)
+
+
+# The handler snippet the keyword retrieve actually lands on — it calls dispose_group but
+# carries NO write line itself (the write is 3 hops down, in another file not yet in scope).
+_HANDLER_SNIPPET = {
+    "file": "server/routers/documents.py", "lines": "40-43",
+    "text": ("def dispose_group_endpoint(group_id):\n"
+             "    reason = \"user requested\"\n"
+             "    return dispose_group(group_id, reason)\n"),
+}
+_MUT_PLAN = SearchPlan(axis_id="backend-dispose-service",
+                       keywords=["dispose", "group", "event"],
+                       file_globs=["server/**/*.py"])
+
+
+def test_mutation_writer_surfaced_from_deep_callchain(tmp_path):
+    root = _mk_mutation_repo(tmp_path)
+    out = _resolve_mutation_writers([dict(_HANDLER_SNIPPET)], _MUT_PLAN, root)
+    assert out, "writer should be reached via the 3-hop call chain"
+    writers = [n for n in out if n.get("via") == "mutation-writer"]
+    assert writers, out
+    w = writers[0]
+    assert w["table"] == "events"
+    assert w["symbol"] == "insert_event"
+    assert w["file"].endswith("process_service.py")     # a NEW file, not in the seed bundle
+    # FK facts the judge can rule on are attached inline.
+    assert "doc_id->documents" in w["text"]
+    assert "NO FK to" in w["text"] and "groups" in w["text"]
+    assert "WRITE-PATH / FK GROUNDING" in w["text"]
+
+
+def test_writer_bundle_unstarves_converge_fk_check(tmp_path):
+    # End-to-end starvation-closed proof: the writer node this resolver adds to the bundle is
+    # exactly what converge's _fk_misrouting_facets needs to fire (it scans bundle call_chain
+    # FILES for insert_<table>(...)). Without this resolver, process_service.py never entered
+    # the bundle and the FK check stayed dormant (the 0037 MISS).
+    import hive.converge as C
+    root = _mk_mutation_repo(tmp_path)
+    out = _resolve_mutation_writers([dict(_HANDLER_SNIPPET)], _MUT_PLAN, root)
+    bundles = [{"axis_id": "A", "code_snippets": [dict(_HANDLER_SNIPPET)], "call_chain": out}]
+    facets = C._fk_misrouting_facets([], [], bundles, root)
+    assert facets, "FK check must fire once the writer file is in the bundle"
+    assert facets[0]["verdict"]["via"] == "fk-misrouting"
+    assert "events" in facets[0]["verdict"]["reason"]
+
+
+def test_mutation_writer_silent_on_read_axis(tmp_path):
+    # A read/UI axis (no mutation cue in keywords or bundle) must not trigger the write follow.
+    root = _mk_mutation_repo(tmp_path)
+    read_plan = SearchPlan(axis_id="frontend-render", keywords=["render", "label", "title"],
+                           file_globs=["client/**/*.vue"])
+    read_snip = [{"file": "client/src/Panel.vue", "lines": "1-3",
+                  "text": "const title = computed(() => doc.value.title)\n"}]
+    assert _resolve_mutation_writers(read_snip, read_plan, root) == []
+
+
+def test_mutation_writer_killswitch(tmp_path, monkeypatch):
+    root = _mk_mutation_repo(tmp_path)
+    monkeypatch.setenv("HIVE_NO_WRITE_PATH", "1")
+    assert _resolve_mutation_writers([dict(_HANDLER_SNIPPET)], _MUT_PLAN, root) == []
+
+
+def test_mutation_writer_failopen_without_migrations(tmp_path):
+    # No DDL → no schema → silent (fail-open), never raises.
+    svc = tmp_path / "server" / "services" / "process_service.py"
+    svc.parent.mkdir(parents=True, exist_ok=True)
+    svc.write_text(_MUT_SERVICE_SRC, encoding="utf-8")
+    assert _resolve_mutation_writers([dict(_HANDLER_SNIPPET)], _MUT_PLAN, str(tmp_path)) == []
+
+
+def test_mutation_writer_no_fire_on_legal_writer(tmp_path):
+    # insert_group_event(group_id, …): arg == the table's OWN FK column ⇒ surfaced as a writer
+    # but NOT misroutable, so converge stays silent (the legal path must not be flagged).
+    import hive.converge as C
+    legal = ("def dispose_group(group_id, reason):\n"
+             "    db.insert_group_event(group_id, \"group_disposed\", note=reason)\n")
+    root = _mk_mutation_repo(tmp_path, service=legal)
+    out = _resolve_mutation_writers([dict(_HANDLER_SNIPPET)], _MUT_PLAN, root)
+    bundles = [{"axis_id": "A", "code_snippets": [], "call_chain": out}]
+    assert C._fk_misrouting_facets([], [], bundles, root) == []
+
+
+def test_writer_table_for_pluralization():
+    keys = {"events", "group_events", "documents"}
+    assert _writer_table_for("event", keys) == "events"
+    assert _writer_table_for("group_event", keys) == "group_events"
+    assert _writer_table_for("document", keys) == "documents"
+    assert _writer_table_for("widget", keys) is None
+
+
+def test_fk_annotation_names_constraint_and_absence():
+    from hive.schema_ground import load_migration_schema
+    import tempfile, os as _os
+    d = tempfile.mkdtemp(prefix="fkann_")
+    try:
+        mig = _os.path.join(d, "migrations")
+        _os.makedirs(mig)
+        with open(_os.path.join(mig, "001.sql"), "w", encoding="utf-8") as fh:
+            fh.write(_MUT_MIGRATION_SQL)
+        schema = load_migration_schema(d)
+        ann = _fk_annotation("events", schema)
+        assert "doc_id->documents" in ann
+        assert "NO FK to" in ann and "groups" in ann
+    finally:
+        __import__("shutil").rmtree(d, ignore_errors=True)
+
+
+def test_mutation_cue_present_detection():
+    p_write = SearchPlan(axis_id="a", keywords=["dispose"], file_globs=[])
+    p_read = SearchPlan(axis_id="b", keywords=["title", "render"], file_globs=[])
+    assert _mutation_cue_present(p_write, [])
+    assert not _mutation_cue_present(p_read, [])
+    assert _mutation_cue_present(p_read, [{"text": "db.insert_event(x)"}])
+
+
+def test_retrieve_integration_surfaces_writer_in_bundle(tmp_path):
+    # TSR0007 independent verification: the FULL retrieve() (not just the isolated resolver)
+    # must place the deep writer into the returned bundle. Proves step 3f wiring end-to-end:
+    # keyword scan lands on the handler (routers), the resolver follows whole-tree into
+    # services/process_service.py, and insert_event surfaces in call_chain + stats.
+    mig = tmp_path / "server" / "sql" / "migrations"
+    mig.mkdir(parents=True, exist_ok=True)
+    (mig / "001_schema.sql").write_text(_MUT_MIGRATION_SQL, encoding="utf-8")
+    routers = tmp_path / "server" / "routers"
+    routers.mkdir(parents=True, exist_ok=True)
+    (routers / "documents.py").write_text(
+        "def dispose_group_endpoint(group_id):\n"
+        "    reason = \"user requested\"\n"
+        "    return dispose_group(group_id, reason)\n", encoding="utf-8")
+    services = tmp_path / "server" / "services"
+    services.mkdir(parents=True, exist_ok=True)
+    (services / "process_service.py").write_text(_MUT_SERVICE_SRC, encoding="utf-8")
+
+    plan = SearchPlan(axis_id="backend-dispose-service",
+                      keywords=["dispose", "group"],
+                      file_globs=["server/routers/**/*.py"])  # scan lands on the handler only
+    bundle = retrieve(plan, str(tmp_path), max_hops=2)
+    assert bundle["stats"]["mutation_writers"] >= 1, bundle["stats"]
+    writers = [n for n in bundle["call_chain"] if n.get("via") == "mutation-writer"]
+    assert writers, [n.get("via") for n in bundle["call_chain"]]
+    w = writers[0]
+    assert w["table"] == "events" and w["symbol"] == "insert_event"
+    assert w["file"].endswith("process_service.py")     # reached via whole-tree follow, NOT the axis glob
+    assert "doc_id->documents" in w["text"] and "groups" in w["text"]
+
+
+# ── Repo-tree writer ANCHOR fallback (0039 NR0005) ───────────────────────────────
+# run510 root cause: the queen's search_plan MIS-ANCHORED — it named service symbols absent
+# from the repo tree, so retrieve windowed the WRONG service family and the bundle held NO
+# path to the real dispose handler. _resolve_mutation_writers (which follows callees FROM the
+# bundle) therefore had nothing to follow, and the write site never entered evidence (honey:
+# insert_event 0×). These tests prove the fallback recovers the real writer by symptom-verb
+# repo-tree grounding when the axis is under-anchored — and stays inert otherwise.
+
+# A WRONG service file the mis-anchored keyword scan landed on: plausible "dispose" prose but
+# NO FK-table write (mirrors run510's pipeline_service / transition_rules windows).
+_WRONG_SERVICE_SNIPPET = {
+    "file": "server/workflow/pipeline_service.py", "lines": "300-312",
+    "text": ("def transition_group(group_id, target):\n"
+             "    # dispose/close transition routing — no DB write here\n"
+             "    rule = resolve_transition_rule(group_id, target)\n"
+             "    return rule.apply(group_id)\n"),
+}
+
+
+def test_writer_anchor_recovers_misanchored_service(tmp_path):
+    # The bundle anchored on the WRONG service (no writer reachable). The fallback greps the
+    # repo tree by the symptom verb and surfaces the REAL process_service.dispose_group body.
+    root = _mk_mutation_repo(tmp_path)
+    out = _anchor_mutation_writer_defs([dict(_WRONG_SERVICE_SNIPPET)], _MUT_PLAN, root)
+    assert out, "anchor must recover the real handler when the axis mis-anchored"
+    n = out[0]
+    assert n["via"] == "writer-anchor"
+    assert n["file"].endswith("process_service.py")    # the REAL handler file recovered
+    assert "def dispose_group" in n["text"]            # its body (write is 1 hop down; the
+    assert "REPO-TREE WRITER ANCHOR" in n["text"]      # full-file FK scan / BFS reach it)
+
+
+def test_writer_anchor_unstarves_converge_fk_check_when_misanchored(tmp_path):
+    # End-to-end starvation-closed proof for the mis-anchor case: the node the anchor injects
+    # puts process_service.py into the bundle, which is exactly what converge's FK check needs.
+    import hive.converge as C
+    root = _mk_mutation_repo(tmp_path)
+    anchor = _anchor_mutation_writer_defs([dict(_WRONG_SERVICE_SNIPPET)], _MUT_PLAN, root)
+    bundles = [{"axis_id": "A", "code_snippets": [dict(_WRONG_SERVICE_SNIPPET)],
+                "call_chain": anchor}]
+    facets = C._fk_misrouting_facets([], [], bundles, root)
+    assert facets, "FK check must fire once the anchor places the writer file in the bundle"
+    assert facets[0]["verdict"]["via"] == "fk-misrouting"
+    assert "events" in facets[0]["verdict"]["reason"]
+
+
+def test_writer_anchor_skips_when_already_anchored(tmp_path):
+    # If the seeds ALREADY reach an FK-table writer, the existing resolver has it — the fallback
+    # is a free skip (no duplicate work, no behaviour change on healthy axes).
+    root = _mk_mutation_repo(tmp_path)
+    anchored_seed = [{"file": "server/services/process_service.py", "lines": "5-7",
+                      "text": "    db.insert_event(group_id, \"group_disposed\")\n"}]
+    assert _anchor_mutation_writer_defs(anchored_seed, _MUT_PLAN, root) == []
+
+
+def test_writer_anchor_silent_on_read_axis(tmp_path):
+    # No mutation cue (read/UI axis) → no repo-tree grep, even though the repo has a writer.
+    root = _mk_mutation_repo(tmp_path)
+    read_plan = SearchPlan(axis_id="frontend-render", keywords=["render", "title"],
+                           file_globs=["client/**/*.vue"])
+    read_snip = [{"file": "client/src/Panel.vue", "lines": "1-2",
+                  "text": "const title = doc.title\n"}]
+    assert _anchor_mutation_writer_defs(read_snip, read_plan, root) == []
+
+
+def test_writer_anchor_no_verb_no_fire(tmp_path):
+    # Mutation cue present (a writer-shaped bundle) but NO symptom verb to anchor on → silent
+    # (the fallback needs a verb like dispose/close to grep the handler def by name).
+    root = _mk_mutation_repo(tmp_path)
+    plan = SearchPlan(axis_id="be-write", keywords=["persist", "constraint"],
+                      file_globs=["server/**/*.py"])
+    # seeds carry a mutation cue (constraint) but no FK writer and no verb anywhere
+    seed = [{"file": "server/x.py", "lines": "1-2", "text": "# integrity constraint note\n"}]
+    assert _anchor_mutation_writer_defs(seed, plan, root) == []
+
+
+def test_writer_anchor_killswitch(tmp_path, monkeypatch):
+    root = _mk_mutation_repo(tmp_path)
+    monkeypatch.setenv("HIVE_NO_WRITER_ANCHOR", "1")
+    assert _anchor_mutation_writer_defs([dict(_WRONG_SERVICE_SNIPPET)], _MUT_PLAN, root) == []
+
+
+def test_writer_anchor_failopen_without_migrations(tmp_path):
+    # No DDL → no schema → silent (fail-open), never raises.
+    svc = tmp_path / "server" / "services" / "process_service.py"
+    svc.parent.mkdir(parents=True, exist_ok=True)
+    svc.write_text(_MUT_SERVICE_SRC, encoding="utf-8")
+    assert _anchor_mutation_writer_defs(
+        [dict(_WRONG_SERVICE_SNIPPET)], _MUT_PLAN, str(tmp_path)) == []
+
+
+def test_writer_anchor_extended_body_window_captures_deep_write(tmp_path):
+    # NR0005 lever 3: the write may sit PAST the 60-line default def-body cap (run510:
+    # dispose_group def@2091, write@2156 = 6 lines beyond a 60-line window). The anchor reads
+    # an EXTENDED body so the gate sees the writer AND the injected window carries it.
+    pad = "    x = 0\n" * 80   # 80 filler body lines push the write past line 60
+    deep_service = ("def dispose_group(group_id, reason):\n"
+                    + pad +
+                    "    db.insert_event(group_id, \"group_disposed\", note=reason)\n"
+                    "    return True\n")
+    root = _mk_mutation_repo(tmp_path, service=deep_service)
+    out = _anchor_mutation_writer_defs([dict(_WRONG_SERVICE_SNIPPET)], _MUT_PLAN, root)
+    assert out, "deep write past the 60-line cap must still anchor (extended body window)"
+    assert "insert_event" in out[0]["text"]
+
+
+def test_retrieve_integration_anchor_fallback_on_misanchor(tmp_path):
+    # Full retrieve() end-to-end: the axis glob lands ONLY on the wrong service (no writer),
+    # the BFS resolver finds nothing — the anchor fallback recovers process_service.py and the
+    # writer surfaces in the bundle (call_chain + stats). Mirrors the run510 mis-anchor.
+    mig = tmp_path / "server" / "sql" / "migrations"
+    mig.mkdir(parents=True, exist_ok=True)
+    (mig / "001_schema.sql").write_text(_MUT_MIGRATION_SQL, encoding="utf-8")
+    # the WRONG service the keyword scan lands on (in-glob), carrying no FK write
+    wrong = tmp_path / "server" / "workflow" / "pipeline_service.py"
+    wrong.parent.mkdir(parents=True, exist_ok=True)
+    wrong.write_text("def transition_group(group_id, target):\n"
+                     "    # dispose/close routing, no write\n"
+                     "    return apply_rule(group_id, target)\n", encoding="utf-8")
+    # the REAL writer, OUT of the axis glob (only reachable via the repo-tree anchor)
+    real = tmp_path / "server" / "services" / "process_service.py"
+    real.parent.mkdir(parents=True, exist_ok=True)
+    real.write_text(_MUT_SERVICE_SRC, encoding="utf-8")
+
+    plan = SearchPlan(axis_id="service-dispose-flow",
+                      keywords=["dispose", "group"],
+                      file_globs=["server/workflow/**/*.py"])  # scan lands on the WRONG file
+    bundle = retrieve(plan, str(tmp_path), max_hops=2)
+    assert bundle["stats"].get("writer_anchor", 0) >= 1, bundle["stats"]
+    anchors = [n for n in bundle["call_chain"] if n.get("via") == "writer-anchor"]
+    assert anchors, [n.get("via") for n in bundle["call_chain"]]
+    assert anchors[0]["file"].endswith("process_service.py")
+    # The anchor seeds the existing BFS resolver, which now cascades one hop further
+    # (dispose_group → _apply_group_terminal_action) and surfaces the actual insert_event
+    # write with its FK grounding — the full chain the mis-anchored bundle could never reach.
+    assert bundle["stats"]["mutation_writers"] >= 1, bundle["stats"]
+    writers = [n for n in bundle["call_chain"] if n.get("via") == "mutation-writer"]
+    assert writers and writers[0]["symbol"] == "insert_event", \
+        [n.get("via") for n in bundle["call_chain"]]
+    assert "doc_id->documents" in writers[0]["text"]

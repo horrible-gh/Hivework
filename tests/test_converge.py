@@ -455,6 +455,8 @@ class TestLensRefutation(unittest.TestCase):
         # M036: a winning-path live datasource refuted by the cheap panel (3/3, fooled by a
         # shadowed look-alike sibling) is HELD converged — registration-order grounding
         # outranks the adversarial vote. Votes are still recorded for visibility.
+        # NR0003: faithful to the real M036 — db/projects.py was a judge-LOCATED winner, so the
+        # located-corroboration precondition is satisfied and the override fires.
         res = C.ConvergeResult(
             converged=True,
             attributed_defect={"file": "server/db/projects.py", "lines": "19-27",
@@ -462,15 +464,85 @@ class TestLensRefutation(unittest.TestCase):
             causal_check={"verdict": "consistent", "trace": "t"},
             winning_path=[{"file": "server/db/projects.py", "lines": "19-27"},
                           {"file": "server/routers/project_settings.py", "lines": "46-51"}])
+        located = [_verdict("DS", True, "server/db/projects.py", "19-27", "live datasource")]
         with mock.patch.object(C, "call_worker", return_value=_wr(_LENS_REFUTE)):
             out = C._lens_refute(
-                res, "selector missing", located=[], windows=[], code_state_block="",
+                res, "selector missing", located=located, windows=[], code_state_block="",
                 lenses=["datasource-liveness", "omission", "reproduction"],
                 provider="swarm", model="120b", pk={}, ledger=None, timeout=60, min_refute=0)
         self.assertTrue(out.converged)                       # override held it converged
         self.assertTrue(out.lens_check["winning_path_override"])
         self.assertEqual(out.lens_check["refuted_votes"], 3)  # votes still recorded
         self.assertEqual(out.lens_check["verdict"], "survived")
+
+    def test_winning_path_override_suppressed_when_attribution_not_located(self):
+        # NR0003 / run512: converge attributed groups.py:45-58 `delete` — on its self-reported
+        # winning path but a FABRICATED node no axis ever located (the real dispose handler never
+        # calls groups.delete; it persists via insert_event). The 4/4 lens refutation is CORRECT.
+        # Without the located-corroboration precondition the file-level winning-path override
+        # would shield the hallucination; with it, the override is SUPPRESSED and the panel
+        # demotes → routed to reinvestigation. db/__init__.py (the true FK locus, T3's winner)
+        # is the only located verdict and does NOT corroborate the groups.py attribution.
+        res = C.ConvergeResult(
+            converged=True,
+            attributed_defect={"file": "server/modules/flow_gate/db/groups.py",
+                               "lines": "45-58", "why": "delete-then-insert FK ordering"},
+            causal_check={"verdict": "consistent", "trace": "t"},
+            winning_path=[{"file": "client/src/main/components/DocHeader.vue", "lines": "720-735"},
+                          {"file": "server/modules/flow_gate/db/groups.py", "lines": "45-58"}])
+        located = [_verdict("T3", True, "server/modules/flow_gate/db/__init__.py", "289-291",
+                            "insert_event → events.doc_id documents-FK violation")]
+        with mock.patch.object(C, "call_worker", return_value=_wr(_LENS_REFUTE)):
+            out = C._lens_refute(
+                res, "dispose 500", located=located, windows=[], code_state_block="",
+                lenses=["datasource-liveness", "omission", "reproduction", "wiring"],
+                provider="swarm", model="120b", pk={}, ledger=None, timeout=60, min_refute=0)
+        self.assertFalse(out.converged)                      # fabricated locus → demoted
+        self.assertFalse(out.lens_check["winning_path_override"])  # override suppressed
+        self.assertEqual(out.lens_check["verdict"], "refuted")
+
+    def test_fk_facet_attribution_override_blocks_demote(self):
+        # NR0009 / run514: the lens panel falsely refuted the CORRECT dispose-FK locus 4/4 on
+        # reachability doubt. An attribution positively located by the deterministic FK-misrouting
+        # facet (via="fk-misrouting") is HELD converged — schema-violation grounding outranks the
+        # cheap panel. Not on the winning_path here (winning-path override would NOT apply), so this
+        # isolates the FK-facet override as the load-bearing protection.
+        res = C.ConvergeResult(
+            converged=True,
+            attributed_defect={"file": "server/modules/flow_gate/process_service.py",
+                               "lines": "2156", "why": "insert_event routes group_id into events.doc_id"},
+            causal_check={"verdict": "consistent", "trace": "t"},
+            winning_path=[{"file": "server/modules/flow_gate/api/v1/tree_routes.py",
+                           "lines": "99-113"}])
+        located = [{"axis_id": "FK_MISROUTE:events.doc_id", "title": "FK-misrouting",
+                    "verdict": {"located": True, "via": "fk-misrouting",
+                                "file": "server/modules/flow_gate/process_service.py",
+                                "lines": "2156",
+                                "reason": "insert_event routes group_id (FK→groups) into "
+                                          "events.doc_id (FK→documents) — FK-misrouting."}}]
+        with mock.patch.object(C, "call_worker", return_value=_wr(_LENS_REFUTE)):
+            out = C._lens_refute(
+                res, "dispose 500", located=located, windows=[], code_state_block="",
+                lenses=["datasource-liveness", "omission", "reproduction", "wiring"],
+                provider="swarm", model="120b", pk={}, ledger=None, timeout=60, min_refute=0)
+        self.assertTrue(out.converged)                       # FK-facet override held it
+        self.assertTrue(out.lens_check["fk_facet_override"])
+        self.assertFalse(out.lens_check["winning_path_override"])  # not via winning-path
+        self.assertEqual(out.lens_check["verdict"], "survived")
+
+    def test_fk_facet_carveout_in_lens_prompt(self):
+        # The FK-misrouting carve-out text + the facet reason reach the refuter prompt, and forbid
+        # reachability-only refutation; absent when no facet reason is supplied.
+        common = dict(seed_text="dispose 500",
+                      attributed={"file": "process_service.py", "lines": "2156"},
+                      causal_check={"verdict": "consistent", "trace": "t"},
+                      lens="wiring", lens_desc=C._LENS_DEFINITIONS.get("wiring", "wiring"),
+                      code_state_block="(code)", evidence="(ev)")
+        p_on = C._build_lens_prompt(**common,
+                                    fk_facet_reason="insert_event routes group_id into events.doc_id")
+        self.assertIn("FK-MISROUTING grounding", p_on)
+        self.assertIn("reachability/liveness uncertainty", p_on)
+        self.assertNotIn("FK-MISROUTING grounding", C._build_lens_prompt(**common))
 
     def test_off_winning_path_attribution_still_demotes(self):
         # The override is scoped: an attribution NOT on the winning path demotes as before
