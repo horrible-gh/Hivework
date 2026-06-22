@@ -609,8 +609,9 @@ RECIPE_FIXED_AXES = """
 - **Design SSOT grep**: grep the design docs under Documents/projects/<proj>/ for the "intended spec." Contrast code vs design.
 - **head-resolver / SQL gate**: investigate where branches, loops, early-returns, and SQL WHERE conditions decide execution reachability. Especially server/sql/queries/*.json.
 - **Regression blame**: use git log / git blame to pin the recent change / introducing commit for the lines tied to the symptom. "Since when did it break / is it already fixed."
+- **Data-mutation / event-persistence write path**: when the symptom is a write failing (500 on a dispose/discard/delete/close/save, an FK / unique / integrity / constraint error), add a leaf axis that traces the actual DB WRITE — the service/db-writer that runs insert_/update_/delete_ or `.add()`/`.commit()` and the table/FK it touches. The failing write sits in a mid-layer service the surface signal (DB error class, FE caller) never names, so it is easy to omit.
 
-In addition to the raw axes A-G, you MUST add/reinforce these three axes.
+In addition to the raw axes A-G, you MUST add/reinforce these axes.
 """
 
 DECOMPOSE_SYSTEM = """# ROLE: DECOMPOSER ("queen") — automated fan-out pipeline

@@ -3564,7 +3564,8 @@ def _build_lens_prompt(seed_text: str, attributed: dict[str, Any],
                        causal_check: dict[str, Any] | None, lens: str, lens_desc: str,
                        code_state_block: str, evidence: str,
                        design_change_site: bool = False,
-                       winning_path_site: bool = False) -> str:
+                       winning_path_site: bool = False,
+                       fk_facet_reason: str = "") -> str:
     """One adversarial refutation prompt: break the attribution through ONE lens.
 
     ``design_change_site`` carries the converger's DESIGN-CHANGE carve-out into the
@@ -3589,6 +3590,25 @@ def _build_lens_prompt(seed_text: str, attributed: dict[str, Any],
             "request or produces the field — that is the exact shadowed-decoy trap. Refute "
             "ONLY with positive evidence that THIS locus is off the executed path, or a "
             "concrete omission/reproduction failure of THIS locus itself.\n")
+    # FK-misrouting carve-out (NR0009): the attributed locus was POSITIVELY located by the
+    # deterministic FK-misrouting facet — a schema-grounded proof that this exact write call
+    # routes a foreign-key value into a column FK'd to a DIFFERENT table. run514 saw all four
+    # refuters falsely refute the correct dispose-FK locus on REACHABILITY doubt ("not confirmed
+    # on the live path", "after group deletion ... fails silently" — the latter citing a phantom
+    # groups.delete node). Reachability uncertainty is not a valid refutation of a deterministic
+    # schema violation, so feed the facet's proof and forbid liveness-only refutation here.
+    fk_facet_note = ""
+    if fk_facet_reason:
+        fk_facet_note = (
+            "\n[FK-MISROUTING grounding — READ FIRST] A DETERMINISTIC schema check positively "
+            "located this locus: " + _trunc(fk_facet_reason, 400) + " This is a hard, "
+            "schema-grounded proof that the write at this locus violates a foreign-key "
+            "constraint at runtime — it does NOT depend on you confirming the call is 'on the "
+            "live path'. Do NOT refute on reachability/liveness uncertainty ('not confirmed "
+            "reached', 'not guaranteed on the live path', 'might be skipped'); the seed reports "
+            "the write DOES execute and 500s. Refute ONLY with positive evidence that this write "
+            "does NOT misroute the FK (e.g. the column is actually FK'd to the passed id's "
+            "table), or a concrete omission/reproduction failure of THIS locus.\n")
     design_change_note = ""
     if design_change_site:
         design_change_note = (
@@ -3610,7 +3630,7 @@ try to PROVE that attribution WRONG, strictly through the {lens} lens. You are a
 unless YOUR lens positively confirms the attribution holds, you REFUTE it. Default to \
 refuted=true when uncertain — a false "survives" ships a wrong fix to a human; a false \
 "refuted" only costs one more re-hunt. You have NO tools; decide from the evidence below.
-{winning_path_note}{design_change_note}
+{winning_path_note}{fk_facet_note}{design_change_note}
 [The {lens} lens] {lens_desc}
 
 [Reported scenario / seed]
@@ -3712,6 +3732,22 @@ def _lens_refute(res: ConvergeResult, seed_text: str, located: list[dict[str, An
     if winning_path_site:
         logger.info("converge: lens panel — WINNING-PATH carve-out active for %s "
                     "(refuters told not to cite shadowed siblings as the live path)", af)
+    # FK-misrouting carve-out (NR0009): the attribution was positively located by the
+    # deterministic FK-misrouting facet (via="fk-misrouting"). Carry its schema-grounded proof
+    # into the refuters and forbid reachability-only refutation (run514: 4/4 false-refute of the
+    # correct dispose-FK locus on liveness doubt). FK-facet loci are located by construction, so
+    # this composes with the NR0003 located-corroboration gate.
+    fk_facet_reason = ""
+    for v in (located or []):
+        vd = v.get("verdict") or {}
+        if str(vd.get("via", "")) == "fk-misrouting" and af and _aligns(af, vd.get("file", "")):
+            fk_facet_reason = str(vd.get("reason", "") or "")
+            break
+    fk_facet_site = bool(fk_facet_reason)
+    if fk_facet_site:
+        logger.info("converge: lens panel — FK-FACET carve-out active for %s "
+                    "(deterministic schema-violation grounding; reachability-only refute invalid)",
+                    af)
     ev_lines: list[str] = []
     for w in (windows or [])[:_LENS_MAX_EVIDENCE]:
         ev_lines.append(f"--- {w.get('file')}:{w.get('lines')}")
@@ -3724,7 +3760,7 @@ def _lens_refute(res: ConvergeResult, seed_text: str, located: list[dict[str, An
             f"Try to refute the attribution on {lens} grounds; default to refuted when unsure."
         prompt = _build_lens_prompt(seed_text, attributed, res.causal_check, lens, desc,
                                     code_state_block, evidence, design_change_site,
-                                    winning_path_site)
+                                    winning_path_site, fk_facet_reason)
         parsed = _lens_refute_once(prompt, provider, model, pk, ledger, timeout, lens)
         refuted = bool(parsed.get("refuted")) if isinstance(parsed, dict) else False
         why = str(parsed.get("why", "") or "") if isinstance(parsed, dict) else ""
@@ -3745,17 +3781,42 @@ def _lens_refute(res: ConvergeResult, seed_text: str, located: list[dict[str, An
     # structural. Votes are still recorded for visibility, and a winning-path node remains
     # subject to the omission / multi-root guards and the apply-side red→green backstop — so a
     # genuinely incomplete fix is still caught, just not by this shadow-blind panel.
-    wp_override = demoted and winning_path_site
-    if wp_override:
-        logger.info("converge: lens panel demote OVERRIDDEN — %s is the winning-path live "
-                    "datasource; %d/%d refutation(s) (shadowed-sibling confusion) do not "
-                    "outrank registration-order grounding — held converged", af,
-                    len(refutes), n)
+    # Located-corroboration precondition (NR0003 §4 — reachability gate on the override).
+    # The override exists to shield a LIVE datasource a shadow-blind panel wrongly demoted by
+    # citing a dead look-alike sibling (M036: db/projects.py was a judge-LOCATED winner, refuted
+    # 3/3 by the dead get_projects_with_modules chain). It must NOT shield a converge-FABRICATED
+    # node that no axis ever located: run512 attributed groups.py:45-58 `delete` — a node the real
+    # dispose handler never calls (dispose persists via insert_event, never groups.delete),
+    # resurrected from path-grounding alone while the 4/4 lens refutation was CORRECT; groups.py
+    # was at most a losing sub-candidate, never a located axis-winner. Requiring the attributed
+    # file to be corroborated by a judge-located verdict keeps M036 (db/projects.py located →
+    # override fires) while letting the panel demote a hallucinated locus (groups.py not located →
+    # override suppressed, refutation stands → routed to reinvestigation).
+    attributed_located = bool(af) and any(
+        _aligns(af, (v.get("verdict") or {}).get("file", "")) for v in (located or []))
+    wp_override = demoted and winning_path_site and attributed_located
+    # FK-facet override (NR0009): a deterministic schema-violation grounding outranks a cheap
+    # refuter panel that demoted the correct FK locus on reachability doubt. The facet is located
+    # by construction, so this needs no separate located-corroboration check.
+    fk_override = demoted and fk_facet_site
+    if wp_override or fk_override:
+        logger.info("converge: lens panel demote OVERRIDDEN — %s is %s; %d/%d refutation(s) do "
+                    "not outrank %s grounding — held converged", af,
+                    "the winning-path live datasource" if wp_override else
+                    "a deterministic FK-misrouting locus",
+                    len(refutes), n,
+                    "registration-order" if wp_override else "schema-violation")
         demoted = False
+    elif demoted and winning_path_site and not attributed_located:
+        logger.info("converge: winning-path override SUPPRESSED — attribution %s is on the "
+                    "winning path but is NOT corroborated by any judge-located verdict "
+                    "(converge-fabricated node); %d/%d lens refutation stands (NR0003)", af,
+                    len(refutes), n)
     # Borderline = the outcome would FLIP if a single lens had voted the other way (the
     # run-to-run wobble seen live on a genuinely-incomplete attribution). Surfaced so a
     # marginal demote/survive is visible rather than reading as a confident verdict.
-    borderline = (not wp_override) and n > 0 and len(refutes) in (threshold - 1, threshold)
+    borderline = (not (wp_override or fk_override)) and n > 0 \
+        and len(refutes) in (threshold - 1, threshold)
     res.lens_check = {
         "lenses": [v["lens"] for v in votes],
         "votes": votes,
@@ -3764,6 +3825,7 @@ def _lens_refute(res: ConvergeResult, seed_text: str, located: list[dict[str, An
         "threshold": threshold,
         "borderline": borderline,
         "winning_path_override": wp_override,
+        "fk_facet_override": fk_override,
         "verdict": "refuted" if demoted else "survived",
     }
     if borderline:

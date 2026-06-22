@@ -540,6 +540,9 @@ def run_pipeline(args: argparse.Namespace) -> None:
     # performance report has fresh input without a hand-authored line (closes
     # NR0005 §2 — the hive is the producer, report.py the consumer).
     _emit_runs_jsonl(ldg.run_id, workdir, cfg.ledger.db_path, logger)
+    # ...then re-render the HTML report so the latest cycle is actually visible
+    # (T0011 — jsonl had fresh data but runs.html stayed frozen until a manual render).
+    _render_runs_html(logger)
 
 
 def _emit_runs_jsonl(run_id, workdir, db_path, logger) -> None:
@@ -566,6 +569,111 @@ def _emit_runs_jsonl(run_id, workdir, db_path, logger) -> None:
             logger.info("  Telemetry: appended run%s → %s", run_id, out_path)
     except Exception as e:  # best-effort: never fatal
         logger.warning("Telemetry emit skipped (%s)", e)
+
+
+def _reconcile_golden_scores(logger, repo: str | None = None) -> int:
+    """Splice orphaned golden scores into runs.jsonl (best-effort). Returns the
+    number of scores spliced (for tests; callers ignore it).
+
+    Golden scoring (found/fixed) is a POST-run judgment, and there is no automated
+    scorer: an operator / test-report reads the converge attribution in the run's
+    honey, compares it against the golden ``_found_rule``, and writes the verdict
+    to ``golden*.scored.json`` IN THE RUN'S WORKDIR (e.g. run511 → TSR0009 wrote
+    smoke/0039_tsr0009/golden_0082.scored.json with found=true, recall 1/1). That
+    file used to sit ORPHANED — nobody carried it into runs.jsonl, so the report
+    showed the run as 미계측 even though it had been scored (T0011 follow-up
+    "왜 채점은 하지 않는가"). This reconciles it, the same way ``_render_runs_html``
+    closed the render gap: for every run with no golden block yet, derive the
+    workdir from the recorded ``seed`` path and, if a ``golden*.scored.json`` lives
+    there, append a golden-scored copy of the run's record. report.load_runs dedups
+    by run_id last-wins, so the scored line supersedes the stub. Idempotent — a run
+    that already carries a golden block is skipped, so re-running never double-
+    appends. An unscored run (no scored file authored yet) stays 미계측, never a
+    faked 0% (report.py honesty rule). Any failure is swallowed.
+    """
+    try:
+        import glob
+        if repo is None:
+            repo = os.path.dirname(os.path.abspath(__file__))
+        jsonl_path = os.path.join(repo, "perf", "metrics", "runs.jsonl")
+        if not os.path.exists(jsonl_path):
+            return 0
+        latest = {}
+        with open(jsonl_path, encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                rid = rec.get("run_id")
+                if rid is not None:
+                    latest[rid] = rec  # last-wins
+        appended = []
+        for rid, rec in latest.items():
+            if rec.get("golden"):
+                continue  # already scored — idempotent
+            seed = rec.get("seed") or ""
+            if not seed:
+                continue
+            workdir = os.path.join(repo, os.path.dirname(seed))
+            if not os.path.isdir(workdir):
+                continue
+            hits = sorted(glob.glob(os.path.join(workdir, "golden*.scored.json")))
+            if not hits:
+                continue
+            with open(hits[0], encoding="utf-8") as f:
+                golden = json.load(f)
+            scored = dict(rec)
+            scored["golden"] = golden
+            appended.append(scored)
+        if appended:
+            with open(jsonl_path, "a", encoding="utf-8") as fh:
+                for rec in appended:
+                    fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+            logger.info("  Golden: spliced %d orphaned score(s) — %s",
+                        len(appended), ", ".join(r["run_id"] for r in appended))
+        return len(appended)
+    except Exception as e:  # best-effort: never fatal
+        logger.warning("Golden reconcile skipped (%s)", e)
+        return 0
+
+
+def _render_runs_html(logger) -> None:
+    """Re-render ``perf/metrics/runs.html`` from runs.jsonl (best-effort).
+
+    The auto-emit hook above lands the finished run's DATA in runs.jsonl, but the
+    human-facing REPORT (runs.html) is produced by ``report.py`` — historically a
+    manual invocation. So after a cycle the data was fresh while runs.html stayed
+    frozen at whatever run was last hand-rendered: the last execution had no
+    report (T0011 "왜 마지막 실행의 레포트를 생성하지 않는가"). Rendering here closes
+    that gap — the report tracks the latest cycle automatically. First we reconcile
+    any orphaned golden score (``_reconcile_golden_scores``) so a run that HAS been
+    scored shows its real recall, not 미계측 (T0011 "왜 채점은 하지 않는가"); a run
+    with no score authored yet still renders 미계측, never a faked 0% (report.py
+    honesty rule). Any failure is swallowed — rendering must never break a run.
+    """
+    try:
+        _reconcile_golden_scores(logger)
+        import importlib.util
+        metrics_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                   "perf", "metrics")
+        report_path = os.path.join(metrics_dir, "report.py")
+        jsonl_path = os.path.join(metrics_dir, "runs.jsonl")
+        html_path = os.path.join(metrics_dir, "runs.html")
+        if not os.path.exists(jsonl_path):
+            return
+        spec = importlib.util.spec_from_file_location("_hive_runs_report", report_path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        runs = mod.load_runs(jsonl_path)
+        with open(html_path, "w", encoding="utf-8") as fh:
+            fh.write(mod.render(runs))
+        logger.info("  Report: rendered %s (%d runs)", html_path, len(runs))
+    except Exception as e:  # best-effort: never fatal
+        logger.warning("Report render skipped (%s)", e)
 
 
 def _write_specify_resume(honey_path, spec_out, specify_role, review_role, args,
@@ -676,6 +784,9 @@ def run_investigate_command(args: argparse.Namespace) -> None:
     if investigate_ok:
         _emit_runs_jsonl(run_id, os.path.dirname(os.path.abspath(args.out)),
                          cfg.ledger.db_path, logger)
+        # ...and re-render the report so this investigate cycle shows up in runs.html
+        # right away, not only after a manual report.py (T0011).
+        _render_runs_html(logger)
 
     located = sum(1 for v in result.get("verdicts", []) if v["verdict"]["located"])
     logger.info("=" * 60)

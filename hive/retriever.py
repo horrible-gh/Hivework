@@ -1749,6 +1749,320 @@ def _resolve_peer_patterns(snippets: list[dict[str, Any]], code_root: str,
     return out
 
 
+# ── WRITE-PATH / FK grounding (mutation-class defect provenance) ────────────────────
+# The MISS this resolves (hivework 0038 NR0003, continuing 0037 TSR0011): a mutation-class
+# defect — a side-effecting ``insert_event(group_id, …)`` whose ``events`` table is FK'd to
+# ``documents`` (via ``doc_id``) but has NO FK to ``groups`` — sits DEEP in a disposal service
+# (handler → dispose_group → _apply_group_terminal_action → insert_event, ~3 hops, line ~2166
+# of a large file). Every OTHER grounding resolver here is READ/RESPONSE oriented:
+# :func:`_resolve_http_producer_paths` follows only ``return``-feeding calls and STOPS at the
+# first ``SELECT`` (skipping ``_RESPONSE_STORE_CALLS``); :func:`_resolve_field_producers` traces
+# a serialized response FIELD. None follow a side-effecting WRITE. So the writer file never
+# enters the bundle, and TWO already-correct downstream checks starve on the same missing input:
+#   • the JUDGE rules on the endpoint/guard loci it WAS handed (it cannot locate a write it never saw);
+#   • converge's ``_fk_misrouting_facets`` scans ``located ∪ winning_path ∪ every bundle
+#     snippet/call_chain FILE`` for ``insert_<table>(...)`` — it fires iff the writer's FILE is in
+#     the bundle, which it is not.
+# This resolver closes that single upstream gap: from the bundle snippets it follows callees toward
+# DB writer calls (NOT stopping at reads), and for each ``insert_<table>(...)`` whose ``<table>`` is
+# a schema FK table it windows the writer site and ATTACHES the migration FK facts. The judge then
+# sees the write+constraint, and the writer file's presence lets converge's FK check fire. Pure-
+# local, deterministic, zero model cost; never invents (only real lines + real migration DDL);
+# self-gating (silent unless the schema has FK tables AND the bundle/axis carries a mutation cue);
+# bounded. A spurious fire is at worst a real-but-unused writer window (mild noise), never a wrong
+# edit — same discipline as the resolvers above. Kill-switch: HIVE_NO_WRITE_PATH=1.
+
+# A DB writer call (mirrors converge ``_FK_WRITER_RE``; converge stays the SSOT for the FK VERDICT,
+# this only FINDS + annotates the site). ``insert_<noun>(`` / ``save_<noun>(`` / ``record_<noun>(`` …
+_WRITER_CALL_RE = re.compile(
+    r"\b((?:insert|add|create|save|store|write|log|record|put|new)_[a-z][a-z0-9_]*)\s*\(")
+_WRITER_PREFIX_RE = re.compile(
+    r"^(?:insert|add|create|save|store|write|log|record|put|new)_(?P<noun>[a-z][a-z0-9_]*)$")
+# A mutation cue gating whether to run the write-path follow at all (keeps READ axes silent). A
+# mutation VERB (dispose/delete/…) or a persistence/constraint/5xx cue in the axis keywords or in
+# the already-retrieved bundle text. Loose on purpose: the schema-FK-table filter on the OUTPUT is
+# the real precision gate; this only avoids the BFS cost on pure read/UI axes.
+_MUTATION_CUE_RE = re.compile(
+    r"(?i)\b(dispose|delete|remove|insert|update|upsert|save|commit|persist|store|write|"
+    r"create|terminate|archive|purge|drop|foreign[\s_]?key|integrity|constraint|not[\s_]?null|"
+    r"unique|rollback|[45]\d\d|exception|traceback)\b")
+
+
+def _writer_table_for(noun: str, table_keys: set[str]) -> str | None:
+    """Map an ``insert_<noun>`` writer to its schema table key (event→events …).
+
+    Mirror of converge ``_resolve_writer_table``; duplicated locally so the retriever
+    does not import the heavier converge module (and to keep the FIND side decoupled
+    from the VERDICT side — converge remains the SSOT for the misrouting ruling).
+    """
+    noun = (noun or "").lower()
+    for cand in (noun, noun + "s", noun + "es"):
+        if cand in table_keys:
+            return cand
+    return None
+
+
+def _fk_annotation(table: str, schema: Any) -> str:
+    """One-line migration-FK summary for ``table`` the judge can rule on.
+
+    Names the table's single-column FKs (col → referenced table) and the set of OTHER
+    FK-referenced tables it has NO relationship with — exactly the facts that make an
+    ``insert_<table>(<foreign>_id, …)`` misrouting provable. Free, deterministic.
+    """
+    tc = schema.get(table)
+    fk_bits: list[str] = []
+    own_refs: set[str] = set()
+    for fk in getattr(tc, "foreign_keys", []) or []:
+        if len(fk.columns) == 1 and fk.referenced_table:
+            fk_bits.append(f"{fk.columns[0].lower()}->{fk.referenced_table.lower()}")
+            own_refs.add(fk.referenced_table.lower())
+    all_tables = {t.lower() for t in schema}
+    no_fk_to = sorted(all_tables - own_refs - {table.lower()})
+    parts = [f"writes table '{table}'"]
+    if fk_bits:
+        parts.append("FK: " + ", ".join(sorted(fk_bits)))
+    if no_fk_to:
+        parts.append("NO FK to: " + ", ".join(no_fk_to))
+    return "; ".join(parts)
+
+
+def _mutation_cue_present(plan: "SearchPlan",
+                          snippets: list[dict[str, Any]]) -> bool:
+    """True when the axis/bundle carries a write/mutation cue (gate 2)."""
+    for kw in plan.keywords:
+        if _MUTATION_CUE_RE.search(kw or ""):
+            return True
+    for s in snippets:
+        text = s.get("text", "") or ""
+        if _WRITER_CALL_RE.search(text) or _MUTATION_CUE_RE.search(text):
+            return True
+    return False
+
+
+def _resolve_mutation_writers(snippets: list[dict[str, Any]], plan: "SearchPlan",
+                              code_root: str, max_hops: int = 4,
+                              max_defs: int = 48, max_sites: int = 6,
+                              max_per_symbol: int = 2, k: int = 6) -> list[dict[str, Any]]:
+    """Follow callees from the bundle to DB writer calls, window them, attach FK facts.
+
+    See the section header for the why. BFS from the seed snippets over ``def <callee>``
+    (whole-tree — the writer is server-side while the axis globs are usually client/handler
+    side, same rationale as the http-binding follow), reading each def BODY and, UNLIKE the
+    response-producer tracer, NOT stopping at reads. Every ``insert_<table>(...)`` whose
+    ``<table>`` is a schema FK table is surfaced once with a ``# WRITE-PATH / FK GROUNDING``
+    header. Pure-local, deterministic, fail-open (no schema / no code_root / any error → ``[]``).
+    """
+    if not code_root or os.environ.get("HIVE_NO_WRITE_PATH"):
+        return []
+    try:
+        from hive.schema_ground import load_migration_schema
+        schema = load_migration_schema(code_root)
+    except Exception:                       # pragma: no cover - parse/import guard
+        return []
+    if not schema:
+        return []                           # not a DB project / no DDL → silent
+    table_keys = {t.lower() for t in schema}
+    fk_tables = {
+        t.lower() for t, tc in schema.items()
+        if any(len(fk.columns) == 1 and fk.referenced_table
+               for fk in (getattr(tc, "foreign_keys", []) or []))
+    }
+    if not fk_tables:
+        return []                           # no single-col FK anywhere → nothing misroutable
+    if not _mutation_cue_present(plan, snippets):
+        return []                           # gate 2: read/UI axis → stay silent
+
+    out: list[dict[str, Any]] = []
+    seen_sites: set[str] = set()
+    seen_syms: set[str] = set()
+    seen_defs: set[str] = set()
+
+    def _harvest(rel: str, start_line: int, text: str) -> None:
+        """Record every FK-table writer call found in ``text`` (relative to start_line)."""
+        for m in _WRITER_CALL_RE.finditer(text):
+            pm = _WRITER_PREFIX_RE.match(m.group(1).lower())
+            if not pm:
+                continue
+            table = _writer_table_for(pm.group("noun"), table_keys)
+            if not table or table not in fk_tables:
+                continue
+            line = start_line + text.count("\n", 0, m.start())
+            site = f"{rel}:{line}"
+            if site in seen_sites or len(out) >= max_sites:
+                continue
+            seen_sites.add(site)
+            w = _read_window(code_root, rel, line, k)
+            header = (f"# WRITE-PATH / FK GROUNDING (hive): {m.group(1)}(...) "
+                      f"{_fk_annotation(table, schema)}\n")
+            out.append({"file": rel, "lines": w["lines"] if w["text"] else str(line),
+                        "text": header + (w["text"] or ""),
+                        "via": "mutation-writer", "symbol": m.group(1),
+                        "table": table, "winning": True})
+
+    # Seed: the bundle snippets themselves may already hold a writer call.
+    for s in snippets:
+        rel = (s.get("file") or "").replace("\\", "/")
+        if rel:
+            lo = int(re.match(r"(\d+)", str(s.get("lines", "1")).strip() or "1").group(1))
+            _harvest(rel, lo, s.get("text", "") or "")
+
+    # Follow callees toward writers (whole-tree def lookup), reading each def body.
+    frontier = list(snippets)
+    for _hop in range(max_hops):
+        if len(out) >= max_sites or len(seen_defs) >= max_defs:
+            break
+        next_frontier: list[dict[str, Any]] = []
+        for s in frontier:
+            for cm in _CALL_RE.finditer(s.get("text", "") or ""):
+                name = cm.group(1)
+                if name in seen_syms or name in _CALL_SKIP:
+                    continue
+                seen_syms.add(name)
+                for h in _ripgrep(rf"def {name}\b", [], code_root, max_hits=max_per_symbol):
+                    key = f"{h['file']}:{h['line']}"
+                    if key in seen_defs or len(seen_defs) >= max_defs:
+                        continue
+                    seen_defs.add(key)
+                    w = _read_def_body(code_root, h["file"], h["line"])
+                    if not w["text"]:
+                        continue
+                    body_lo = int(w["lines"].split("-")[0])
+                    _harvest(h["file"].replace("\\", "/"), body_lo, w["text"])
+                    next_frontier.append({"file": h["file"], "lines": w["lines"],
+                                          "text": w["text"]})
+        if not next_frontier or len(out) >= max_sites:
+            break
+        frontier = next_frontier
+    return out
+
+
+# ── Repo-tree writer ANCHOR fallback (0039 NR0005) ───────────────────────────────
+# _resolve_mutation_writers (above) follows callees FROM the axis bundle to the write site.
+# That works ONLY when the bundle already holds a path to the writer. When the queen's
+# search_plan MIS-ANCHORS — names a service symbol the repo tree does not actually contain
+# (run510: ``group_transition_endpoint`` / ``pipeline_service.transition_group``) — retrieve
+# windows the WRONG service family (pipeline_service / transition_rules / dashboard) and the
+# bundle holds NO path to the real handler. The BFS then starts from the wrong seed and the
+# true write site (``process_service.dispose_group → db.insert_event(group_id, …)`` at line
+# 2156) NEVER enters evidence at any stage — so the judge refutes (no body shown), this
+# resolver no-ops, and converge's ``_fk_misrouting_facets`` has no file to scan (verified in
+# the run510 honey: ``insert_event`` 0 occurrences). This fallback closes that gap: when a
+# mutation-class axis is UNDER-ANCHORED (its seeds carry no FK-table writer), grep the repo
+# tree for the real handler ``def`` by the SYMPTOM VERB (dispose/close/terminate/…), keep the
+# one whose FILE actually writes to an FK table, and inject its def body so the writer enters
+# the bundle. Then the existing _resolve_mutation_writers BFS AND converge's full-file FK scan
+# fire on it deterministically. Self-gating (only under-anchored mutation axes), free, bounded,
+# fail-open. Kill-switch: HIVE_NO_WRITER_ANCHOR.
+_SYMPTOM_VERB_RE = re.compile(
+    r"(?i)\b(dispose|close|terminate|delete|remove|archive|purge|drop|cancel|"
+    r"finalize|finalise|complete|reject|approve|revoke|restore)\b")
+_WRITER_ANCHOR_BODY_LINES = 200    # extended def-body read so a write past the 60-line cap is
+                                   # SEEN (run510: dispose_group write sat 6 lines beyond a
+                                   # 60-line body window) — NR0005 lever 3, applied locally here
+
+
+def _anchor_mutation_writer_defs(seeds: list[dict[str, Any]], plan: "SearchPlan",
+                                 code_root: str, k: int = 6,
+                                 max_cand: int = 24, max_sites: int = 3) -> list[dict[str, Any]]:
+    """Repo-tree fallback: locate the real FK-table-writing handler def by symptom verb.
+
+    Fires ONLY when (1) the axis carries a mutation cue, (2) the repo has single-col FK tables,
+    and (3) the axis seeds DON'T already reach an FK-table writer (under-anchored — otherwise
+    the existing resolver already has it and this is a free skip). Returns def-body windows for
+    the matching handler(s) for injection into ``call_chain``. Deterministic, fail-open, never
+    raises.
+    """
+    if not code_root or os.environ.get("HIVE_NO_WRITER_ANCHOR"):
+        return []
+    if not _mutation_cue_present(plan, seeds):
+        return []                           # gate 1: read/UI axis → silent
+    try:
+        from hive.schema_ground import load_migration_schema
+        schema = load_migration_schema(code_root)
+    except Exception:                       # pragma: no cover - parse/import guard
+        return []
+    if not schema:
+        return []
+    table_keys = {t.lower() for t in schema}
+    fk_tables = {
+        t.lower() for t, tc in schema.items()
+        if any(len(fk.columns) == 1 and fk.referenced_table
+               for fk in (getattr(tc, "foreign_keys", []) or []))
+    }
+    if not fk_tables:
+        return []                           # gate 2: nothing misroutable
+
+    def _has_fk_writer(text: str) -> bool:
+        for m in _WRITER_CALL_RE.finditer(text or ""):
+            pm = _WRITER_PREFIX_RE.match(m.group(1).lower())
+            if pm:
+                t = _writer_table_for(pm.group("noun"), table_keys)
+                if t and t in fk_tables:
+                    return True
+        return False
+
+    # gate 3: only when the axis seeds are UNDER-anchored (no FK-table writer reachable yet).
+    if any(_has_fk_writer(s.get("text", "")) for s in seeds):
+        return []
+
+    verbs: set[str] = set()
+    for token in list(plan.keywords) + [plan.axis_id]:
+        for m in _SYMPTOM_VERB_RE.finditer(str(token or "")):
+            verbs.add(m.group(1).lower())
+    if not verbs:
+        return []                           # no symptom verb to anchor on
+
+    out: list[dict[str, Any]] = []
+    seen_defs: set[str] = set()
+    file_text: dict[str, str] = {}          # full-file cache for the FK-writer gate
+    scanned = 0
+    for verb in sorted(verbs):
+        for h in _ripgrep(rf"def \w*{verb}\w*\s*\(", [], code_root, max_hits=12):
+            rel = h["file"].replace("\\", "/")
+            if not rel.endswith(".py"):
+                continue
+            key = f"{rel}:{h['line']}"
+            if key in seen_defs or scanned >= max_cand:
+                continue
+            seen_defs.add(key)
+            scanned += 1
+            # Gate on the FULL FILE (not the def body): the write may sit past the body window,
+            # and converge's FK check reads the whole file anyway — so file membership is what
+            # matters. Read each file at most once.
+            text = file_text.get(rel)
+            if text is None:
+                try:
+                    with open(os.path.join(code_root, rel), "r",
+                              encoding="utf-8", errors="replace") as fh:
+                        text = fh.read()
+                except OSError:
+                    text = ""
+                file_text[rel] = text
+            if not _has_fk_writer(text):
+                continue
+            w = _read_def_body(code_root, rel, h["line"],
+                               max_lines=_WRITER_ANCHOR_BODY_LINES)
+            if not w["text"]:
+                continue
+            out.append({
+                "file": rel, "lines": w["lines"],
+                "text": (f"# REPO-TREE WRITER ANCHOR (hive): '{verb}' handler "
+                         f"{_norm_path_symbol(h['file'])} — FK-table write site "
+                         f"(axis search-plan mis-anchored; grounded from repo tree)\n"
+                         + w["text"]),
+                "via": "writer-anchor", "symbol": _norm_path_symbol(h["file"]),
+                "winning": True})
+            if len(out) >= max_sites:
+                return out
+    return out
+
+
+def _norm_path_symbol(path: str) -> str:
+    """Basename without extension — a terse label for the anchor header."""
+    base = os.path.basename((path or "").replace("\\", "/"))
+    return base[:-3] if base.endswith(".py") else base
+
+
 def retrieve(plan: SearchPlan, code_root: str, docs_root: str | None = None,
              k: int = 6, top_files: int = 8,
              blame_files: int = 3, max_hops: int = 2,
@@ -1857,6 +2171,29 @@ def retrieve(plan: SearchPlan, code_root: str, docs_root: str | None = None,
     peer_patterns = _resolve_peer_patterns(code_snippets + call_chain, code_root)
     call_chain = call_chain + peer_patterns
 
+    # 3f. write-path / FK grounding (0038 NR0003): a mutation-class defect's writer
+    #     (``insert_event(group_id, …)`` deep in a disposal service) is invisible to every
+    #     read/response resolver above — they follow ``return`` values and stop at SELECT.
+    #     Follow callees toward the DB write site, window it, and attach the migration FK
+    #     facts so the judge sees the constraint AND the writer file enters the bundle for
+    #     converge's ``_fk_misrouting_facets`` to fire. Self-gating (silent on read/UI axes);
+    #     rides in call_chain so judge/converge consume it (no judge.py change).
+    # 3f.0 repo-tree writer ANCHOR fallback (0039 NR0005): when a mutation-class axis
+    #     MIS-ANCHORS (queen named a service symbol absent from the repo tree), its seeds hold
+    #     no path to the writer, so the BFS below starts from the wrong file and the real write
+    #     site never enters evidence (run510: process_service.dispose_group never windowed →
+    #     judge refute, FK check dormant, recall 0/1). Grep the tree for the real handler def by
+    #     symptom verb whose FILE writes an FK table and inject its body FIRST, so the resolver
+    #     below AND converge's full-file FK check both fire on it. Self-gating (only under-
+    #     anchored mutation axes → free skip otherwise), deterministic, fail-open.
+    writer_anchor = _anchor_mutation_writer_defs(
+        code_snippets + call_chain, plan, code_root, k=k)
+    call_chain = call_chain + writer_anchor
+
+    mutation_writers = _resolve_mutation_writers(
+        code_snippets + call_chain, plan, code_root, k=k)
+    call_chain = call_chain + mutation_writers
+
     # 4. git blame/log on the highest-ranked files, around their densest region.
     git_history = []
     for f in ranked[:blame_files]:
@@ -1915,6 +2252,7 @@ def retrieve(plan: SearchPlan, code_root: str, docs_root: str | None = None,
         "http_bindings": http_bindings,
         "http_producers": http_producers,
         "peer_patterns": peer_patterns,
+        "mutation_writers": mutation_writers,
         "git_history": git_history,
         "design_excerpts": design_excerpts,
         "stats": {
@@ -1929,6 +2267,8 @@ def retrieve(plan: SearchPlan, code_root: str, docs_root: str | None = None,
             "fetch_harvest": len(fetch_harvest),
             "field_producers": len(field_producers),
             "peer_patterns": len(peer_patterns),
+            "writer_anchor": len(writer_anchor),
+            "mutation_writers": len(mutation_writers),
             "resolved_refs": resolved_refs,
             "design_excerpts": len(design_excerpts),
             "ranked_files": ranked[:top_files],

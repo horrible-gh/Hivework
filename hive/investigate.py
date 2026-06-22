@@ -541,6 +541,109 @@ def ensure_mutation_path_axis(leaves: list[dict[str, Any]], seed_text: str,
     return pinned + rest
 
 
+# ── Mutation-path INJECTION (NR hivework.0037.0007) ────────────────────────────
+# The reorder guards above (ensure_mutation_path_axis / promote_mutation_path_axes /
+# _prioritize_axes) only rescue a write-path axis the queen ALREADY emitted — their
+# docstrings say it: they "only reorder WITHIN the leaf set". The 0082(Lv3) MISS is
+# a GENERATION gap, one layer upstream: a stochastic decompose (notably the haiku /
+# medium preset — live run506/507/508/509) never emits ANY axis covering the data-
+# mutation site (process_service.dispose_group's insert_event → events.doc_id FK), so
+# every reorder guard is a no-op and recall stays 0/1 no matter how many cycles or how
+# much spend — there is no answer in the candidate set to select. Adding a line to
+# recipe §1 cannot guarantee this either: §1 is PROMPT TEXT the queen may ignore, and
+# the preset that drops the axis is exactly the one that ignores the prompt. The fix
+# must be the same KIND of deterministic candidate injection SEED_ANCHOR already is —
+# synthesise the missing write-path axis from a real-file grep, in code.
+#
+# Writer-layer path heuristic: service / db-writer / repository / persistence dirs
+# where mutation sites live, used to SCOPE the injected anchor onto the write layer
+# rather than every DML site in the repo (so a read-path SQL file does not anchor it).
+_WRITER_PATH_RE = re.compile(
+    r"(?:^|/)(?:service|services|svc|db|dao|repo|repository|repositories|store|"
+    r"stores|persist\w*|model|models|migration|migrations|mutation|mutations|"
+    r"crud|writer|writers|process_\w+)(?:/|_|\.)",
+    re.IGNORECASE)
+
+
+def _writer_layer_hits(code_root: str, table_hints: set[str]) -> list[dict[str, Any]]:
+    """Real (non-test) write/mutation sites in the repo, writer-layer-first.
+
+    A repo-wide grep for the write signature (:data:`_MUTATION_CODE_PATTERN`),
+    filtered to non-test code. Hits whose PATH looks like a write/persistence layer
+    (service/db/repo/…) float to the front; when the seed named concrete table/symbol
+    hints, hits whose LINE carries a hint float further still. Deterministic (ripgrep
+    order is stable), free, bounded; [] when nothing writes.
+    """
+    hits = _grep_mutation_hits(["**/*.py", "**/*.sql"], code_root)
+    if not hits:
+        return []
+    writer = [h for h in hits if _WRITER_PATH_RE.search(h.get("file", ""))]
+    pool = writer or hits
+    if table_hints:
+        hint_re = re.compile("|".join(re.escape(h) for h in sorted(table_hints)),
+                             re.IGNORECASE)
+        named = [h for h in pool if hint_re.search(h.get("text", ""))]
+        if named:
+            named_ids = {id(h) for h in named}
+            pool = named + [h for h in pool if id(h) not in named_ids]
+    return pool
+
+
+def inject_mutation_path_anchor(
+        leaves: list[dict[str, Any]], seed_text: str,
+        code_root: str | None) -> list[dict[str, Any]]:
+    """Synthesise a write-path axis when the decompose produced NONE (recall lever).
+
+    Closes the GENERATION gap the reorder guards cannot: when the symptom is mutation-
+    class yet NO existing leaf covers a write path, the answer locus is absent from the
+    candidate set and the judge can never rule on it (run506/507/508/509 MISS). This
+    guard deterministically INJECTS a ``MUTATION_ANCHOR`` axis — the same mechanism as
+    :data:`SEED_ANCHOR`, but armed by the mutation symptom instead of a seed-named file
+    — scoped to the writer-layer files a real-file grep actually hit (≤4), so a paid
+    judge rules on the real mutation locus every cycle and every preset.
+
+    Strict no-op unless (a) the symptom is mutation-class (:func:`_mutation_symptom_seed`,
+    the shared over-fire gate), (b) NO existing leaf already covers a write path (else
+    the reorder guards handle it — never duplicates), and (c) the repo grep finds a real
+    write site to anchor on. Pure, free, deterministic; never raises; input not mutated.
+    """
+    if not leaves or not code_root or not _mutation_symptom_seed(seed_text):
+        return leaves
+    table_hints = _extract_table_hints(seed_text)
+    if any(_is_mutation_path_axis(a, table_hints, code_root) for a in leaves):
+        return leaves                       # queen covered it — reorder guards rescue
+                                            # it; do not duplicate the candidate.
+    hits = _writer_layer_hits(code_root, table_hints)
+    if not hits:
+        return leaves                       # nothing writes — no locus to anchor on.
+    globs: list[str] = []
+    for h in hits:
+        f = h.get("file", "")
+        if f and f not in globs:
+            globs.append(f)
+        if len(globs) >= 4:
+            break
+    keywords = (sorted(table_hints)[:3] + ["insert", "update", "delete", "commit"])[:6]
+    anchor = {
+        "id": "MUTATION_ANCHOR",
+        "title": "data-mutation / event-persistence write path (injected)",
+        "brief": ("Investigate the data-write / event-persistence site this mutation "
+                  "reaches (the FK/constraint locus). Deterministically injected "
+                  "(NR hivework.0037.0007) because the decompose produced no write-path "
+                  "axis, so this locus would otherwise never reach a judge."),
+        "depends_on": [],
+        "search_plan": {
+            "keywords": keywords,
+            "file_globs": globs,
+            "doc_topics": [],
+        },
+    }
+    logger.info("mutation-path injection: mutation-class symptom with NO write-path "
+                "leaf — synthesised MUTATION_ANCHOR scoped to %s (table_hints=%s)",
+                globs, sorted(table_hints) or "(none — bare-message fallback)")
+    return [anchor] + leaves
+
+
 def promote_mutation_path_axes(
         tasks: list[dict[str, Any]], seed_text: str,
         code_root: str | None) -> list[dict[str, Any]]:
@@ -858,6 +961,16 @@ def run_investigate(
     # axis, BEFORE the position-based max_axes truncation — so a scattered queen
     # cannot bury or skip the spot the seed explicitly points at.
     leaves = _prioritize_axes(leaves, seed_text)
+    # Mutation-path INJECTION (NR hivework.0037.0007): the reorder guards below only
+    # rescue a write-path axis the queen ALREADY emitted. When a stochastic decompose
+    # (notably the haiku/medium preset — live run506/507/508/509) emits NO write-path
+    # axis at all, the answer locus is absent from the candidate set and every reorder
+    # guard is a no-op — recall stays 0/1 regardless of cycles/spend. Synthesise the
+    # missing write-path axis from a real-file grep (same KIND of deterministic
+    # injection as SEED_ANCHOR), so the FK/mutation locus is judged every cycle and
+    # every preset. Runs AFTER promote/_prioritize had their chance, so it only fires
+    # on a genuine generation gap; no-op when a write-path leaf already exists.
+    leaves = inject_mutation_path_anchor(leaves, seed_text, code_root)
     # Mutation-path guard (NR hivework.0034.0006): a persistence/constraint failure
     # fails on a data WRITE the symptom never advertises (run500: dispose_group's
     # insert_event → events.doc_id FK), so the write-path axis scores low on surface
@@ -1108,6 +1221,31 @@ def run_investigate(
     verdicts: list[dict[str, Any]] = [s[0] for s in slots if s is not None]
     bundles: list[dict[str, Any]] = [s[1] for s in slots if s is not None]
 
+    # ── Lever A (hivework.default.0036.0005-NR): gate-independent FK-misrouting check.
+    # The deterministic schema/FK write-arg check (rec B, hivework.0033.0013-T) that
+    # surfaces a provable cross-FK swap — e.g. ``insert_event(group_id, ...)`` routing a
+    # ``group_id`` (FK→groups) into ``events.doc_id`` (FK→documents) → runtime FK violation
+    # — lives INSIDE run_converge, which is itself gated behind ``located_n >= 2`` below.
+    # run506 (0082, swarm OFF) exposed the failure: the judge dismissed the real write-path
+    # axis as "functions as designed" (it never inferred the FK mechanism from code alone,
+    # comments stripped), so only a decoy axis located → located_n=1 → converge skipped →
+    # the ONE check that does NOT depend on the judge's reasoning never ran, in exactly the
+    # case it exists for. We run it here over the pooled judge evidence, independent of the
+    # converge gate, and inject any facet as a located verdict. Pure / deterministic / no
+    # LLM call / fail-open; same kill-switch (HIVE_NO_FK_MISROUTE) and dedup as converge.
+    # Surfacing it here both restores ``found`` (the honey now carries the FK locus +
+    # mechanism) and lifts located_n so converge runs and attributes to it (converge already
+    # prioritises ``via=fk-misrouting`` loci, converge.py §873).
+    if not os.environ.get("HIVE_NO_FK_MISROUTE"):
+        try:
+            from hive.converge import _fk_misrouting_facets
+            _fk_facets = _fk_misrouting_facets(verdicts, [], bundles, code_root)
+        except Exception as e:  # import / parse guard — never blocks the pipeline
+            logger.warning("investigate: gate-independent FK check skipped: %s", e)
+            _fk_facets = []
+        _inject_fk_facets(_fk_facets, verdicts, bundles,
+                          "gate-independent rec B — judge-blind safeguard, NR0005 lever A")
+
     # ── ④ converge (the reconcile step the cheap path was missing): stitch the
     # scattered per-axis verdicts into ONE executed call path and attribute the
     # defect to one node. ONE tool-OFF call, and only when ≥2 axes located (nothing
@@ -1171,6 +1309,45 @@ def run_investigate(
     else:
         logger.info("converge: skipped (%d located verdict(s) < 2 — nothing to stitch)",
                     located_n)
+
+    # ── Lever B (hivework.default.0036.0011-NR): post-convergence FK re-scan. Both the
+    # pre-converge check (lever A) and converge's own internal FK call build their
+    # candidate-file set BEFORE converge's iterative data-re-pass / missing-link path
+    # tracing runs. run507 (0082, swarm OFF) exposed the gap: the judge located only
+    # decoys (process_service.py never retrieved into any bundle), yet converge's tracing
+    # still REACHED the real write file as its final attributed_defect
+    # (process_service.py:2068-2150) — but that file enters scope only AFTER the FK check
+    # has already run, so the dispose write (insert_event(group_id,...) @2156) is never
+    # scanned. Re-run the deterministic check over converge's FINAL path (attributed_defect
+    # + winning_path) and, on a hit, surface the FK locus + mechanism and promote it to the
+    # attributed defect (converge already prioritises via=fk-misrouting, converge.py §873).
+    # Pure / deterministic / no LLM call / fail-open; same kill-switch and dedup.
+    if converge_dict and not os.environ.get("HIVE_NO_FK_MISROUTE"):
+        try:
+            from hive.converge import _fk_misrouting_facets
+            _ad = converge_dict.get("attributed_defect") or {}
+            _seed_loci = ([{"verdict": {"located": True, "file": _ad.get("file"),
+                                        "lines": str(_ad.get("lines", ""))}}]
+                          if _ad.get("file") else [])
+            _post_facets = _fk_misrouting_facets(
+                _seed_loci, converge_dict.get("winning_path") or [], bundles, code_root)
+        except Exception as e:  # import / parse guard — never blocks the pipeline
+            logger.warning("investigate: post-converge FK re-scan skipped: %s", e)
+            _post_facets = []
+        _new = _inject_fk_facets(_post_facets, verdicts, bundles,
+                                 "post-converge re-scan over final path, NR0011 lever B")
+        if _new:
+            _f0 = _new[0]["verdict"]
+            # Promote the proven runtime FK violation to THE attributed defect: it carries
+            # the migration-DDL-grounded mechanism, replacing converge's generic node.
+            converge_dict["attributed_defect"] = {
+                "file": _f0.get("file"), "lines": _f0.get("lines"),
+                "via": "fk-misrouting", "why": _f0.get("reason", ""),
+            }
+            located_n = sum(1 for v in verdicts if v["verdict"]["located"])
+            logger.info("investigate: post-converge FK re-scan promoted %s:%s to the "
+                        "attributed defect (NR0011 lever B)",
+                        _f0.get("file"), _f0.get("lines"))
 
     result = {
         "seed_chars": len(seed_text),
@@ -1775,6 +1952,41 @@ def _locus_aligns(a: str, b: str) -> bool:
     """Path-segment-aligned equality/suffix match (handles abs↔rel, basename-degrade)."""
     a, b = _norm_locus(a), _norm_locus(b)
     return bool(a) and bool(b) and (a == b or a.endswith("/" + b) or b.endswith("/" + a))
+
+
+def _inject_fk_facets(facets: list[dict[str, Any]], verdicts: list[dict[str, Any]],
+                      bundles: list[dict[str, Any]], label: str) -> list[dict[str, Any]]:
+    """Dedup-and-append deterministic FK-misrouting facets (converge.py rec B) as full
+    investigate verdict entries, keeping ``verdicts``/``bundles`` parallel. A facet whose
+    locus already has a *located* verdict is skipped. Returns the facets actually injected
+    (empty when all were duplicates). Used by both the gate-independent pre-converge check
+    (lever A, NR0005) and the post-converge re-scan (lever B, NR0011)."""
+    injected: list[dict[str, Any]] = []
+    for facet in facets or []:
+        ff = (facet.get("verdict") or {}).get("file", "")
+        fl = (facet.get("verdict") or {}).get("lines", "")
+        if any(_locus_aligns(ff, (v.get("verdict") or {}).get("file", ""))
+               and str((v.get("verdict") or {}).get("lines", "")) == str(fl)
+               and (v.get("verdict") or {}).get("located")
+               for v in verdicts):
+            continue
+        # Normalise into a full investigate verdict entry so the report renderer and
+        # downstream consumers (calls_made/votes/etc.) treat it like a judged axis.
+        # No judge call was made → calls_made=0.
+        verdicts.append({
+            "axis_id": facet.get("axis_id", "FK_MISROUTE"),
+            "title": facet.get("title", "FK-misrouting write"),
+            "search_plan": {"keywords": [], "file_globs": [], "doc_topics": []},
+            "calls_made": 0,
+            "verdict": facet["verdict"],
+            "votes": {"n": 0, "located": 0},
+            "candidates": [],
+            "coverage": None,
+        })
+        bundles.append({})  # keep verdicts/bundles lists parallel
+        injected.append(facet)
+        logger.info("investigate: FK-misrouting facet located at %s:%s (%s)", ff, fl, label)
+    return injected
 
 
 def _rerun_converge(result: dict[str, Any], seed_text: str, *, code_root: str | None,
