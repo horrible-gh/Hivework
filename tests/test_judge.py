@@ -391,6 +391,70 @@ class TestDismissalBackstop(unittest.TestCase):
         self.assertIn("Ruling mandate", prompt)
 
 
+class TestDismissalReask(unittest.TestCase):
+    """rec A (NR 0044.0005): a waved-off mutation/persistence-class axis gets ONE
+    targeted re-ask; a grounded located re-ask is adopted, else the flag stands."""
+
+    DISMISS = json.dumps({
+        "verdict": {"located": False, "file": "", "lines": "",
+                    "reason": "This is an informational request to list the dispose "
+                              "callers, not a code defect."},
+        "need": {"symbols": [], "greps": [], "file_globs": []}})
+
+    def _run(self, seq, **kw):
+        calls = []
+
+        def fake_call(provider, model, prompt, cwd=None, timeout=300, **_kw):
+            calls.append(prompt)
+            return _wr(seq[min(len(calls) - 1, len(seq) - 1)])
+
+        with mock.patch.object(J, "call_worker", side_effect=fake_call), \
+             mock.patch.object(J, "retrieve_followup"):
+            res = J.run_judge(plan_bundle=PLAN_BUNDLE,
+                              symptom="POST /groups/{id}/dispose returns 500",
+                              axis_globs=["g"], code_root="/x", provider="deepinfra",
+                              model="m", judge_cfg=JudgeConfig(max_calls_per_axis=1), **kw)
+        return res, calls
+
+    def test_mutation_dismissal_reask_recovers_grounded_located(self):
+        # judge1 dismisses → re-ask returns a grounded located verdict → adopted.
+        res, calls = self._run([self.DISMISS, FINAL_VERDICT], mutation_symptom=True)
+        self.assertEqual(len(calls), 2)                       # one targeted re-ask spent
+        self.assertTrue(res["verdict"].located)
+        self.assertEqual(res["verdict"].file, "server/store.py")
+        self.assertNotIn("unruled-dismissal", res["verdict"].reason)
+        self.assertIn("RE-ASK", calls[1])                     # escalation re-pose sent
+
+    def test_non_mutation_dismissal_is_noop(self):
+        # Not a mutation-class symptom and not seed-mandated → no re-ask (over-fire gate).
+        res, calls = self._run([self.DISMISS, FINAL_VERDICT], mutation_symptom=False)
+        self.assertEqual(len(calls), 1)                       # no extra call
+        self.assertFalse(res["verdict"].located)
+        self.assertIn("unruled-dismissal", res["verdict"].reason)
+
+    def test_reask_still_dismissed_keeps_flag(self):
+        # Re-ask waved off again → not adopted; the flagged non-ruling stands.
+        res, calls = self._run([self.DISMISS, self.DISMISS], mutation_symptom=True)
+        self.assertEqual(len(calls), 2)
+        self.assertFalse(res["verdict"].located)
+        self.assertIn("unruled-dismissal", res["verdict"].reason)
+
+    def test_reask_ungrounded_located_not_adopted(self):
+        # Re-ask locates a file ABSENT from the bundle → ungrounded → not adopted.
+        ghost = json.dumps({"verdict": {"located": True, "file": "server/ghost.py",
+                                        "lines": "1-2", "reason": "here"}})
+        res, calls = self._run([self.DISMISS, ghost], mutation_symptom=True)
+        self.assertEqual(len(calls), 2)
+        self.assertFalse(res["verdict"].located)
+
+    def test_seed_axis_dismissal_reasks_even_without_mutation(self):
+        # A seed-mandated axis is recovered even when the symptom is not mutation-class.
+        res, calls = self._run([self.DISMISS, FINAL_VERDICT],
+                               mutation_symptom=False, seed_axis=True)
+        self.assertEqual(len(calls), 2)
+        self.assertTrue(res["verdict"].located)
+
+
 class TestLedgerRecording(unittest.TestCase):
     """Each model call is recorded to the ledger under stage 'judge'."""
 
@@ -456,6 +520,87 @@ class TestFieldProducerNote(unittest.TestCase):
                         judge_cfg=JudgeConfig(max_calls_per_axis=1))
         prompt = cw.call_args_list[0].args[2]
         self.assertNotIn("Field-producer grounding", prompt)
+
+
+class TestWriterEvidenceNote(unittest.TestCase):
+    """Lever ② (NR0006): the FK write-site + its module-doc prose reach the judge VERBATIM,
+    cap-proof against summarize_bundle's 14×700 truncation."""
+
+    def _bundle_with_writer(self, n_pad=0):
+        pad = [{"file": f"pad{i}.py", "lines": "1-2", "text": "x" * 900}
+               for i in range(n_pad)]
+        return {"axis_id": "BE_DISPOSE",
+                "code_snippets": pad,
+                "call_chain": [
+                    {"file": "server/services/process_service.py", "lines": "5-7",
+                     "via": "writer-anchor", "symbol": "process_service",
+                     "text": "# REPO-TREE WRITER ANCHOR\n"
+                             "    db.insert_event(group_id, \"group_disposed\")\n"},
+                    {"file": "server/services/process_service.py", "lines": "1-6",
+                     "via": "writer-doc", "symbol": "process_service",
+                     "text": "# WRITER-ANCHOR MODULE DOC\n"
+                             "group events belong in group_events (group_id -> groups); "
+                             "events has NO FK to groups."}],
+                "call_sites": [], "git_history": [], "design_excerpts": []}
+
+    def test_note_renders_writer_and_doc_verbatim(self):
+        note = J._writer_evidence_note(self._bundle_with_writer())
+        self.assertIn("FK write-site evidence", note)
+        self.assertIn("insert_event", note)
+        self.assertIn("group_events", note)            # the doc prose
+        self.assertIn("NO FK to groups", note)
+        self.assertIn("via=writer-doc", note)
+
+    def test_doc_ordered_before_write_site(self):
+        note = J._writer_evidence_note(self._bundle_with_writer())
+        self.assertLess(note.index("via=writer-doc"), note.index("via=writer-anchor"))
+
+    def test_note_empty_without_writer_evidence(self):
+        self.assertEqual(J._writer_evidence_note(PLAN_BUNDLE), "")
+
+    def test_cap_proof_survives_snippet_truncation(self):
+        # 20 padding snippets push the writer-anchor past summarize_bundle's _MAX_SNIPPETS
+        # cap: the compact render drops it, but the verbatim note still carries it.
+        bundle = self._bundle_with_writer(n_pad=20)
+        compact = J.summarize_bundle(bundle)
+        self.assertNotIn("insert_event", compact)      # truncated out of the compact body
+        note = J._writer_evidence_note(bundle)
+        self.assertIn("insert_event", note)            # but preserved verbatim
+
+    def test_cap_proof_preserves_mutation_writer_when_anchor_dormant(self):
+        # ★The live-relevant case (group 0040 A/B): in the run510 form the seeds ALREADY reach
+        # insert_event, so the writer-ANCHOR gate-3 skips (dormant) — but _resolve_mutation_writers
+        # still surfaces a `via=mutation-writer` node carrying the FK facts inline. The proven
+        # live failure was that those facts get TRUNCATED by summarize_bundle before the judge
+        # sees them. Lever ② preserves them verbatim even on the gate-3-dormant path.
+        bundle = {"axis_id": "BE_DISPOSE",
+                  "code_snippets": [{"file": f"pad{i}.py", "lines": "1-2", "text": "x" * 900}
+                                    for i in range(20)],
+                  "call_chain": [
+                      {"file": "server/services/process_service.py", "lines": "2150-2160",
+                       "via": "mutation-writer", "symbol": "insert_event", "table": "events",
+                       "text": "# WRITE-PATH / FK GROUNDING: insert_event owner=group_id but "
+                               "events FK is doc_id->documents; events has NO FK to groups "
+                               "(group events belong in group_events).\n"
+                               "    db.insert_event(group_id, \"group_disposed\", note=reason)"}],
+                  "call_sites": [], "git_history": [], "design_excerpts": []}
+        compact = J.summarize_bundle(bundle)
+        self.assertNotIn("NO FK to groups", compact)   # truncated out of the compact body
+        note = J._writer_evidence_note(bundle)
+        self.assertIn("NO FK to groups", note)         # preserved verbatim
+        self.assertIn("insert_event", note)
+
+    def test_prompt_carries_writer_note_when_evidence_present(self):
+        with mock.patch.object(J, "call_worker",
+                               return_value=_wr(VERDICT_NO_NEED)) as cw, \
+             mock.patch.object(J, "retrieve_followup"):
+            J.run_judge(plan_bundle=self._bundle_with_writer(n_pad=20),
+                        symptom="group disposal writes to the wrong table",
+                        axis_globs=["g"], code_root="/x", provider="deepinfra", model="m",
+                        judge_cfg=JudgeConfig(max_calls_per_axis=1))
+        prompt = cw.call_args_list[0].args[2]
+        self.assertIn("FK write-site evidence", prompt)
+        self.assertIn("insert_event", prompt)
 
 
 class TestSummarizeBundle(unittest.TestCase):

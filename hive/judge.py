@@ -208,6 +208,65 @@ already-correct value incorrectly. Do not default to the render side.
 """
 
 
+# Lever ② (NR0006 §6): the writer-anchor pulls the real FK-table write site (and its
+# module-doc prose) into the bundle, but ``summarize_bundle`` caps code windows at
+# _MAX_SNIPPETS × _SNIPPET_CHARS — exactly the truncation that let the decisive FK line
+# and the documenting docstring evaporate before the judge saw them (NR0006 §3: the
+# already-implemented FK gate stayed dormant because its INPUT never arrived). This note
+# is computed from the FULL bundle and rendered VERBATIM (un-truncated, generous cap), so
+# the write site + its contract prose are guaranteed to reach the judge intact.
+_WRITER_EVIDENCE_VIA = {"writer-anchor", "writer-doc", "mutation-writer"}
+_WRITER_EVIDENCE_MAX_ENTRIES = 6
+_WRITER_EVIDENCE_CHARS = 1600
+
+
+def _writer_evidence_note(bundle: dict[str, Any]) -> str:
+    """A verbatim, cap-proof block surfacing the FK write site + its module-doc prose.
+
+    Empty when the bundle carries no writer-anchor/mutation-writer evidence (no behaviour
+    change for read/UI axes). Structural — harvested from the full bundle dict, so a
+    snippet-cap truncation in ``summarize_bundle`` cannot drop it.
+    """
+    snips = (bundle.get("code_snippets") or []) + (bundle.get("call_chain") or [])
+    picked: list[dict[str, Any]] = []
+    seen: set[tuple] = set()
+    # Order docstrings (the contract prose) first, then the write-site bodies.
+    for want_doc in (True, False):
+        for s in snips:
+            if s.get("via") not in _WRITER_EVIDENCE_VIA:
+                continue
+            is_doc = s.get("via") == "writer-doc"
+            if is_doc != want_doc:
+                continue
+            key = (s.get("file"), s.get("lines"), s.get("via"))
+            if key in seen:
+                continue
+            seen.add(key)
+            picked.append(s)
+            if len(picked) >= _WRITER_EVIDENCE_MAX_ENTRIES:
+                break
+        if len(picked) >= _WRITER_EVIDENCE_MAX_ENTRIES:
+            break
+    if not picked:
+        return ""
+    parts = []
+    for s in picked:
+        parts.append(f"--- {s.get('file')}:{s.get('lines')} via={s.get('via')}")
+        parts.append(_trunc(s.get("text", ""), _WRITER_EVIDENCE_CHARS))
+    block = "\n".join(parts)
+    return f"""
+[FK write-site evidence — VERBATIM, do not skip] The local FIND anchored the actual \
+FK-table write site for this symptom (and, where present, the module-level documentation \
+that states the correct table/FK contract). These windows are reproduced in full below \
+because they are decisive and must not be judged from a truncated summary. When the \
+symptom is a row written/routed to the WRONG table or with a misrouted owner/parent id, \
+the bug is at the write call here — compare each ``insert_/update_/delete_`` call's owner \
+argument against the FK column the documented contract requires, and localise the write \
+line that violates it:
+{block}
+"""
+
+
 def _verdict_contract(want_need: bool) -> str:
     need_block = (
         ',\n  "need": { "symbols": ["<callee/def names to resolve>"], '
@@ -231,7 +290,8 @@ def _verdict_contract(want_need: bool) -> str:
 
 def build_judge_prompt(axis_id: str, symptom: str, bundle_text: str,
                        *, want_need: bool, code_root: str = "",
-                       seed_axis: bool = False, field_producer_note: str = "") -> str:
+                       seed_axis: bool = False, field_producer_note: str = "",
+                       writer_evidence_note: str = "", reask_note: str = "") -> str:
     """Build the JUDGE prompt for one axis. ``want_need`` enables follow-up asks.
 
     The judge rules on the SUPPLIED bundle — it has no tools and must not try to
@@ -282,7 +342,7 @@ You may NOT decline to rule. A brief phrased as a question ("does X call the wro
 key?", "is the ORDER BY wrong?") still demands a confirm/refute answer about the \
 symptom — do NOT dismiss it as "merely an informational/lookup request", "not itself \
 a code defect", or "no source-line change needed" to sidestep judging. "located=false" \
-must mean "refuted, because <evidence>", never "this was not a real question."{seed_line}{field_producer_note}
+must mean "refuted, because <evidence>", never "this was not a real question."{seed_line}{field_producer_note}{writer_evidence_note}{reask_note}
 
 [Symptom / axis brief]
 {symptom}
@@ -498,6 +558,32 @@ def _is_design_match_closure(reason: str) -> bool:
     return any(m in norm for m in _DESIGN_MATCH_MARKERS)
 
 
+# rec A (NR hivework.0044.0005): the escalation appended to the RE-ASK prompt after a
+# mutation/persistence-class axis was waved off (dismissed or design-match-closed). It
+# forbids the "informational request / matches its own design" framing that produced the
+# non-ruling and re-points the judge at the write call on the symptom's path — the FK
+# write-site in particular (run520 axis H: the judge dismissed the FK question twice and
+# the FOUND survived only on the deterministic FK_MISROUTE facet).
+_DISMISSAL_REASK_NOTE = (
+    "\n[RE-ASK — your prior verdict on this axis WAVED THE QUESTION OFF ('informational "
+    "request', 'not a code defect', or 'the code matches its own design'). That is NOT an "
+    "allowed ruling: this symptom is a DATA-MUTATION / persistence failure (a write that "
+    "fails at runtime — e.g. a 500 on dispose/close/delete). Re-rule NOW, strictly from "
+    "the evidence: trace the write/persistence call that runs on the symptom's path and "
+    "decide whether THIS code PRODUCES the failure (CONFIRM — located=true, name the exact "
+    "write call site + lines) or, citing concrete evidence, that it does NOT (REFUTE). Pay "
+    "particular attention to any write-helper call that passes the id of the WRONG entity "
+    "into a foreign-key column (e.g. a group id handed to a column whose FK targets a "
+    "different table). Do NOT dismiss the question again.]\n")
+
+
+def _was_waved_off(reason: str) -> bool:
+    """True when run_judge's passive backstops downgraded this verdict to a flagged
+    non-ruling (unruled-dismissal or possible-design-change) rather than a real refute."""
+    r = reason or ""
+    return r.startswith("[unruled-dismissal") or r.startswith("[possible-design-change")
+
+
 def _cites_seed_file(cited: str, seed_files: set[str]) -> bool:
     """True when a verdict's cited file is one of the seed's named (on-disk) targets.
 
@@ -517,7 +603,8 @@ def run_judge(*, plan_bundle: dict[str, Any], symptom: str, axis_globs: list[str
               ledger=None, provider_kwargs: dict | None = None,
               k: int = 6, max_hops: int = 2, timeout: int = 180,
               seed_files: set[str] | None = None,
-              seed_axis: bool = False) -> dict[str, Any]:
+              seed_axis: bool = False,
+              mutation_symptom: bool = False) -> dict[str, Any]:
     """End-to-end JUDGE for one axis: verdict (+ optional one re-judge after follow-up).
 
     Returns a comb dict::
@@ -544,9 +631,12 @@ def run_judge(*, plan_bundle: dict[str, Any], symptom: str, axis_globs: list[str
     # field-producer directive (computed from the FULL bundle, cap-proof) — corrects the
     # judge's render-side default so a wrong FE-bound field value localises to its producer.
     fp_note = _field_producer_note(plan_bundle)
+    # Lever ② (NR0006): verbatim FK write-site + module-doc evidence, cap-proof.
+    we_note = _writer_evidence_note(plan_bundle)
     prompt1 = build_judge_prompt(axis_id, symptom, bundle_text,
                                  want_need=want_need, code_root=code_root,
-                                 seed_axis=seed_axis, field_producer_note=fp_note)
+                                 seed_axis=seed_axis, field_producer_note=fp_note,
+                                 writer_evidence_note=we_note)
     parsed1 = _call_and_parse(provider, model, prompt1, cwd=code_root,
                               axis_id=axis_id, stage="judge1", ledger=ledger,
                               provider_kwargs=pk, timeout=timeout)
@@ -570,7 +660,8 @@ def run_judge(*, plan_bundle: dict[str, Any], symptom: str, axis_globs: list[str
         prompt2 = build_judge_prompt(axis_id, symptom, summarize_bundle(merged),
                                      want_need=False, code_root=code_root,
                                      seed_axis=seed_axis,
-                                     field_producer_note=_field_producer_note(merged) or fp_note)
+                                     field_producer_note=_field_producer_note(merged) or fp_note,
+                                     writer_evidence_note=_writer_evidence_note(merged) or we_note)
         parsed2 = _call_and_parse(provider, model, prompt2, cwd=code_root,
                                   axis_id=axis_id, stage="judge2", ledger=ledger,
                                   provider_kwargs=pk, timeout=timeout)
@@ -638,6 +729,40 @@ def run_judge(*, plan_bundle: dict[str, Any], symptom: str, axis_globs: list[str
                    "this site emits the rejected behaviour, do not bury it as a refute] "
                    + (verdict.reason or ""),
             verdict_type="refuted", raw=verdict.raw)
+
+    # ── Active re-ask on a waved-off mutation/persistence-class axis (rec A, NR 0044.0005).
+    # The two backstops above are PASSIVE — they flag the non-ruling and downgrade it to a
+    # refute, so a write-path axis the judge dismissed contributes nothing and the FOUND
+    # rides entirely on the deterministic FK_MISROUTE facet (run520 axis H: dismissed twice
+    # + an SSE wrong-facet). When the symptom is data-mutation/persistence class (or the
+    # axis is seed-mandated), spend ONE targeted call to RE-POSE the axis as a defect-
+    # localisation task (``_DISMISSAL_REASK_NOTE`` forbids the info-request framing and the
+    # writer-evidence note forces the FK write-site into view), and adopt only a GROUNDED
+    # located verdict. This is deliberately independent of the generic re-judge budget at
+    # L629 (vote mode collapses ``max_calls_per_axis`` to 1, which would otherwise starve
+    # the recovery); it is bounded to at most one extra call and is a strict no-op outside
+    # the mutation/persistence class — the over-fire gate. Pure recovery: a non-located or
+    # ungrounded re-ask leaves the flagged verdict untouched.
+    if (not verdict.located and _was_waved_off(verdict.reason)
+            and (mutation_symptom or seed_axis)):
+        reask_prompt = build_judge_prompt(
+            axis_id, symptom, summarize_bundle(check_bundle),
+            want_need=False, code_root=code_root, seed_axis=seed_axis,
+            field_producer_note=_field_producer_note(check_bundle) or fp_note,
+            writer_evidence_note=_writer_evidence_note(check_bundle) or we_note,
+            reask_note=_DISMISSAL_REASK_NOTE)
+        parsed_r = _call_and_parse(provider, model, reask_prompt, cwd=code_root,
+                                   axis_id=axis_id, stage="judge-reask", ledger=ledger,
+                                   provider_kwargs=pk, timeout=timeout)
+        calls_made += 1
+        history.append({"stage": "judge-reask", "parsed": parsed_r})
+        vr = _verdict_from(parsed_r, axis_id)
+        if vr.raw and vr.located and _verdict_is_grounded(vr, check_bundle):
+            logger.info("judge: [%s]%s dismissal re-ask recovered a grounded located "
+                        "verdict at %s (mutation/persistence-class re-pose, rec A "
+                        "NR0044.0005)", axis_id,
+                        " SEED-MANDATED" if seed_axis else "", vr.file)
+            verdict = vr
 
     return {
         "axis_id": axis_id,
