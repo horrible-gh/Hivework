@@ -19,32 +19,23 @@ from datetime import datetime
 
 from hive.config import load_config
 from hive.ledger import open_ledger
-from hive.decompose import run_decompose, independent_axes
-from hive.be_root import be_root_axis
-from hive.providers import call_worker
-from hive.fanout import run_fanout, load_comb_contract
-from hive.parse import partition_combs
-from hive.conflict_scan import scan_conflicts
-from hive.reconcile import run_reconcile_loop
-from hive.assemble import run_assemble
-from hive.specify import run_specify
-from hive.reinvestigate import run_reinvestigation_loop
-from hive.apply import run_apply
 from hive.commit import run_propose, run_commit, render_commit_summary_lines
-from hive.converge import run_converge
-from hive.coordinator import run_coordinator
-from hive.coordinator.gapstate import open_store as open_gapstate_store
-from hive.investigate import (
-    _converge_fragments,
-    _rebuild_bundles,
-    format_caller_context,
-    render_local_honey,
-    rerun_reinvestigation,
-    run_investigate,
-    seed_edit_targets,
-)
 from hive import backup as backup_store
 from hive import secrets as hive_secrets
+
+# NOTE (B0001 / NR hivework.default.0049.0003): the heavy pipeline stages
+# (decompose, fanout, parse, conflict_scan, reconcile, assemble, specify,
+# reinvestigate, apply, converge, coordinator, investigate, providers, be_root)
+# are imported LAZILY inside the command handlers that use them — NOT at module
+# top — on purpose. This CLI is self-hosting: the same `hive.py` that commits
+# Hivework's own changes is itself part of the working tree being edited. When a
+# stage module is mid-edit (a half-saved WIP try/except → startup SyntaxError),
+# an eager top-level import of that module would make `python hive.py commit-plan`
+# die at parse/import time — blocking the commit precisely when it's needed most.
+# Deferring stage imports keeps the commit / commit-plan path (config, ledger,
+# commit→parse, backup, secrets — all light, WIP-stable) importable even while an
+# unrelated pipeline module is broken. Keep this invariant: do not move stage
+# imports back to module scope, and do not add stage imports to the commit path.
 
 
 def _force_utf8_io() -> None:
@@ -142,8 +133,44 @@ def http_shape_specify_kwargs(cfg, codebase_root: str | None) -> dict:
     return out
 
 
+def write_sink_specify_kwargs(cfg, codebase_root: str | None) -> dict:
+    """run_specify kwargs that bind lever L2's not-500 red test to the target's TestClient.
+
+    Resolves the per-codebase ``write_sink`` harness (config ``targets.<name>.write_sink``)
+    and forwards its setup block / mutating request / test dir into ``run_specify``. Returns
+    an empty dict when the codebase has no entry — synthesis then stays a no-op, so behaviour
+    is unchanged until a harness is configured (a mutation needs a seeded harness; there is
+    no auto-discovery fallback).
+    """
+    ws = cfg.write_sink_for_codebase(codebase_root)
+    if not ws:
+        return {}
+    out: dict = {"write_sink_test_dir": ws.test_dir or "tests"}
+    setup_block = ws.resolve_setup_block(codebase_root)
+    if setup_block:
+        out["write_sink_setup_block"] = setup_block
+    if ws.request:
+        out["write_sink_request"] = ws.request
+    return out
+
+
 def run_pipeline(args: argparse.Namespace) -> None:
     """Execute the full 6-stage pipeline."""
+    # Lazy stage imports — see module-top NOTE (B0001): keep the commit path free
+    # of these so a WIP SyntaxError in any stage can't block commits.
+    from hive.decompose import run_decompose, independent_axes
+    from hive.be_root import be_root_axis
+    from hive.providers import call_worker
+    from hive.fanout import run_fanout, load_comb_contract
+    from hive.parse import partition_combs
+    from hive.conflict_scan import scan_conflicts
+    from hive.reconcile import run_reconcile_loop
+    from hive.assemble import run_assemble
+    from hive.specify import run_specify
+    from hive.coordinator import run_coordinator
+    from hive.coordinator.gapstate import open_store as open_gapstate_store
+    from hive.investigate import format_caller_context
+
     start_time = time.time()
     logger = logging.getLogger("hive")
     cfg = load_config(profile=getattr(args, "profile", None))
@@ -480,6 +507,7 @@ def run_pipeline(args: argparse.Namespace) -> None:
             if specify_role.timeout_sec is not None:
                 specify_kwargs["author_timeout"] = specify_role.timeout_sec
             specify_kwargs.update(http_shape_specify_kwargs(cfg, args.codebase))
+            specify_kwargs.update(write_sink_specify_kwargs(cfg, args.codebase))
             try:
                 spec = run_specify(
                     honey_path=honey_path,
@@ -723,6 +751,17 @@ def run_investigate_command(args: argparse.Namespace) -> None:
     1 decompose call plus ≤ ``judge.max_calls_per_axis`` per judged axis over
     ≤ ``judge.max_axes`` axes (all from hive.config.json).
     """
+    # Lazy stage imports — see module-top NOTE (B0001).
+    from hive.investigate import (
+        format_caller_context,
+        render_local_honey,
+        rerun_reinvestigation,
+        run_investigate,
+        seed_edit_targets,
+    )
+    from hive.reinvestigate import run_reinvestigation_loop
+    from hive.specify import run_specify
+
     logger = logging.getLogger("hive")
     cfg = load_config(profile=getattr(args, "profile", None))
     cfg.apply_cli_model(args.model)
@@ -832,6 +871,7 @@ def run_investigate_command(args: argparse.Namespace) -> None:
             if specify_role.timeout_sec is not None:
                 specify_kwargs["author_timeout"] = specify_role.timeout_sec
             specify_kwargs.update(http_shape_specify_kwargs(cfg, args.codebase))
+            specify_kwargs.update(write_sink_specify_kwargs(cfg, args.codebase))
 
             def _respecify():
                 spec = run_specify(
@@ -895,6 +935,14 @@ def run_reconverge_command(args: argparse.Namespace) -> None:
     tested for ~1 call instead of an 8-minute full pipeline, and with NO decompose
     non-determinism between runs. Propose-only; writes nothing to the target codebase.
     """
+    # Lazy stage imports — see module-top NOTE (B0001).
+    from hive.investigate import (
+        _converge_fragments,
+        _rebuild_bundles,
+        render_local_honey,
+    )
+    from hive.converge import run_converge
+
     logger = logging.getLogger("hive")
     cfg = load_config(profile=getattr(args, "profile", None))
     cfg.apply_cli_model(args.model)
@@ -980,6 +1028,9 @@ def run_specify_command(args: argparse.Namespace) -> None:
     It is a single-author stage and Stage-1 propose-only: nothing is written to
     the target codebase.
     """
+    # Lazy stage imports — see module-top NOTE (B0001).
+    from hive.specify import run_specify
+
     logger = logging.getLogger("hive")
     cfg = load_config(profile=getattr(args, "profile", None))
     cfg.apply_cli_model(args.model)
@@ -1007,6 +1058,7 @@ def run_specify_command(args: argparse.Namespace) -> None:
     if role.timeout_sec is not None:
         specify_kwargs["author_timeout"] = role.timeout_sec
     specify_kwargs.update(http_shape_specify_kwargs(cfg, args.codebase))
+    specify_kwargs.update(write_sink_specify_kwargs(cfg, args.codebase))
     spec: dict = {}
     try:
         spec = run_specify(
@@ -1083,6 +1135,7 @@ def _build_repair_regenerator(args: argparse.Namespace, cfg, logger):
     if specify_role.timeout_sec is not None:
         specify_kwargs["author_timeout"] = specify_role.timeout_sec
     specify_kwargs.update(http_shape_specify_kwargs(cfg, args.codebase))
+    specify_kwargs.update(write_sink_specify_kwargs(cfg, args.codebase))
     spec_out = os.path.splitext(args.spec)[0] + ".repair"
     logger.info("apply: --repair will re-author fixes via specify (%s/%s) from honey %s",
                 specify_role.provider, specify_role.model, honey_path)
@@ -1111,6 +1164,9 @@ def run_apply_command(args: argparse.Namespace) -> None:
     codebase after the originals are snapshotted into a scratch backup bundle
     (all-or-nothing, with rollback). A non-ready proposal is never written.
     """
+    # Lazy stage imports — see module-top NOTE (B0001).
+    from hive.apply import run_apply
+
     logger = logging.getLogger("hive")
     cfg = load_config(profile=getattr(args, "profile", None))
     backup_root = cfg.apply.backup_root()

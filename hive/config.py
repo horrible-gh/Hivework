@@ -326,6 +326,55 @@ class HttpShapeConfig:
 
 
 @dataclass
+class WriteSinkConfig:
+    """One target codebase's write-sink red-test harness (lever L2 enabler — NR0003 0048).
+
+    The mutating counterpart of :class:`HttpShapeConfig`. It tells specify how to bind the
+    synthesised not-500 red test to the TARGET's own seeded ``TestClient`` so ``apply
+    --verify`` can observe red→green when the symptom is a MUTATING endpoint whose FK
+    mis-routing 500s (the 0082 dispose/close defect). NEUTRAL by design — no caller
+    semantics, mirroring :class:`HttpShapeConfig`.
+
+    - ``setup_block`` (inline) or ``setup_block_file`` (path; relative resolves under the
+      codebase root): explicit pytest source — imports + a ``@pytest.fixture`` that builds a
+      seeded ``TestClient`` AND seeds the row the mutation acts on (a group to dispose) —
+      prepended to the generated test. A mutation needs pre-seeded state, so unlike lever ⑦
+      there is no auto-discovery fallback: with no harness the lever stays a safe no-op.
+    - ``request``: the CONCRETE mutating request the test issues — ``{"verb","path","json"?}``
+      with path params already substituted with the values the harness seeds. When omitted,
+      the verb+path are grounded from the honey, but only when the route carries no unfilled
+      ``{param}`` (which a seeded mutation usually does), so ``request`` is normally given.
+
+    ``test_dir`` is where the synthesised test file is created (relative to the codebase, e.g.
+    ``"server/tests"`` so it lands beside the conftest). ``codebase`` optionally binds this
+    entry to an explicit codebase path, exactly like the other per-target blocks.
+    """
+    setup_block: str = ""
+    setup_block_file: str = ""
+    request: dict = field(default_factory=dict)
+    test_dir: str = "tests"
+    codebase: str = ""
+
+    def resolve_setup_block(self, codebase_root: str | None) -> str | None:
+        """Return the harness source: inline ``setup_block`` wins, else read the file.
+
+        A relative ``setup_block_file`` resolves under ``codebase_root``. Returns None when
+        neither is set or the file cannot be read (synthesis then declines). Never raises."""
+        if self.setup_block.strip():
+            return self.setup_block
+        if self.setup_block_file:
+            path = self.setup_block_file
+            if not os.path.isabs(path) and codebase_root:
+                path = os.path.join(codebase_root, path)
+            try:
+                with open(path, "r", encoding="utf-8") as fh:
+                    return fh.read()
+            except OSError:
+                return None
+        return None
+
+
+@dataclass
 class SafetyConfig:
     """Cost guard-rails enforced by the CLI before any spend.
 
@@ -540,6 +589,10 @@ class Config:
     # default — lever ⑦ synthesis stays a no-op when a run's codebase has no entry
     # (auto-discovery declines on an ambiguous test tree), graceful like the two above.
     http_shape_targets: dict[str, HttpShapeConfig] = field(default_factory=dict)
+    # Per-codebase write-sink red-test harnesses (lever L2), same shape/contract as
+    # http_shape_targets. Empty by default — synthesis stays a no-op when a run's codebase
+    # has no entry (a mutation needs a seeded harness, never auto-discovered).
+    write_sink_targets: dict[str, WriteSinkConfig] = field(default_factory=dict)
 
     def db_for_codebase(self, codebase_root: str | None) -> DbConnection | None:
         """Resolve the DB connection for a run's ``--codebase`` path, or None.
@@ -604,6 +657,26 @@ class Config:
         for key, hs in self.http_shape_targets.items():
             if key.strip().lower() == leaf:
                 return hs
+        return None
+
+    def write_sink_for_codebase(self, codebase_root: str | None) -> "WriteSinkConfig | None":
+        """Resolve the write-sink harness for a run's ``--codebase`` path, or None.
+
+        Same match order as :meth:`http_shape_for_codebase`: an explicit ``codebase`` binding
+        wins, else the entry whose KEY equals the codebase's leaf folder name. Returns None
+        when nothing matches (the common case → lever L2 stays a no-op), never raises.
+        """
+        if not codebase_root or not self.write_sink_targets:
+            return None
+        norm = codebase_root.replace("\\", "/").rstrip("/").lower()
+        leaf = norm.rsplit("/", 1)[-1]
+        for ws in self.write_sink_targets.values():
+            cb = (ws.codebase or "").replace("\\", "/").rstrip("/").lower()
+            if cb and (cb == norm or norm.endswith("/" + cb) or cb.endswith("/" + norm)):
+                return ws
+        for key, ws in self.write_sink_targets.items():
+            if key.strip().lower() == leaf:
+                return ws
         return None
 
     def role(self, name: str) -> RoleConfig:
@@ -858,6 +931,7 @@ def _normalize(raw: dict) -> dict:
         db_conns = dict(raw.get("db_connections") or {})
         runners = dict(raw.get("test_runners") or {})
         http_shapes = dict(raw.get("http_shape_targets") or {})
+        write_sinks = dict(raw.get("write_sink_targets") or {})
         for name, t in targets.items():
             if not isinstance(t, dict):  # skips a targets-level "_comment", etc.
                 continue
@@ -867,12 +941,16 @@ def _normalize(raw: dict) -> dict:
                 runners[name] = t["tests"]
             if isinstance(t.get("http_shape"), dict):
                 http_shapes[name] = t["http_shape"]
+            if isinstance(t.get("write_sink"), dict):
+                write_sinks[name] = t["write_sink"]
         if db_conns:
             out["db_connections"] = db_conns
         if runners:
             out["test_runners"] = runners
         if http_shapes:
             out["http_shape_targets"] = http_shapes
+        if write_sinks:
+            out["write_sink_targets"] = write_sinks
 
     return out
 
@@ -1045,6 +1123,22 @@ def load_config(path: str | None = None, profile: str | None = None) -> Config:
         str(k): _http_shape(v) for k, v in http_shape_raw.items() if isinstance(v, dict)
     }
 
+    write_sink_raw = merged.get("write_sink_targets", {})
+
+    def _write_sink(d: dict) -> WriteSinkConfig:
+        req = d.get("request")
+        return WriteSinkConfig(
+            setup_block=str(d.get("setup_block", "")),
+            setup_block_file=str(d.get("setup_block_file", "")),
+            request=dict(req) if isinstance(req, dict) else {},
+            test_dir=str(d.get("test_dir", "tests")) or "tests",
+            codebase=str(d.get("codebase", "")),
+        )
+
+    write_sink_targets = {
+        str(k): _write_sink(v) for k, v in write_sink_raw.items() if isinstance(v, dict)
+    }
+
     def _role(name: str, default_model: str = "gpt-5-mini") -> RoleConfig:
         r = roles.get(name, {})
         timeout = r.get("timeout_sec")
@@ -1139,4 +1233,5 @@ def load_config(path: str | None = None, profile: str | None = None) -> Config:
         db_connections=db_connections,
         test_runners=test_runners,
         http_shape_targets=http_shape_targets,
+        write_sink_targets=write_sink_targets,
     )

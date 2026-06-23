@@ -1147,6 +1147,7 @@ def run_investigate(
             model=judge_role.model, judge_cfg=cfg.judge, ledger=ledger,
             provider_kwargs=pk, k=k, seed_files=seed_files,
             seed_axis=(sp.axis_id == "SEED_ANCHOR"),
+            mutation_symptom=_mutation_symptom_seed(seed_text),
         )
         v = jr["verdict"]
         # Best-of-N tally (M010 §5): surface how the votes split across files so the
