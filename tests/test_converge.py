@@ -2808,6 +2808,125 @@ class TestFieldProvenanceGuard(unittest.TestCase):
         finally:
             del os.environ["HIVE_NO_FIELD_PROVENANCE"]
 
+    # ── mutation-class carve-out (NR hivework.0046.0009) ────────────────────────────
+    def test_mutation_symptom_abstains_no_reaim(self):
+        # a write-failure (mutation) symptom has no wrong FE-bound field VALUE, so the re-aim
+        # premise is void → abstain entirely (run528: the re-aim had demoted the correct FK
+        # write-site onto a README name-decoy producer).
+        res = self._res_attr(self.DECOY)
+        out = C._field_provenance_guard(
+            res, self._located(self.DECOY), self._windows(), is_mutation_symptom=True)
+        self.assertEqual(C._norm(out.attributed_defect["file"]), C._norm(self.DECOY))
+        self.assertTrue(out.converged)
+        self.assertIsNone(out.missing_link)
+        self.assertNotIn("field_provenance_reaimed", out.causal_check)
+
+    def test_mutation_symptom_abstains_no_repoint(self):
+        # the confirm/re-point job is equally void for a mutation symptom.
+        res = self._res_attr(self.DECOY)
+        out = C._field_provenance_guard(
+            res, self._located(self.DECOY, self.DOCS), self._windows(),
+            is_mutation_symptom=True)
+        self.assertEqual(C._norm(out.attributed_defect["file"]), C._norm(self.DECOY))
+        self.assertNotIn("field_provenance_repointed", out.causal_check)
+
+    def test_read_symptom_still_reaims(self):
+        # non-mutation (read/field) symptom: behaviour unchanged — over-fire guard.
+        res = self._res_attr(self.DECOY)
+        out = C._field_provenance_guard(
+            res, self._located(self.DECOY), self._windows(), is_mutation_symptom=False)
+        self.assertFalse(out.converged)
+        self.assertIn("field_provenance_reaimed", out.causal_check)
+
+
+class TestFKFacetConvergeRestore(unittest.TestCase):
+    """NR 0046.0009 (run528 fix): a deterministic FK-misrouting attribution demoted by an
+    upstream guard (field-provenance re-aim / counterfactual peer) BEFORE the lens panel's
+    converged-only gate is re-asserted, so the panel's FK-FACET carve-out can adjudicate it."""
+
+    FK = "server/modules/flow_gate/process_service.py"
+    REASON = ("insert_event(...) routes `group_id` (a FOREIGN KEY -> groups) into "
+              "events.doc_id, which is FOREIGN KEY -> documents (FK-misrouting).")
+
+    def _located_fk(self):
+        return [{"axis_id": "FK_MISROUTE:events.doc_id",
+                 "verdict": {"located": True, "file": self.FK, "lines": "2153-2159",
+                             "symbol": "dispose_group", "via": "fk-misrouting",
+                             "reason": self.REASON}}]
+
+    def _res(self, *, converged, missing_link=None):
+        return C.ConvergeResult(
+            converged=converged,
+            attributed_defect={"node": "other", "file": self.FK, "lines": "2153-2159"},
+            causal_check={"verdict": "consistent", "trace": "fk write-site"},
+            missing_link=missing_link)
+
+    def test_restores_demoted_fk_attribution(self):
+        # run528 shape: attribution at the FK write-site but a prior guard demoted converged
+        # and aimed a field-producer missing_link at a README. Restore + clear the link.
+        ml = {"between": ["fe-binding", "field-producer"],
+              "need": {"file_globs": ["README.md"]}}
+        out = C._fk_facet_converge_restore(
+            self._res(converged=False, missing_link=ml), self._located_fk())
+        self.assertTrue(out.converged)
+        self.assertIsNone(out.missing_link)
+        self.assertIn("fk_facet_restored", out.causal_check)
+        self.assertTrue(out.causal_check["fk_facet_restored"]["cleared_missing_link"])
+
+    def test_noop_when_already_converged_on_fk(self):
+        out = C._fk_facet_converge_restore(self._res(converged=True), self._located_fk())
+        self.assertTrue(out.converged)
+        self.assertNotIn("fk_facet_restored", out.causal_check)
+
+    def test_noop_when_attribution_not_fk_locus(self):
+        # attribution elsewhere (no aligned fk-misrouting facet) → leave the demotion.
+        res = C.ConvergeResult(
+            converged=False,
+            attributed_defect={"node": "n", "file": "server/db/connection.py", "lines": "1-2"},
+            causal_check={"verdict": "consistent"},
+            missing_link={"need": {}})
+        out = C._fk_facet_converge_restore(res, self._located_fk())
+        self.assertFalse(out.converged)
+        self.assertNotIn("fk_facet_restored", out.causal_check)
+
+    def test_noop_when_no_fk_facet_located(self):
+        # the locus is located but NOT flagged via="fk-misrouting" → not schema-grounded proof.
+        res = self._res(converged=False, missing_link={"need": {}})
+        located = [{"axis_id": "AX0", "verdict": {"located": True, "file": self.FK,
+                    "lines": "2153-2159", "reason": "r"}}]
+        out = C._fk_facet_converge_restore(res, located)
+        self.assertFalse(out.converged)
+
+    def test_kill_switch_disables(self):
+        with mock.patch.dict(os.environ, {"HIVE_NO_FK_FACET_RESTORE": "1"}):
+            out = C._fk_facet_converge_restore(
+                self._res(converged=False, missing_link={"need": {}}), self._located_fk())
+        self.assertFalse(out.converged)
+
+    def test_arbiter_run528_end_to_end(self):
+        # full arbiter on the run528 shape: mutation symptom + counterfactual peer demotion +
+        # field-producer README decoy + a located FK facet → field-provenance abstains and the
+        # FK-FACET restore re-asserts converged at the write-site (was MISS pre-fix).
+        res = C.ConvergeResult(
+            converged=True,
+            attributed_defect={"node": "other", "file": self.FK, "lines": "2153-2159"},
+            causal_check={"verdict": "consistent", "counterfactual": "fixing it removes the 500",
+                          "trace": "dispose-FK write-site"})
+        located = self._located_fk() + [
+            {"axis_id": "PEER", "verdict": {
+                "located": True,
+                "file": "server/modules/flow_gate/db/mention_copies.py",
+                "lines": "38-43", "reason": "peer"}}]
+        fp = [{"file": "README.md", "lines": "132-148", "via": "field-producer",
+               "field": "workflow_head_type", "text": "docs mention workflow_head_type"}]
+        out = C._causal_provenance_arbiter(
+            res, located, fp_windows=fp, http_ds_windows=[], data_backed=True,
+            data_chain_broke=False, db_available=True, code_root=None,
+            windows=[], min_located=2, is_mutation_symptom=True)
+        self.assertTrue(out.converged)
+        self.assertEqual(C._norm(out.attributed_defect["file"]), C._norm(self.FK))
+        self.assertIn("fk_facet_restored", out.causal_check)
+
 
 class TestMultiRootCoverageGuard(unittest.TestCase):
     """M037 / N179: a multi-mechanism scenario whose distinct FE-bound field producers were
@@ -3530,6 +3649,82 @@ class TestFKMisrouting(unittest.TestCase):
                     "call_chain": []}]
         facets = C._fk_misrouting_facets(located, [], bundles, root)
         self.assertEqual(len(facets), 1, facets)
+
+    # ── 0046 NR0003: repo-tree write-site PATH fallback (run524 missing-link) ──────────
+    def _unrelated_bundle(self):
+        """located + bundle that point ONLY at an unrelated endpoint (no write-site, no
+        FK-writer text) — the run524 shape where the write-site never rode in."""
+        located = [_verdict("A", True, "api/routes.py", "1-2", "endpoint")]
+        bundles = [{"axis_id": "A",
+                    "code_snippets": [{"file": "api/routes.py", "lines": "1-2",
+                                       "text": "def dispose():\n    service.dispose_group(gid)"}],
+                    "call_chain": []}]
+        return located, bundles
+
+    def test_repo_tree_fallback_resolves_write_site_absent_from_bundle(self):
+        # The write-site rides in NEITHER located NOR the bundle (run524 MISS). With a mutation
+        # symptom the repo-tree verb fallback must surface server/process_service.py so the
+        # full-file FK scan fires — converting the run523/524 coin-flip into a deterministic hit.
+        src = ("def dispose_group(group_id, reason):\n"
+               "    db.insert_event(group_id, \"group_disposed\", note=reason)\n")
+        root, _ = _fk_repo(self._tmp, src, rel="server/process_service.py")
+        located, bundles = self._unrelated_bundle()
+        os.environ.pop("HIVE_NO_WRITER_ANCHOR", None)
+        # No symptom verb → no fallback → no facet (isolates the fallback as the cause).
+        self.assertEqual(C._fk_misrouting_facets(located, [], bundles, root), [])
+        # Symptom carries the verb → repo-tree fallback resolves the write-site → facet fires.
+        facets = C._fk_misrouting_facets(
+            located, [], bundles, root,
+            symptom="group dispose/close no longer persists the disposal event")
+        self.assertEqual(len(facets), 1, facets)
+        vd = facets[0]["verdict"]
+        self.assertEqual(vd["file"], "server/process_service.py")
+        self.assertEqual(vd["via"], "fk-misrouting")
+        self.assertIn("group_id", vd["reason"])
+        self.assertIn("events.doc_id", vd["reason"])
+
+    def test_repo_tree_fallback_silent_on_read_symptom(self):
+        # A read/UI symptom (no mutation verb) must NOT trigger the repo-tree grep, even though
+        # the misrouting write-site exists in the repo — no behaviour change for non-mutation axes.
+        src = ("def dispose_group(group_id, reason):\n"
+               "    db.insert_event(group_id, \"group_disposed\", note=reason)\n")
+        root, _ = _fk_repo(self._tmp, src, rel="server/process_service.py")
+        located, bundles = self._unrelated_bundle()
+        self.assertEqual(
+            C._fk_misrouting_facets(located, [], bundles, root,
+                                    symptom="the list view renders slowly on first paint"), [])
+
+    def test_repo_tree_fallback_respects_writer_anchor_killswitch(self):
+        # HIVE_NO_WRITER_ANCHOR disables the reused resolver → fallback no-ops → no facet.
+        src = ("def dispose_group(group_id, reason):\n"
+               "    db.insert_event(group_id, \"group_disposed\", note=reason)\n")
+        root, _ = _fk_repo(self._tmp, src, rel="server/process_service.py")
+        located, bundles = self._unrelated_bundle()
+        os.environ["HIVE_NO_WRITER_ANCHOR"] = "1"
+        try:
+            self.assertEqual(
+                C._fk_misrouting_facets(located, [], bundles, root,
+                                        symptom="group dispose fails to persist event"), [])
+        finally:
+            os.environ.pop("HIVE_NO_WRITER_ANCHOR", None)
+
+    def test_repo_tree_fallback_noop_when_evidence_already_reaches_writer(self):
+        # run523 shape: the bundle ALREADY carries the FK-writer text → under-anchor gate makes
+        # the helper a no-op (returns no extra path); the normal scan finds it from the bundle.
+        src = ("def dispose_group(group_id, reason):\n"
+               "    db.insert_event(group_id, \"group_disposed\", note=reason)\n")
+        root, rel = _fk_repo(self._tmp, src, rel="server/process_service.py")
+        seed_windows = [{"file": rel, "lines": "1-2",
+                         "text": "db.insert_event(group_id, \"group_disposed\")"}]
+        # Helper itself returns nothing to add (already reachable).
+        self.assertEqual(
+            C._repo_tree_fk_writer_files("group dispose fails", seed_windows, root), [])
+
+    def test_repo_tree_helper_empty_symptom_fail_open(self):
+        root, rel = _fk_repo(self._tmp, "def dispose_group(g):\n    db.insert_event(g)\n",
+                             rel="server/process_service.py")
+        self.assertEqual(C._repo_tree_fk_writer_files("", [], root), [])
+        self.assertEqual(C._repo_tree_fk_writer_files("dispose", [], None), [])
 
     def test_fragment_cards_emit_fk_directive(self):
         located = [_verdict("A", True, "api/routes.py", "1-2", "endpoint")]

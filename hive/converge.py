@@ -607,6 +607,46 @@ _FK_BARE_ID_RE = re.compile(r"^[a-z][a-z0-9_]*$")
 _FK_MISROUTE_MAX_FILES = 24    # distinct evidence/located files scanned for write calls
 
 
+def _repo_tree_fk_writer_files(symptom: str, seed_windows: list[dict[str, Any]],
+                               code_root: str | None) -> list[str]:
+    """Deterministic write-site PATH fallback for the FK-misrouting scan (0046 NR0003).
+
+    The FK facet scanner reads candidate files in FULL from disk, so the *only* thing it
+    needs is the write-site's file PATH in its candidate set. When the upstream (stochastic)
+    retrieve/judge happens NOT to bundle ``process_service.py`` (run524 MISS) the scanner has
+    no file to look at and converge silently skips at the ``min_located`` gate — never even
+    naming a missing-link, so the existing follow-up re-retrieve can't fire. That makes
+    detection a coin-flip on whether the write-site rode in (run523 FOUND / run524 MISS).
+
+    This closes that gap at the converge boundary: resolve the FK-table-writing handler(s)
+    from the REPO TREE by the symptom verb (dispose/close/…) and hand back their ``.py``
+    paths so the full-file FK scan runs on them deterministically — independent of what the
+    bundle happened to carry. Reuses ``retriever._anchor_mutation_writer_defs`` verbatim, so
+    it inherits the same gates: mutation cue present, repo has single-col FK tables, the
+    pooled evidence is UNDER-anchored (no FK-table writer reachable yet — a true fallback that
+    no-ops when run523-style evidence already reaches it), and the ``HIVE_NO_WRITER_ANCHOR``
+    kill-switch. Pure, bounded, fail-open: any error / no symptom verb / killed → ``[]``.
+    """
+    if not symptom or not code_root:
+        return []
+    try:
+        from types import SimpleNamespace
+        from hive.retriever import _anchor_mutation_writer_defs
+        # _anchor_mutation_writer_defs only reads ``plan.keywords`` (mutation cue + symptom
+        # verb source) and ``plan.axis_id`` — a light shim avoids coupling to SearchPlan.
+        plan = SimpleNamespace(keywords=[symptom], axis_id="CONVERGE_FK")
+        hits = _anchor_mutation_writer_defs(seed_windows, plan, code_root)
+    except Exception as e:  # pragma: no cover - import / resolve guard, never blocks converge
+        logger.warning("converge: FK write-site repo-tree resolve failed: %s", e)
+        return []
+    out: list[str] = []
+    for h in hits or []:
+        rel = (h.get("file") or "").replace("\\", "/").strip().lstrip("./")
+        if rel.endswith(".py") and rel not in out:
+            out.append(rel)
+    return out
+
+
 def _resolve_writer_table(noun: str, table_keys: set[str]) -> str | None:
     """Map an ``insert_<noun>`` writer to its schema table key (event→events …)."""
     noun = (noun or "").lower()
@@ -619,7 +659,8 @@ def _resolve_writer_table(noun: str, table_keys: set[str]) -> str | None:
 def _fk_misrouting_facets(located: list[dict[str, Any]],
                           winning_path: list[dict[str, Any]],
                           bundles: list[dict[str, Any]],
-                          code_root: str | None) -> list[dict[str, Any]]:
+                          code_root: str | None,
+                          symptom: str = "") -> list[dict[str, Any]]:
     """Schema-grounded write-arg/FK check → deterministic ``fk-misrouting`` located facets.
 
     Reads the codebase's migration DDL for real foreign keys, scans the pooled evidence /
@@ -661,6 +702,7 @@ def _fk_misrouting_facets(located: list[dict[str, Any]],
 
     # Candidate files: located loci + winning-path nodes + every pooled evidence window.
     files: list[str] = []
+    seed_windows: list[dict[str, Any]] = []   # pooled evidence text → under-anchor gate
 
     def _add(rel: str) -> None:
         rel = (rel or "").replace("\\", "/").strip().lstrip("./")
@@ -677,6 +719,16 @@ def _fk_misrouting_facets(located: list[dict[str, Any]],
         for w in (b.get("code_snippets") or []) + (b.get("call_chain") or []):
             if isinstance(w, dict):
                 _add(w.get("file", ""))
+                seed_windows.append(w)
+
+    # Deterministic write-site PATH fallback (0046 NR0003): when the pooled evidence
+    # UNDER-anchors the FK-table writer (run524 missing-link — the write-site file never rode
+    # in), resolve it from the repo tree by symptom verb so the full-file scan below is no
+    # longer a coin-flip on the upstream bundle. Self-gating fallback (no-ops when the
+    # evidence already reaches the writer, e.g. run523), bounded, fail-open.
+    for rel in _repo_tree_fk_writer_files(symptom, seed_windows, code_root):
+        _add(rel)
+
     if not files:
         return []
 
@@ -2914,7 +2966,8 @@ def _field_provenance_reaim(res: ConvergeResult,
 
 def _field_provenance_guard(res: ConvergeResult,
                             located: list[dict[str, Any]],
-                            fp_windows: list[dict[str, Any]]) -> ConvergeResult:
+                            fp_windows: list[dict[str, Any]],
+                            is_mutation_symptom: bool = False) -> ConvergeResult:
     """Anchor the attribution to the code that PRODUCES the FE-bound field the symptom is
     about (field-producer provenance).
 
@@ -2946,8 +2999,22 @@ def _field_provenance_guard(res: ConvergeResult,
     are never harvested by field-producer, so field-poor symptoms never reach this guard.
     Operates on the FULL (uncapped) field-producer evidence — the pooled ``windows`` cap
     can drop the symptom producer, so the caller passes facts straight from the bundles.
+
+    Mutation-class carve-out (NR hivework.0046.0009): this guard arbitrates a wrong FE-bound
+    field VALUE (M035 head off-by-one / M037 name-decoy). A persistence/MUTATION-class symptom
+    is a write FAILURE (dispose-FK 500) — there is NO emptied read field to attribute, so the
+    confirm/re-point/re-aim premise is void. On run528 the re-aim fired on exactly such a
+    symptom and demoted the correct FK write-site (process_service.py) onto a README name-decoy
+    (field-producer grounding had tagged the doc), leaving converge ``not converged`` so the
+    lens FK-FACET carve-out was never reached → MISS. Abstaining here mirrors the sibling
+    HTTP-datasource guard's mutation carve-out (NR hivework.0035.0009); the deterministic
+    :func:`_fk_facet_converge_restore` then re-asserts the FK write-site attribution.
     """
     if os.environ.get("HIVE_NO_FIELD_PROVENANCE"):
+        return res
+    if is_mutation_symptom:
+        logger.info("converge: field-provenance guard abstained (mutation-class symptom — "
+                    "write-failure, not a wrong FE-bound field value; NR hivework.0046.0009)")
         return res
     prod_fields: dict[str, set[str]] = {}
     prod_text: dict[str, str] = {}
@@ -3063,6 +3130,72 @@ def _field_provenance_guard(res: ConvergeResult,
     logger.info("converge: field-provenance guard re-pointed attribution %s:%s → %s:%s",
                 old["file"], old["lines"], tvd.get("file", ""), tvd.get("lines", ""))
     return res
+
+
+def _fk_facet_converge_restore(res: ConvergeResult,
+                               located: list[dict[str, Any]]) -> ConvergeResult:
+    """Re-assert convergence for a deterministic FK-misrouting attribution that an upstream
+    arbiter demotion knocked down before the lens panel could adjudicate it.
+
+    The lens panel already carries an FK-FACET carve-out — a ``via="fk-misrouting"`` locus is
+    schema-grounded proof (the migration DDL says the write argument violates a real FK), so
+    reachability-only refutation is invalid (run514). But the lens panel runs ONLY on a
+    still-``converged`` result; when an EARLIER guard demotes the attribution first, the panel
+    — and its carve-out — never run. run528 (NR hivework.0046.0009): a mutation-class
+    dispose-FK 500 converged at the FK write-site, the counterfactual guard demoted it over an
+    unrefuted peer, and (pre-fix) the field-provenance re-aim then re-aimed the correct locus
+    onto a README name-decoy — leaving ``converged=False`` so the lens FK-FACET carve-out was
+    skipped → MISS, while a sibling run where field-producer grounding happened to tag the
+    write-site as a producer was FOUND (pure stochastic split).
+
+    When the FINAL attribution still aligns with a located ``via="fk-misrouting"`` facet (the
+    same detection the lens panel uses, :func:`_lens_refute`), this guard re-asserts
+    convergence and clears any field/producer ``missing_link`` so the lens panel runs and its
+    carve-out decides — the deterministic schema-violation grounding outranks the
+    field-provenance/counterfactual demotions exactly as it does inside the panel. The
+    independent peer the counterfactual guard flagged is left for the next guard
+    (:func:`_multi_root_coverage_guard`) to surface as an additional root. Deterministic, no
+    model call. Disabled by ``HIVE_NO_FK_FACET_RESTORE``; fail-open (any error → unchanged).
+    """
+    if os.environ.get("HIVE_NO_FK_FACET_RESTORE"):
+        return res
+    try:
+        ad = res.attributed_defect or {}
+        af = _norm(ad.get("file", ""))
+        if not af:
+            return res
+        reason = ""
+        for v in (located or []):
+            vd = v.get("verdict") or {}
+            if str(vd.get("via", "")) == "fk-misrouting" and _aligns(af, vd.get("file", "")):
+                reason = str(vd.get("reason", "") or "")
+                break
+        if not reason:
+            return res
+        if res.converged and not res.missing_link:
+            return res  # already converged on the FK locus — nothing to restore
+        cleared = bool(res.missing_link)
+        res.converged = True
+        res.missing_link = None
+        cc = dict(res.causal_check or {})
+        cc["fk_facet_restored"] = {"file": ad.get("file", ""), "lines": ad.get("lines", ""),
+                                   "cleared_missing_link": cleared}
+        cc["trace"] = (cc.get("trace") or "") + (
+            f" [FK-FACET carve-out] attribution {ad.get('file', '')}:{ad.get('lines', '')} is a "
+            f"deterministic FK-misrouting locus (schema-grounded): {_trunc(reason, 300)} "
+            f"Re-asserted convergence over an upstream field-provenance/counterfactual demotion "
+            f"so the lens FK-FACET carve-out can adjudicate it.")
+        res.causal_check = cc
+        res.summary = (
+            f"converged (FK-FACET carve-out): defect at {ad.get('file', '')}:"
+            f"{ad.get('lines', '')} is a deterministic FK-misrouting write-site")
+        logger.info("converge: FK-FACET carve-out — restored converged for deterministic "
+                    "FK-misrouting attribution %s:%s (overrides field-provenance/counterfactual "
+                    "demotion; NR hivework.0046.0009)", ad.get("file", ""), ad.get("lines", ""))
+        return res
+    except Exception as e:  # deterministic restore must never crash converge
+        logger.warning("converge: FK-FACET restore failed (kept result): %s", e)
+        return res
 
 
 def _multi_root_coverage_guard(res: ConvergeResult,
@@ -3190,7 +3323,12 @@ def _causal_provenance_arbiter(
         res = _http_datasource_provenance_guard(
             res, located, http_ds_windows, code_root,
             is_mutation_symptom=is_mutation_symptom)
-        res = _field_provenance_guard(res, located, fp_windows)
+        res = _field_provenance_guard(res, located, fp_windows,
+                                      is_mutation_symptom=is_mutation_symptom)
+        # A deterministic FK-misrouting attribution outranks the field-provenance /
+        # counterfactual demotions (the lens panel's FK-FACET carve-out, lifted ahead of the
+        # panel's converged-only gate so an early demotion can no longer skip it). NR 0046.0009.
+        res = _fk_facet_converge_restore(res, located)
         # Last: with the attribution settled, surface any INDEPENDENT roots (distinct
         # FE-bound field producers) the single-path stitch collapsed (N179 reinforcement).
         res = _multi_root_coverage_guard(res, located, fp_windows)
@@ -3960,7 +4098,8 @@ def run_converge(*, seed_text: str, verdicts: list[dict[str, Any]],
     # (e.g. group_id → events.doc_id) as a located fragment carrying the FK mechanism, so a
     # comment decoy / leaf-starved write-path / wobbly converge cannot bury it. Added BEFORE
     # the min_located gate so the facet also counts toward stitching.
-    for facet in _fk_misrouting_facets(located, winning_path, bundles, code_root):
+    for facet in _fk_misrouting_facets(located, winning_path, bundles, code_root,
+                                       symptom=seed_text):
         ff = (facet.get("verdict") or {}).get("file", "")
         fl = (facet.get("verdict") or {}).get("lines", "")
         if not any(
