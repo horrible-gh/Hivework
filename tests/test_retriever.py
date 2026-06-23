@@ -1389,6 +1389,72 @@ def test_writer_anchor_extended_body_window_captures_deep_write(tmp_path):
     assert "insert_event" in out[0]["text"]
 
 
+# ── R3 companion: module-doc grounding of the write-site file (NR0006 §4) ────────
+# The 0082 answer signal sat in PLAIN PROSE in the write file's module docstring (the FK
+# contract), not in the def body. These tests prove the writer-anchor pulls that prose into
+# the bundle as a `via=writer-doc` companion, and that it is fail-open when absent.
+_MUT_SERVICE_SRC_WITH_DOC = (
+    '"""Group disposal service.\n'
+    "\n"
+    "Persists terminal group actions. NOTE: group events belong in the\n"
+    "group_events table (group_id -> groups). The events table is for DOCUMENT\n"
+    "events only (doc_id -> documents) and has NO foreign key to groups.\n"
+    '"""\n'
+    "def dispose_group(group_id, reason):\n"
+    "    return _apply_group_terminal_action(group_id, reason)\n"
+    "\n"
+    "\n"
+    "def _apply_group_terminal_action(group_id, reason):\n"
+    "    db.insert_event(group_id, \"group_disposed\", note=reason)\n"
+    "    return True\n"
+)
+
+
+def test_module_doc_window_extracts_docstring_and_comments(tmp_path):
+    f = tmp_path / "svc.py"
+    f.write_text("# leading contract note: group_events.group_id\n"
+                 '"""Module doc line 1.\nline 2 mentions documents(doc_id).\n"""\n'
+                 "import os\n", encoding="utf-8")
+    from hive.retriever import _module_doc_window
+    w = _module_doc_window(str(tmp_path), "svc.py")
+    assert w is not None
+    assert "leading contract note" in w["text"]
+    assert "Module doc line 1" in w["text"]
+    assert "documents(doc_id)" in w["text"]
+    assert "import os" not in w["text"]            # stops at the first code line
+
+
+def test_module_doc_window_none_when_no_prose(tmp_path):
+    f = tmp_path / "bare.py"
+    f.write_text("import os\n\ndef f():\n    return 1\n", encoding="utf-8")
+    from hive.retriever import _module_doc_window
+    assert _module_doc_window(str(tmp_path), "bare.py") is None
+
+
+def test_writer_anchor_emits_module_doc_companion(tmp_path):
+    # When the recovered write-site file carries a module docstring, the anchor emits a
+    # `via=writer-doc` companion carrying that FK-contract prose (R3 reach).
+    root = _mk_mutation_repo(tmp_path, service=_MUT_SERVICE_SRC_WITH_DOC)
+    out = _anchor_mutation_writer_defs([dict(_WRONG_SERVICE_SNIPPET)], _MUT_PLAN, root)
+    docs = [n for n in out if n.get("via") == "writer-doc"]
+    assert docs, "module-doc companion must be emitted for a documented write file"
+    d = docs[0]
+    assert d["file"].endswith("process_service.py")
+    assert "group_events" in d["text"] and "NO foreign key to groups" in d["text"]
+    assert "WRITER-ANCHOR MODULE DOC" in d["text"]
+    # exactly one doc companion per file (not one per matched verb/def)
+    assert len(docs) == 1
+
+
+def test_writer_anchor_no_doc_companion_when_file_has_no_docstring(tmp_path):
+    # Default fixture service has no module docstring → writer-anchor still fires but emits
+    # no doc companion (fail-open, no crash).
+    root = _mk_mutation_repo(tmp_path)
+    out = _anchor_mutation_writer_defs([dict(_WRONG_SERVICE_SNIPPET)], _MUT_PLAN, root)
+    assert any(n.get("via") == "writer-anchor" for n in out)
+    assert not [n for n in out if n.get("via") == "writer-doc"]
+
+
 def test_retrieve_integration_anchor_fallback_on_misanchor(tmp_path):
     # Full retrieve() end-to-end: the axis glob lands ONLY on the wrong service (no writer),
     # the BFS resolver finds nothing — the anchor fallback recovers process_service.py and the

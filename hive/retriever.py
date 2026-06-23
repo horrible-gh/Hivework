@@ -515,6 +515,77 @@ def _read_def_body(root: str, relpath: str, line: int,
     return {"lines": f"{line}-{hi}", "text": text[:2400]}
 
 
+def _module_doc_window(root: str, relpath: str,
+                       max_lines: int = 80) -> dict[str, Any] | None:
+    """Read a file's MODULE DOCSTRING (+ any leading ``#`` comment block).
+
+    R3 (NR0006 §4): the answer signal for 0082 sat in plain prose in the
+    write-site file's *module docstring* (``db/group_events.py`` documented the
+    FK relationship the misroute violated) — but the writer-anchor only pulls the
+    handler *def body*, so the prose that names the correct table never reached
+    the judge. This grabs the leading comment block + the first triple-quoted
+    module docstring so that prose rides into the bundle next to the write site.
+
+    Returns ``{lines, text}`` or ``None`` when the file has no leading docstring/
+    comment (so an empty companion snippet is never emitted). Deterministic,
+    fail-open: any read/parse trouble returns ``None``.
+    """
+    abspath = os.path.join(root, relpath)
+    try:
+        with open(abspath, "r", encoding="utf-8", errors="replace") as f:
+            all_lines = f.readlines()
+    except OSError:
+        return None
+    i = 0
+    n = len(all_lines)
+    # Skip a shebang / ``# -*- coding -*-`` style preamble and blank lines, but
+    # CAPTURE a leading ``#`` comment block (often where the FK/table contract is
+    # spelled out) up to the first code/docstring line.
+    start = 0
+    comment_lines: list[str] = []
+    while i < n:
+        stripped = all_lines[i].strip()
+        if not stripped:
+            i += 1
+            continue
+        if stripped.startswith("#"):
+            if not comment_lines:
+                start = i
+            comment_lines.append(all_lines[i])
+            i += 1
+            continue
+        break
+    # Now ``i`` is the first non-blank, non-comment line. A module docstring is a
+    # triple-quoted string literal here.
+    doc_lines: list[str] = []
+    if i < n:
+        first = all_lines[i].lstrip()
+        for q in ('"""', "'''"):
+            if first.startswith(q):
+                if not comment_lines:
+                    start = i
+                # Single-line docstring on one physical line.
+                if first.count(q) >= 2 and len(first.strip()) > len(q):
+                    doc_lines.append(all_lines[i])
+                else:
+                    j = i
+                    doc_lines.append(all_lines[j])
+                    j += 1
+                    while j < n and q not in all_lines[j]:
+                        doc_lines.append(all_lines[j])
+                        j += 1
+                    if j < n:
+                        doc_lines.append(all_lines[j])
+                break
+    block = comment_lines + doc_lines
+    if not block:
+        return None
+    block = block[:max_lines]
+    end = start + len(block)
+    text = "".join(block)
+    return {"lines": f"{start + 1}-{end}", "text": text[:2000]}
+
+
 def _merge_windows(snips: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Collapse overlapping ±k windows in the same file into one snippet."""
     by_file: dict[str, list[dict[str, Any]]] = defaultdict(list)
@@ -2014,6 +2085,7 @@ def _anchor_mutation_writer_defs(seeds: list[dict[str, Any]], plan: "SearchPlan"
 
     out: list[dict[str, Any]] = []
     seen_defs: set[str] = set()
+    doc_emitted: set[str] = set()           # one writer-doc companion per file (R3)
     file_text: dict[str, str] = {}          # full-file cache for the FK-writer gate
     scanned = 0
     for verb in sorted(verbs):
@@ -2052,6 +2124,23 @@ def _anchor_mutation_writer_defs(seeds: list[dict[str, Any]], plan: "SearchPlan"
                          + w["text"]),
                 "via": "writer-anchor", "symbol": _norm_path_symbol(h["file"]),
                 "winning": True})
+            # R3 companion: pull the SAME file's module docstring / leading comment
+            # block so the prose that names the correct FK table rides in next to the
+            # write site (the 0082 answer lived there, not in the def body). One per
+            # file, fail-open: skip silently when the file has no leading prose.
+            if rel not in doc_emitted:
+                doc_emitted.add(rel)
+                dw = _module_doc_window(code_root, rel)
+                if dw and dw["text"].strip():
+                    out.append({
+                        "file": rel, "lines": dw["lines"],
+                        "text": (f"# WRITER-ANCHOR MODULE DOC (hive): module-level "
+                                 f"documentation of FK-table write file "
+                                 f"{_norm_path_symbol(h['file'])} — read the table/FK "
+                                 f"contract stated here before ruling\n"
+                                 + dw["text"]),
+                        "via": "writer-doc", "symbol": _norm_path_symbol(h["file"]),
+                        "winning": True})
             if len(out) >= max_sites:
                 return out
     return out
