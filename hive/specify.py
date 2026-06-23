@@ -43,6 +43,7 @@ from typing import Any
 from hive import dbread
 from hive import schema_ground
 from hive.http_shape_synth import synthesize_http_shape_red_test
+from hive.write_sink_synth import synthesize_write_sink_red_test
 from hive.investigate import SEED_TARGET_SECTION, CONVERGE_TARGET_SECTION
 from hive.parse import extract_first_json
 from hive.providers import call_worker
@@ -149,6 +150,10 @@ RI_LEGACY_COERCE = "legacy_coerce"
 RI_AUTHOR_DECLARED = "author_declared"
 RI_OFF_WINNING_PATH = "off_winning_path"
 RI_LAYER_CONTRADICTION = "converge_author_layer_contradiction"
+#   same_facet_divergence → two write-sites sharing ONE diagnosed mis-routing facet were
+#   lowered to DIVERGENT repairs (one swaps the callee/sink, a sibling only swaps an
+#   argument); the spec cannot be vouched until both sites take the canonical transform.
+RI_SAME_FACET_DIVERGENCE = "same_facet_divergence"
 
 
 def _append_note(spec: dict[str, Any], note: str) -> None:
@@ -2437,6 +2442,236 @@ def _apply_anchor_not_grounded_gate(spec: dict[str, Any]) -> dict[str, Any]:
     return spec
 
 
+# ── Same-facet transformation consistency (lever L1 — hivework.default.0048.0003-NR) ──
+# Kill-switch for A/B isolation, mirroring HIVE_NO_DEFERRED_ESCAPE / HIVE_NO_HTTP_SHAPE.
+_FACET_NORMALIZE_ENV_OFF = "HIVE_NO_FACET_NORMALIZE"
+
+# A persistence/event ROUTING call: a (possibly receiver-qualified) ``insert_*event(arg0``.
+# This is the exact shape of the 0082 Lv3 defect — ``db.insert_event(group_id, ...)`` mis-
+# routes a groups-FK value into a documents-FK'd ``events.doc_id``. The canonical repair
+# swaps the CALLEE (the sink: ``insert_event`` → ``insert_group_event``) while preserving the
+# value; the decoy repair keeps the callee and swaps the ARGUMENT (``group_id`` → ``doc_id``),
+# satisfying the raw FK but writing to the wrong table. NR0003 found a single author lowering
+# two byte-identical-facet sites to these two DIFFERENT transforms within one spec.
+_ROUTING_CALL_RE = re.compile(
+    r"(?:(?P<recv>[A-Za-z_][\w]*)\s*\.\s*)?(?P<callee>insert_\w*event)\s*\(\s*"
+    r"(?P<arg0>[A-Za-z_][\w.]*)?")
+
+# Transform classes for a routing edit (anchor_old → replacement_new).
+_T_CALLEE_SWAP = "callee_swap"   # sink changed, value preserved → canonical for mis-routing
+_T_ARG_SWAP = "arg_swap"         # value changed, sink preserved → the decoy direction
+
+
+def _routing_call_sig(text: str) -> tuple[str, str, str] | None:
+    """First ``insert_*event(arg0`` call in ``text`` as ``(receiver, callee, arg0)``.
+
+    Returns ``None`` when no routing call is present. ``receiver``/``arg0`` may be ''
+    (an unqualified call, or a call whose first argument is not a bare identifier).
+    Deterministic, never raises.
+    """
+    m = _ROUTING_CALL_RE.search(text or "")
+    if not m:
+        return None
+    return (m.group("recv") or "", m.group("callee") or "", m.group("arg0") or "")
+
+
+def _routing_transform(anchor_old: str, replacement_new: str
+                       ) -> tuple[str, tuple[str, str, str], str] | None:
+    """Classify a routing edit's transform.
+
+    Returns ``(transform, old_sig, new_callee)`` where ``transform`` is
+    ``_T_CALLEE_SWAP`` / ``_T_ARG_SWAP``, or ``None`` when the edit is not a single,
+    unambiguous routing transform (no routing call on a side, receiver changed, or BOTH
+    callee and arg0 changed — which is not a clean swap to reason about). ``old_sig`` is
+    the anchor's ``(receiver, callee, arg0)`` — the diagnosed-facet key.
+    """
+    old = _routing_call_sig(anchor_old)
+    new = _routing_call_sig(replacement_new)
+    if not old or not new:
+        return None
+    o_recv, o_callee, o_arg0 = old
+    n_recv, n_callee, n_arg0 = new
+    if o_recv != n_recv:
+        return None  # receiver moved — not a clean callee/arg swap
+    callee_changed = o_callee != n_callee
+    arg0_changed = (o_arg0 != n_arg0) and bool(o_arg0) and bool(n_arg0)
+    if callee_changed and not arg0_changed:
+        return (_T_CALLEE_SWAP, old, n_callee)
+    if arg0_changed and not callee_changed:
+        return (_T_ARG_SWAP, old, n_callee)
+    return None  # both changed / neither changed → not a divergence we can adjudicate
+
+
+def _swap_callee_token(anchor_old: str, old_callee: str, canonical_callee: str) -> str:
+    """Rebuild ``replacement_new`` from the live anchor by swapping ONLY the callee token.
+
+    Replaces the first whole-word occurrence of ``old_callee`` in ``anchor_old`` with
+    ``canonical_callee``, preserving every argument and surrounding byte exactly. This is
+    the canonical callee-swap repair lifted from a sibling edit — applied to the live-
+    verified anchor so the result stays apply-anchorable. Deterministic, never raises.
+    """
+    return re.sub(r"\b" + re.escape(old_callee) + r"\b", canonical_callee,
+                  anchor_old, count=1)
+
+
+def _apply_same_facet_consistency_gate(spec: dict[str, Any]) -> dict[str, Any]:
+    """Normalize (or downgrade) write-sites that share ONE facet but diverge in repair.
+
+    NR0003 (hivework.default.0048) root cause RC1/RC2: the 0082 Lv3 defect is two write-
+    sites — ``dispose_group`` (:2156) and ``_apply_group_terminal_action`` (:2282) — that
+    the judge attributes to ONE identical facet (``insert_event(group_id, ...)`` mis-routing
+    a groups-FK value into ``events.doc_id``). A single specify author lowered them to TWO
+    DIFFERENT repairs in one spec: the dispose site to the DECOY arg-swap
+    (``insert_event(doc_id, ...)`` — keeps the wrong ``events`` sink) and the close site to
+    the CANONICAL callee-swap (``insert_group_event(group_id, ...)`` — the groups-FK sink the
+    golden test requires). Nothing in specify checked that same-facet siblings take the SAME
+    transform, so a half-decoy spec shipped (and, when its self-authored red test happened to
+    pin the decoy, could ship green on its own test while failing the real fix).
+
+    This gate groups routing edits by their diagnosed facet ``(file, old_callee, old_arg0)``.
+    Within a group of ≥2 routing edits that DIVERGES (both a callee-swap and an arg-swap are
+    present):
+      - When the callee-swap siblings agree on ONE canonical target callee, every divergent
+        (arg-swap / non-canonical) sibling is NORMALIZED to that callee-swap — its
+        ``replacement_new`` is rebuilt from its own live anchor with only the callee token
+        swapped, so both sites end up routing to the same correct sink. Each normalized edit
+        is stamped ``facet_normalized``.
+      - A verify red-test that PINS the decoy it just normalized away (its test text names the
+        old callee but not the canonical one) can no longer certify the changed behavior, so
+        the spec is downgraded to needs_reinvestigation (normalized edits RETAINED) with a
+        canonical-transform directive for the next author/repair round.
+      - When the callee-swap siblings DISAGREE on the target callee (no single canonical sink
+        to normalize to), the spec is downgraded with the same directive rather than guessing.
+
+    Downgrade-only / normalize-toward-a-sibling's-own-choice — it never invents a sink the
+    author did not already pick for a peer site. Pure-local, deterministic, never raises.
+    Kill-switch ``HIVE_NO_FACET_NORMALIZE=1`` makes it a no-op (A/B isolation).
+    """
+    if os.environ.get(_FACET_NORMALIZE_ENV_OFF):
+        return spec
+
+    edits = [e for e in (spec.get("edits") or []) if isinstance(e, dict)]
+    # Classify each routing edit and group by its diagnosed facet.
+    groups: dict[tuple[str, str, str], list[dict[str, Any]]] = {}
+    for e in edits:
+        if e.get("kind", "edit") == "create_file":
+            continue
+        cls = _routing_transform(e.get("anchor_old") or "", e.get("replacement_new") or "")
+        if cls is None:
+            continue
+        transform, old_sig, new_callee = cls
+        _o_recv, o_callee, o_arg0 = old_sig
+        rel = str(e.get("file", "")).replace("\\", "/").lstrip("/")
+        key = (os.path.basename(rel), o_callee, o_arg0)
+        e["_facet_transform"] = transform          # transient, stripped before return
+        e["_facet_new_callee"] = new_callee
+        groups.setdefault(key, []).append(e)
+
+    normalized_ids: list[str] = []
+    canonical_callee: str | None = None
+    divergent_key: tuple[str, str, str] | None = None
+    undecidable = False
+
+    for key, group in groups.items():
+        if len(group) < 2:
+            continue
+        kinds = {str(e["_facet_transform"]) for e in group}
+        if kinds == {_T_CALLEE_SWAP}:
+            continue  # already consistent — both sites swap the sink. Nothing to do.
+        if _T_CALLEE_SWAP not in kinds:
+            # All arg-swaps (or other): no sibling chose a sink to normalize toward.
+            undecidable = True
+            divergent_key = key
+            continue
+        # Divergent: at least one callee-swap + at least one non-callee-swap sibling.
+        targets = {str(e["_facet_new_callee"]) for e in group
+                   if e["_facet_transform"] == _T_CALLEE_SWAP}
+        divergent_key = key
+        if len(targets) != 1:
+            undecidable = True   # callee-swap siblings disagree on the sink → don't guess
+            continue
+        canonical_callee = next(iter(targets))
+        old_callee = key[1]
+        for e in group:
+            if e["_facet_transform"] == _T_CALLEE_SWAP:
+                continue
+            anchor = e.get("anchor_old") or ""
+            new_repl = _swap_callee_token(anchor, old_callee, canonical_callee)
+            if not new_repl or _normalize_ws(new_repl) == _normalize_ws(anchor):
+                undecidable = True  # rebuild collapsed to a no-op → can't safely normalize
+                continue
+            e["replacement_new"] = new_repl
+            e["facet_normalized"] = (
+                f"same-facet consistency (L1): sibling site routes {old_callee} → "
+                f"{canonical_callee}; this site diverged ({e['_facet_transform']}) and was "
+                f"re-lowered to the same callee-swap so both sites take the canonical sink")
+            normalized_ids.append(str(e.get("id", "?")))
+
+    # Strip the transient classification fields before any return.
+    for e in edits:
+        e.pop("_facet_transform", None)
+        e.pop("_facet_new_callee", None)
+
+    if normalized_ids:
+        spec["facet_consistency"] = {
+            "normalized_ids": normalized_ids, "canonical_callee": canonical_callee}
+        logger.info("specify: same-facet consistency gate normalized %d divergent site(s) "
+                    "to callee-swap %r so all sites route to the same sink",
+                    len(normalized_ids), canonical_callee)
+        _append_note(spec, f"same-facet consistency gate (L1): normalized {normalized_ids} "
+                     f"to the canonical sink {canonical_callee!r} (a sibling site already "
+                     "swapped the callee; the divergent site only swapped an argument).")
+        # If a verify red-test still pins the decoy we normalized away, it can no longer
+        # certify the new behavior → loop back so a consistent test is re-authored.
+        if canonical_callee and _verify_test_pins_old_callee(spec, divergent_key[1],
+                                                             canonical_callee):
+            note = ("same-facet consistency gate: normalized the divergent site to "
+                    f"{canonical_callee!r}, but the verify red-test still pins the old "
+                    f"{divergent_key[1]!r} call — it cannot certify the corrected routing; "
+                    "re-author a test that asserts the event lands via the canonical sink.")
+            _set_reinvestigation(spec, reason_code=RI_SAME_FACET_DIVERGENCE,
+                                 gate="same_facet_consistency", note=note)
+        return spec
+
+    if undecidable and divergent_key is not None and spec.get("termination") != "needs_runtime":
+        note = ("same-facet consistency gate: two write-sites share one diagnosed facet "
+                f"({divergent_key[1]}({divergent_key[2]}, ...) in {divergent_key[0]}) but "
+                "were lowered to DIVERGENT repairs and no single canonical sink could be "
+                "derived from a sibling — route BOTH sites through the same callee-swap "
+                "(the sink whose FK matches the value's referent), not an argument "
+                "substitution that keeps the wrong sink.")
+        logger.warning("specify: same-facet consistency gate — divergent repairs for facet "
+                       "%s and no canonical sink to normalize toward; downgrading", divergent_key)
+        _set_reinvestigation(spec, reason_code=RI_SAME_FACET_DIVERGENCE,
+                             gate="same_facet_consistency", note=note)
+    return spec
+
+
+def _verify_test_pins_old_callee(spec: dict[str, Any], old_callee: str,
+                                 canonical_callee: str) -> bool:
+    """True when the spec's verify red-test text references ``old_callee`` but not the
+    canonical one — i.e. it certifies the decoy routing the gate just normalized away.
+
+    Looks only at the edits named by ``verify.test_edit_ids`` (the red test), and only when
+    a ``verify.red_test_node`` is present. Conservative: a test that already mentions the
+    canonical callee is NOT treated as stale. Pure-local, never raises.
+    """
+    verify = spec.get("verify")
+    if not isinstance(verify, dict) or not verify.get("red_test_node"):
+        return False
+    test_ids = {str(i) for i in (verify.get("test_edit_ids") or [])}
+    if not test_ids:
+        return False
+    for e in (spec.get("edits") or []):
+        if not isinstance(e, dict) or str(e.get("id", "")) not in test_ids:
+            continue
+        text = (e.get("content") or "") + "\n" + (e.get("replacement_new") or "")
+        if re.search(r"\b" + re.escape(old_callee) + r"\b", text) and not re.search(
+                r"\b" + re.escape(canonical_callee) + r"\b", text):
+            return True
+    return False
+
+
 def _apply_decisiveness_gate(spec: dict[str, Any]) -> dict[str, Any]:
     """Promote a conservatively-authored needs_reinvestigation spec to ready_to_apply.
 
@@ -2943,6 +3178,95 @@ def _synthesize_http_shape_red_test(spec: dict[str, Any], honey_text: str,
     return spec
 
 
+# Kill-switch for the write-sink oracle synthesis (lever L2 — NR0003 0048), mirroring
+# HIVE_NO_HTTP_SHAPE. When set, the pass is a no-op and specify keeps prior behaviour.
+_WRITE_SINK_ENV_OFF = "HIVE_NO_WRITE_SINK_ORACLE"
+
+
+def _synthesize_write_sink_red_test(spec: dict[str, Any], honey_text: str,
+                                    codebase_root: str,
+                                    setup_block: str | None = None,
+                                    request: Any = None,
+                                    test_dir: str = "tests") -> dict[str, Any]:
+    """Attach a write-sink not-500 red test so apply observes red→green (lever L2).
+
+    The independent oracle L1 could not supply: when the spec REPAIRS a write-sink (a
+    routing ``insert_*event`` edit — the 0082 FK mis-routing) and the symptom is a mutating
+    endpoint that 500s, synthesise a TestClient red test that issues the mutating request
+    and asserts the response does NOT 500. Because the author wrote both the fix and its
+    self-test (NR0003 RC1), L1's loop-back fired whenever that self-test pinned the decoy;
+    this synthesised oracle is independent of the author, so apply can certify the corrected
+    routing by EXECUTION instead of looping. Delegates recognition + test construction to
+    :func:`hive.write_sink_synth.synthesize_write_sink_red_test`.
+
+    Two firing modes, both fail-open and conservative:
+
+    * HAPPY PATH — no red-test node yet: attach the independent oracle so apply observes
+      red→green. Never clobbers an author-written or lever-⑦ node here (a present node is
+      assumed sound), and a no-op unless a write-sink repair, a runnable harness, and a
+      concrete request all resolve.
+    * DIVERGENCE OVERRIDE — L1 (same-facet gate) flagged ``RI_SAME_FACET_DIVERGENCE``: L1
+      already determined the author's OWN red test PINS the decoy it normalised away, so it
+      looped back rather than certify on a non-independent test (NR0003 RC1, the whole reason
+      L2 exists). Here L2 REPLACES that decoy-pinning node with its independent not-500 oracle
+      and LIFTS the loop-back, so apply certifies the normalised routing by EXECUTION (the
+      "곧장 자동 GREEN" L1 alone could not reach). Strictly an improvement: it swaps a test L1
+      proved is non-independent for one that is, and verify.py still rejects it if it does not
+      bite, so a mis-seeded harness only fails to certify (apply withholds READY) — never
+      ships a bad fix.
+
+    Adds a ``create_file`` test edit + the verify wiring; never a new gate. Never raises.
+    """
+    if os.environ.get(_WRITE_SINK_ENV_OFF):
+        return spec
+    try:
+        verify = spec.get("verify") if isinstance(spec.get("verify"), dict) else {}
+        reinv = spec.get("reinvestigation") if isinstance(spec.get("reinvestigation"), dict) else {}
+        l1_loopback = reinv.get("reason_code") == RI_SAME_FACET_DIVERGENCE
+        if verify.get("red_test_node") and not l1_loopback:
+            return spec  # a sound red test already drives the loop — don't clobber
+        result = synthesize_write_sink_red_test(
+            spec, honey_text, codebase_root, setup_block=setup_block,
+            request=request, test_dir=test_dir or "tests")
+        if not result:
+            return spec  # symptom not recognised, or no runnable harness → fail-open
+        edits = [e for e in (spec.get("edits") or []) if isinstance(e, dict)]
+        existing_ids = {str(e.get("id")) for e in edits}
+        existing_files = {e.get("file") for e in edits}
+        if (result["edit"]["id"] in existing_ids
+                or result["edit"]["file"] in existing_files):
+            return spec
+        spec.setdefault("edits", []).append(result["edit"])
+        vblock = spec.setdefault("verify", {})
+        if not isinstance(vblock, dict):
+            vblock = {}
+            spec["verify"] = vblock
+        vblock["red_test_node"] = result["node"]   # the independent oracle is authoritative
+        ids = list(vblock.get("test_edit_ids") or [])
+        if result["edit"]["id"] not in ids:
+            ids.append(result["edit"]["id"])
+        vblock["test_edit_ids"] = ids
+        req = result["request"]
+        _append_note(spec, f"write-sink oracle synthesised (lever L2): {req.verb.upper()} "
+                     f"{req.path} must not 500 (the repaired event write must route to the "
+                     "table its FK references).")
+        logger.info("specify: synthesised write-sink not-500 red test for %s %s → node %s",
+                    req.verb.upper(), req.path, result["node"])
+        if l1_loopback:
+            # The independent oracle now certifies the normalised fix → lift L1's loop-back.
+            spec["termination"] = "ready_to_apply"
+            spec.pop("reinvestigation", None)
+            _append_note(spec, "write-sink oracle (L2) lifted the same-facet-divergence "
+                         "loop-back: the author's decoy-pinning self-test is superseded by the "
+                         "independent not-500 oracle, which certifies the normalised routing by "
+                         "execution — apply can proceed to red→green.")
+            logger.info("specify: write-sink oracle superseded the decoy-pinning red test and "
+                        "lifted the same_facet_divergence loop-back → ready_to_apply")
+    except Exception as e:  # observation must never break authoring
+        logger.warning("specify: write-sink oracle synthesis skipped (%s)", e)
+    return spec
+
+
 def run_specify(
     honey_path: str,
     codebase_root: str,
@@ -2963,6 +3287,9 @@ def run_specify(
     http_shape_setup_block: str | None = None,
     http_shape_app_fixture: str | None = None,
     http_shape_test_dir: str = "tests",
+    write_sink_setup_block: str | None = None,
+    write_sink_request: Any = None,
+    write_sink_test_dir: str = "tests",
 ) -> dict[str, Any]:
     """Run the specify stage: honey + live code → edit-spec JSON.
 
@@ -3158,6 +3485,14 @@ def run_specify(
     spec = _apply_layer_consistency_gate(spec, honey_text)
     spec = _apply_winning_path_gate(spec, honey_text)
 
+    # Same-facet consistency gate (L1 — NR0003): two write-sites sharing ONE diagnosed
+    # mis-routing facet must take the SAME canonical repair. When one site swaps the sink
+    # (callee) but a sibling only swaps an argument (the decoy that keeps the wrong sink),
+    # normalize the divergent site to the sibling's callee-swap — or downgrade when no single
+    # canonical sink can be derived. Runs before decisiveness so a normalized-but-untestable
+    # spec is not promoted, and after the effectiveness gate so it sees the final edits.
+    spec = _apply_same_facet_consistency_gate(spec)
+
     # Decisiveness gate: a verified+effective edit must be applyable even when the
     # honey also surfaced optional/policy directions (which sit in deferred[]).
     spec = _apply_decisiveness_gate(spec)
@@ -3195,6 +3530,20 @@ def run_specify(
         setup_block=http_shape_setup_block,
         app_fixture=http_shape_app_fixture,
         test_dir=http_shape_test_dir)
+
+    # Write-sink oracle synthesis (lever L2 — NR0003 0048): the independent oracle L1's
+    # loop-back was missing. When the spec REPAIRS a write-sink (a routing insert_*event
+    # edit) and the symptom is a mutating endpoint that 500s on the FK mis-routing, attach
+    # a TestClient red test that issues the request and asserts NOT 500 — so apply observes
+    # the corrected routing go red→green by execution rather than relying on the author's
+    # own (decoy-pinning) self-test. Runs AFTER lever ⑦ and guards on an existing red-test
+    # node, so the two never clobber; fully fail-open (no-op unless a harness + a mutating
+    # request both resolve).
+    spec = _synthesize_write_sink_red_test(
+        spec, honey_text, codebase_root,
+        setup_block=write_sink_setup_block,
+        request=write_sink_request,
+        test_dir=write_sink_test_dir)
 
     # Step A finalizer: if the spec lands in needs_reinvestigation but NO gate stamped a
     # structured reason, the AUTHOR itself emitted it — record that so the reactive bridge

@@ -1124,6 +1124,132 @@ class TestDecisivenessGate(unittest.TestCase):
                 "needs_reinvestigation", reason)
 
 
+class TestSameFacetConsistencyGate(unittest.TestCase):
+    """specify._apply_same_facet_consistency_gate — two write-sites sharing ONE diagnosed
+    mis-routing facet must take the SAME canonical repair (L1 / NR0003 0048)."""
+
+    # The real 0082 Lv3 divergence: dispose site lowered to the DECOY arg-swap
+    # (insert_event(doc_id, ...)), close site to the CANONICAL callee-swap
+    # (insert_group_event(group_id, ...)). Lifted from state/0046_apply_spec.json.
+    def _divergent_0082(self, **over):
+        spec = {
+            "edits": [
+                {  # dispose :2156 — DECOY: keeps insert_event, swaps group_id -> doc_id
+                    "id": "E1", "file": "server/modules/flow_gate/process_service.py",
+                    "anchor_old": '        db.insert_event(group_id, "group_disposed", note=note)',
+                    "replacement_new": '        db.insert_event(doc_id, "group_disposed", note=note)',
+                    "confidence": "high", "anchor_status": "verified",
+                },
+                {  # close :2282 — CANONICAL: insert_event -> insert_group_event, group_id kept
+                    "id": "E2", "file": "server/modules/flow_gate/process_service.py",
+                    "anchor_old": "    db.insert_event(\n        group_id,\n        event_type,\n        note=note,\n    )",
+                    "replacement_new": "    db.insert_group_event(\n        group_id,\n        event_type,\n        note=note,\n    )",
+                    "confidence": "high", "anchor_status": "verified",
+                },
+            ],
+            "deferred": [],
+            "termination": "ready_to_apply",
+            "effectiveness": {"inconclusive": False, "ineffective_ids": []},
+            "notes": "",
+        }
+        spec.update(over)
+        return spec
+
+    def test_normalizes_decoy_site_to_canonical_callee(self):
+        out = specify._apply_same_facet_consistency_gate(self._divergent_0082())
+        e1 = next(e for e in out["edits"] if e["id"] == "E1")
+        # E1's decoy arg-swap is re-lowered to the sibling's callee-swap, args preserved.
+        self.assertIn("insert_group_event(group_id,", e1["replacement_new"])
+        self.assertNotIn("insert_event(doc_id", e1["replacement_new"])
+        self.assertIn("facet_normalized", e1)
+        self.assertEqual(out["facet_consistency"]["canonical_callee"], "insert_group_event")
+        self.assertIn("E1", out["facet_consistency"]["normalized_ids"])
+
+    def test_consistent_sites_untouched(self):
+        # Both sites already swap the callee → no divergence, no normalization, no stamp.
+        spec = self._divergent_0082()
+        spec["edits"][0]["replacement_new"] = (
+            '        db.insert_group_event(group_id, "group_disposed", note=note)')
+        out = specify._apply_same_facet_consistency_gate(spec)
+        self.assertNotIn("facet_consistency", out)
+        self.assertEqual(out["termination"], "ready_to_apply")
+        self.assertNotIn("facet_normalized", out["edits"][0])
+
+    def test_verify_test_pinning_decoy_triggers_loopback(self):
+        # A self-authored red test that pins insert_event (the decoy) cannot certify the
+        # normalized insert_group_event routing → downgrade with the canonical directive.
+        spec = self._divergent_0082()
+        spec["edits"].append({
+            "id": "E3", "kind": "create_file",
+            "file": "server/tests/test_dispose_event.py",
+            "content": ('with patch("modules.flow_gate.process_service.db.insert_event") '
+                        'as m:\n    assert m.call_args.args[0] == doc_id\n'),
+            "confidence": "high",
+        })
+        spec["verify"] = {
+            "red_test_node": "server/tests/test_dispose_event.py::test_x",
+            "test_edit_ids": ["E3"],
+        }
+        out = specify._apply_same_facet_consistency_gate(spec)
+        self.assertEqual(out["termination"], "needs_reinvestigation")
+        self.assertEqual(out["reinvestigation"]["reason_code"],
+                         specify.RI_SAME_FACET_DIVERGENCE)
+        # the normalized source edit is RETAINED (not discarded by the loop-back)
+        e1 = next(e for e in out["edits"] if e["id"] == "E1")
+        self.assertIn("insert_group_event", e1["replacement_new"])
+
+    def test_verify_test_naming_canonical_is_not_stale(self):
+        # A test that already references the canonical callee is not treated as pinning
+        # the decoy → no loop-back from this gate.
+        spec = self._divergent_0082()
+        spec["edits"].append({
+            "id": "E3", "kind": "create_file",
+            "file": "server/tests/test_dispose_event.py",
+            "content": "assert 'group_events' in tables  # insert_group_event sink\n",
+            "confidence": "high",
+        })
+        spec["verify"] = {"red_test_node": "server/tests/test_dispose_event.py::test_x",
+                          "test_edit_ids": ["E3"]}
+        out = specify._apply_same_facet_consistency_gate(spec)
+        self.assertEqual(out["termination"], "ready_to_apply")
+
+    def test_all_argswap_no_canonical_downgrades(self):
+        # Both sites took the decoy arg-swap: no sibling chose a sink to normalize toward
+        # → honest downgrade rather than a guess.
+        spec = self._divergent_0082()
+        spec["edits"][1] = {
+            "id": "E2", "file": "server/modules/flow_gate/process_service.py",
+            "anchor_old": "    db.insert_event(\n        group_id,\n        event_type,\n        note=note,\n    )",
+            "replacement_new": "    db.insert_event(\n        doc_id,\n        event_type,\n        note=note,\n    )",
+            "confidence": "high", "anchor_status": "verified",
+        }
+        out = specify._apply_same_facet_consistency_gate(spec)
+        self.assertEqual(out["termination"], "needs_reinvestigation")
+        self.assertEqual(out["reinvestigation"]["reason_code"],
+                         specify.RI_SAME_FACET_DIVERGENCE)
+
+    def test_kill_switch_makes_it_a_noop(self):
+        with mock.patch.dict(os.environ, {specify._FACET_NORMALIZE_ENV_OFF: "1"}):
+            out = specify._apply_same_facet_consistency_gate(self._divergent_0082())
+        self.assertNotIn("facet_consistency", out)
+        self.assertEqual(out["edits"][0]["replacement_new"],
+                         '        db.insert_event(doc_id, "group_disposed", note=note)')
+
+    def test_single_site_is_not_a_divergence(self):
+        # One routing edit alone is not a facet group → never normalized/downgraded.
+        spec = self._divergent_0082()
+        spec["edits"] = [spec["edits"][0]]
+        out = specify._apply_same_facet_consistency_gate(spec)
+        self.assertNotIn("facet_consistency", out)
+        self.assertEqual(out["termination"], "ready_to_apply")
+
+    def test_transient_classification_fields_stripped(self):
+        out = specify._apply_same_facet_consistency_gate(self._divergent_0082())
+        for e in out["edits"]:
+            self.assertNotIn("_facet_transform", e)
+            self.assertNotIn("_facet_new_callee", e)
+
+
 class TestDeferredSubstanceGate(unittest.TestCase):
     """specify._apply_deferred_substance_gate — a ready_to_apply spec that punted a
     substantive fix to deferred[] is downgraded (N176 cheap-path guard)."""
