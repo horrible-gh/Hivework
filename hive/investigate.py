@@ -1349,6 +1349,7 @@ def run_investigate(
             logger.info("investigate: post-converge FK re-scan promoted %s:%s to the "
                         "attributed defect (NR0011 lever B)",
                         _f0.get("file"), _f0.get("lines"))
+        _promote_fk_sibling_facets(converge_dict, verdicts)
 
     result = {
         "seed_chars": len(seed_text),
@@ -1988,6 +1989,67 @@ def _inject_fk_facets(facets: list[dict[str, Any]], verdicts: list[dict[str, Any
         injected.append(facet)
         logger.info("investigate: FK-misrouting facet located at %s:%s (%s)", ff, fl, label)
     return injected
+
+
+def _promote_fk_sibling_facets(converge: dict[str, Any] | None,
+                               verdicts: list[dict[str, Any]]) -> None:
+    """Keep same-mechanism FK write-site siblings as author-visible edit targets.
+
+    0082 has two independent callsites for the same schema violation
+    (dispose + close). Converge can crown one as the attributed defect, but specify
+    must still see the sibling or it can ship a half-fix. This mutates the converge
+    dict in place, adding other located ``via=fk-misrouting`` facets to
+    ``additional_defects`` so the existing converge-coverage gate owns them.
+    """
+    if not converge:
+        return
+    ad = converge.get("attributed_defect") or {}
+    af = ad.get("file", "")
+    al = str(ad.get("lines", ""))
+    if not af:
+        return
+    fk_verdicts = []
+    ad_is_fk = str(ad.get("via", "")) == "fk-misrouting"
+    for v in verdicts or []:
+        vd = v.get("verdict") or {}
+        if str(vd.get("via", "")) != "fk-misrouting" or not vd.get("file"):
+            continue
+        fk_verdicts.append(vd)
+        if _locus_aligns(af, vd.get("file", "")) and str(vd.get("lines", "")) == al:
+            ad_is_fk = True
+    if not ad_is_fk:
+        return
+
+    extras = [d for d in (converge.get("additional_defects") or [])
+              if isinstance(d, dict)]
+    seen = {(_norm_locus(af), al)}
+    for d in extras:
+        seen.add((_norm_locus(d.get("file", "")), str(d.get("lines", ""))))
+
+    added = 0
+    for vd in fk_verdicts:
+        key = (_norm_locus(vd.get("file", "")), str(vd.get("lines", "")))
+        if key in seen:
+            continue
+        seen.add(key)
+        extras.append({
+            "node": "fk-misrouting",
+            "file": vd.get("file", ""),
+            "lines": vd.get("lines", ""),
+            "why": vd.get("reason", ""),
+            "via": "fk-misrouting",
+        })
+        added += 1
+    if added:
+        converge["additional_defects"] = extras
+        cc = dict(converge.get("causal_check") or {})
+        cc["fk_sibling_facets"] = [
+            {"file": d.get("file", ""), "lines": d.get("lines", "")}
+            for d in extras if d.get("via") == "fk-misrouting"
+        ]
+        converge["causal_check"] = cc
+        logger.info("investigate: promoted %d FK-misrouting sibling facet(s) to "
+                    "additional_defects for specify coverage", added)
 
 
 def _rerun_converge(result: dict[str, Any], seed_text: str, *, code_root: str | None,

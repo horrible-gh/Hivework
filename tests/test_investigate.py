@@ -1796,6 +1796,39 @@ class TestGateIndependentFKMisrouting(unittest.TestCase):
         self.assertEqual(_norm(ad["file"]), "server/x.py")
         self.assertEqual(ad["lines"], "2")
 
+    def test_fk_sibling_facets_are_rendered_as_coverage_targets(self):
+        # The 0082 fixed rule needs BOTH dispose and close callsites. If converge crowns
+        # one FK facet, the sibling must ride as an additional defect so specify cannot
+        # ship a one-site half-fix.
+        converge = {
+            "converged": True,
+            "attributed_defect": {
+                "file": "server/x.py", "lines": "2", "via": "fk-misrouting",
+                "why": "dispose group_id into events.doc_id",
+            },
+            "causal_check": {"verdict": "consistent"},
+            "additional_defects": [],
+        }
+        verdicts = [
+            {"verdict": {"located": True, "file": "server/x.py", "lines": "2",
+                         "via": "fk-misrouting", "reason": "dispose"}},
+            {"verdict": {"located": True, "file": "server/x.py", "lines": "5",
+                         "via": "fk-misrouting", "reason": "close"}},
+        ]
+
+        INV._promote_fk_sibling_facets(converge, verdicts)
+
+        extras = converge["additional_defects"]
+        self.assertEqual(len(extras), 1)
+        self.assertEqual(extras[0]["lines"], "5")
+        honey = INV.render_local_honey(
+            {"axes_total": 2, "axes_judged": 2, "seed_kind": "fix",
+             "verdicts": verdicts, "converge": converge},
+            "dispose and close return 500")
+        self.assertIn("## Converge-attributed edit targets", honey)
+        self.assertIn("- server/x.py:2", honey)
+        self.assertIn("- server/x.py:5", honey)
+
 
 def _norm(p: str) -> str:
     return (p or "").replace("\\", "/")
