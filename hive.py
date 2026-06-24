@@ -386,7 +386,8 @@ def run_pipeline(args: argparse.Namespace) -> None:
         # `findings` list is excluded from the evidence set — recorded in
         # parse_errors so the dropped axis stays visible in telemetry — so noise
         # can never masquerade as honey evidence.
-        combs, excluded_notes, parse_fail_notes = partition_combs(comb_files)
+        combs, excluded_notes, parse_fail_notes = partition_combs(
+            comb_files, codebase_root=args.codebase)
         for note in parse_fail_notes:
             logger.error("  PARSE FAIL %s", note)
         for note in excluded_notes:
