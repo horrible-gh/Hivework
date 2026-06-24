@@ -520,15 +520,44 @@ class TestLensRefutation(unittest.TestCase):
                                 "lines": "2156",
                                 "reason": "insert_event routes group_id (FK→groups) into "
                                           "events.doc_id (FK→documents) — FK-misrouting."}}]
-        with mock.patch.object(C, "call_worker", return_value=_wr(_LENS_REFUTE)):
+        with mock.patch.object(C, "call_worker", return_value=_wr(_LENS_REFUTE)) as m:
             out = C._lens_refute(
                 res, "dispose 500", located=located, windows=[], code_state_block="",
                 lenses=["datasource-liveness", "omission", "reproduction", "wiring"],
                 provider="swarm", model="120b", pk={}, ledger=None, timeout=60, min_refute=0)
+        # P2 (R0050 NR0006): an FK-facet locus is held converged regardless of the votes, so the
+        # panel is SKIPPED entirely — no per-lens refuter calls are made (run544: avoided 4 calls).
+        self.assertEqual(m.call_count, 0)                    # lens refuters never invoked
         self.assertTrue(out.converged)                       # FK-facet override held it
         self.assertTrue(out.lens_check["fk_facet_override"])
         self.assertFalse(out.lens_check["winning_path_override"])  # not via winning-path
-        self.assertEqual(out.lens_check["verdict"], "survived")
+        self.assertEqual(out.lens_check["verdict"], "skipped")
+        self.assertEqual(out.lens_check["votes"], [])        # no votes collected (panel skipped)
+        self.assertEqual(out.lens_check["of"], 4)            # but the avoided lens count is recorded
+
+    def test_non_fk_attribution_still_runs_lens_panel(self):
+        # P2 regression guard (R0050 NR0006): the early-skip is scoped to FK-facet loci ONLY. A
+        # non-FK attribution (no via="fk-misrouting" located verdict) must STILL run every lens —
+        # the skip must not silently disarm the panel for ordinary attributions.
+        res = C.ConvergeResult(
+            converged=True,
+            attributed_defect={"file": "server/modules/flow_gate/process_service.py",
+                               "lines": "1986-2007", "why": "x"},
+            causal_check={"verdict": "consistent", "trace": "t"},
+            winning_path=[{"file": "server/other.py", "lines": "1-2"}])
+        located = [{"axis_id": "F", "title": "close path",
+                    "verdict": {"located": True,   # no via="fk-misrouting" → not an FK-facet site
+                                "file": "server/modules/flow_gate/process_service.py",
+                                "lines": "1986-2007", "reason": "close returns early"}}]
+        with mock.patch.object(C, "call_worker", return_value=_wr(_LENS_REFUTE)) as m:
+            out = C._lens_refute(
+                res, "dispose 500", located=located, windows=[], code_state_block="",
+                lenses=["datasource-liveness", "omission", "reproduction", "wiring"],
+                provider="swarm", model="120b", pk={}, ledger=None, timeout=60, min_refute=0)
+        self.assertEqual(m.call_count, 4)                    # all 4 lenses invoked (not skipped)
+        self.assertFalse(out.lens_check["fk_facet_override"])
+        self.assertNotEqual(out.lens_check["verdict"], "skipped")
+        self.assertFalse(out.converged)                      # 4/4 refuted → demoted as before
 
     def test_fk_facet_carveout_in_lens_prompt(self):
         # The FK-misrouting carve-out text + the facet reason reach the refuter prompt, and forbid

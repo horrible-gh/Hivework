@@ -103,6 +103,47 @@ def test_changed_paths_expands_untracked_new_dir(tmp_path):
     assert "docs/" not in changed
 
 
+def test_changed_paths_decodes_non_ascii_filename(tmp_path):
+    """A CJK filename must appear as real UTF-8 in the change set, NOT git's \\NNN octal
+    escaping (core.quotepath). Otherwise the author copies the escaped form and the
+    membership check false-negatives → false NOT-READY (R0001)."""
+    repo = _repo(tmp_path)
+    _write(repo, "_work/職.md", "x\n")
+    changed = changed_paths(repo)
+    assert "_work/職.md" in changed
+    assert not any("\\" in p for p in changed)  # no escaped path leaked through
+
+
+def test_ready_with_non_ascii_filename(tmp_path):
+    """End-to-end: a plan listing the real UTF-8 CJK path is committable (the author now
+    sees that exact name in its git context, so it can echo it verbatim)."""
+    repo = _repo(tmp_path)
+    _write(repo, "_work/職.md", "x\n")
+    plan = _plan([{"id": "c1", "message": "docs(work): add note", "files": ["_work/職.md"]}])
+    proposal = build_commit_proposal(plan, repo)
+    assert proposal["ready"] is True
+
+
+def test_commit_files_decodes_bare_octal_escaped_path(tmp_path):
+    """Defensive: if the author still echoes a bare \\NNN-octal path (quotes dropped, the
+    exact R0001 failure), _commit_files decodes it to real UTF-8 so it matches the change
+    set instead of dropping to FILE_NOT_CHANGED."""
+    repo = _repo(tmp_path)
+    _write(repo, "_work/職.md", "x\n")
+    # "職" = UTF-8 E8 81 B7 = git octal \350\201\267, surrounding quotes dropped.
+    plan = _plan([{"id": "c1", "message": "docs(work): add note",
+                   "files": ["_work/\\350\\201\\267.md"]}])
+    assert C._commit_files(plan["commits"][0]) == ["_work/職.md"]
+    proposal = build_commit_proposal(plan, repo)
+    assert proposal["ready"] is True
+
+
+def test_commit_files_keeps_backslash_separator_path():
+    """A path that merely uses backslash as a separator (no \\NNN octal) is only slash-
+    normalized, never byte-decoded (\\f etc. must not corrupt it)."""
+    assert C._commit_files({"files": ["dir\\file.py"]}) == ["dir/file.py"]
+
+
 def test_ready_when_all_committable(tmp_path):
     repo = _repo(tmp_path)
     _write(repo, "a.py", "x = 1\n")
