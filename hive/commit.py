@@ -79,7 +79,13 @@ def _git(repo_root: str, args: list[str], check: bool = False) -> subprocess.Com
     stdout/stderr are decoded as UTF-8 (errors replaced) so non-ASCII paths and
     messages don't crash on Windows. With ``check=True`` a non-zero exit raises.
     """
-    cmd = ["git", "-C", repo_root, *args]
+    # ``-c core.quotepath=false``: emit non-ASCII path bytes LITERALLY (real UTF-8)
+    # instead of git's default ``\NNN`` octal escaping. This keeps the author's git
+    # context (_git_context) and the verifier's change set (changed_paths) on the SAME
+    # path encoding. Without it the author copies an escaped CJK path verbatim while
+    # changed_paths decodes it, so the two never match and any non-ASCII filename forces
+    # a false NOT-READY ("커밋 보류") — hivework.commit.0001 R0001.
+    cmd = ["git", "-C", repo_root, "-c", "core.quotepath=false", *args]
     result = subprocess.run(cmd, capture_output=True, text=True,
                             encoding="utf-8", errors="replace")
     if check and result.returncode != 0:
@@ -136,16 +142,33 @@ def staged_paths(repo_root: str) -> set[str]:
     return paths
 
 
+# A git C-style octal escape: backslash + three octal digits (e.g. ``\350`` for one
+# UTF-8 byte of a CJK char). Used to tell a genuinely-escaped path apart from a path
+# that merely uses backslash as a separator (``dir\file.py``), which must NOT be
+# byte-decoded (``\f`` etc. would corrupt it).
+_C_OCTAL_RE = re.compile(r"\\[0-3][0-7]{2}")
+
+
+def _decode_c_escapes(s: str) -> str:
+    """Decode git C-style escapes (``\\NNN`` octal, ``\\xNN``, ``\\t`` …) to real UTF-8.
+
+    Returns ``s`` unchanged when it carries no backslash escapes or fails to decode.
+    """
+    if "\\" not in s:
+        return s
+    try:
+        return s.encode("latin-1", "backslashreplace").decode(
+            "unicode_escape").encode("latin-1").decode("utf-8")
+    except (UnicodeDecodeError, UnicodeEncodeError):
+        return s
+
+
 def _unquote_path(path: str) -> str:
     """Normalize a porcelain path: strip C-style quoting, use forward slashes."""
     path = path.strip()
     if len(path) >= 2 and path[0] == '"' and path[-1] == '"':
         # git quotes paths with special chars; decode the C-escaped, UTF-8 bytes.
-        try:
-            path = path[1:-1].encode("latin-1", "backslashreplace").decode(
-                "unicode_escape").encode("latin-1").decode("utf-8")
-        except (UnicodeDecodeError, UnicodeEncodeError):
-            path = path[1:-1]
+        path = _decode_c_escapes(path[1:-1])
     return path.replace("\\", "/")
 
 
@@ -373,10 +396,21 @@ def run_propose(
 # ── execute (deterministic) ──────────────────────────────────────────────────
 
 def _commit_files(commit: dict[str, Any]) -> list[str]:
-    """Return a commit's file list as normalized rel paths (deduped, order kept)."""
+    """Return a commit's file list as normalized rel paths (deduped, order kept).
+
+    Plan paths are canonicalized to match the verifier's change set. A model handed an
+    escaped git-status path may echo it back quoted (``"_work/\\350…"``) or, as observed
+    in R0001, bare (``_work/\\350\\201\\267…`` with the surrounding quotes dropped).
+    Decoding the octal escapes to real UTF-8 here means the membership check against
+    changed_paths() no longer false-negatives on CJK / non-ASCII filenames. Paths that
+    merely use backslash as a separator are left alone (only ``\\NNN`` octal is decoded).
+    """
     files: list[str] = []
     for f in commit.get("files") or []:
-        rel = str(f).strip().replace("\\", "/")
+        raw = str(f).strip()
+        if len(raw) >= 2 and raw[0] == '"' and raw[-1] == '"':
+            raw = raw[1:-1]
+        rel = (_decode_c_escapes(raw) if _C_OCTAL_RE.search(raw) else raw).replace("\\", "/")
         if rel and rel not in files:
             files.append(rel)
     return files

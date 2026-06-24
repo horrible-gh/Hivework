@@ -3886,6 +3886,30 @@ def _lens_refute(res: ConvergeResult, seed_text: str, located: list[dict[str, An
         logger.info("converge: lens panel — FK-FACET carve-out active for %s "
                     "(deterministic schema-violation grounding; reachability-only refute invalid)",
                     af)
+        # P2 (R0050 NR0006 — performance): an FK-facet locus is held converged by the override
+        # below (``fk_override = demoted and fk_facet_site``) NO MATTER how the lenses vote — a
+        # full refutation is structurally overridden (run544: lens 4/4 refuted → still held). So
+        # the per-lens refuter calls cannot change the outcome on an FK-facet site; running them
+        # only burns N model calls + latency (run544: 4 copilot calls, ~109s). Skip the panel and
+        # record the skip honestly. Only the FK-facet carve-out is short-circuited: design-change
+        # bars merely spec-conformance refutation and winning-path needs located-corroboration —
+        # those overrides are conditional, so their panels must still run.
+        threshold = min_refute if (min_refute and min_refute > 0) else (len(lenses) // 2 + 1)
+        res.lens_check = {
+            "lenses": list(lenses),
+            "votes": [],
+            "refuted_votes": 0,
+            "of": len(lenses),
+            "threshold": threshold,
+            "borderline": False,
+            "winning_path_override": False,
+            "fk_facet_override": True,
+            "verdict": "skipped",
+            "skip_reason": "fk-facet deterministic — override certain (NR0006 P2)",
+        }
+        logger.info("converge: lens panel SKIPPED — deterministic FK-facet locus %s; override "
+                    "certain regardless of votes, avoided %d lens call(s)", af, len(lenses))
+        return res
     ev_lines: list[str] = []
     for w in (windows or [])[:_LENS_MAX_EVIDENCE]:
         ev_lines.append(f"--- {w.get('file')}:{w.get('lines')}")
