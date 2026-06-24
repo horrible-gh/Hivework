@@ -256,6 +256,42 @@ class TestShapeRejectRetry(unittest.TestCase):
         self.assertIn("Conclusion mandate", contract)
         self.assertNotIn("{codebase_root}", contract)  # template fully substituted
 
+    def test_file_contract_substitutes_codebase_root_placeholder(self):
+        contract_path = os.path.join(self.workdir, "comb_contract_v2.md")
+        with open(contract_path, "w", encoding="utf-8") as f:
+            f.write("[Target] {codebase_root}\n{\"findings\": []}")
+
+        contract = fanout.load_comb_contract(contract_path, r"C:\target\repo")
+
+        self.assertIn(r"C:\target\repo", contract)
+        self.assertNotIn("{codebase_root}", contract)
+        self.assertIn('{"findings": []}', contract)
+
+    def test_call_budget_preserves_write_axis(self):
+        axes = [
+            {"id": "EP", "title": "API Endpoint", "brief": "route"},
+            {"id": "SVC", "title": "Service", "brief": "logic"},
+            {"id": "SQL", "title": "SQL", "brief": "queries"},
+            {"id": "WRT", "title": "Data-Write Path", "brief": "DB mutation FK"},
+        ]
+
+        selected = fanout._apply_axis_call_budget(
+            axes, max_calls=4, respecify_retries=1)
+
+        self.assertEqual([a["id"] for a in selected], ["WRT", "EP"])
+
+    def test_call_budget_preserves_event_sink_axis(self):
+        axes = [
+            {"id": "EP", "title": "API Endpoint", "brief": "route"},
+            {"id": "SVC", "title": "Service", "brief": "logic"},
+            {"id": "EVT", "title": "Terminal Event Sink", "brief": "group event persistence"},
+        ]
+
+        selected = fanout._apply_axis_call_budget(
+            axes, max_calls=2, respecify_retries=1)
+
+        self.assertEqual([a["id"] for a in selected], ["EVT"])
+
 
 if __name__ == "__main__":
     unittest.main()

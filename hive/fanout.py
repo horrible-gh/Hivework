@@ -71,8 +71,9 @@ def load_comb_contract(contract_path: str | None, codebase_root: str) -> str:
     if contract_path and os.path.exists(contract_path):
         with open(contract_path, 'r', encoding='utf-8') as f:
             template = f.read()
-        # The contract file uses the codebase root directly — return as-is
-        return template
+        # Contract files may contain JSON examples with literal braces, so avoid
+        # str.format() here. Only the explicit placeholder is substituted.
+        return template.replace("{codebase_root}", codebase_root)
 
     # Use default, substituting codebase_root
     return DEFAULT_COMB_CONTRACT.format(codebase_root=codebase_root)
@@ -161,6 +162,68 @@ def build_respecify_prompt(contract: str, axis: dict[str, Any], seed_text: str,
     return _RESPECIFY_BANNER.format(prev=prev) + build_comb_prompt(contract, axis, seed_text)
 
 
+_PROTECTED_AXIS_TERMS = (
+    "wrt",
+    "data-write",
+    "data write",
+    "write path",
+    "data-mutation",
+    "data mutation",
+    "event-persistence",
+    "event persistence",
+    "event sink",
+    "terminal event",
+    "group event",
+    "mutation sink",
+    "persistence",
+    "db write",
+    "foreign key",
+    "fk",
+    "constraint",
+)
+
+
+def _is_protected_axis(axis: dict[str, Any]) -> bool:
+    """Return True for axes that should survive a tight fan-out call budget."""
+    text = " ".join(
+        str(axis.get(k, "")) for k in ("id", "axis_id", "title", "brief")
+    ).lower()
+    return any(term in text for term in _PROTECTED_AXIS_TERMS)
+
+
+def _apply_axis_call_budget(
+    axes: list[dict[str, Any]],
+    *,
+    max_calls: int,
+    respecify_retries: int,
+) -> list[dict[str, Any]]:
+    """Trim axes for spend while preserving write/FK axes before generic ones."""
+    if not (max_calls and max_calls > 0 and axes):
+        return axes
+    per_axis = 1 + max(0, respecify_retries)
+    allowed = max(1, max_calls // per_axis)
+    if len(axes) <= allowed:
+        return axes
+
+    protected = [axis for axis in axes if _is_protected_axis(axis)]
+    regular = [axis for axis in axes if not _is_protected_axis(axis)]
+    selected: list[dict[str, Any]] = []
+    seen: set[int] = set()
+    for axis in protected + regular:
+        marker = id(axis)
+        if marker in seen:
+            continue
+        selected.append(axis)
+        seen.add(marker)
+        if len(selected) >= allowed:
+            break
+
+    logger.warning("Fan-out: trimming %d axes to %d to honor max_calls=%d "
+                   "(%d call(s)/axis; protected=%d)",
+                   len(axes), allowed, max_calls, per_axis, len(protected))
+    return selected
+
+
 def run_fanout(
     axes: list[dict[str, Any]],
     seed_text: str,
@@ -198,15 +261,8 @@ def run_fanout(
     combs_dir = os.path.join(workdir, "combs")
     os.makedirs(combs_dir, exist_ok=True)
 
-    # Pre-launch budget ceiling: trim axes so worst-case calls <= max_calls. Deterministic
-    # and opt-in (0 = no cap), so today's uncapped behavior is unchanged unless configured.
-    if max_calls and max_calls > 0 and axes:
-        per_axis = 1 + max(0, respecify_retries)
-        allowed = max(1, max_calls // per_axis)
-        if len(axes) > allowed:
-            logger.warning("Fan-out: trimming %d axes to %d to honor max_calls=%d "
-                           "(%d call(s)/axis)", len(axes), allowed, max_calls, per_axis)
-            axes = axes[:allowed]
+    axes = _apply_axis_call_budget(axes, max_calls=max_calls,
+                                   respecify_retries=respecify_retries)
 
     contract = load_comb_contract(contract_path, codebase_root)
     comb_files: dict[str, str] = {}
