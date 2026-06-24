@@ -409,6 +409,39 @@ class TestPartitionCombs(unittest.TestCase):
         self.assertEqual(len(parse_fail), 1)
         self.assertTrue(parse_fail[0].startswith("BAD:"))
 
+    def test_out_of_root_source_path_is_excluded(self):
+        raw = (
+            r"Read C:\workspace\projects\FlowGate\server\modules\flow_gate\process_service.py"
+            "\n"
+            + json.dumps({"axis_id": "SVC", "findings": [{"claim": "wrong root"}]})
+        )
+        comb_files = {"SVC": self._write("SVC", raw)}
+
+        combs, excluded, parse_fail = partition_combs(
+            comb_files,
+            codebase_root=r"C:\workspace\projects\Hivework-FlowGate-test\FlowGate",
+        )
+
+        self.assertEqual(combs, [])
+        self.assertEqual(parse_fail, [])
+        self.assertEqual(len(excluded), 1)
+        self.assertIn("out-of-root source path", excluded[0])
+
+    def test_target_root_source_path_is_kept(self):
+        root = r"C:\workspace\projects\Hivework-FlowGate-test\FlowGate"
+        raw = (
+            rf"Read {root}\server\modules\flow_gate\process_service.py"
+            "\n"
+            + json.dumps({"axis_id": "EP", "findings": [{"claim": "right root"}]})
+        )
+        comb_files = {"EP": self._write("EP", raw)}
+
+        combs, excluded, parse_fail = partition_combs(comb_files, codebase_root=root)
+
+        self.assertEqual([c.get("axis_id") for c in combs], ["EP"])
+        self.assertEqual(excluded, [])
+        self.assertEqual(parse_fail, [])
+
 
 if __name__ == "__main__":
     unittest.main()

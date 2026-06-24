@@ -16,6 +16,7 @@ Returns the parsed dict, or raises ValueError on failure.
 """
 
 import json
+import os
 import re
 from typing import Any, Iterator
 
@@ -183,8 +184,36 @@ def _iter_top_level_objects(text: str) -> Iterator[str]:
                     start = None
 
 
+_SOURCE_ABS_PATH_RE = re.compile(
+    r'[A-Za-z]:\\[^\s"<>|]*(?:\\server\\|\\client\\)[^\s"<>|]*',
+    re.IGNORECASE,
+)
+
+
+def _norm_path_prefix(path: str) -> str:
+    return os.path.normcase(os.path.normpath(path)).rstrip("\\/")
+
+
+def find_out_of_root_source_paths(raw: str, codebase_root: str | None) -> list[str]:
+    """Return absolute source paths in raw output that are outside codebase_root."""
+    if not codebase_root:
+        return []
+    root = _norm_path_prefix(codebase_root)
+    bad: list[str] = []
+    seen: set[str] = set()
+    for match in _SOURCE_ABS_PATH_RE.finditer(raw or ""):
+        path = _norm_path_prefix(match.group(0))
+        if path.startswith(root + os.sep) or path == root:
+            continue
+        if path not in seen:
+            seen.add(path)
+            bad.append(match.group(0))
+    return bad
+
+
 def partition_combs(
     comb_files: dict[str, str],
+    codebase_root: str | None = None,
 ) -> tuple[list[dict[str, Any]], list[str], list[str]]:
     """Parse each comb file and split comb-shaped conclusions from noise (G1).
 
@@ -208,13 +237,20 @@ def partition_combs(
     parse_fail_notes: list[str] = []
     for axis_id, comb_path in sorted(comb_files.items()):
         try:
-            parsed = parse_comb_file(comb_path)
+            with open(comb_path, "r", encoding="utf-8") as f:
+                raw = f.read()
+            parsed = extract_first_json(raw)
         except (ValueError, FileNotFoundError) as e:
             parse_fail_notes.append(f"{axis_id}: {e}")
             continue
         if not is_comb_dict(parsed):
             excluded_notes.append(
                 f"{axis_id}: non-comb output (no findings array) — excluded from evidence")
+            continue
+        bad_paths = find_out_of_root_source_paths(raw, codebase_root)
+        if bad_paths:
+            excluded_notes.append(
+                f"{axis_id}: out-of-root source path {bad_paths[0]} — excluded from evidence")
             continue
         combs.append(parsed)
     return combs, excluded_notes, parse_fail_notes
