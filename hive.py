@@ -154,6 +154,40 @@ def write_sink_specify_kwargs(cfg, codebase_root: str | None) -> dict:
     return out
 
 
+def overwrite_race_specify_kwargs(cfg, codebase_root: str | None) -> dict:
+    """run_specify kwargs that arm lever L3 (overwrite-race guard) for the target codebase.
+
+    NR0008 root: ``run_specify()`` already calls the L3 lowering + oracle, but every CLI
+    specify entry point starved it of the two inputs it cannot derive — so on a multi-file
+    honey the lever fail-opened to the model's weak Option-B and ``apply --verify`` ran no
+    oracle. This resolves the per-codebase ``overwrite_race`` binding (config
+    ``targets.<name>.overwrite_race``) and forwards:
+
+    - ``overwrite_race_source_file`` — the racing component file, so lowering ① fires even
+      when the honey names several files (the lever's own auto-resolve declines there). This
+      alone makes specify lower Option-A instead of Option-B.
+    - ``overwrite_race_setup_block`` / ``overwrite_race_fixture_call`` — the vitest harness so
+      oracle ② synthesises a last-write-wins red test (``apply --verify`` then certifies
+      RED→GREEN). Forwarded only when a harness is configured; without it lowering still
+      fires, the oracle stays a safe no-op.
+
+    Returns an empty dict when the codebase has no entry — L3 stays a no-op, so behaviour is
+    unchanged until a binding is configured (the racing file + harness are never invented).
+    """
+    orc = cfg.overwrite_race_for_codebase(codebase_root)
+    if not orc:
+        return {}
+    out: dict = {"overwrite_race_test_dir": orc.test_dir or "client/src/test"}
+    if orc.source_file:
+        out["overwrite_race_source_file"] = orc.source_file
+    setup_block = orc.resolve_setup_block(codebase_root)
+    if setup_block:
+        out["overwrite_race_setup_block"] = setup_block
+    if orc.fixture_call:
+        out["overwrite_race_fixture_call"] = orc.fixture_call
+    return out
+
+
 def run_pipeline(args: argparse.Namespace) -> None:
     """Execute the full 6-stage pipeline."""
     # Lazy stage imports — see module-top NOTE (B0001): keep the commit path free
@@ -535,6 +569,7 @@ def run_pipeline(args: argparse.Namespace) -> None:
                 specify_kwargs["author_timeout"] = specify_role.timeout_sec
             specify_kwargs.update(http_shape_specify_kwargs(cfg, args.codebase))
             specify_kwargs.update(write_sink_specify_kwargs(cfg, args.codebase))
+            specify_kwargs.update(overwrite_race_specify_kwargs(cfg, args.codebase))
             try:
                 spec = run_specify(
                     honey_path=honey_path,
@@ -899,6 +934,7 @@ def run_investigate_command(args: argparse.Namespace) -> None:
                 specify_kwargs["author_timeout"] = specify_role.timeout_sec
             specify_kwargs.update(http_shape_specify_kwargs(cfg, args.codebase))
             specify_kwargs.update(write_sink_specify_kwargs(cfg, args.codebase))
+            specify_kwargs.update(overwrite_race_specify_kwargs(cfg, args.codebase))
 
             def _respecify():
                 spec = run_specify(
@@ -1086,6 +1122,7 @@ def run_specify_command(args: argparse.Namespace) -> None:
         specify_kwargs["author_timeout"] = role.timeout_sec
     specify_kwargs.update(http_shape_specify_kwargs(cfg, args.codebase))
     specify_kwargs.update(write_sink_specify_kwargs(cfg, args.codebase))
+    specify_kwargs.update(overwrite_race_specify_kwargs(cfg, args.codebase))
     spec: dict = {}
     try:
         spec = run_specify(
@@ -1163,6 +1200,7 @@ def _build_repair_regenerator(args: argparse.Namespace, cfg, logger):
         specify_kwargs["author_timeout"] = specify_role.timeout_sec
     specify_kwargs.update(http_shape_specify_kwargs(cfg, args.codebase))
     specify_kwargs.update(write_sink_specify_kwargs(cfg, args.codebase))
+    specify_kwargs.update(overwrite_race_specify_kwargs(cfg, args.codebase))
     spec_out = os.path.splitext(args.spec)[0] + ".repair"
     logger.info("apply: --repair will re-author fixes via specify (%s/%s) from honey %s",
                 specify_role.provider, specify_role.model, honey_path)

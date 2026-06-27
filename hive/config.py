@@ -375,6 +375,62 @@ class WriteSinkConfig:
 
 
 @dataclass
+class OverwriteRaceConfig:
+    """One target codebase's overwrite-race guard binding (lever L3 enabler — NR0008 0058).
+
+    The client-side counterpart of :class:`HttpShapeConfig` / :class:`WriteSinkConfig`. It
+    feeds specify the two inputs the L3 lever (``hive.overwrite_race_synth``) needs but cannot
+    derive on its own, so a ``run --specify`` chain can AUTO lower the Option-A generation
+    guard AND synthesise the last-write-wins oracle. NEUTRAL by design — no caller semantics,
+    mirroring its siblings. NR0008 root: ``run_specify()`` was wired for L3 but every CLI
+    entry point starved it of these inputs (no config schema, no plumbing), so the lever
+    fail-opened to the model's weak Option-B.
+
+    - ``source_file``: codebase-relative path of the client component the honey points at
+      (e.g. ``"client/src/components/DocHeader.vue"``). Passed straight to
+      ``detect_overwrite_race_symptom`` so lowering ① fires on a MULTI-file honey, where the
+      lever's own auto-resolve (``_resolve_component_file``) DECLINES because several files
+      qualify. Lowering needs ONLY this — no harness.
+    - ``setup_block`` (inline) or ``setup_block_file`` (path; relative resolves under the
+      codebase root): the vitest harness source — imports + the ``makeRaceHarness()`` factory
+      exposing ``startStaleAsyncWrite`` / ``liveWrite`` / ``read`` over the racing ref —
+      prepended to the synthesised red test. The race needs a CONSTRUCTED harness (it cannot
+      be grounded), so oracle ② stays a safe no-op without it, exactly like lever L2.
+    - ``fixture_call``: the factory call the test drives (default ``"makeRaceHarness()"`` to
+      match the harness above).
+
+    ``test_dir`` is where the synthesised red test lands (relative to the codebase, e.g.
+    ``"client/src/test"``). ``codebase`` optionally binds this entry to an explicit codebase
+    path, exactly like the other per-target blocks.
+    """
+    setup_block: str = ""
+    setup_block_file: str = ""
+    source_file: str = ""
+    fixture_call: str = "makeRaceHarness()"
+    test_dir: str = "client/src/test"
+    codebase: str = ""
+
+    def resolve_setup_block(self, codebase_root: str | None) -> str | None:
+        """Return the harness source: inline ``setup_block`` wins, else read the file.
+
+        A relative ``setup_block_file`` resolves under ``codebase_root``. Returns None when
+        neither is set or the file cannot be read (oracle synthesis then declines — lowering
+        still fires on ``source_file`` alone). Never raises."""
+        if self.setup_block.strip():
+            return self.setup_block
+        if self.setup_block_file:
+            path = self.setup_block_file
+            if not os.path.isabs(path) and codebase_root:
+                path = os.path.join(codebase_root, path)
+            try:
+                with open(path, "r", encoding="utf-8") as fh:
+                    return fh.read()
+            except OSError:
+                return None
+        return None
+
+
+@dataclass
 class SafetyConfig:
     """Cost guard-rails enforced by the CLI before any spend.
 
@@ -593,6 +649,10 @@ class Config:
     # http_shape_targets. Empty by default — synthesis stays a no-op when a run's codebase
     # has no entry (a mutation needs a seeded harness, never auto-discovered).
     write_sink_targets: dict[str, WriteSinkConfig] = field(default_factory=dict)
+    # Per-codebase overwrite-race guard bindings (lever L3), same shape/contract as the two
+    # above. Empty by default — lowering ① / oracle ② stay a no-op when a run's codebase has
+    # no entry (the racing file + harness cannot be auto-derived). NR0008 0058.
+    overwrite_race_targets: dict[str, OverwriteRaceConfig] = field(default_factory=dict)
 
     def db_for_codebase(self, codebase_root: str | None) -> DbConnection | None:
         """Resolve the DB connection for a run's ``--codebase`` path, or None.
@@ -677,6 +737,26 @@ class Config:
         for key, ws in self.write_sink_targets.items():
             if key.strip().lower() == leaf:
                 return ws
+        return None
+
+    def overwrite_race_for_codebase(self, codebase_root: str | None) -> "OverwriteRaceConfig | None":
+        """Resolve the overwrite-race binding for a run's ``--codebase`` path, or None.
+
+        Same match order as :meth:`write_sink_for_codebase`: an explicit ``codebase`` binding
+        wins, else the entry whose KEY equals the codebase's leaf folder name. Returns None
+        when nothing matches (the common case → lever L3 stays a no-op), never raises.
+        """
+        if not codebase_root or not self.overwrite_race_targets:
+            return None
+        norm = codebase_root.replace("\\", "/").rstrip("/").lower()
+        leaf = norm.rsplit("/", 1)[-1]
+        for orc in self.overwrite_race_targets.values():
+            cb = (orc.codebase or "").replace("\\", "/").rstrip("/").lower()
+            if cb and (cb == norm or norm.endswith("/" + cb) or cb.endswith("/" + norm)):
+                return orc
+        for key, orc in self.overwrite_race_targets.items():
+            if key.strip().lower() == leaf:
+                return orc
         return None
 
     def role(self, name: str) -> RoleConfig:
@@ -932,6 +1012,7 @@ def _normalize(raw: dict) -> dict:
         runners = dict(raw.get("test_runners") or {})
         http_shapes = dict(raw.get("http_shape_targets") or {})
         write_sinks = dict(raw.get("write_sink_targets") or {})
+        overwrite_races = dict(raw.get("overwrite_race_targets") or {})
         for name, t in targets.items():
             if not isinstance(t, dict):  # skips a targets-level "_comment", etc.
                 continue
@@ -943,6 +1024,8 @@ def _normalize(raw: dict) -> dict:
                 http_shapes[name] = t["http_shape"]
             if isinstance(t.get("write_sink"), dict):
                 write_sinks[name] = t["write_sink"]
+            if isinstance(t.get("overwrite_race"), dict):
+                overwrite_races[name] = t["overwrite_race"]
         if db_conns:
             out["db_connections"] = db_conns
         if runners:
@@ -951,6 +1034,8 @@ def _normalize(raw: dict) -> dict:
             out["http_shape_targets"] = http_shapes
         if write_sinks:
             out["write_sink_targets"] = write_sinks
+        if overwrite_races:
+            out["overwrite_race_targets"] = overwrite_races
 
     return out
 
@@ -1139,6 +1224,22 @@ def load_config(path: str | None = None, profile: str | None = None) -> Config:
         str(k): _write_sink(v) for k, v in write_sink_raw.items() if isinstance(v, dict)
     }
 
+    overwrite_race_raw = merged.get("overwrite_race_targets", {})
+
+    def _overwrite_race(d: dict) -> OverwriteRaceConfig:
+        return OverwriteRaceConfig(
+            setup_block=str(d.get("setup_block", "")),
+            setup_block_file=str(d.get("setup_block_file", "")),
+            source_file=str(d.get("source_file", "")),
+            fixture_call=str(d.get("fixture_call", "makeRaceHarness()")) or "makeRaceHarness()",
+            test_dir=str(d.get("test_dir", "client/src/test")) or "client/src/test",
+            codebase=str(d.get("codebase", "")),
+        )
+
+    overwrite_race_targets = {
+        str(k): _overwrite_race(v) for k, v in overwrite_race_raw.items() if isinstance(v, dict)
+    }
+
     def _role(name: str, default_model: str = "gpt-5-mini") -> RoleConfig:
         r = roles.get(name, {})
         timeout = r.get("timeout_sec")
@@ -1234,4 +1335,5 @@ def load_config(path: str | None = None, profile: str | None = None) -> Config:
         test_runners=test_runners,
         http_shape_targets=http_shape_targets,
         write_sink_targets=write_sink_targets,
+        overwrite_race_targets=overwrite_race_targets,
     )
