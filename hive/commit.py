@@ -416,6 +416,75 @@ def _commit_files(commit: dict[str, Any]) -> list[str]:
     return files
 
 
+def prune_phantom_files(
+    plan: dict[str, Any], repo_root: str
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Deterministically drop author-fabricated paths from a commit-plan (NR0003 §8-A).
+
+    On a large change set the propose stage runs in *filename-only budget mode*: the
+    author's file tools are disabled (``available_tools=[]``), so the model groups from
+    the path list alone and pattern-completes *plausible sibling paths that are not in
+    the change set* (e.g. a full CRUD set for a table that only ships some files). A
+    single such phantom path makes its commit ``FILE_NOT_CHANGED``, and the all-or-
+    nothing ready gate then blocks the WHOLE plan — so ~7% fabricated paths can refuse
+    100% of the real, safe changes (R0001 "커밋 보류").
+
+    The author's hallucination is non-deterministic, but it is neutralized here
+    deterministically, before verification: for every commit, drop any file not
+    currently changed in live git. A commit left entirely empty (it was wholly
+    fabricated) is dropped as a whole rather than left to re-block as ``empty_files``.
+    Real changes survive and stay committable. Nothing is hidden — what was dropped is
+    returned and surfaced in the proposal. A path that is genuinely uncovered after this
+    still shows up as ``leftover`` (build_commit_proposal); a plan that prunes down to
+    nothing still fails the no-commits gate (we never commit fabricated content).
+
+    Returns ``(pruned_plan, info)`` where ``info`` carries ``dropped_files``
+    (``[{id, message, files}]`` — phantoms removed from surviving commits),
+    ``dropped_commits`` (wholly-fabricated commits removed), and the two totals
+    ``n_dropped_files`` / ``n_dropped_commits``.
+    """
+    changed = changed_paths(repo_root)
+    commits = plan.get("commits") if isinstance(plan.get("commits"), list) else []
+
+    new_commits: list[Any] = []
+    dropped_files: list[dict[str, Any]] = []
+    dropped_commits: list[dict[str, Any]] = []
+    for idx, c in enumerate(commits):
+        if not isinstance(c, dict):
+            new_commits.append(c)
+            continue
+        cid = c.get("id", f"c{idx + 1}")
+        files = _commit_files(c)
+        real = [f for f in files if f in changed]
+        phantom = [f for f in files if f not in changed]
+        if phantom and not real:
+            # Wholly fabricated commit — drop it entirely (no real file to keep).
+            dropped_commits.append(
+                {"id": cid, "message": c.get("message", ""), "files": phantom})
+            continue
+        if phantom:
+            dropped_files.append(
+                {"id": cid, "message": c.get("message", ""), "files": phantom})
+            c = {**c, "files": real}
+        new_commits.append(c)
+
+    pruned = {**plan, "commits": new_commits}
+    n_dropped_files = (sum(len(d["files"]) for d in dropped_files)
+                       + sum(len(d["files"]) for d in dropped_commits))
+    info = {
+        "dropped_files": dropped_files,
+        "dropped_commits": dropped_commits,
+        "n_dropped_files": n_dropped_files,
+        "n_dropped_commits": len(dropped_commits),
+    }
+    if n_dropped_files:
+        logger.warning(
+            "commit-plan: dropped %d author-fabricated path(s) not in the change set "
+            "(%d commit(s) were wholly fabricated and removed) — real changes kept",
+            n_dropped_files, len(dropped_commits))
+    return pruned, info
+
+
 def build_commit_proposal(plan: dict[str, Any], repo_root: str) -> dict[str, Any]:
     """Evaluate every planned commit against live git state; decide the verdict.
 
@@ -710,6 +779,19 @@ def render_commit_summary_lines(
             lines.append(f"        … +{len(files) - max_files} more")
         for msg in r.get("messages") or []:
             lines.append(f"        ! {msg}")
+    phantom = proposal.get("phantom") or {}
+    if phantom.get("n_dropped_files"):
+        lines.append(
+            f"Dropped {phantom['n_dropped_files']} author-fabricated path(s) "
+            f"not in the change set ({phantom.get('n_dropped_commits', 0)} commit(s) "
+            f"wholly fabricated):")
+        for d in (phantom.get("dropped_commits") or []):
+            lines.append(f"  [drop commit] {d.get('id')}: {d.get('message', '')}")
+            for rel in (d.get("files") or [])[:max_files]:
+                lines.append(f"        - {rel}")
+        for d in (phantom.get("dropped_files") or []):
+            for rel in (d.get("files") or [])[:max_files]:
+                lines.append(f"  - {d.get('id')}: {rel}")
     staged_left = proposal.get("staged_leftover") or []
     if staged_left:
         lines.append(f"Staged but unassigned (auto-committed on --write): "
@@ -810,6 +892,25 @@ def render_commit_proposal_markdown(proposal: dict[str, Any]) -> str:
             lines.append(f"- `{rel}`")
         lines.append("")
 
+    phantom = proposal.get("phantom") or {}
+    if phantom.get("n_dropped_files"):
+        lines.append("## Dropped author-fabricated paths (not in the change set)")
+        lines.append("")
+        lines.append("The author listed paths that are not in live git — pattern-"
+                     "completed siblings the file-tool-less budget mode could not "
+                     "verify. They were removed deterministically so they cannot block "
+                     "the real changes; nothing real was dropped.")
+        lines.append("")
+        for d in (phantom.get("dropped_commits") or []):
+            lines.append(f"- **{d.get('id')}** (wholly fabricated commit — removed): "
+                         f"`{d.get('message', '')}`")
+            for rel in (d.get("files") or []):
+                lines.append(f"  - `{rel}`")
+        for d in (phantom.get("dropped_files") or []):
+            lines.append(f"- **{d.get('id')}**: dropped "
+                         + ", ".join(f"`{rel}`" for rel in (d.get("files") or [])))
+        lines.append("")
+
     return "\n".join(lines)
 
 
@@ -841,7 +942,13 @@ def run_commit(
     if _git(root, ["rev-parse", "--is-inside-work-tree"]).returncode != 0:
         raise ValueError(f"not a git work tree: {root}")
 
+    # Deterministic pre-pass (NR0003 §8-A): strip author-fabricated paths so a phantom
+    # cannot block the real, safe changes. Both the verifier below AND execute_commits
+    # operate on the SAME pruned plan, so what is verified is exactly what is committed.
+    plan, phantom_info = prune_phantom_files(plan, root)
+
     proposal = build_commit_proposal(plan, root)
+    proposal["phantom"] = phantom_info
 
     if write:
         if proposal["ready"]:

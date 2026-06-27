@@ -26,6 +26,7 @@ from hive.commit import (
     build_propose_prompt,
     changed_paths,
     execute_commits,
+    prune_phantom_files,
     render_commit_proposal_markdown,
     render_commit_summary_lines,
     run_commit,
@@ -343,6 +344,89 @@ def test_write_refused_when_not_ready(tmp_path):
     assert proposal["ready"] is False
     assert proposal["write"]["attempted"] is False
     assert before == after  # not-ready plan never commits
+
+
+# ── prune_phantom_files (NR0003 §8-A: author-fabricated paths) ─────────────────
+
+def test_prune_drops_phantom_from_mixed_commit(tmp_path):
+    """A real change in a commit survives; the fabricated sibling is removed."""
+    repo = _repo(tmp_path)
+    _write(repo, "real.sql", "SELECT 1;\n")
+    plan = _plan([{"id": "c1", "message": "feat(db): sql",
+                   "files": ["real.sql", "phantom_crud.sql"]}])
+    pruned, info = prune_phantom_files(plan, repo)
+    assert pruned["commits"][0]["files"] == ["real.sql"]
+    assert info["n_dropped_files"] == 1
+    assert info["n_dropped_commits"] == 0
+    assert info["dropped_files"][0]["files"] == ["phantom_crud.sql"]
+
+
+def test_prune_drops_wholly_fabricated_commit(tmp_path):
+    """A commit whose every path is fabricated is removed, not left empty-blocking."""
+    repo = _repo(tmp_path)
+    _write(repo, "real.py", "x = 1\n")
+    plan = _plan([
+        {"id": "c1", "message": "feat(core): real", "files": ["real.py"]},
+        {"id": "c2", "message": "feat(core): ghosts",
+         "files": ["ghost_a.sql", "ghost_b.sql"]},
+    ])
+    pruned, info = prune_phantom_files(plan, repo)
+    assert [c["id"] for c in pruned["commits"]] == ["c1"]
+    assert info["n_dropped_commits"] == 1
+    assert info["dropped_commits"][0]["id"] == "c2"
+    assert info["n_dropped_files"] == 2
+
+
+def test_phantom_does_not_block_real_changes_end_to_end(tmp_path):
+    """R0001 reproduction: a phantom path no longer makes the whole plan NOT READY."""
+    repo = _repo(tmp_path)
+    _write(repo, "real.sql", "SELECT 1;\n")
+    plan = _plan([{"id": "c1", "message": "feat(db): add sql",
+                   "files": ["real.sql", "totp_auth/create_table.sql"]}])
+    plan_path = os.path.join(repo, "plan.json")
+    with open(plan_path, "w", encoding="utf-8") as f:
+        json.dump(plan, f)
+
+    proposal = run_commit(plan_path, repo_root=repo, write=True)
+    assert proposal["ready"] is True                       # phantom did not block it
+    assert proposal["write"]["ok"] is True
+    assert proposal["phantom"]["n_dropped_files"] == 1
+    log = _git(repo, "log", "--oneline").stdout
+    assert "feat(db): add sql" in log
+    # the fabricated path was never committed
+    tracked = _git(repo, "ls-files").stdout
+    assert "totp_auth/create_table.sql" not in tracked
+    assert "real.sql" in tracked
+
+
+def test_prune_to_nothing_still_not_ready(tmp_path):
+    """If every path is fabricated, the plan still fails (no-commits gate) — we never
+    commit fabricated content."""
+    repo = _repo(tmp_path)
+    plan = _plan([{"id": "c1", "message": "feat(core): ghost", "files": ["ghost.py"]}])
+    plan_path = os.path.join(repo, "plan.json")
+    with open(plan_path, "w", encoding="utf-8") as f:
+        json.dump(plan, f)
+
+    before = _git(repo, "rev-parse", "HEAD").stdout.strip()
+    proposal = run_commit(plan_path, repo_root=repo, write=True)
+    after = _git(repo, "rev-parse", "HEAD").stdout.strip()
+    assert proposal["ready"] is False
+    assert before == after
+    assert proposal["phantom"]["n_dropped_commits"] == 1
+
+
+def test_prune_surfaced_in_summary(tmp_path):
+    repo = _repo(tmp_path)
+    _write(repo, "real.sql", "SELECT 1;\n")
+    plan = _plan([{"id": "c1", "message": "feat(db): sql",
+                   "files": ["real.sql", "phantom.sql"]}])
+    plan_path = os.path.join(repo, "plan.json")
+    with open(plan_path, "w", encoding="utf-8") as f:
+        json.dump(plan, f)
+    proposal = run_commit(plan_path, repo_root=repo, write=False)
+    text = "\n".join(render_commit_summary_lines(proposal))
+    assert "fabricated" in text and "phantom.sql" in text
 
 
 def test_execute_rolls_back_on_midsequence_failure(tmp_path):
