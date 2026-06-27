@@ -153,6 +153,11 @@ Rules for the JSON:
 
 - `files` paths are **relative to the repo root**, forward slashes, exactly as they
   appear in `git status` output.
+- Every path you emit **MUST be a member of the provided change set** (the `git status`
+  / change list given to you). Never invent, complete, or guess a sibling path that is
+  not in that list — e.g. do not add a full CRUD set for a file just because some of its
+  siblings changed. If a path is not in the change set, it does not exist for this plan.
+  (Hivework drops any out-of-set path before committing, but emitting one is an error.)
 - `gate.commit` is always `false`. You never authorize the write — a human does, via
   the `--write` flag on the deterministic stage. (Hivework forces this false anyway.)
 - `termination`:
