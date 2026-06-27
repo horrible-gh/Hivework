@@ -144,6 +144,68 @@ function onOther(e: any): void { otherBadge.value = e.v }
             "something unrelated", root, source_file=path))
 
 
+class TestAutonomousMultiFileResolution(unittest.TestCase):
+    """detect_overwrite_race_symptom — T0009 multi-candidate driver (no config crutch).
+
+    The 0062 honey is MULTI-file, so the single-file ``_resolve_component_file`` declines and,
+    BEFORE T0009, the lever needed the answer hand-fed via ``targets.<name>.overwrite_race.
+    source_file`` (the preset "목발"). These tests assert the hive now DERIVES source_file
+    itself by running the per-file recogniser across every honey-named candidate, with explicit
+    smoking-gun signals on 0 / several matches."""
+
+    def _write_multi(self, files: dict[str, str]) -> tuple[str, dict[str, str]]:
+        """Write several files under one codebase; return (root, {name: rel_path})."""
+        root = tempfile.mkdtemp()
+        rels: dict[str, str] = {}
+        for name, text in files.items():
+            p = os.path.join(root, "client", "src", "components", name)
+            os.makedirs(os.path.dirname(p), exist_ok=True)
+            with open(p, "w", encoding="utf-8") as fh:
+                fh.write(text)
+            rels[name] = os.path.relpath(p, root).replace("\\", "/")
+        return root, rels
+
+    # An inert sibling the honey also names — present so the honey is multi-file.
+    _INERT_TS = "export function useFlowGateSse(): void {\n  // no race here\n}\n"
+
+    def test_auto_resolves_unique_racing_file_among_candidates(self):
+        root, rels = self._write_multi(
+            {"DocHeader.vue": _RACE_COMPONENT, "useFlowGateSse.ts": self._INERT_TS})
+        honey = (f"mentionCopy in {rels['DocHeader.vue']} appears then vanishes; see also "
+                 f"{rels['useFlowGateSse.ts']} for the SSE refetch.")
+        # NO source_file supplied — the driver must pick the racing file itself.
+        sym = orc.detect_overwrite_race_symptom(honey, root)
+        self.assertIsNotNone(sym, "the unique racing file must be auto-resolved")
+        self.assertEqual(sym.source_file, rels["DocHeader.vue"])
+        self.assertEqual(sym.ref, "mentionCopy")
+
+    def test_zero_race_candidates_declines_quietly_with_signal(self):
+        # Two named files, neither racing → honest "nothing to fix" (None), not a guess.
+        inert2 = "export function helper(): number {\n  return 1\n}\n"
+        root, rels = self._write_multi(
+            {"useFlowGateSse.ts": self._INERT_TS, "helper.ts": inert2})
+        honey = f"check {rels['useFlowGateSse.ts']} and {rels['helper.ts']} for the badge."
+        self.assertIsNone(orc.detect_overwrite_race_symptom(honey, root))
+
+    def test_several_racing_files_decline_as_ambiguous(self):
+        # Two DISTINCT racing files both named → ambiguous, never guess which (failure mode #2).
+        other_race = _RACE_COMPONENT.replace("DocHeader", "DocFooter")
+        root, rels = self._write_multi(
+            {"DocHeader.vue": _RACE_COMPONENT, "DocFooter.vue": other_race})
+        honey = (f"mentionCopy races in {rels['DocHeader.vue']} and {rels['DocFooter.vue']} "
+                 "both.")
+        self.assertIsNone(orc.detect_overwrite_race_symptom(honey, root),
+                          "two racing candidates must decline, not silently pick one")
+
+    def test_candidate_enumerator_dedups_and_resolves(self):
+        root, rels = self._write_multi(
+            {"DocHeader.vue": _RACE_COMPONENT, "useFlowGateSse.ts": self._INERT_TS})
+        honey = (f"{rels['DocHeader.vue']} {rels['DocHeader.vue']} "  # named twice
+                 f"{rels['useFlowGateSse.ts']}")
+        cands = orc._candidate_component_files(honey, root)
+        self.assertEqual(len(cands), 2, "duplicates must collapse, both existing files kept")
+
+
 class TestLowering(unittest.TestCase):
     """overwrite_race_synth.synthesize_guarded_write_edits — the ① guarded-write template."""
 

@@ -60,10 +60,13 @@ Everything here is pure-local, deterministic, zero model cost, fail-open (any mi
 → ``None`` / no edits), and never raises.
 """
 
+import logging
 import os
 import re
 from dataclasses import dataclass, field
 from typing import Any
+
+logger = logging.getLogger("hive.overwrite_race_synth")
 
 # --- recognition regexes (Vue <script setup> / TS) --------------------------------------
 
@@ -214,18 +217,74 @@ def detect_overwrite_race_symptom(honey_text: str, codebase_root: str,
     Several refs, several async clobber-writers, or an already-guarded async writer (it
     already compares the generation token) → ``None`` so the caller keeps today's behaviour.
     Pure-local, zero model cost, never raises.
+
+    Source-file resolution (T0009 — autonomous, no config crutch):
+      1. an explicit ``source_file`` (config binding OR an already-resolved path) wins;
+      2. else the honey names exactly ONE existing client file → use it (fast path);
+      3. else (the MULTI-file 0062 honey, where the single-file resolve declines because
+         several client files are named) DRIVE the per-file recogniser across every named
+         candidate and accept the UNIQUE file that actually exhibits the race. Zero matches →
+         honest "nothing to fix" signal; several matches → "ambiguous" signal. Both decline.
+    Step 3 is what lets the hive derive ``source_file`` ITSELF on a multi-file honey instead of
+    being hand-fed the answer in the preset — the matcher (per-file recognition) already
+    existed; only the multi-candidate driver was missing.
     """
     if not honey_text and not source_file:
         return None
-    path = source_file or _resolve_component_file(honey_text, codebase_root)
-    # A caller may pass a repo-RELATIVE source_file (run_specify does); resolve it against the
-    # codebase root when it is not already an existing absolute path.
-    if path and not os.path.isfile(path) and codebase_root:
-        joined = os.path.join(codebase_root, *str(path).replace("\\", "/").lstrip("/").split("/"))
-        if os.path.isfile(joined):
-            path = joined
-    if not path or not os.path.isfile(path):
+    # (1) Explicit binding / already-resolved path.
+    if source_file:
+        path = source_file
+        # A caller may pass a repo-RELATIVE source_file (run_specify does); resolve it against
+        # the codebase root when it is not already an existing absolute path.
+        if path and not os.path.isfile(path) and codebase_root:
+            joined = os.path.join(
+                codebase_root, *str(path).replace("\\", "/").lstrip("/").split("/"))
+            if os.path.isfile(joined):
+                path = joined
+        if not path or not os.path.isfile(path):
+            return None
+        return _recognize_symptom_in_file(path, honey_text, codebase_root)
+
+    # (2) Single named client file → today's behaviour.
+    path = _resolve_component_file(honey_text, codebase_root)
+    if path:
+        return _recognize_symptom_in_file(path, honey_text, codebase_root)
+
+    # (3) Multi-file honey: scan every named candidate, accept the unique racing file.
+    cands = _candidate_component_files(honey_text, codebase_root)
+    matches: list[RaceSymptom] = []
+    for p in cands:
+        sym = _recognize_symptom_in_file(p, honey_text, codebase_root)
+        if sym is not None:
+            matches.append(sym)
+    if len(matches) == 1:
+        logger.info("overwrite-race: auto-resolved source_file from %d honey-named "
+                    "candidate(s) → %s (ref=%s)",
+                    len(cands), matches[0].source_file, matches[0].ref)
+        return matches[0]
+    if not matches:
+        # Smoking-gun (failure mode #1): never a silent no-op. Either no file was named, or
+        # none of the named files exhibits the race → there is honestly nothing to lower.
+        if cands:
+            logger.info("overwrite-race: no race candidate among %d honey-named file(s) "
+                        "(smoking-gun: nothing to auto-fix)", len(cands))
         return None
+    # Smoking-gun (failure mode #2 guard): several files race → we never guess which.
+    logger.warning("overwrite-race: %d candidate files exhibit a race (%s) — ambiguous, "
+                   "declining (smoking-gun: cannot auto-pick a source_file)",
+                   len(matches), ", ".join(m.source_file for m in matches))
+    return None
+
+
+def _recognize_symptom_in_file(path: str, honey_text: str,
+                               codebase_root: str) -> RaceSymptom | None:
+    """Recognise the overwrite-race symptom in ONE already-resolved file, or ``None``.
+
+    The per-file matcher (factored out of :func:`detect_overwrite_race_symptom` so the
+    multi-candidate driver can run it against each honey-named file). Reads ``path``, grounds
+    the racing ref from the honey, and returns the unique :class:`RaceSymptom` or ``None`` when
+    the file does not exhibit an unambiguous race. Pure-local, zero model cost, never raises.
+    """
     try:
         with open(path, "r", encoding="utf-8", errors="replace") as fh:
             text = fh.read()
@@ -294,20 +353,31 @@ def _already_guarded(text: str, writer: WriterSite) -> bool:
     return bool(re.search(r"Generation\b", body) and re.search(r"return\b", body))
 
 
-def _resolve_component_file(honey_text: str, codebase_root: str) -> str | None:
-    """The single client component file the honey points at, or ``None``.
+def _candidate_component_files(honey_text: str, codebase_root: str) -> list[str]:
+    """Every existing ``.vue``/``.ts`` file the honey names, resolved against the codebase root.
 
-    Scans the honey for ``.vue``/``.ts`` paths, resolves each against the codebase root, and
-    returns the unique existing one. Zero or several distinct existing files → ``None`` (we
-    never guess which file). Never raises."""
+    The candidate set the multi-file driver scans (and the single-file resolve's source of
+    truth). Order-preserving, de-duplicated. Empty when the honey names no existing client
+    file. Never raises."""
     if not honey_text or not codebase_root:
-        return None
+        return []
     cands: list[str] = []
     for m in re.finditer(r"[\w./\\-]+\.(?:vue|ts)\b", honey_text):
         rel = m.group(0).replace("\\", "/").lstrip("/")
         p = os.path.join(codebase_root, *rel.split("/"))
         if os.path.isfile(p) and p not in cands:
             cands.append(p)
+    return cands
+
+
+def _resolve_component_file(honey_text: str, codebase_root: str) -> str | None:
+    """The single client component file the honey points at, or ``None``.
+
+    Returns the UNIQUE existing ``.vue``/``.ts`` file the honey names. Zero or several distinct
+    existing files → ``None`` (the multi-candidate driver in
+    :func:`detect_overwrite_race_symptom` then disambiguates the several-files case by which
+    one actually races). Never raises."""
+    cands = _candidate_component_files(honey_text, codebase_root)
     return cands[0] if len(cands) == 1 else None
 
 
