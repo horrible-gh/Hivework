@@ -12,6 +12,7 @@ Uses subprocess + concurrent.futures for parallel execution.
 import os
 import subprocess
 import logging
+import re
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any
@@ -32,6 +33,7 @@ DEFAULT_COMB_CONTRACT = """[Role] You are one Hivework free worker (drone). You 
 2. **Call-chain trace**: connect file:line with `→` from entry point → … → the DB write.
 3. **Design contrast** (when possible): contrast the code's behavior against the spec intended by the design docs. A mismatch is the bug; a match is intended behavior — UNLESS the reporter declares that intended behavior itself wrong or unwanted, in which case the matching site is a DESIGN-CHANGE candidate (the site still must change), not a non-finding.
 4. **blame** (if the axis is about regression/history): use `git log` / `git blame` to pin the introducing/modifying commit (hash + title) for the relevant lines. Also check "is it already fixed."
+5. **Async state-overwrite races (reactive UI / shared state)**: when the symptom is "the value appears then disappears / flickers / is intermittently missing" AND one reactive state (a ref / store field / rendered badge or flag) is written by BOTH (a) a live event handler or optimistic local update, AND (b) an asynchronous fetch/refetch (silent SSE-driven reload, focus/visibility refresh, poll, re-open) that RESETS that same state to a default / null / empty value, then the prime root-cause candidate is the **later-resolving stale write clobbering the live value** — a write-write race — UNLESS a generation / version / sequence / timestamp guard provably discards the stale response. You MUST enumerate every writer site of that one piece of state (file:line) and state whether any such guard sits between them. Do NOT default to "the event was missed / the listener mounted late / the setter call is absent" when a second writer demonstrably overwrites an already-set value: "missed event" and "stale-overwrite" are DISTINCT mechanisms — *value set then cleared* ("appeared then vanished") points to the overwrite race, whereas *value never set* ("never appeared") points to the missed event. Pick the one the symptom and the writer-set actually support.
 
 [Conclusion mandate — conclude, do NOT keep searching] Your job is to DELIVER A CONCLUSION, not to plan more searching. The moment you have opened the relevant files, STOP searching and synthesize what you found into `findings`. Do NOT emit your next search step — a tool-argument object such as {{"path":"...","pattern":"...","glob":"..."}} — or any prose as your answer. That is a search note, not a comb; it will be rejected and sent back to you. Even if your investigation genuinely turned up nothing, still CONCLUDE: return a well-formed comb with `findings`: [] and `termination` set. Decide with the evidence you already have.
 
@@ -183,11 +185,109 @@ _PROTECTED_AXIS_TERMS = (
 )
 
 
-def _is_protected_axis(axis: dict[str, Any]) -> bool:
+_FK_PERSISTENCE_RE = re.compile(
+    r"foreign\s*key|foreignkey|\bfk\b|integrity\s*error|integrityerror|"
+    r"unique\s+constraint|not\s*null\s+constraint|check\s+constraint|"
+    r"constraint\s+(?:failed|violat)|\bconstraint\b[^\n]{0,40}\bviolat|"
+    r"\borphan(?:ed)?\b|\bcascade\b",
+    re.IGNORECASE,
+)
+_WRITE_OR_FAIL_RE = re.compile(
+    r"\binsert\b|\bupdate\b|\bdelete\b|\bcommit\b|\btransaction\b|\brollback\b|"
+    r"\bwrite\b|\bpersist|\bmigrat|\b5\d\d\b|exception|error|fail|raise|traceback",
+    re.IGNORECASE,
+)
+_MUTATION_VERB_RE = re.compile(
+    r"\bdispose\b|\bdiscard(?:ed|ing|s)?\b|\bdelete\b|\bremov(?:e|ed|ing|al)\b|"
+    r"\bdrop\b|\bclose\b|\bclosing\b|\binsert\b|\bupdate\b|\bsave\b|\bpersist|"
+    r"\bcommit\b|\bwrite\b|\bmutat|"
+    r"폐기|마감|삭제|제거|저장|기록|등록",
+    re.IGNORECASE,
+)
+_SERVER_ERROR_RE = re.compile(
+    r"\b5\d\d\b|internal\s+server\s+error|integrity\s*error|integrityerror|"
+    r"\bexception\b|traceback|\braise[sd]?\b|\bfail(?:ed|s|ure)?\b|에러|오류|실패",
+    re.IGNORECASE,
+)
+_BACKEND_FAILURE_RE = re.compile(
+    r"\b5\d\d\b|internal\s+server\s+error|integrity\s*error|integrityerror|"
+    r"\bexception\b|traceback|foreign\s*key|\bfk\b|constraint\s+(?:failed|violat)|"
+    r"sqlite|sqlalchemy|database|db\s+error",
+    re.IGNORECASE,
+)
+_FE_UI_SYMPTOM_RE = re.compile(
+    r"\bfront[-\s]?end\b|\bui\b|\bux\b|\bbrowser\b|\bclient\b|"
+    r"\bvue\b|\breact\b|\bcomponent\b|\bmodal\b|\bbutton\b|\bbadge\b|"
+    r"\bheader\b|\brender(?:ed|ing)?\b|\bcop(?:y|ied|ies|ying)\b|"
+    r"\bclipboard\b|\btoast\b|\btooltip\b|\bcss\b|\bclass(?:es)?\b|"
+    r"프론트|클라이언트|브라우저|화면|표시|렌더|복사|클립보드|"
+    r"뱃지|배지|헤더|버튼|모달|토스트|툴팁|스타일|색상",
+    re.IGNORECASE,
+)
+_FE_AXIS_RE = re.compile(
+    r"\bfront[-\s]?end\b|\bfrontend\b|client/src/|frontend/src/|web/src/|"
+    r"ui/src/|\.vue\b|\.tsx\b|\.jsx\b|\.svelte\b",
+    re.IGNORECASE,
+)
+
+
+def _axis_budget_text(axis: dict[str, Any]) -> str:
+    sp = axis.get("search_plan") or {}
+    bits = [
+        str(axis.get(k, ""))
+        for k in ("id", "axis_id", "title", "brief")
+    ]
+    bits.extend(str(v) for v in (sp.get("keywords") or []))
+    bits.extend(str(v) for v in (sp.get("file_globs") or []))
+    return " ".join(bits).replace("\\", "/").lower()
+
+
+def _mutation_budget_seed(seed_text: str) -> bool:
+    text = seed_text or ""
+    if _FK_PERSISTENCE_RE.search(text) and _WRITE_OR_FAIL_RE.search(text):
+        return True
+    if _FE_UI_SYMPTOM_RE.search(text) and not _BACKEND_FAILURE_RE.search(text):
+        return False
+    return bool(_SERVER_ERROR_RE.search(text) and _MUTATION_VERB_RE.search(text))
+
+
+def _fe_ui_budget_seed(seed_text: str) -> bool:
+    return bool(_FE_UI_SYMPTOM_RE.search(seed_text or ""))
+
+
+def _is_frontend_axis(axis: dict[str, Any]) -> bool:
+    return bool(_FE_AXIS_RE.search(_axis_budget_text(axis)))
+
+
+def _fe_seed_axis_score(axis: dict[str, Any], seed_text: str) -> int:
+    seed = (seed_text or "").lower()
+    text = _axis_budget_text(axis)
+    score = 0
+    if re.search(r"workflow|워크플로|결정|decision", seed, re.IGNORECASE):
+        score += 2 * len(re.findall(r"workflow|decision|decided|status|side[-\s]?effect", text))
+    if re.search(r"header|헤더", seed, re.IGNORECASE):
+        score += 2 * len(re.findall(r"header|docheader", text))
+    if re.search(r"badge|뱃지|배지|copied|복사됨", seed, re.IGNORECASE):
+        score += 2 * len(re.findall(r"badge|copied|mentioncopy", text))
+    if re.search(r"copy|clipboard|복사|멘트|mention", seed, re.IGNORECASE):
+        score += len(re.findall(r"copy|clipboard|mention|fg:mention_copied", text))
+    if re.search(r"timing|race|타이밍|사라지|안\s*보", seed, re.IGNORECASE):
+        score += len(re.findall(r"race|timing|state|lifecycle|side[-\s]?effect|"
+                                r"silent|refetch|timeout|clear|reset", text))
+    if _is_frontend_axis(axis):
+        score += 1
+    if re.search(r"regression|blame|git log|design spec|ssot|documents/", text):
+        score -= 30
+    if re.search(r"hierarchy|data flow", text):
+        score -= 8
+    return score
+
+
+def _is_protected_axis(axis: dict[str, Any], *, mutation_seed: bool = True) -> bool:
     """Return True for axes that should survive a tight fan-out call budget."""
-    text = " ".join(
-        str(axis.get(k, "")) for k in ("id", "axis_id", "title", "brief")
-    ).lower()
+    if not mutation_seed:
+        return False
+    text = _axis_budget_text(axis)
     return any(term in text for term in _PROTECTED_AXIS_TERMS)
 
 
@@ -196,8 +296,9 @@ def _apply_axis_call_budget(
     *,
     max_calls: int,
     respecify_retries: int,
+    seed_text: str | None = None,
 ) -> list[dict[str, Any]]:
-    """Trim axes for spend while preserving write/FK axes before generic ones."""
+    """Trim axes for spend without letting symptom-irrelevant protected terms dominate."""
     if not (max_calls and max_calls > 0 and axes):
         return axes
     per_axis = 1 + max(0, respecify_retries)
@@ -205,11 +306,25 @@ def _apply_axis_call_budget(
     if len(axes) <= allowed:
         return axes
 
-    protected = [axis for axis in axes if _is_protected_axis(axis)]
-    regular = [axis for axis in axes if not _is_protected_axis(axis)]
+    # ``None`` preserves the historical helper default used by older direct tests.
+    # Runtime fan-out passes the real seed, making write/FK protection symptom-aware.
+    mutation_seed = True if seed_text is None else _mutation_budget_seed(seed_text)
+    protected = [axis for axis in axes if _is_protected_axis(axis, mutation_seed=mutation_seed)]
+    regular = [axis for axis in axes if not _is_protected_axis(axis, mutation_seed=mutation_seed)]
+    reserved_fe = []
+    if (seed_text is not None and not os.environ.get("HIVE_NO_FE_RESERVE")
+            and _fe_ui_budget_seed(seed_text)):
+        regular = sorted(
+            regular,
+            key=lambda axis: _fe_seed_axis_score(axis, seed_text),
+            reverse=True,
+        )
+        reserved_fe = [axis for axis in regular if _is_frontend_axis(axis)][:1]
+
+    ordered = protected + reserved_fe + regular if mutation_seed else reserved_fe + regular
     selected: list[dict[str, Any]] = []
     seen: set[int] = set()
-    for axis in protected + regular:
+    for axis in ordered:
         marker = id(axis)
         if marker in seen:
             continue
@@ -219,8 +334,9 @@ def _apply_axis_call_budget(
             break
 
     logger.warning("Fan-out: trimming %d axes to %d to honor max_calls=%d "
-                   "(%d call(s)/axis; protected=%d)",
-                   len(axes), allowed, max_calls, per_axis, len(protected))
+                   "(%d call(s)/axis; protected=%d; fe_reserved=%d; mutation_seed=%s)",
+                   len(axes), allowed, max_calls, per_axis, len(protected),
+                   len(reserved_fe), mutation_seed)
     return selected
 
 
@@ -262,7 +378,8 @@ def run_fanout(
     os.makedirs(combs_dir, exist_ok=True)
 
     axes = _apply_axis_call_budget(axes, max_calls=max_calls,
-                                   respecify_retries=respecify_retries)
+                                   respecify_retries=respecify_retries,
+                                   seed_text=seed_text)
 
     contract = load_comb_contract(contract_path, codebase_root)
     comb_files: dict[str, str] = {}

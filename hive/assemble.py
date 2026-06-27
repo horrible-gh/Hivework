@@ -45,6 +45,14 @@ Your ONLY job is to synthesize all comb findings into a single honey markdown do
 - Use ONLY information from the provided combs. Do NOT invent or assume.
 - Every claim must cite the source axis and file:line from comb evidence.
 - Call-chain traces must be in code blocks with file:line → arrows.
+- When several combs offer competing root causes, choose the key conclusion whose
+  mechanism matches the symptom's TEMPORAL signature: "value appeared then vanished /
+  flickers / is intermittently lost" is a later write OVERWRITING an already-set value
+  (a write-write / stale-refetch-clobber race), NOT a "value never set / event missed /
+  setter absent" story. If any comb enumerates two writers of the same state (a live/
+  optimistic setter and an async refetch that resets it) with no generation/version
+  guard between them, that overwrite race outranks a missed-event hypothesis for an
+  appeared-then-vanished symptom.
 - Output pure markdown. No JSON wrapping.
 """
 

@@ -592,16 +592,20 @@ class TestShippedDefaultProfile(unittest.TestCase):
         self.assertEqual(self.cfg.judge.max_axes, 10)
         self.assertEqual(self.cfg.judge.votes_per_axis, 5)
 
-    def test_swarm_run_enabled(self):
-        # The shipped default enables the source-mining swarm (pipeline.fanout.enabled
-        # = true, R0001). This maps onto safety.allow_swarm = True.
-        self.assertTrue(self.cfg.safety.allow_swarm)
+    def test_swarm_run_default_off(self):
+        # The SHIPPED default keeps the source-mining swarm OFF (pipeline.fanout.enabled
+        # = false), so safety.allow_swarm (derived from fanout.enabled, config.py:798) is
+        # False. Swarm is turned on per-run by an explicit profile (e.g. --profile small2,
+        # group 0056 / NR0006 #2): the shipped default stays a lean, swarm-off baseline
+        # rather than the 24/true this test originally anticipated at R0001 start.
+        self.assertFalse(self.cfg.safety.allow_swarm)
 
     def test_fanout_tuning_knobs_surfaced(self):
-        # The previously-hidden fan-out spend knobs are now read from config.
+        # The previously-hidden fan-out spend knobs are now read from config. The shipped
+        # default carries the lean 8-call ceiling; profiles like small2 raise/enable it.
         self.assertEqual(self.cfg.fanout.parallel, 4)
         self.assertEqual(self.cfg.fanout.retries, 1)
-        self.assertEqual(self.cfg.fanout.max_calls, 24)
+        self.assertEqual(self.cfg.fanout.max_calls, 8)
 
     def test_converge_split_enabled_without_placeholder_model(self):
         self.assertTrue(self.cfg.converge_split.enabled)

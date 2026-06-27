@@ -169,7 +169,13 @@ def run_pipeline(args: argparse.Namespace) -> None:
     from hive.specify import run_specify
     from hive.coordinator import run_coordinator
     from hive.coordinator.gapstate import open_store as open_gapstate_store
-    from hive.investigate import format_caller_context
+    from hive.investigate import (
+        format_caller_context,
+        promote_mutation_path_axes,
+        _prioritize_axes,
+        inject_mutation_path_anchor,
+        ensure_mutation_path_axis,
+    )
 
     start_time = time.time()
     logger = logging.getLogger("hive")
@@ -311,12 +317,32 @@ def run_pipeline(args: argparse.Namespace) -> None:
         # guaranteed-empty synthesis axis. Honour the dependency: dependent tasks are
         # dropped from the fan-out (synthesis belongs to the assemble/queen stage).
         all_tasks = decompose_result.get("tasks", [])
+        # Hook M (NR hivework.default.0054.0003): the mutation-axis guard family was
+        # only wired into the cheap `investigate` path, so the swarm `run` path fed the
+        # RAW decompose axes straight to fan-out with NO write-path protection. When the
+        # (cheap, stochastic) queen frames a persistence-class symptom around its named
+        # endpoint instead of the data-write site — run553 emitted `EP`/`SVC` for the
+        # `POST /groups/{id}/dispose` 500 and MISSED the events FK locus, while run554
+        # happened to emit `db_mutation` and FOUND it — the swarm chases the routing/CORS
+        # decoy. These guards are the SAME deterministic, model-call-free (grep/reorder)
+        # functions the cheap path runs; they NO-OP unless the seed is mutation-class
+        # (_mutation_symptom_seed) AND a real-file write signature is present, so a
+        # non-write bug is unaffected. promote_* runs on the FULL task set BEFORE
+        # independent_axes (which would otherwise drop a buried non-leaf write axis); the
+        # rest reorder/inject on the surviving fan-out set. Mirrors Hook A (be_root) below,
+        # which was ported from investigate→swarm for the same reason. The synthesised
+        # MUTATION_ANCHOR carries protected terms ("data-mutation"/"write path"), so
+        # fanout._apply_axis_call_budget keeps it ahead of the max_calls trim.
+        all_tasks = promote_mutation_path_axes(all_tasks, seed_text, args.codebase)
         axes = independent_axes(all_tasks)
         dropped_axes = [t.get("id", "?") for t in all_tasks if t.get("depends_on")]
         if dropped_axes:
             logger.info("RC-B: %d dependent axis(es) excluded from swarm fan-out "
                         "(synthesis/integration is an assemble-stage job, not a blind "
                         "drone): %s", len(dropped_axes), ", ".join(dropped_axes))
+        axes = _prioritize_axes(axes, seed_text)
+        axes = inject_mutation_path_anchor(axes, seed_text, args.codebase)
+        axes = ensure_mutation_path_axis(axes, seed_text, args.codebase)
         logger.info("Decompose produced %d axes (%d independent → fan-out)",
                     len(all_tasks), len(axes))
 

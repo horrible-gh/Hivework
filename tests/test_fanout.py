@@ -292,6 +292,114 @@ class TestShapeRejectRetry(unittest.TestCase):
 
         self.assertEqual([a["id"] for a in selected], ["EVT"])
 
+    def test_call_budget_keeps_write_axis_for_mutation_seed(self):
+        axes = [
+            {"id": "EP", "title": "API Endpoint", "brief": "route"},
+            {"id": "SVC", "title": "Service", "brief": "logic"},
+            {"id": "WRT", "title": "Data-Write Path", "brief": "DB mutation FK"},
+        ]
+
+        selected = fanout._apply_axis_call_budget(
+            axes, max_calls=2, respecify_retries=1,
+            seed_text="POST /groups/{id}/dispose returns 500 FOREIGN KEY constraint failed")
+
+        self.assertEqual([a["id"] for a in selected], ["WRT"])
+
+    def test_fe_ui_seed_does_not_protect_backend_write_decoys(self):
+        # NR hivework.default.0055.0006: 0062 is a pure FE copy/badge/header timing
+        # symptom. Backend write/FK decoys must not consume every tight-budget slot.
+        axes = [
+            {"id": "A", "title": "Frontend copy button and copied badge rendering",
+             "brief": "trace badge render conditions in Vue"},
+            {"id": "B", "title": "Frontend copy state lifecycle and timeout management",
+             "brief": "trace copied state races and timeout cleanup"},
+            {"id": "D", "title": "Backend workflow decision API endpoint and mutations",
+             "brief": "data mutation path for decision writes"},
+            {"id": "F", "title": "SQL write path and constraint gates",
+             "brief": "FK and constraint handling"},
+        ]
+
+        selected = fanout._apply_axis_call_budget(
+            axes, max_calls=4, respecify_retries=1,
+            seed_text="복사 버튼을 누른 뒤 헤더의 copied 뱃지 표시 타이밍이 어긋난다")
+
+        self.assertEqual(set(a["id"] for a in selected), {"A", "B"})
+
+    def test_fe_ui_seed_reserves_a_frontend_axis_when_decoys_come_first(self):
+        axes = [
+            {"id": "D", "title": "Backend workflow decision API endpoint and mutations",
+             "brief": "data mutation path for decision writes"},
+            {"id": "F", "title": "SQL write path and constraint gates",
+             "brief": "FK and constraint handling"},
+            {"id": "A", "title": "Frontend copy button and copied badge rendering",
+             "brief": "trace badge render conditions in Vue"},
+            {"id": "B", "title": "Frontend copy state lifecycle and timeout management",
+             "brief": "trace copied state races and timeout cleanup"},
+        ]
+
+        selected = fanout._apply_axis_call_budget(
+            axes, max_calls=4, respecify_retries=1,
+            seed_text="copy 버튼 이후 clipboard badge가 header에서 늦게 렌더링된다")
+
+        self.assertEqual(selected[0]["id"], "A")
+        self.assertIn("A", [a["id"] for a in selected])
+
+    def test_fe_ui_failure_word_does_not_arm_write_protection(self):
+        axes = [
+            {"id": "D", "title": "Backend workflow decision API endpoint and mutations",
+             "brief": "data mutation path for decision writes"},
+            {"id": "F", "title": "SQL write path and constraint gates",
+             "brief": "FK and constraint handling"},
+            {"id": "A", "title": "Frontend copied badge rendering",
+             "brief": "trace copied badge render conditions in Vue"},
+        ]
+
+        selected = fanout._apply_axis_call_budget(
+            axes, max_calls=2, respecify_retries=1,
+            seed_text="copy button fails to update the copied badge in the header")
+
+        self.assertEqual([a["id"] for a in selected], ["A"])
+
+    def test_fe_ui_seed_ranks_workflow_side_effect_axis(self):
+        axes = [
+            {"id": "A", "title": "FE: Document header copy badge component",
+             "brief": "Locate copied badge rendering in DocHeader.vue"},
+            {"id": "B", "title": "FE: Clipboard copy state and auto-clear logic",
+             "brief": "Trace copied lifecycle and timeout cleanup"},
+            {"id": "C", "title": "FE: Workflow decision state and side-effects",
+             "brief": "Trace workflow decision completion, refetch, reset, and copied badge effects"},
+            {"id": "D", "title": "BE: Workflow decision endpoint and mutations",
+             "brief": "data mutation path for decision writes"},
+        ]
+
+        selected = fanout._apply_axis_call_budget(
+            axes, max_calls=4, respecify_retries=1,
+            seed_text="워크플로 결정 직후 멘트 복사 헤더 뱃지가 타이밍상 사라진다")
+
+        self.assertEqual([a["id"] for a in selected], ["A", "C"])
+
+
+class TestOverwriteRaceContractGuidance(unittest.TestCase):
+    """The comb contract teaches drones to recognize an async state-OVERWRITE race
+    (live setter + stale refetch clobbering the same reactive state) for an
+    'appears-then-vanishes' symptom, instead of defaulting to 'missed event / late
+    listener'. Group 0056 / R0001 0062: the FE axis survived fan-out but every drone
+    mis-classified the silent-refetch overwrite as a mount-timing missed event."""
+
+    def test_default_contract_constant_carries_overwrite_rule(self):
+        c = fanout.DEFAULT_COMB_CONTRACT
+        self.assertIn("Async state-overwrite races", c)
+        self.assertIn("write-write race", c)
+        # The discriminator the drones kept getting wrong: set-then-cleared vs never-set.
+        self.assertIn("appeared then vanished", c)
+        self.assertIn("missed event", c)
+
+    def test_loaded_file_contract_carries_overwrite_rule(self):
+        # run_pipeline loads recipes/comb_contract_v2.md (not the constant); keep parity.
+        c = fanout.load_comb_contract("recipes/comb_contract_v2.md", "X:/cb")
+        self.assertIn("Async state-overwrite races", c)
+        self.assertIn("generation / version / sequence / timestamp guard", c)
+
 
 if __name__ == "__main__":
     unittest.main()

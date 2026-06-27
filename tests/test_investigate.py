@@ -26,6 +26,7 @@ from hive.investigate import (
     _mutation_symptom_seed, promote_mutation_path_axes,
     inject_mutation_path_anchor, _writer_layer_hits,
 )
+from hive.decompose import independent_axes
 from hive.reinvestigate import (
     ReinvestPlan, ACTION_RE_CONVERGE, ACTION_RE_RETRIEVE,
 )
@@ -1832,6 +1833,106 @@ class TestGateIndependentFKMisrouting(unittest.TestCase):
 
 def _norm(p: str) -> str:
     return (p or "").replace("\\", "/")
+
+
+class TestSwarmPathMutationGuardWiring(unittest.TestCase):
+    """NR hivework.0054.0003 — the swarm `run` path used to feed RAW decompose axes to
+    fan-out with NO write-path guard (only the cheap `investigate` path ran them). When
+    the queen framed a persistence-class 500 around its endpoint (run553: EP/SVC) the
+    swarm chased the routing decoy and MISSED the events FK locus; run554 happened to
+    emit a db_mutation axis and FOUND it (same small-copilot preset → recall coin-flip).
+    These tests pin the guard CHAIN now applied in hive.run_pipeline so the swarm path
+    no longer depends on decompose luck."""
+
+    FK_SEED = ("POST /groups/{id}/dispose returns 500: sqlite3.IntegrityError: "
+               "FOREIGN KEY constraint failed.")
+    REAL_SEED = ("Discarding a workflow group fails: POST /groups/{id}/dispose "
+                 "returns 500 Internal Server Error.")
+
+    def _mk_repo(self, td):
+        svc = os.path.join(td, "server", "modules")
+        os.makedirs(svc)
+        with open(os.path.join(svc, "process_service.py"), "w",
+                  encoding="utf-8") as f:
+            f.write("def dispose_group(group_id, reason):\n"
+                    "    db.insert_event(group_id, 'group_disposed', note=reason)\n")
+
+    def _run553_axes(self):
+        # The MISS shape: only endpoint/service-narrative axes, no write signature.
+        return [
+            {"id": "EP", "title": "endpoint / routing",
+             "brief": "trace POST /groups/{id}/dispose handler, CORS, auth, routing",
+             "search_plan": {"keywords": ["dispose", "route"],
+                             "file_globs": ["server/**/router*.py"], "doc_topics": []}},
+            {"id": "SVC", "title": "service surface",
+             "brief": "the dispose service entrypoint and its response shape",
+             "search_plan": {"keywords": ["dispose"],
+                             "file_globs": ["server/**/api*.py"], "doc_topics": []}},
+        ]
+
+    def _swarm_axis_prep(self, tasks, seed, code_root):
+        # The EXACT chain hive.run_pipeline now applies after decompose.
+        tasks = promote_mutation_path_axes(tasks, seed, code_root)
+        axes = independent_axes(tasks)
+        axes = _prioritize_axes(axes, seed)
+        axes = inject_mutation_path_anchor(axes, seed, code_root)
+        axes = ensure_mutation_path_axis(axes, seed, code_root)
+        return axes
+
+    def test_run553_shape_gets_mutation_anchor_injected(self):
+        with tempfile.TemporaryDirectory() as td:
+            self._mk_repo(td)
+            axes = self._swarm_axis_prep(self._run553_axes(), self.FK_SEED, td)
+            ids = [a["id"] for a in axes]
+            self.assertIn("MUTATION_ANCHOR", ids,
+                          "swarm path must synthesise the write-path axis the queen "
+                          "omitted (the run553 MISS)")
+            anchor = next(a for a in axes if a["id"] == "MUTATION_ANCHOR")
+            globs = anchor["search_plan"]["file_globs"]
+            self.assertTrue(any("process_service.py" in g for g in globs),
+                            "anchor must be scoped to the real write site")
+
+    def test_run553_realistic_seed_without_fk_word_still_injects(self):
+        with tempfile.TemporaryDirectory() as td:
+            self._mk_repo(td)
+            axes = self._swarm_axis_prep(self._run553_axes(), self.REAL_SEED, td)
+            self.assertIn("MUTATION_ANCHOR", [a["id"] for a in axes])
+
+    def test_injected_anchor_survives_fanout_call_budget(self):
+        # Guardrail #1 (NR §4): a tight max_calls must NOT trim the synthesised anchor.
+        from hive.fanout import _apply_axis_call_budget
+        with tempfile.TemporaryDirectory() as td:
+            self._mk_repo(td)
+            axes = self._swarm_axis_prep(self._run553_axes(), self.FK_SEED, td)
+            trimmed = _apply_axis_call_budget(axes, max_calls=1, respecify_retries=0)
+            self.assertIn("MUTATION_ANCHOR", [a["id"] for a in trimmed],
+                          "the protected write-path anchor must outrank generic axes "
+                          "under a tight fan-out budget")
+
+    def test_run554_shape_is_noop_no_duplicate_anchor(self):
+        # The FOUND shape: queen already emitted a real db-write axis → no injection,
+        # no regression on the cycles that already worked.
+        with tempfile.TemporaryDirectory() as td:
+            self._mk_repo(td)
+            tasks = self._run553_axes() + [
+                {"id": "db_mutation", "title": "data-mutation write path",
+                 "brief": "dispose_group calls db.insert_event(group_id, ...) write",
+                 "search_plan": {"keywords": ["insert_event"],
+                                 "file_globs": ["server/modules/**/*.py"],
+                                 "doc_topics": []}}]
+            axes = self._swarm_axis_prep(tasks, self.FK_SEED, td)
+            self.assertNotIn("MUTATION_ANCHOR", [a["id"] for a in axes],
+                             "must not duplicate when a real write axis exists")
+            self.assertIn("db_mutation", [a["id"] for a in axes])
+
+    def test_non_mutation_seed_injects_nothing(self):
+        # Regression safety: a read/sort bug must not trigger the write-path guard.
+        with tempfile.TemporaryDirectory() as td:
+            self._mk_repo(td)
+            axes = self._swarm_axis_prep(
+                self._run553_axes(),
+                "the group list renders in the wrong sort order", td)
+            self.assertNotIn("MUTATION_ANCHOR", [a["id"] for a in axes])
 
 
 if __name__ == "__main__":

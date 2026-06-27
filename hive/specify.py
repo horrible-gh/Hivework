@@ -44,6 +44,11 @@ from hive import dbread
 from hive import schema_ground
 from hive.http_shape_synth import synthesize_http_shape_red_test
 from hive.write_sink_synth import synthesize_write_sink_red_test
+from hive.overwrite_race_synth import (
+    detect_overwrite_race_symptom,
+    synthesize_guarded_write_edits,
+    synthesize_overwrite_race_red_test,
+)
 from hive.investigate import SEED_TARGET_SECTION, CONVERGE_TARGET_SECTION
 from hive.parse import extract_first_json
 from hive.providers import call_worker
@@ -154,6 +159,12 @@ RI_LAYER_CONTRADICTION = "converge_author_layer_contradiction"
 #   lowered to DIVERGENT repairs (one swaps the callee/sink, a sibling only swaps an
 #   argument); the spec cannot be vouched until both sites take the canonical transform.
 RI_SAME_FACET_DIVERGENCE = "same_facet_divergence"
+#   guard_inert → an overwrite-race guard was lowered with its three symbols split apart —
+#   a generation token is declared/advanced/captured but never COMPARED (stale-reject
+#   missing), or compared but never advanced — so the guard does nothing; both write-sites
+#   must carry the full guard (token + live-writer advance + async-writer stale-reject) or
+#   the appear-then-vanish race is unfixed (lever L3 — NR0003 0057).
+RI_GUARD_INERT = "guard_inert"
 
 
 def _append_note(spec: dict[str, Any], note: str) -> None:
@@ -2647,6 +2658,104 @@ def _apply_same_facet_consistency_gate(spec: dict[str, Any]) -> dict[str, Any]:
     return spec
 
 
+# Kill-switch for the overwrite-race guard consistency gate (lever L3 — NR0003 0057),
+# mirroring HIVE_NO_FACET_NORMALIZE. When set, the gate is a no-op (A/B isolation).
+_GUARD_CONSISTENCY_ENV_OFF = "HIVE_NO_GUARD_CONSISTENCY"
+
+# The three symbols a sound overwrite-race guard needs, recognised in edit text so the gate
+# catches BOTH lever-L3-lowered edits (which also carry ``guard_role``) and a hand-authored
+# guard. A token that is written (advanced/captured) but never COMPARED — or compared but
+# never advanced — is inert: it gates nothing, so the stale async write still clobbers.
+_GUARD_TOKEN_DECL_RE = re.compile(r"\b(?:let|var|const)\s+\w*[Gg]eneration\b\s*=")
+_GUARD_ADVANCE_RE = re.compile(r"\w*[Gg]eneration\b\s*(?:\+=\s*1|\+\+)|\+\+\s*\w*[Gg]eneration\b")
+_GUARD_COMPARE_RE = re.compile(r"===\s*\w*[Gg]eneration\b|\w*[Gg]eneration\b\s*===|_shouldReplace\w*")
+
+
+def _guard_symbols_present(spec: dict[str, Any]) -> dict[str, bool]:
+    """Which of the three overwrite-race guard symbols the spec's SOURCE edits carry.
+
+    ``decl`` (the generation token is declared), ``advance`` (a writer advances it so an
+    in-flight async write is superseded), ``compare`` (a writer rejects a stale response by
+    comparing the captured generation — the actual bite). Reads ``guard_role`` markers when
+    present (lever-L3 lowering) and falls back to recognising the symbols in edit text (a
+    hand-authored guard). Pure-local, never raises."""
+    roles: set[str] = set()
+    blob_parts: list[str] = []
+    for e in (spec.get("edits") or []):
+        if not isinstance(e, dict):
+            continue
+        if e.get("kind", "edit") == "create_file" and _is_test_path(e.get("file", "")):
+            continue  # a red test naming the token is not the guard itself
+        r = e.get("guard_role")
+        if r:
+            roles.add(str(r))
+        blob_parts.append((e.get("replacement_new") or "") + "\n" + (e.get("content") or ""))
+    if roles:
+        # Lever-L3-lowered edits are fully role-tagged → decide by roles ALONE. The text
+        # fallback would over-count here: the token-decl edit embeds the helper DEFINITION
+        # (``=== generation``) and the async capture writes ``const fetchGeneration = …`` —
+        # both would wrongly satisfy the compare/decl regexes that exist for a role-less guard.
+        return {"decl": "token_decl" in roles,
+                "advance": "live_advance" in roles or "async_capture" in roles,
+                "compare": "async_reject" in roles}
+    blob = "\n".join(blob_parts)
+    return {"decl": bool(_GUARD_TOKEN_DECL_RE.search(blob)),
+            "advance": bool(_GUARD_ADVANCE_RE.search(blob)),
+            "compare": bool(_GUARD_COMPARE_RE.search(blob))}
+
+
+def _has_any_guard_activity(spec: dict[str, Any]) -> bool:
+    """True when ANY source edit touches a generation token (a guard repair is in play)."""
+    syms = _guard_symbols_present(spec)
+    return any(syms.values())
+
+
+def _apply_guard_consistency_gate(spec: dict[str, Any]) -> dict[str, Any]:
+    """Ensure an overwrite-race guard lands as a WHOLE, or downgrade it (lever L3 — NR0003).
+
+    The 0062 fix is a generation guard threaded through BOTH writers of one reactive ref: a
+    token declared once, ADVANCED by the live writer (so a stale in-flight async write is
+    superseded) and COMPARED by the async writer (so it discards its own stale response). The
+    three symbols are load-bearing only TOGETHER — a token advanced but never compared gates
+    nothing (the async write still clobbers); a compare with nothing advancing always passes
+    (also inert). NR0003 hole ③: no sibling-consistency gate existed for this guard class.
+
+    This gate fires ONLY when a guard repair is in play (some generation-token symbol is
+    present). It then requires all three symbols across the source edits; if any is missing
+    the guard is inert, so the spec is downgraded to needs_reinvestigation with a directive to
+    complete the guard (edits RETAINED). A complete guard is stamped ``guard_consistency`` and
+    left untouched. Downgrade-only — it never invents the missing edit, mirroring L1's
+    discipline. Pure-local, deterministic, never raises. Kill-switch
+    ``HIVE_NO_GUARD_CONSISTENCY=1`` makes it a no-op (A/B isolation)."""
+    if os.environ.get(_GUARD_CONSISTENCY_ENV_OFF):
+        return spec
+    if not _has_any_guard_activity(spec):
+        return spec  # no guard repair in this spec → nothing to check
+    syms = _guard_symbols_present(spec)
+    missing = [k for k in ("decl", "advance", "compare") if not syms[k]]
+    if not missing:
+        spec["guard_consistency"] = {"complete": True, "symbols": syms}
+        logger.info("specify: overwrite-race guard consistency gate — all three guard "
+                    "symbols present (decl+advance+compare); guard is load-bearing")
+        return spec
+    _LABEL = {"decl": "the generation-token declaration",
+              "advance": "the live writer's generation advance",
+              "compare": "the async writer's stale-reject comparison"}
+    note = ("overwrite-race guard consistency gate (L3): a generation guard was started but "
+            f"is INERT — missing {', '.join(_LABEL[m] for m in missing)}. The guard only "
+            "discards a stale async write when ALL THREE land together: declare the token, "
+            "ADVANCE it in the live/optimistic writer, and COMPARE the captured generation in "
+            "the async writer before it commits. Complete the guard at both write-sites.")
+    logger.warning("specify: overwrite-race guard consistency gate — guard is inert "
+                   "(missing %s); downgrading", missing)
+    _set_reinvestigation(spec, reason_code=RI_GUARD_INERT,
+                         gate="guard_consistency", note=note,
+                         detail=f"missing guard symbols: {missing}")
+    spec.setdefault("guard_consistency", {})["complete"] = False
+    spec["guard_consistency"]["missing"] = missing
+    return spec
+
+
 def _verify_test_pins_old_callee(spec: dict[str, Any], old_callee: str,
                                  canonical_callee: str) -> bool:
     """True when the spec's verify red-test text references ``old_callee`` but not the
@@ -3267,6 +3376,127 @@ def _synthesize_write_sink_red_test(spec: dict[str, Any], honey_text: str,
     return spec
 
 
+# Kill-switches for the overwrite-race lever L3 (NR0003 0057): the guarded-write LOWERING
+# (① — inject the generation guard) and the behaviour ORACLE (② — the last-write-wins red
+# test). Mirror HIVE_NO_HTTP_SHAPE / HIVE_NO_WRITE_SINK_ORACLE; when set, each pass is a
+# no-op and specify keeps prior behaviour.
+_OVERWRITE_RACE_LOWER_ENV_OFF = "HIVE_NO_OVERWRITE_RACE_LOWER"
+_OVERWRITE_RACE_ORACLE_ENV_OFF = "HIVE_NO_OVERWRITE_RACE_ORACLE"
+
+
+def _lower_overwrite_race(spec: dict[str, Any], honey_text: str, codebase_root: str,
+                          source_file: str | None = None) -> dict[str, Any]:
+    """Inject the guarded-write edits when the 0062 overwrite-race symptom is recognised but
+    the spec carries NO guard repair yet (lever L3 lowering ① — NR0003 hole ①).
+
+    The lowering template specify never had: when the live file shows one reactive ref written
+    by an async clobber-writer (assigns from an awaited response) AND a live writer, but the
+    author lowered no generation guard, synthesise the deterministic guarded-write edits
+    (token + helper, live-writer advance, async capture + stale-reject) from the live anchors
+    — the same SAME-FILE ``docFetchGeneration`` discipline 0062 already trusts for the
+    document detail. Each edit's ``file`` is stamped to the symptom's source path and a
+    ``red_test_node`` is left for the oracle (②) to attach.
+
+    Fail-open and conservative: a no-op when the kill-switch is on, when the spec ALREADY
+    carries a guard repair (never clobber the author's own guard — the consistency gate ③
+    validates that one), when the symptom does not resolve, or when an edit id/file would
+    collide. Adds edits only; never a gate. Never raises."""
+    if os.environ.get(_OVERWRITE_RACE_LOWER_ENV_OFF):
+        return spec
+    try:
+        if _has_any_guard_activity(spec):
+            return spec  # the author (or a prior pass) already lowered a guard → don't clobber
+        symptom = detect_overwrite_race_symptom(honey_text, codebase_root,
+                                                source_file=source_file)
+        if symptom is None:
+            return spec  # symptom not recognised → fail-open, keep today's behaviour
+        edits = synthesize_guarded_write_edits(symptom)
+        if not edits:
+            return spec
+        existing_ids = {str(e.get("id")) for e in (spec.get("edits") or [])
+                        if isinstance(e, dict)}
+        for e in edits:
+            if str(e.get("id")) in existing_ids:
+                return spec  # id collision (very unlikely) → decline rather than risk a dup
+        for e in edits:
+            e["file"] = symptom.source_file
+        spec.setdefault("edits", []).extend(edits)
+        # The guard is a concrete, anchor-derived fix → the spec is applyable.
+        if spec.get("termination") != "ready_to_apply":
+            spec["termination"] = "ready_to_apply"
+            spec.pop("reinvestigation", None)
+        _append_note(spec, f"overwrite-race guard lowered (lever L3): threaded a "
+                     f"{symptom.gen_token} generation guard through the live writer "
+                     f"({', '.join(w.name for w in symptom.live_writers)}) and the async "
+                     f"writer ({symptom.async_writer.name}) so a stale refetch can no longer "
+                     f"clobber {symptom.ref} (the appear-then-vanish race).")
+        logger.info("specify: lowered overwrite-race guard for %s in %s (writers: live=%s "
+                    "async=%s) → %d edits", symptom.ref, symptom.source_file,
+                    [w.name for w in symptom.live_writers], symptom.async_writer.name,
+                    len(edits))
+    except Exception as e:  # lowering must never break authoring
+        logger.warning("specify: overwrite-race guard lowering skipped (%s)", e)
+    return spec
+
+
+def _synthesize_overwrite_race_red_test(spec: dict[str, Any], honey_text: str,
+                                        codebase_root: str,
+                                        setup_block: str | None = None,
+                                        fixture_call: str = "makeRaceHarness()",
+                                        source_file: str | None = None,
+                                        test_dir: str = "client/src/test") -> dict[str, Any]:
+    """Attach a last-write-wins red test so apply observes red→green (lever L3 oracle ②).
+
+    The independent behaviour oracle NR0003 hole ② named: when the spec carries an
+    overwrite-race guard repair (a ``guard_role`` edit) and a runnable vitest harness is
+    supplied, synthesise a test that drives the race ORDER — async clobber-writer starts,
+    live writer commits, the stale async response resolves last — and asserts the ref still
+    holds the live value. RED while the async write is unguarded (it clobbers), GREEN once the
+    generation guard discards the stale response; ``verify.py`` certifies by EXECUTION.
+
+    Mirrors the lever-⑦ / L2 wrappers: fail-open (no-op without a guard repair, without a
+    harness, or under the kill-switch), never clobbers an existing red-test node, and wires
+    ``spec.verify`` so ``apply --verify`` runs it. Never raises."""
+    if os.environ.get(_OVERWRITE_RACE_ORACLE_ENV_OFF):
+        return spec
+    try:
+        verify = spec.get("verify") if isinstance(spec.get("verify"), dict) else {}
+        if verify.get("red_test_node"):
+            return spec  # a red test already drives the loop — don't clobber
+        symptom = detect_overwrite_race_symptom(honey_text, codebase_root,
+                                                source_file=source_file)
+        result = synthesize_overwrite_race_red_test(
+            spec, honey_text, codebase_root, symptom=symptom,
+            setup_block=setup_block, fixture_call=fixture_call,
+            test_dir=test_dir or "client/src/test")
+        if not result:
+            return spec  # no guard repair, or no runnable harness → fail-open
+        edits = [e for e in (spec.get("edits") or []) if isinstance(e, dict)]
+        existing_ids = {str(e.get("id")) for e in edits}
+        existing_files = {e.get("file") for e in edits}
+        if (result["edit"]["id"] in existing_ids
+                or result["edit"]["file"] in existing_files):
+            return spec
+        spec.setdefault("edits", []).append(result["edit"])
+        vblock = spec.setdefault("verify", {})
+        if not isinstance(vblock, dict):
+            vblock = {}
+            spec["verify"] = vblock
+        vblock["red_test_node"] = result["node"]
+        ids = list(vblock.get("test_edit_ids") or [])
+        if result["edit"]["id"] not in ids:
+            ids.append(result["edit"]["id"])
+        vblock["test_edit_ids"] = ids
+        sym = result["symptom"]
+        _append_note(spec, f"overwrite-race oracle synthesised (lever L3): {sym.ref} must "
+                     "equal the live write after a stale async response resolves last.")
+        logger.info("specify: synthesised overwrite-race last-write-wins red test for %s → "
+                    "node %s", sym.ref, result["node"])
+    except Exception as e:  # observation must never break authoring
+        logger.warning("specify: overwrite-race oracle synthesis skipped (%s)", e)
+    return spec
+
+
 def run_specify(
     honey_path: str,
     codebase_root: str,
@@ -3290,6 +3520,10 @@ def run_specify(
     write_sink_setup_block: str | None = None,
     write_sink_request: Any = None,
     write_sink_test_dir: str = "tests",
+    overwrite_race_setup_block: str | None = None,
+    overwrite_race_fixture_call: str = "makeRaceHarness()",
+    overwrite_race_source_file: str | None = None,
+    overwrite_race_test_dir: str = "client/src/test",
 ) -> dict[str, Any]:
     """Run the specify stage: honey + live code → edit-spec JSON.
 
@@ -3544,6 +3778,29 @@ def run_specify(
         setup_block=write_sink_setup_block,
         request=write_sink_request,
         test_dir=write_sink_test_dir)
+
+    # Overwrite-race lever L3 (NR0003 0057): the 0062 client write-write race fix-synthesis,
+    # in three pieces that close NR0003's three holes, run as a unit so a lowered guard is
+    # always validated and certifiable:
+    #   ① LOWERING — when the live file shows the symptom (one reactive ref written by an
+    #      async clobber-writer + a live writer) but the author lowered no guard, inject the
+    #      deterministic guarded-write edits (token + live advance + async capture/reject).
+    #   ③ CONSISTENCY GATE — require the guard's three symbols to land TOGETHER (a token
+    #      advanced but never compared, or vice versa, is inert); downgrade a partial guard.
+    #      Runs after lowering so it validates both a lowered guard and an author's own.
+    #   ② ORACLE — attach the last-write-wins red test so apply observes red→green by
+    #      execution. Like ⑦/L2 it needs a runnable (vitest) harness and is fail-open.
+    # All three are fully fail-open and gated on the symptom/harness; a no-op on non-race
+    # specs and under their kill-switches.
+    spec = _lower_overwrite_race(spec, honey_text, codebase_root,
+                                 source_file=overwrite_race_source_file)
+    spec = _apply_guard_consistency_gate(spec)
+    spec = _synthesize_overwrite_race_red_test(
+        spec, honey_text, codebase_root,
+        setup_block=overwrite_race_setup_block,
+        fixture_call=overwrite_race_fixture_call,
+        source_file=overwrite_race_source_file,
+        test_dir=overwrite_race_test_dir)
 
     # Step A finalizer: if the spec lands in needs_reinvestigation but NO gate stamped a
     # structured reason, the AUTHOR itself emitted it — record that so the reactive bridge
