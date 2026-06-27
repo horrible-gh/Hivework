@@ -1,0 +1,12 @@
+[tool.pytest.ini_options]
+# Hivework has no package build; this file exists only to scope pytest collection.
+# Root-level `pytest` / `pytest -q` previously aborted at collection because
+# `perf/golden/test_group_r.py` is a clone-injected golden fixture importing the
+# FlowGate `modules` package (see perf/golden/conftest.py). We ignore that dir here
+# as a second, explicit guard while still collecting `tests/` and `perf/metrics/`.
+#
+# `smoke/` is gitignored: it holds clone-injection golden/behavioral fixtures (e.g.
+# smoke/0018_apply/test_*_0082.py, which also import the clone's `modules`/server
+# packages) and per-run output artifacts -- never Hivework's own unit tests. Ignored
+# so a bare root `pytest` collects only the real suite (`tests/` + `perf/metrics/`).
+addopts = "-p no:cacheprovider --ignore=perf/golden --ignore=smoke"
