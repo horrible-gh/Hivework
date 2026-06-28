@@ -1,0 +1,69 @@
+# Hivework custom — live config profiles are local (machine paths, future secrets);
+# only the example reference is tracked.
+config/hive.config.*
+!config/hive.config.example.json
+/state/
+/memory/
+.*
+
+# Perf harness: track source/config/docs, ignore generated run output.
+/perf/*
+!/perf/*.py
+!/perf/README.md
+!/perf/matrix.json
+!/perf/HANDOFF_module_unit.md
+!/perf/golden/
+/perf/golden/*
+!/perf/golden/manifest.json
+
+# Perf metrics report (perf/metrics/): track renderer/docs/sample input,
+# ignore generated HTML and live run output (runs.jsonl, runs.sample.html).
+!/perf/metrics/
+/perf/metrics/*
+!/perf/metrics/*.py
+!/perf/metrics/*.md
+!/perf/metrics/runs.sample.jsonl
+
+# Claude / local
+/.claude/
+
+# Smoke fixtures (local only)
+/smoke/
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+build/
+dist/
+
+# Virtual envs
+.venv/
+venv/
+env/
+
+# Secrets — Hivework's real secrets live OUTSIDE the repo (~/.hivework/.env or
+# $HIVE_ENV_FILE; run setup.bat / setup.sh to create it). These patterns are
+# defence-in-depth so a stray local .env can never be committed.
+.env
+.env.*
+*.secrets.json
+
+# Hive runtime artifacts
+hive_ledger.db*
+hive_workdir/
+/.apply_backups/
+
+# T901 perf-sweep run output (gen_profiles regenerates the profiles, already ignored above)
+/perf/results/
+# decompose debug dumps written to the run cwd
+/decompose_prompt_last.txt
+/decompose_raw_last.txt
+
+# OS / editor cruft
+.DS_Store
+Thumbs.db
+.idea/
