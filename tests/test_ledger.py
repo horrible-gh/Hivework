@@ -196,6 +196,20 @@ class TestLedgerInsertAndAggregate(unittest.TestCase):
         ldg.close()
         self.assertEqual(n, 0)
 
+    def test_timed_local_records_local_row(self):
+        with self.ldg.timed_local("axis_plan", mechanism="searchplan", detail="judged=2"):
+            pass
+        conn = sqlite3.connect(self.db_path)
+        row = conn.execute(
+            "SELECT stage, provider, model, comb_path, latency_s FROM worker_calls"
+        ).fetchone()
+        conn.close()
+        self.assertEqual(row[0], "axis_plan")
+        self.assertEqual(row[1], "local")
+        self.assertEqual(row[2], "searchplan")
+        self.assertEqual(row[3], "judged=2")
+        self.assertGreaterEqual(row[4], 0.0)
+
     def test_finish_run_aggregates(self):
         self.ldg.record_call("swarm", "A", "copilot", "gpt-5-mini",
                               prompt="a"*100, output="b"*50, latency_s=1.0)

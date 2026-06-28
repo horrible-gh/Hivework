@@ -590,7 +590,10 @@ class TestShippedDefaultProfile(unittest.TestCase):
     def test_judge_routed_to_openai_with_tuned_caps(self):
         self.assertEqual(self.cfg.role("judge").provider, "openai")
         self.assertEqual(self.cfg.judge.max_axes, 10)
-        self.assertEqual(self.cfg.judge.votes_per_axis, 5)
+        # L3 (0062.0004-T): jury_size lowered 5->3 (recall-safe — frozen A/B core_recall
+        # Δ=0; judge was the #1 modelpath cost). The shipped default now ships the 3-juror
+        # floor. Premise updated from the old votes=5 default.
+        self.assertEqual(self.cfg.judge.votes_per_axis, 3)
 
     def test_swarm_run_default_off(self):
         # The SHIPPED default keeps the source-mining swarm OFF (pipeline.fanout.enabled
