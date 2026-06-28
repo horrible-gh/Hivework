@@ -1,5 +1,7 @@
 # Hivework
 
+> ⚠️ **Status: WIP / experimental** — actively developed, interfaces may change.
+
 A tool that orchestrates codebase investigation and fixes as a **multi-stage
 pipeline** rather than a single model call. It investigates broadly with a swarm of
 cheap workers, converges conflicts through re-investigation, and spends expensive
