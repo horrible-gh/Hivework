@@ -14,7 +14,7 @@ Token accounting tiers:
                            and code metrics but no prompt/completion token fields).
                           Column is kept nullable for future providers.
 """
-import logging, os, sqlite3, threading, time
+import contextlib, logging, os, sqlite3, threading, time
 from datetime import datetime, timezone
 from typing import Any
 
@@ -280,6 +280,28 @@ class Ledger:
         except Exception as e:
             logger.warning("Ledger: record_local failed: %s", e)
 
+    @contextlib.contextmanager
+    def timed_local(self, stage: str, axis_id: str = "", mechanism: str = "",
+                    detail: str = ""):
+        """Time a LOCAL (non-model) orchestration phase and record it as a local row.
+
+        L4 (0062.0006-T): the 0061 diagnosis split a cycle's wall into modelpath
+        (Σ worker-call critical path) + a ~31.7% local RESIDUAL — parse / conflict-
+        scan / reconcile / codemap / prompt-assembly that never hit a model and so
+        carried no ledger row, leaving the residual un-attributable. This wraps such
+        a phase: it measures wall with ``time.monotonic`` and emits ONE
+        ``record_local`` row (provider='local', model spend untouched) so
+        ``perf/residual_breakdown.py`` can attribute the residual to named phases.
+        Pure-additive: the body runs identically whether or not a row lands, and a
+        recording failure never propagates (record_local swallows its own errors).
+        """
+        t0 = time.monotonic()
+        try:
+            yield
+        finally:
+            self.record_local(stage, axis_id, mechanism=mechanism, detail=detail,
+                              latency_s=round(time.monotonic() - t0, 3))
+
     def finish_run(self, honey_path: str = "", axes_n: int = 0, rounds: int = 0,
                    conflicts_n: int = 0, remaining_n: int = 0,
                    parse_errs: int = 0, status: str = "done") -> None:
@@ -324,6 +346,9 @@ class NullLedger:
     def finish_call(self, *a, **kw): pass
     def record_call(self, *a, **kw): pass
     def record_local(self, *a, **kw): pass
+    @contextlib.contextmanager
+    def timed_local(self, *a, **kw):
+        yield
     def finish_run(self, *a, **kw): pass
     def close(self): pass
 

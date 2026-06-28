@@ -20,6 +20,7 @@ are skipped (a deterministic, free gate; smarter routing is a later lever).
 """
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import os
@@ -40,6 +41,15 @@ from hive.searchplan import (
 )
 
 logger = logging.getLogger("hive.investigate")
+
+
+def _local_timer(ledger, **kwargs):
+    timed = getattr(ledger, "timed_local", None)
+    if callable(timed):
+        cm = timed(**kwargs)
+        if hasattr(cm, "__enter__") and hasattr(cm, "__exit__"):
+            return cm
+    return contextlib.nullcontext()
 
 # Header for the honey section that lists the seed's own explicitly-named edit
 # targets (Defect 2). specify parses this section to GROUND those files' live text
@@ -960,6 +970,11 @@ def run_investigate(
     # leaves by seed-relevance and inject the seed's own named target as a front
     # axis, BEFORE the position-based max_axes truncation — so a scattered queen
     # cannot bury or skip the spot the seed explicitly points at.
+    # L4 (0062.0006-T) residual instrumentation: the post-decompose prep below
+    # (_prioritize_axes + mutation/seed anchor injection + codemap BE-root trace +
+    # call-budget) is pure-local CPU + ripgrep that carries no worker-call row, so it
+    # lands in the 0061 ~31.7% wall residual unattributed. Bracket it as one local row.
+    _t_decompose_local = time.monotonic()
     leaves = _prioritize_axes(leaves, seed_text)
     # Mutation-path INJECTION (NR hivework.0037.0007): the reorder guards below only
     # rescue a write-path axis the queen ALREADY emitted. When a stochastic decompose
@@ -1026,6 +1041,11 @@ def run_investigate(
                     budget, votes_cfg, effective_votes, len(judged),
                     len(judged) * effective_votes * per_vote_calls,
                     len(judged), effective_votes, per_vote_calls)
+    if ledger:
+        ledger.record_local(
+            stage="decompose_local", axis_id="", mechanism="prioritize+anchor+codemap",
+            detail=f"leaves={len(leaves)} judged={len(judged)}",
+            latency_s=round(time.monotonic() - _t_decompose_local, 3))
 
     # ── ②..③ per axis: bridge → local retrieve (free) → JUDGE (budgeted).
     # The axes are INDEPENDENT: each judges only its own retrieve bundle against the
@@ -1040,34 +1060,36 @@ def run_investigate(
     # Seed-named, on-disk edit targets — passed to every axis's judge so a verdict
     # citing one is grounded even when that axis's own retrieve didn't window it
     # (Defect 4a: seed files aren't guaranteed in every per-axis bundle).
-    seed_files = {t["file"] for t in seed_edit_targets(seed_text, code_root, docs_root)}
-    # Pre-resolve each judged axis's search plan (pure, cheap) so the docs=(none)
-    # confound (N165) is surfaced ONCE here, before the fan-out — not racily (and
-    # possibly multiple times) from inside concurrent workers.
-    plans = [task_to_searchplan(task, default_globs=default_globs) for task in judged]
-    # Visibility-class symptom (N176): a "not visible / disabled / not rendered" report
-    # is produced by the component template's conditional-render branch, not the data
-    # layer the brief is usually worded around. Deterministically add the template
-    # directives (v-if/v-show/…) to every plan so the branch is retrieved wherever a
-    # front-end file is in scope — a no-op where none is (never a fabricated finding).
-    if is_visibility_symptom(seed_text):
-        plans = [with_visibility_probe(sp) for sp in plans]
-        logger.info("visibility-class symptom detected — added template conditional-"
-                    "render probe (v-if/v-show/v-for/:disabled) to %d axis plan(s)",
-                    len(plans))
-    if docs_root is None:
-        # docs=(none) confound (N165): the queen produced doc_topics for an axis but
-        # no docs tree was supplied, so the entire design-doc channel is silently
-        # skipped and any doc-targeting glob degrades into a code-tree search. Surface
-        # it once at WARNING — a missing --docs is an invocation bug, not a result.
-        for sp in plans:
-            if sp.doc_topics:
-                logger.warning(
-                    "docs_root not supplied (--docs) but axes carry doc_topics "
-                    "(first: [%s] topics=%s): the design-doc channel is DISABLED and "
-                    "doc-targeted globs fall back to the code tree. Pass --docs <dir> "
-                    "to enable design retrieval.", sp.axis_id, sp.doc_topics)
-                break
+    with _local_timer(ledger, stage="axis_plan", mechanism="searchplan",
+                      detail=f"judged={len(judged)}"):
+        seed_files = {t["file"] for t in seed_edit_targets(seed_text, code_root, docs_root)}
+        # Pre-resolve each judged axis's search plan (pure, cheap) so the docs=(none)
+        # confound (N165) is surfaced ONCE here, before the fan-out — not racily (and
+        # possibly multiple times) from inside concurrent workers.
+        plans = [task_to_searchplan(task, default_globs=default_globs) for task in judged]
+        # Visibility-class symptom (N176): a "not visible / disabled / not rendered" report
+        # is produced by the component template's conditional-render branch, not the data
+        # layer the brief is usually worded around. Deterministically add the template
+        # directives (v-if/v-show/…) to every plan so the branch is retrieved wherever a
+        # front-end file is in scope — a no-op where none is (never a fabricated finding).
+        if is_visibility_symptom(seed_text):
+            plans = [with_visibility_probe(sp) for sp in plans]
+            logger.info("visibility-class symptom detected — added template conditional-"
+                        "render probe (v-if/v-show/v-for/:disabled) to %d axis plan(s)",
+                        len(plans))
+        if docs_root is None:
+            # docs=(none) confound (N165): the queen produced doc_topics for an axis but
+            # no docs tree was supplied, so the entire design-doc channel is silently
+            # skipped and any doc-targeting glob degrades into a code-tree search. Surface
+            # it once at WARNING — a missing --docs is an invocation bug, not a result.
+            for sp in plans:
+                if sp.doc_topics:
+                    logger.warning(
+                        "docs_root not supplied (--docs) but axes carry doc_topics "
+                        "(first: [%s] topics=%s): the design-doc channel is DISABLED and "
+                        "doc-targeted globs fall back to the code tree. Pass --docs <dir> "
+                        "to enable design retrieval.", sp.axis_id, sp.doc_topics)
+                    break
 
     def _investigate_axis(idx, task, sp):
         """Retrieve (free, local) then JUDGE one axis. Independent of other axes;
@@ -1219,33 +1241,36 @@ def run_investigate(
                 slots[idx] = (verdict_entry, keep_bundle)
     # Reassemble in the original judged order so the verdicts/bundles pairing (and
     # therefore converge's input) is identical to the sequential path.
-    verdicts: list[dict[str, Any]] = [s[0] for s in slots if s is not None]
-    bundles: list[dict[str, Any]] = [s[1] for s in slots if s is not None]
+    with _local_timer(ledger, stage="verdict_merge", mechanism="slots+fk_pre",
+                      detail=f"slots={len(slots)}"):
+        verdicts: list[dict[str, Any]] = [s[0] for s in slots if s is not None]
+        bundles: list[dict[str, Any]] = [s[1] for s in slots if s is not None]
 
-    # ── Lever A (hivework.default.0036.0005-NR): gate-independent FK-misrouting check.
-    # The deterministic schema/FK write-arg check (rec B, hivework.0033.0013-T) that
-    # surfaces a provable cross-FK swap — e.g. ``insert_event(group_id, ...)`` routing a
-    # ``group_id`` (FK→groups) into ``events.doc_id`` (FK→documents) → runtime FK violation
-    # — lives INSIDE run_converge, which is itself gated behind ``located_n >= 2`` below.
-    # run506 (0082, swarm OFF) exposed the failure: the judge dismissed the real write-path
-    # axis as "functions as designed" (it never inferred the FK mechanism from code alone,
-    # comments stripped), so only a decoy axis located → located_n=1 → converge skipped →
-    # the ONE check that does NOT depend on the judge's reasoning never ran, in exactly the
-    # case it exists for. We run it here over the pooled judge evidence, independent of the
-    # converge gate, and inject any facet as a located verdict. Pure / deterministic / no
-    # LLM call / fail-open; same kill-switch (HIVE_NO_FK_MISROUTE) and dedup as converge.
-    # Surfacing it here both restores ``found`` (the honey now carries the FK locus +
-    # mechanism) and lifts located_n so converge runs and attributes to it (converge already
-    # prioritises ``via=fk-misrouting`` loci, converge.py §873).
-    if not os.environ.get("HIVE_NO_FK_MISROUTE"):
-        try:
-            from hive.converge import _fk_misrouting_facets
-            _fk_facets = _fk_misrouting_facets(verdicts, [], bundles, code_root)
-        except Exception as e:  # import / parse guard — never blocks the pipeline
-            logger.warning("investigate: gate-independent FK check skipped: %s", e)
-            _fk_facets = []
-        _inject_fk_facets(_fk_facets, verdicts, bundles,
-                          "gate-independent rec B — judge-blind safeguard, NR0005 lever A")
+        # ── Lever A (hivework.default.0036.0005-NR): gate-independent FK-misrouting check.
+        # The deterministic schema/FK write-arg check (rec B, hivework.0033.0013-T) that
+        # surfaces a provable cross-FK swap — e.g. ``insert_event(group_id, ...)`` routing a
+        # ``group_id`` (FK→groups) into ``events.doc_id`` (FK→documents) → runtime FK violation
+        # — lives INSIDE run_converge, which is itself gated behind ``located_n >= 2`` below.
+        # run506 (0082, swarm OFF) exposed the failure: the judge dismissed the real write-path
+        # axis as "functions as designed" (it never inferred the FK mechanism from code alone,
+        # comments stripped), so only a decoy axis located → located_n=1 → converge skipped →
+        # the ONE check that does NOT depend on the judge's reasoning never ran, in exactly the
+        # case it exists for. We run it here over the pooled judge evidence, independent of the
+        # converge gate, and inject any facet as a located verdict. Pure / deterministic / no
+        # LLM call / fail-open; same kill-switch (HIVE_NO_FK_MISROUTE) and dedup as converge.
+        # Surfacing it here both restores ``found`` (the honey now carries the FK locus +
+        # mechanism) and lifts located_n so converge runs and attributes to it (converge already
+        # prioritises ``via=fk-misrouting`` loci, converge.py §873).
+        if not os.environ.get("HIVE_NO_FK_MISROUTE"):
+            try:
+                from hive.converge import _fk_misrouting_facets
+                _fk_facets = _fk_misrouting_facets(verdicts, [], bundles, code_root)
+            except Exception as e:  # import / parse guard — never blocks the pipeline
+                logger.warning("investigate: gate-independent FK check skipped: %s", e)
+                _fk_facets = []
+            _inject_fk_facets(
+                _fk_facets, verdicts, bundles,
+                "gate-independent rec B — judge-blind safeguard, NR0005 lever A")
 
     # ── ④ converge (the reconcile step the cheap path was missing): stitch the
     # scattered per-axis verdicts into ONE executed call path and attribute the
@@ -1324,32 +1349,36 @@ def run_investigate(
     # attributed defect (converge already prioritises via=fk-misrouting, converge.py §873).
     # Pure / deterministic / no LLM call / fail-open; same kill-switch and dedup.
     if converge_dict and not os.environ.get("HIVE_NO_FK_MISROUTE"):
-        try:
-            from hive.converge import _fk_misrouting_facets
-            _ad = converge_dict.get("attributed_defect") or {}
-            _seed_loci = ([{"verdict": {"located": True, "file": _ad.get("file"),
-                                        "lines": str(_ad.get("lines", ""))}}]
-                          if _ad.get("file") else [])
-            _post_facets = _fk_misrouting_facets(
-                _seed_loci, converge_dict.get("winning_path") or [], bundles, code_root)
-        except Exception as e:  # import / parse guard — never blocks the pipeline
-            logger.warning("investigate: post-converge FK re-scan skipped: %s", e)
-            _post_facets = []
-        _new = _inject_fk_facets(_post_facets, verdicts, bundles,
-                                 "post-converge re-scan over final path, NR0011 lever B")
-        if _new:
-            _f0 = _new[0]["verdict"]
-            # Promote the proven runtime FK violation to THE attributed defect: it carries
-            # the migration-DDL-grounded mechanism, replacing converge's generic node.
-            converge_dict["attributed_defect"] = {
-                "file": _f0.get("file"), "lines": _f0.get("lines"),
-                "via": "fk-misrouting", "why": _f0.get("reason", ""),
-            }
-            located_n = sum(1 for v in verdicts if v["verdict"]["located"])
-            logger.info("investigate: post-converge FK re-scan promoted %s:%s to the "
-                        "attributed defect (NR0011 lever B)",
-                        _f0.get("file"), _f0.get("lines"))
-        _promote_fk_sibling_facets(converge_dict, verdicts)
+        with _local_timer(ledger, stage="post_converge_local",
+                          mechanism="fk_rescan+promote",
+                          detail=f"located={located_n}"):
+            try:
+                from hive.converge import _fk_misrouting_facets
+                _ad = converge_dict.get("attributed_defect") or {}
+                _seed_loci = ([{"verdict": {"located": True, "file": _ad.get("file"),
+                                            "lines": str(_ad.get("lines", ""))}}]
+                              if _ad.get("file") else [])
+                _post_facets = _fk_misrouting_facets(
+                    _seed_loci, converge_dict.get("winning_path") or [], bundles, code_root)
+            except Exception as e:  # import / parse guard — never blocks the pipeline
+                logger.warning("investigate: post-converge FK re-scan skipped: %s", e)
+                _post_facets = []
+            _new = _inject_fk_facets(
+                _post_facets, verdicts, bundles,
+                "post-converge re-scan over final path, NR0011 lever B")
+            if _new:
+                _f0 = _new[0]["verdict"]
+                # Promote the proven runtime FK violation to THE attributed defect: it carries
+                # the migration-DDL-grounded mechanism, replacing converge's generic node.
+                converge_dict["attributed_defect"] = {
+                    "file": _f0.get("file"), "lines": _f0.get("lines"),
+                    "via": "fk-misrouting", "why": _f0.get("reason", ""),
+                }
+                located_n = sum(1 for v in verdicts if v["verdict"]["located"])
+                logger.info("investigate: post-converge FK re-scan promoted %s:%s to the "
+                            "attributed defect (NR0011 lever B)",
+                            _f0.get("file"), _f0.get("lines"))
+            _promote_fk_sibling_facets(converge_dict, verdicts)
 
     result = {
         "seed_chars": len(seed_text),
@@ -1361,7 +1390,9 @@ def run_investigate(
         "converge": converge_dict,
         "verdicts": verdicts,
     }
-    _write_report(result, output_path)
+    with _local_timer(ledger, stage="report_write", mechanism="verdict_json_md",
+                      detail=f"verdicts={len(verdicts)}"):
+        _write_report(result, output_path)
     result["report_path"] = output_path
     return result
 

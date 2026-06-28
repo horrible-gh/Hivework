@@ -31,6 +31,7 @@ located verdicts (nothing to stitch otherwise → free skip, no model call).
 """
 from __future__ import annotations
 
+import contextlib
 import logging
 import os
 import re
@@ -42,6 +43,15 @@ from hive.providers import call_worker
 from hive.retriever import FollowupNeed, retrieve_followup
 
 logger = logging.getLogger("hive.converge")
+
+
+def _local_timer(ledger, **kwargs):
+    timed = getattr(ledger, "timed_local", None)
+    if callable(timed):
+        cm = timed(**kwargs)
+        if hasattr(cm, "__enter__") and hasattr(cm, "__exit__"):
+            return cm
+    return contextlib.nullcontext()
 
 # Prompt-budget guards — mirror judge: the evidence is rendered COMPACT, not raw.
 _MAX_EVIDENCE = 24          # distinct (file,lines) windows shown to the converger
@@ -4100,76 +4110,79 @@ def run_converge(*, seed_text: str, verdicts: list[dict[str, Any]],
     When fewer than ``min_located`` axes located there is nothing to stitch and the
     whole stage is SKIPPED (free, no model spend).
     """
-    winning_path = _winning_http_path_nodes(bundles)
-    located = _located(verdicts)
-    for lifted in _winning_producer_loci(winning_path):
-        lf = (lifted.get("verdict") or {}).get("file", "")
-        ll = (lifted.get("verdict") or {}).get("lines", "")
-        if not any(
-            _aligns(lf, (item.get("verdict") or {}).get("file", ""))
-            and str((item.get("verdict") or {}).get("lines", "")) == str(ll)
-            for item in located
-        ):
-            located.append(lifted)
-    if winning_path:
-        logger.info("converge: winning HTTP path grounded %d node(s), lifted %d "
-                    "response producer locus/loci",
-                    len(winning_path),
-                    sum(1 for item in located
-                        if str(item.get("axis_id", "")).startswith("HTTP_WINNING_PATH:")))
+    with _local_timer(ledger, stage="converge_local", axis_id="converge",
+                      mechanism="grounding+schema",
+                      detail=f"verdicts={len(verdicts)}"):
+        winning_path = _winning_http_path_nodes(bundles)
+        located = _located(verdicts)
+        for lifted in _winning_producer_loci(winning_path):
+            lf = (lifted.get("verdict") or {}).get("file", "")
+            ll = (lifted.get("verdict") or {}).get("lines", "")
+            if not any(
+                _aligns(lf, (item.get("verdict") or {}).get("file", ""))
+                and str((item.get("verdict") or {}).get("lines", "")) == str(ll)
+                for item in located
+            ):
+                located.append(lifted)
+        if winning_path:
+            logger.info("converge: winning HTTP path grounded %d node(s), lifted %d "
+                        "response producer locus/loci",
+                        len(winning_path),
+                        sum(1 for item in located
+                            if str(item.get("axis_id", "")).startswith("HTTP_WINNING_PATH:")))
 
-    # FK-misrouting facet (rec B): deterministically surface a schema-violating write call
-    # (e.g. group_id → events.doc_id) as a located fragment carrying the FK mechanism, so a
-    # comment decoy / leaf-starved write-path / wobbly converge cannot bury it. Added BEFORE
-    # the min_located gate so the facet also counts toward stitching.
-    for facet in _fk_misrouting_facets(located, winning_path, bundles, code_root,
-                                       symptom=seed_text):
-        ff = (facet.get("verdict") or {}).get("file", "")
-        fl = (facet.get("verdict") or {}).get("lines", "")
-        if not any(
-            _aligns(ff, (item.get("verdict") or {}).get("file", ""))
-            and str((item.get("verdict") or {}).get("lines", "")) == str(fl)
-            for item in located
-        ):
-            located.append(facet)
-            logger.info("converge: FK-misrouting facet located at %s:%s", ff, fl)
+        # FK-misrouting facet (rec B): deterministically surface a schema-violating write call
+        # (e.g. group_id → events.doc_id) as a located fragment carrying the FK mechanism, so a
+        # comment decoy / leaf-starved write-path / wobbly converge cannot bury it. Added BEFORE
+        # the min_located gate so the facet also counts toward stitching.
+        for facet in _fk_misrouting_facets(located, winning_path, bundles, code_root,
+                                           symptom=seed_text):
+            ff = (facet.get("verdict") or {}).get("file", "")
+            fl = (facet.get("verdict") or {}).get("lines", "")
+            if not any(
+                _aligns(ff, (item.get("verdict") or {}).get("file", ""))
+                and str((item.get("verdict") or {}).get("lines", "")) == str(fl)
+                for item in located
+            ):
+                located.append(facet)
+                logger.info("converge: FK-misrouting facet located at %s:%s", ff, fl)
 
-    if len(located) < min_located:
-        return ConvergeResult(
-            summary=f"skipped: {len(located)} located verdict(s) < min_located={min_located}",
-            winning_path=winning_path)
+        if len(located) < min_located:
+            return ConvergeResult(
+                summary=f"skipped: {len(located)} located verdict(s) < min_located={min_located}",
+                winning_path=winning_path)
 
-    unlocated = [v for v in verdicts if v not in located]
-    windows = _evidence_windows(bundles)
-    known = _known_files(verdicts, windows)
+        unlocated = [v for v in verdicts if v not in located]
+        windows = _evidence_windows(bundles)
+        known = _known_files(verdicts, windows)
 
-    # Live-code grounding (N177): lift the CURRENT source at the located loci so the
-    # causal check rules on real code, not on the compacted retrieved snippets. Free,
-    # deterministic; empty when no code_root is given (degrades to the snippet-only path).
-    code_state_block = _lift_live_code(located, code_root)
-    if code_state_block:
-        logger.info("converge: live-code grounding lifted %d located locus block(s)",
-                    code_state_block.count("--- "))
+        # Live-code grounding (N177): lift the CURRENT source at the located loci so the
+        # causal check rules on real code, not on the compacted retrieved snippets. Free,
+        # deterministic; empty when no code_root is given (degrades to the snippet-only path).
+        code_state_block = _lift_live_code(located, code_root)
+        if code_state_block:
+            logger.info("converge: live-code grounding lifted %d located locus block(s)",
+                        code_state_block.count("--- "))
 
-    # FE→BE HTTP-edge grounding (N183): resolve fetch-URL literals to the BE routes they
-    # hit so converge can stitch a FE mapping to its BE getter across the request boundary
-    # instead of reporting a missing_link. Free, deterministic, fail-open (empty → no-op).
-    http_binding_block = _http_binding_bridges(located, windows, code_root)
-    if http_binding_block:
-        logger.info("converge: HTTP-edge grounding resolved %d FE→BE binding(s)",
-                    http_binding_block.count("- FE client"))
+        # FE→BE HTTP-edge grounding (N183): resolve fetch-URL literals to the BE routes they
+        # hit so converge can stitch a FE mapping to its BE getter across the request boundary
+        # instead of reporting a missing_link. Free, deterministic, fail-open (empty → no-op).
+        http_binding_block = _http_binding_bridges(located, windows, code_root)
+        if http_binding_block:
+            logger.info("converge: HTTP-edge grounding resolved %d FE→BE binding(s)",
+                        http_binding_block.count("- FE client"))
 
-    fragment_fact_block = _fragment_fact_cards(located, windows, bundles, code_root)
+        fragment_fact_block = _fragment_fact_cards(located, windows, bundles, code_root)
 
-    # Tool-OFF single-shot (mirrors judge): no file/shell access, decide on the bundle.
-    pk = dict(provider_kwargs or {})
-    pk.setdefault("available_tools", [])
+        # Tool-OFF single-shot (mirrors judge): no file/shell access, decide on the bundle.
+        pk = dict(provider_kwargs or {})
+        pk.setdefault("available_tools", [])
 
-    db_available = db_conn is not None
-    # Introspect the live schema ONCE: feeds BOTH the prompt block (name real objects,
-    # NR174) and the pre-execution read guard (reject hallucinated table/columns).
-    schema_map = _introspect_schema(db_conn)
-    db_schema = _render_schema_block(schema_map)
+        db_available = db_conn is not None
+        # Introspect the live schema ONCE: feeds BOTH the prompt block (name real objects,
+        # NR174) and the pre-execution read guard (reject hallucinated table/columns).
+        schema_map = _introspect_schema(db_conn)
+        db_schema = _render_schema_block(schema_map)
 
     # ── Per-locus SPLIT pass (M020, opt-in): ask one narrow cause→symptom question per
     # located locus and combine by deterministic elimination. On a CLEAN elimination

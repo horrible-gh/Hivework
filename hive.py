@@ -446,8 +446,11 @@ def run_pipeline(args: argparse.Namespace) -> None:
         # `findings` list is excluded from the evidence set — recorded in
         # parse_errors so the dropped axis stays visible in telemetry — so noise
         # can never masquerade as honey evidence.
-        combs, excluded_notes, parse_fail_notes = partition_combs(
-            comb_files, codebase_root=args.codebase)
+        # L4 (0062.0006-T): parse is pure-local CPU with no worker-call row → part of
+        # the 0061 ~31.7% wall residual. Time it as one local row for attribution.
+        with ldg.timed_local(stage="parse", mechanism="partition_combs"):
+            combs, excluded_notes, parse_fail_notes = partition_combs(
+                comb_files, codebase_root=args.codebase)
         for note in parse_fail_notes:
             logger.error("  PARSE FAIL %s", note)
         for note in excluded_notes:
@@ -478,7 +481,9 @@ def run_pipeline(args: argparse.Namespace) -> None:
         logger.info("STAGE ④ conflict-scan")
         logger.info("─" * 60)
 
-        conflicts = scan_conflicts(combs)
+        with ldg.timed_local(stage="conflict_scan", mechanism="scan_conflicts",
+                             detail=f"combs={len(combs)}"):
+            conflicts = scan_conflicts(combs)
         logger.info("Conflict scan: %d conflicts detected", len(conflicts))
         for c in conflicts:
             logger.info("  [%s] %s vs %s: %s",

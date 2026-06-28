@@ -32,6 +32,7 @@ ones — see ``_verdict_is_grounded``.
 Like specify's effectiveness review, JUDGE never raises: a flaky/unparseable
 model response degrades to ``located=false`` rather than crashing the pipeline.
 """
+import contextlib
 import dataclasses
 import json
 import logging
@@ -43,6 +44,15 @@ from hive.providers import call_worker
 from hive.retriever import FollowupNeed, retrieve_followup
 
 logger = logging.getLogger("hive.judge")
+
+
+def _local_timer(ledger, **kwargs):
+    timed = getattr(ledger, "timed_local", None)
+    if callable(timed):
+        cm = timed(**kwargs)
+        if hasattr(cm, "__enter__") and hasattr(cm, "__exit__"):
+            return cm
+    return contextlib.nullcontext()
 
 # Prompt-budget guards — the whole redesign exists to protect the token budget,
 # so the bundle is rendered COMPACT into the judge prompt, not dumped raw.
@@ -627,16 +637,19 @@ def run_judge(*, plan_bundle: dict[str, Any], symptom: str, axis_globs: list[str
     pk.setdefault("available_tools", [])
 
     # ── Call 1: verdict + (optional) need, on the first-pass bundle.
-    bundle_text = summarize_bundle(plan_bundle)
-    # field-producer directive (computed from the FULL bundle, cap-proof) — corrects the
-    # judge's render-side default so a wrong FE-bound field value localises to its producer.
-    fp_note = _field_producer_note(plan_bundle)
-    # Lever ② (NR0006): verbatim FK write-site + module-doc evidence, cap-proof.
-    we_note = _writer_evidence_note(plan_bundle)
-    prompt1 = build_judge_prompt(axis_id, symptom, bundle_text,
-                                 want_need=want_need, code_root=code_root,
-                                 seed_axis=seed_axis, field_producer_note=fp_note,
-                                 writer_evidence_note=we_note)
+    with _local_timer(ledger, stage="judge_prep", axis_id=axis_id,
+                      mechanism="prompt1",
+                      detail=f"snippets={len(plan_bundle.get('code_snippets') or [])}"):
+        bundle_text = summarize_bundle(plan_bundle)
+        # field-producer directive (computed from the FULL bundle, cap-proof) — corrects the
+        # judge's render-side default so a wrong FE-bound field value localises to its producer.
+        fp_note = _field_producer_note(plan_bundle)
+        # Lever ② (NR0006): verbatim FK write-site + module-doc evidence, cap-proof.
+        we_note = _writer_evidence_note(plan_bundle)
+        prompt1 = build_judge_prompt(axis_id, symptom, bundle_text,
+                                     want_need=want_need, code_root=code_root,
+                                     seed_axis=seed_axis, field_producer_note=fp_note,
+                                     writer_evidence_note=we_note)
     parsed1 = _call_and_parse(provider, model, prompt1, cwd=code_root,
                               axis_id=axis_id, stage="judge1", ledger=ledger,
                               provider_kwargs=pk, timeout=timeout)
@@ -655,13 +668,19 @@ def run_judge(*, plan_bundle: dict[str, Any], symptom: str, axis_globs: list[str
     followup_bundle = None
     if (want_need and need is not None and calls_made < max_calls
             and not (verdict.located and grounded1)):
-        followup_bundle = retrieve_followup(need, code_root, k=k, max_hops=max_hops)
+        with _local_timer(ledger, stage="judge_followup", axis_id=axis_id,
+                          mechanism="retrieve_followup",
+                          detail=f"symbols={len(need.symbols)} greps={len(need.greps)}"):
+            followup_bundle = retrieve_followup(need, code_root, k=k, max_hops=max_hops)
         merged = _merge_followup(plan_bundle, followup_bundle)
-        prompt2 = build_judge_prompt(axis_id, symptom, summarize_bundle(merged),
-                                     want_need=False, code_root=code_root,
-                                     seed_axis=seed_axis,
-                                     field_producer_note=_field_producer_note(merged) or fp_note,
-                                     writer_evidence_note=_writer_evidence_note(merged) or we_note)
+        with _local_timer(ledger, stage="judge_prep", axis_id=axis_id,
+                          mechanism="prompt2",
+                          detail=f"snippets={len(merged.get('code_snippets') or [])}"):
+            prompt2 = build_judge_prompt(axis_id, symptom, summarize_bundle(merged),
+                                         want_need=False, code_root=code_root,
+                                         seed_axis=seed_axis,
+                                         field_producer_note=_field_producer_note(merged) or fp_note,
+                                         writer_evidence_note=_writer_evidence_note(merged) or we_note)
         parsed2 = _call_and_parse(provider, model, prompt2, cwd=code_root,
                                   axis_id=axis_id, stage="judge2", ledger=ledger,
                                   provider_kwargs=pk, timeout=timeout)
@@ -745,12 +764,15 @@ def run_judge(*, plan_bundle: dict[str, Any], symptom: str, axis_globs: list[str
     # ungrounded re-ask leaves the flagged verdict untouched.
     if (not verdict.located and _was_waved_off(verdict.reason)
             and (mutation_symptom or seed_axis)):
-        reask_prompt = build_judge_prompt(
-            axis_id, symptom, summarize_bundle(check_bundle),
-            want_need=False, code_root=code_root, seed_axis=seed_axis,
-            field_producer_note=_field_producer_note(check_bundle) or fp_note,
-            writer_evidence_note=_writer_evidence_note(check_bundle) or we_note,
-            reask_note=_DISMISSAL_REASK_NOTE)
+        with _local_timer(ledger, stage="judge_prep", axis_id=axis_id,
+                          mechanism="reask",
+                          detail=f"snippets={len(check_bundle.get('code_snippets') or [])}"):
+            reask_prompt = build_judge_prompt(
+                axis_id, symptom, summarize_bundle(check_bundle),
+                want_need=False, code_root=code_root, seed_axis=seed_axis,
+                field_producer_note=_field_producer_note(check_bundle) or fp_note,
+                writer_evidence_note=_writer_evidence_note(check_bundle) or we_note,
+                reask_note=_DISMISSAL_REASK_NOTE)
         parsed_r = _call_and_parse(provider, model, reask_prompt, cwd=code_root,
                                    axis_id=axis_id, stage="judge-reask", ledger=ledger,
                                    provider_kwargs=pk, timeout=timeout)
