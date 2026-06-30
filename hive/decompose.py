@@ -29,6 +29,94 @@ from hive.searchplan import extract_keywords
 
 logger = logging.getLogger("hive.decompose")
 
+# ── box-0 new-feature driver (group 0064, L0006 §2.6) ────────────────────────
+# When the seed is a NEW-FEATURE request (not a bug), the decompose should run the
+# feature recipe and force the acceptance-criteria axis to the FRONT of the first
+# step so a later position-based cap cannot bury it (the design's contract is the
+# load-bearing axis for a feature). Conservative by construction: an unrecognised
+# seed falls back to the bug recipe (today's behaviour), so a mis-classification is
+# absorbed safely. The classifier's final threshold is tuned by a follow-up T via
+# ablation (L DEFERRED); these helpers fix the WIRING, not the threshold.
+FEATURE_RECIPE_ID = "recipe_code_feature"
+ACCEPTANCE_AXIS_ID = "ACCEPTANCE_CRITERIA"
+# Signals that a seed asks to BUILD something new rather than repair a symptom. A
+# bug seed (error/500/broken/wrong/regression) never matches, so the default stays
+# the bug recipe. Deliberately narrow — over-matching costs nothing worse than a
+# feature recipe on a bug, but the safe default is bug.
+_FEATURE_SIGNAL_RE = re.compile(
+    r"새\s*기능|기능\s*추가|새로\s*추가|구현(?:해|하)|만들어\s*줘|"
+    r"\bnew feature\b|\badd (?:a |an |the )?\w+ (?:feature|page|screen|endpoint)\b|"
+    r"\bimplement\b|\bbuild (?:a|an|the)\b", re.IGNORECASE)
+_BUG_SIGNAL_RE = re.compile(
+    r"버그|오류|에러|안\s*(?:됨|돼|나|보)|깨졌|회귀|"
+    r"\bbug\b|\berror\b|\b500\b|\bbroken\b|\bregress|\bwrong\b|\bfails?\b", re.IGNORECASE)
+
+
+def is_new_feature_request(seed_text: str) -> bool:
+    """True only when the seed reads as a NEW-FEATURE ask and NOT a bug (L §4.3/2.6).
+
+    A bug signal (error/500/regression/…) vetoes the feature classification, so a seed
+    that says both stays on the bug recipe — the safe default. Deterministic, never
+    raises."""
+    t = seed_text or ""
+    if _BUG_SIGNAL_RE.search(t):
+        return False
+    return bool(_FEATURE_SIGNAL_RE.search(t))
+
+
+def select_recipe(instruction: str, explicit_recipe: str | None = None) -> str:
+    """L §2.6 recipe selection: operator override > feature > bug default.
+
+    Returns ``FEATURE_RECIPE_ID`` for a recognised new-feature seed, the operator's
+    ``explicit_recipe`` when given (manual override always wins), else the bug recipe id
+    so existing flows are untouched."""
+    if explicit_recipe:
+        return explicit_recipe
+    if is_new_feature_request(instruction):
+        return FEATURE_RECIPE_ID
+    return "recipe_code_bug"
+
+
+def enforce_feature_axis_order(result: dict, recipe_id: str) -> dict:
+    """L §2.6 — force the acceptance axis to the front of step 0 for a feature recipe.
+
+    Mirrors the FE-derived / PROVENANCE injection: when running the feature recipe and
+    the decomposition lacks the acceptance axis, prepend a leaf that grounds the design's
+    acceptance criteria and slot its id at the head of the first step. A no-op for the bug
+    recipe (so bug flows are unchanged) and idempotent (won't double-insert). Never
+    raises."""
+    if recipe_id != FEATURE_RECIPE_ID or not isinstance(result, dict):
+        return result
+    tasks = result.get("tasks")
+    if not isinstance(tasks, list):
+        return result
+    if any(isinstance(t, dict) and str(t.get("id")) == ACCEPTANCE_AXIS_ID for t in tasks):
+        return result  # already present → idempotent
+    axis = {
+        "id": ACCEPTANCE_AXIS_ID,
+        "title": "Design acceptance criteria → executable contract",
+        "brief": (
+            "Read the design doc's `## 수용기준` section. For each criterion, pin the "
+            "exact route/field/value (or file::symbol/value) it promises and contrast it "
+            "against the live code; report the single grounded contract per criterion so "
+            "box-0 can synthesise the acceptance red test."),
+        "depends_on": [],
+        "coverage_risk": "ok",
+        "search_plan": {"keywords": ["수용기준", "acceptance"], "file_globs": [],
+                        "doc_topics": []},
+    }
+    tasks.insert(0, axis)
+    steps = result.get("steps")
+    if isinstance(steps, list):
+        if steps and isinstance(steps[0], list):
+            steps[0].insert(0, ACCEPTANCE_AXIS_ID)
+        else:
+            steps.insert(0, [ACCEPTANCE_AXIS_ID])
+    logger.info("box-0: feature recipe → injected acceptance axis %s at step head",
+                ACCEPTANCE_AXIS_ID)
+    return result
+
+
 # Conditional FE-derived-state axis. This is deliberately opt-in: every leaf
 # reaches the paid judge, so a generic "also inspect the frontend" axis would
 # turn a targeted escalation into a permanent cost increase.
@@ -746,6 +834,17 @@ with `}}`. No prose, no markdown fences, no "I'm ready", nothing else.
 """
 
 
+def _recipe_id_from_path(recipe_path: str | None) -> str | None:
+    """Derive the recipe id (basename stem) from a recipe card path, or None.
+
+    ``smoke/loop/recipe_code_feature.md`` → ``recipe_code_feature`` so box-0's
+    feature-axis enforcement (L0006 §2.6) can fire from the recipe the operator (or
+    ``select_recipe``) chose — no extra threading through every caller. Never raises."""
+    if not recipe_path:
+        return None
+    return os.path.splitext(os.path.basename(recipe_path))[0] or None
+
+
 def run_decompose(
     seed_text: str,
     recipe_path: str | None = None,
@@ -756,6 +855,7 @@ def run_decompose(
     provider_kwargs: dict | None = None,
     retries: int = 0,
     timeout: int = 300,
+    recipe_id: str | None = None,
 ) -> dict[str, Any]:
     """Run the decompose stage by calling a copilot worker.
 
@@ -768,6 +868,9 @@ def run_decompose(
             Callers pass the queen role's ``worker_timeout()`` so a slow codex
             queen (150–290s under parallel load) gets its roomier 600s default
             instead of being killed at a flat 300s wall and retried.
+        recipe_id: The selected recipe id (e.g. ``recipe_code_feature``). When None it
+            is derived from ``recipe_path``'s basename — so the feature recipe drives
+            box-0's acceptance-axis enforcement (L0006 §2.6) without caller changes.
 
     Returns:
         Parsed decomposition JSON dict.
@@ -873,6 +976,13 @@ def run_decompose(
         raise ValueError("Decompose output missing 'tasks' key")
 
     ensure_fe_derived_state_axis(result, seed_text, codebase_root)
+    # box-0 (group 0064, L0006 §2.6): when the FEATURE recipe is running, force the
+    # design's acceptance-criteria axis to the head of step 0 so a later position cap
+    # cannot bury the load-bearing contract. A no-op for the bug recipe (default), so
+    # existing flows are byte-for-byte unchanged. recipe_id falls back to the recipe
+    # card's basename when not passed explicitly (live wiring, group 0065).
+    eff_recipe_id = recipe_id or _recipe_id_from_path(recipe_path)
+    result = enforce_feature_axis_order(result, eff_recipe_id)
     # apply_provenance_grounding REMOVED: bolting a code-READING result onto the
     # blind queen's output was an e2e regression (inherits FE-axis errors + noise).
     # The trace now lives in the reading loop via hive.be_root (Hook A, M028),

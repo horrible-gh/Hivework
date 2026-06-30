@@ -188,6 +188,70 @@ def overwrite_race_specify_kwargs(cfg, codebase_root: str | None) -> dict:
     return out
 
 
+def acceptance_specify_kwargs(cfg, codebase_root: str | None,
+                              design_path: str | None = None) -> dict:
+    """run_specify kwargs that arm box-0's acceptance red-test synthesis (group 0064/0065).
+
+    Group 0065 root: ``run_specify()`` was wired for box-0 (TR0008) but every CLI specify entry
+    starved it of the acceptance inputs (no kwargs builder), so ``_synthesize_acceptance_red_test``
+    was a permanent no-op live — box-0 only ever ran via direct unit calls. This sources:
+
+    - ``acceptance_criteria_text`` — the design text whose ``## 수용기준`` seeds the criteria.
+      A per-run ``--acceptance-design`` path wins (read here); else the per-codebase
+      ``targets.<name>.acceptance`` binding's ``design_file`` / inline ``criteria_text``.
+    - ``acceptance_app_fixture`` / ``acceptance_setup_block`` / ``acceptance_test_dir`` — the
+      harness from the config binding (per-codebase static, like ``http_shape``).
+
+    Returns an empty dict when neither a design path nor a binding resolves criteria text —
+    synthesis then stays a no-op, so behaviour is unchanged until acceptance is configured.
+    """
+    ac = cfg.acceptance_for_codebase(codebase_root)
+    # criteria text: explicit --acceptance-design path wins (per-run), else config binding.
+    criteria_text: str | None = None
+    if design_path:
+        try:
+            with open(design_path, "r", encoding="utf-8") as fh:
+                criteria_text = fh.read()
+        except OSError:
+            criteria_text = None
+    if criteria_text is None and ac is not None:
+        criteria_text = ac.resolve_criteria_text(codebase_root)
+    if not criteria_text:
+        return {}  # no criteria → nothing to ground → safe no-op
+    out: dict = {"acceptance_criteria_text": criteria_text}
+    if ac is not None:
+        out["acceptance_test_dir"] = ac.test_dir or "tests"
+        if ac.app_fixture:
+            out["acceptance_app_fixture"] = ac.app_fixture
+        setup_block = ac.resolve_setup_block(codebase_root)
+        if setup_block:
+            out["acceptance_setup_block"] = setup_block
+    return out
+
+
+_RECIPES_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "recipes")
+
+
+def resolve_recipe_path(explicit_recipe: str | None, seed_text: str) -> str | None:
+    """Resolve the recipe card path for a run (group 0065 live wiring of ``select_recipe``).
+
+    An explicit ``--recipe`` always wins (operator override). When omitted, the recipe id is
+    auto-selected from the seed (``select_recipe``: a new-feature seed → ``recipe_code_feature``,
+    else the ``recipe_code_bug`` default — the safe fallback) and mapped to
+    ``recipes/<recipe_id>.md``. If the chosen card is missing, falls back to the bug card so a
+    run is never blocked by a missing feature card. Returns None only when nothing resolves
+    (then ``run_decompose`` uses its built-in fixed-axis fallback)."""
+    if explicit_recipe:
+        return explicit_recipe
+    from hive.decompose import select_recipe  # lazy (module NOTE: keep stage imports lazy)
+    recipe_id = select_recipe(seed_text or "")
+    path = os.path.join(_RECIPES_DIR, f"{recipe_id}.md")
+    if os.path.exists(path):
+        return path
+    bug_path = os.path.join(_RECIPES_DIR, "recipe_code_bug.md")
+    return bug_path if os.path.exists(bug_path) else None
+
+
 def run_pipeline(args: argparse.Namespace) -> None:
     """Execute the full 6-stage pipeline."""
     # Lazy stage imports — see module-top NOTE (B0001): keep the commit path free
@@ -280,6 +344,14 @@ def run_pipeline(args: argparse.Namespace) -> None:
             logger.info("Caller-supplied context: %d comment(s) folded into seed",
                         len(args.comment))
         logger.info("Seed loaded: %d chars", len(seed_text))
+
+        # Group 0065: auto-select the recipe from the seed when --recipe was omitted
+        # (select_recipe → feature/bug). An explicit --recipe always wins. Resolved AFTER
+        # the seed is loaded so the classifier sees the real instruction; downstream stages
+        # read args.recipe, so run_decompose derives the recipe id (→ box-0 axis enforcement).
+        if not args.recipe:
+            args.recipe = resolve_recipe_path(None, seed_text)
+            logger.info("Recipe auto-selected from seed → %s", args.recipe)
 
         # ────────────────────────────────────────────────────────────
         # STAGE L-01 coordinator (opt-in, pre-decompose seed enrichment)
@@ -575,6 +647,8 @@ def run_pipeline(args: argparse.Namespace) -> None:
             specify_kwargs.update(http_shape_specify_kwargs(cfg, args.codebase))
             specify_kwargs.update(write_sink_specify_kwargs(cfg, args.codebase))
             specify_kwargs.update(overwrite_race_specify_kwargs(cfg, args.codebase))
+            specify_kwargs.update(acceptance_specify_kwargs(
+                cfg, args.codebase, getattr(args, "acceptance_design", None)))
             try:
                 spec = run_specify(
                     honey_path=honey_path,
@@ -940,6 +1014,8 @@ def run_investigate_command(args: argparse.Namespace) -> None:
             specify_kwargs.update(http_shape_specify_kwargs(cfg, args.codebase))
             specify_kwargs.update(write_sink_specify_kwargs(cfg, args.codebase))
             specify_kwargs.update(overwrite_race_specify_kwargs(cfg, args.codebase))
+            specify_kwargs.update(acceptance_specify_kwargs(
+                cfg, args.codebase, getattr(args, "acceptance_design", None)))
 
             def _respecify():
                 spec = run_specify(
@@ -1128,6 +1204,8 @@ def run_specify_command(args: argparse.Namespace) -> None:
     specify_kwargs.update(http_shape_specify_kwargs(cfg, args.codebase))
     specify_kwargs.update(write_sink_specify_kwargs(cfg, args.codebase))
     specify_kwargs.update(overwrite_race_specify_kwargs(cfg, args.codebase))
+    specify_kwargs.update(acceptance_specify_kwargs(
+        cfg, args.codebase, getattr(args, "acceptance_design", None)))
     spec: dict = {}
     try:
         spec = run_specify(
@@ -1206,6 +1284,8 @@ def _build_repair_regenerator(args: argparse.Namespace, cfg, logger):
     specify_kwargs.update(http_shape_specify_kwargs(cfg, args.codebase))
     specify_kwargs.update(write_sink_specify_kwargs(cfg, args.codebase))
     specify_kwargs.update(overwrite_race_specify_kwargs(cfg, args.codebase))
+    specify_kwargs.update(acceptance_specify_kwargs(
+        cfg, args.codebase, getattr(args, "acceptance_design", None)))
     spec_out = os.path.splitext(args.spec)[0] + ".repair"
     logger.info("apply: --repair will re-author fixes via specify (%s/%s) from honey %s",
                 specify_role.provider, specify_role.model, honey_path)
@@ -1465,8 +1545,11 @@ def main() -> None:
         help="Path to seed markdown file (investigation instruction)",
     )
     run_parser.add_argument(
-        "--recipe", required=True,
-        help="Path to recipe card markdown (e.g., smoke/loop/recipe_code_bug.md)",
+        "--recipe", default=None,
+        help="Path to recipe card markdown (e.g., recipes/recipe_code_bug.md). Optional: "
+             "when omitted, the recipe is auto-selected from the seed (a new-feature seed "
+             "→ recipe_code_feature, else recipe_code_bug — the safe default). An explicit "
+             "path always overrides the classifier.",
     )
     run_parser.add_argument(
         "--codebase", required=True,
@@ -1519,6 +1602,13 @@ def main() -> None:
     run_parser.add_argument(
         "--contract", default=None,
         help="Path to the edit-spec contract for --specify (default: recipes/edit_spec_contract_v1.md)",
+    )
+    run_parser.add_argument(
+        "--acceptance-design", dest="acceptance_design", default=None,
+        help="Path to the design doc whose `## 수용기준` seeds box-0's acceptance red test "
+             "(group 0064/0065). When given with --specify, the FIRST unambiguous criterion is "
+             "grounded against the live code and a red test is synthesised so apply --verify "
+             "certifies the feature was built. Optional; no-op when absent.",
     )
     run_parser.add_argument(
         "-v", "--verbose", action="store_true",
@@ -1611,6 +1701,13 @@ def main() -> None:
     spec_parser.add_argument(
         "--contract", default=None,
         help="Path to the edit-spec contract (default: recipes/edit_spec_contract_v1.md)",
+    )
+    spec_parser.add_argument(
+        "--acceptance-design", dest="acceptance_design", default=None,
+        help="Path to the design doc whose `## 수용기준` seeds box-0's acceptance red test "
+             "(group 0064/0065). The FIRST unambiguous criterion is grounded against the live "
+             "code and a red test is synthesised so apply --verify certifies the feature was "
+             "built. Optional; no-op when absent.",
     )
     spec_parser.add_argument(
         "--model", default=None,

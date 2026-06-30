@@ -43,6 +43,12 @@ from typing import Any
 from hive import dbread
 from hive import schema_ground
 from hive.http_shape_synth import synthesize_http_shape_red_test
+from hive.acceptance_synth import (
+    KILL_SWITCH_ENV as _ACCEPTANCE_ENV_OFF,
+    detect_acceptance,
+    read_acceptance_criteria,
+    synthesize_acceptance_red_test,
+)
 from hive.write_sink_synth import synthesize_write_sink_red_test
 from hive.overwrite_race_synth import (
     detect_overwrite_race_symptom,
@@ -3222,6 +3228,82 @@ def _review_and_gate(
 _HTTP_SHAPE_ENV_OFF = "HIVE_NO_HTTP_SHAPE"
 
 
+def _synthesize_acceptance_red_test(spec: dict[str, Any],
+                                    acceptance_criteria_text: str | None,
+                                    codebase_root: str,
+                                    setup_block: str | None = None,
+                                    app_fixture: str | None = None,
+                                    test_dir: str = "tests") -> dict[str, Any]:
+    """Attach a box-0 acceptance red test from a design doc's ``## 수용기준`` (group 0064).
+
+    The design-seeded sibling of lever ⑦: instead of recognising a BUG symptom in the
+    honey, it reads the acceptance criteria the design author wrote, grounds each one
+    against the live code (:func:`hive.acceptance_synth.detect_acceptance` — explicit
+    ``oracle`` block or §2.3 prose derivation), and — for the FIRST criterion that
+    resolves UNAMBIGUOUSLY — synthesises a RED test wired into ``spec.verify`` so
+    ``apply --verify`` certifies the feature was built by EXECUTION. The single hard cell
+    (prose → contract) declines on any ambiguity, so a vague criterion is a no-go
+    candidate (handed back to the human, NR0003 §6), never a guessed test.
+
+    Fully fail-open, mirroring ⑦: a no-op unless the kill-switch is off, criteria text is
+    supplied (the design+criteria handoff is provided from OUTSIDE the chain — NR0003
+    conclusion, L DEFERRED — so ``None`` means "nothing to extract"), the spec carries no
+    red-test node yet (never clobber an author's or ⑦'s), there is a SOURCE edit to
+    certify, and a criterion + (for http_read) a runnable harness both resolve. Runs
+    BEFORE ⑦ so an explicit acceptance criterion wins; ⑦ fills in when none resolves.
+    Never raises.
+    """
+    if os.environ.get(_ACCEPTANCE_ENV_OFF):
+        return spec
+    if not acceptance_criteria_text:
+        return spec  # design+criteria provided from outside the chain; none here → no-op
+    try:
+        verify = spec.get("verify") if isinstance(spec.get("verify"), dict) else {}
+        if verify.get("red_test_node"):
+            return spec  # an author/⑦ red test already drives the loop — don't clobber
+        edits = [e for e in (spec.get("edits") or []) if isinstance(e, dict)]
+        source_edits = [e for e in edits
+                        if e.get("kind", "edit") != "create_file"
+                        or not _is_test_path(e.get("file", ""))]
+        if not source_edits:
+            return spec  # nothing to certify → no point synthesising a red test
+        criteria = read_acceptance_criteria(acceptance_criteria_text)
+        if not criteria:
+            return spec  # no marker / no well-formed criterion → fail-open
+        existing_ids = {str(e.get("id")) for e in edits}
+        existing_files = {e.get("file") for e in edits}
+        for ac in criteria:
+            symptom = detect_acceptance(ac, codebase_root)
+            result = synthesize_acceptance_red_test(
+                symptom, codebase_root, setup_block=setup_block,
+                app_fixture=app_fixture, test_dir=test_dir or "tests")
+            if not result:
+                continue  # this criterion declined (ambiguous / no harness) → next AC
+            # Avoid an id/path collision with an existing edit (rare; be safe).
+            edit = result["edit"]
+            if edit["id"] in existing_ids or edit["file"] in existing_files:
+                continue
+            spec.setdefault("edits", []).append(edit)
+            vblock = spec.setdefault("verify", {})
+            if not isinstance(vblock, dict):
+                vblock = {}
+                spec["verify"] = vblock
+            vblock["red_test_node"] = result["node"]
+            ids = list(vblock.get("test_edit_ids") or [])
+            if edit["id"] not in ids:
+                ids.append(edit["id"])
+            vblock["test_edit_ids"] = ids
+            sym = result["symptom"]
+            _append_note(spec, f"acceptance red test synthesised (box-0, AC "
+                         f"{sym.source_ac_id}) → node {result['node']}.")
+            logger.info("specify: synthesised box-0 acceptance red test for AC %s "
+                        "(kind=%s) → node %s", sym.source_ac_id, sym.kind, result["node"])
+            return spec  # one node — first resolving criterion wins
+    except Exception as e:  # observation must never break authoring
+        logger.warning("specify: acceptance red-test synthesis skipped (%s)", e)
+    return spec
+
+
 def _synthesize_http_shape_red_test(spec: dict[str, Any], honey_text: str,
                                     codebase_root: str,
                                     setup_block: str | None = None,
@@ -3514,6 +3596,10 @@ def run_specify(
     author_timeout: int = _AUTHOR_TIMEOUT_DEFAULT,
     author_retries: int = 0,
     db_conn: Any = None,
+    acceptance_criteria_text: str | None = None,
+    acceptance_setup_block: str | None = None,
+    acceptance_app_fixture: str | None = None,
+    acceptance_test_dir: str = "tests",
     http_shape_setup_block: str | None = None,
     http_shape_app_fixture: str | None = None,
     http_shape_test_dir: str = "tests",
@@ -3753,6 +3839,19 @@ def run_specify(
     # others stay broken on screen is exactly the false-ready this catches. No-op unless
     # converge itself declared ≥2 independent loci, so a single-defect converge is untouched.
     spec = _apply_converge_coverage_gate(spec, honey_text)
+
+    # box-0 acceptance red-test synthesis (group 0064): when a design doc's ``## 수용기준``
+    # is supplied, ground the FIRST unambiguous criterion against the live code and attach
+    # a TestClient/unit red test so apply --verify certifies the FEATURE was built by
+    # execution — the design-seeded sibling of lever ⑦. Runs BEFORE ⑦ so an explicit
+    # acceptance criterion wins; fully fail-open (a no-op unless criteria text is supplied
+    # and a criterion + harness resolve). Guards on an existing red-test node so the two
+    # never clobber.
+    spec = _synthesize_acceptance_red_test(
+        spec, acceptance_criteria_text, codebase_root,
+        setup_block=acceptance_setup_block,
+        app_fixture=acceptance_app_fixture,
+        test_dir=acceptance_test_dir)
 
     # HTTP-shape red-test synthesis (lever ⑦): when the symptom is an FE-bound field
     # served by an HTTP route, attach a TestClient red test so apply --verify ALWAYS

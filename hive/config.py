@@ -431,6 +431,77 @@ class OverwriteRaceConfig:
 
 
 @dataclass
+class AcceptanceConfig:
+    """One target codebase's box-0 acceptance red-test harness (group 0064/0065 enabler).
+
+    The design-seeded sibling of :class:`HttpShapeConfig`: it feeds specify the inputs
+    ``_synthesize_acceptance_red_test`` needs to certify a FEATURE was built from its design's
+    ``## 수용기준``. NEUTRAL by design — no caller semantics, mirroring its siblings. Group 0065
+    root: ``run_specify()`` was wired for box-0 (TR0008) but every CLI entry starved it of the
+    acceptance inputs (no config schema, no plumbing), so the pass was a permanent no-op live.
+
+    - ``design_file`` (path; relative resolves under the codebase root) or ``criteria_text``
+      (inline): the design doc text whose ``## 수용기준`` section seeds the criteria. Inline
+      ``criteria_text`` wins; otherwise the file is read at resolve time. A per-run design is
+      better supplied via the ``--acceptance-design`` CLI flag (which overrides this); the
+      config form fits a codebase whose acceptance doc lives at a stable path.
+    - ``app_fixture``: NAME of an existing seeded-``TestClient`` fixture in the target's test
+      tree (for ``http_read`` criteria). Overrides auto-discovery that declines on an ambiguous
+      test tree — same contract as :class:`HttpShapeConfig`.
+    - ``setup_block`` (inline) or ``setup_block_file`` (path; relative resolves under the
+      codebase root): explicit pytest harness source prepended to the generated test.
+
+    ``test_dir`` is where the synthesised red test lands (relative to the codebase). With no
+    criteria text the pass stays a safe no-op (synthesis declines). ``codebase`` optionally
+    binds this entry to an explicit codebase path, exactly like the other per-target blocks.
+    """
+    design_file: str = ""
+    criteria_text: str = ""
+    app_fixture: str = ""
+    setup_block: str = ""
+    setup_block_file: str = ""
+    test_dir: str = "tests"
+    codebase: str = ""
+
+    def resolve_criteria_text(self, codebase_root: str | None) -> str | None:
+        """Return the design text carrying ``## 수용기준``: inline wins, else read the file.
+
+        A relative ``design_file`` resolves under ``codebase_root``. Returns None when neither
+        is set or the file cannot be read (synthesis then stays a no-op). Never raises."""
+        if self.criteria_text.strip():
+            return self.criteria_text
+        if self.design_file:
+            path = self.design_file
+            if not os.path.isabs(path) and codebase_root:
+                path = os.path.join(codebase_root, path)
+            try:
+                with open(path, "r", encoding="utf-8") as fh:
+                    return fh.read()
+            except OSError:
+                return None
+        return None
+
+    def resolve_setup_block(self, codebase_root: str | None) -> str | None:
+        """Return the harness source: inline ``setup_block`` wins, else read the file.
+
+        A relative ``setup_block_file`` resolves under ``codebase_root``. Returns None when
+        neither is set or the file cannot be read (synthesis then falls back to ``app_fixture``
+        / auto-discovery). Never raises."""
+        if self.setup_block.strip():
+            return self.setup_block
+        if self.setup_block_file:
+            path = self.setup_block_file
+            if not os.path.isabs(path) and codebase_root:
+                path = os.path.join(codebase_root, path)
+            try:
+                with open(path, "r", encoding="utf-8") as fh:
+                    return fh.read()
+            except OSError:
+                return None
+        return None
+
+
+@dataclass
 class SafetyConfig:
     """Cost guard-rails enforced by the CLI before any spend.
 
@@ -653,6 +724,10 @@ class Config:
     # above. Empty by default — lowering ① / oracle ② stay a no-op when a run's codebase has
     # no entry (the racing file + harness cannot be auto-derived). NR0008 0058.
     overwrite_race_targets: dict[str, OverwriteRaceConfig] = field(default_factory=dict)
+    # Per-codebase box-0 acceptance harnesses (group 0064/0065), same shape/contract as the
+    # three above. Empty by default — acceptance synthesis stays a no-op when a run's codebase
+    # has no entry AND no --acceptance-design is supplied (no criteria text → nothing to ground).
+    acceptance_targets: dict[str, AcceptanceConfig] = field(default_factory=dict)
 
     def db_for_codebase(self, codebase_root: str | None) -> DbConnection | None:
         """Resolve the DB connection for a run's ``--codebase`` path, or None.
@@ -757,6 +832,27 @@ class Config:
         for key, orc in self.overwrite_race_targets.items():
             if key.strip().lower() == leaf:
                 return orc
+        return None
+
+    def acceptance_for_codebase(self, codebase_root: str | None) -> "AcceptanceConfig | None":
+        """Resolve the box-0 acceptance harness for a run's ``--codebase`` path, or None.
+
+        Same match order as :meth:`http_shape_for_codebase`: an explicit ``codebase`` binding
+        wins, else the entry whose KEY equals the codebase's leaf folder name. Returns None
+        when nothing matches (the common case → acceptance synthesis stays a no-op unless
+        ``--acceptance-design`` supplies the criteria text), never raises.
+        """
+        if not codebase_root or not self.acceptance_targets:
+            return None
+        norm = codebase_root.replace("\\", "/").rstrip("/").lower()
+        leaf = norm.rsplit("/", 1)[-1]
+        for ac in self.acceptance_targets.values():
+            cb = (ac.codebase or "").replace("\\", "/").rstrip("/").lower()
+            if cb and (cb == norm or norm.endswith("/" + cb) or cb.endswith("/" + norm)):
+                return ac
+        for key, ac in self.acceptance_targets.items():
+            if key.strip().lower() == leaf:
+                return ac
         return None
 
     def role(self, name: str) -> RoleConfig:
@@ -1013,6 +1109,7 @@ def _normalize(raw: dict) -> dict:
         http_shapes = dict(raw.get("http_shape_targets") or {})
         write_sinks = dict(raw.get("write_sink_targets") or {})
         overwrite_races = dict(raw.get("overwrite_race_targets") or {})
+        acceptances = dict(raw.get("acceptance_targets") or {})
         for name, t in targets.items():
             if not isinstance(t, dict):  # skips a targets-level "_comment", etc.
                 continue
@@ -1026,6 +1123,8 @@ def _normalize(raw: dict) -> dict:
                 write_sinks[name] = t["write_sink"]
             if isinstance(t.get("overwrite_race"), dict):
                 overwrite_races[name] = t["overwrite_race"]
+            if isinstance(t.get("acceptance"), dict):
+                acceptances[name] = t["acceptance"]
         if db_conns:
             out["db_connections"] = db_conns
         if runners:
@@ -1036,6 +1135,8 @@ def _normalize(raw: dict) -> dict:
             out["write_sink_targets"] = write_sinks
         if overwrite_races:
             out["overwrite_race_targets"] = overwrite_races
+        if acceptances:
+            out["acceptance_targets"] = acceptances
 
     return out
 
@@ -1240,6 +1341,23 @@ def load_config(path: str | None = None, profile: str | None = None) -> Config:
         str(k): _overwrite_race(v) for k, v in overwrite_race_raw.items() if isinstance(v, dict)
     }
 
+    acceptance_raw = merged.get("acceptance_targets", {})
+
+    def _acceptance(d: dict) -> AcceptanceConfig:
+        return AcceptanceConfig(
+            design_file=str(d.get("design_file", "")),
+            criteria_text=str(d.get("criteria_text", "")),
+            app_fixture=str(d.get("app_fixture", "")),
+            setup_block=str(d.get("setup_block", "")),
+            setup_block_file=str(d.get("setup_block_file", "")),
+            test_dir=str(d.get("test_dir", "tests")) or "tests",
+            codebase=str(d.get("codebase", "")),
+        )
+
+    acceptance_targets = {
+        str(k): _acceptance(v) for k, v in acceptance_raw.items() if isinstance(v, dict)
+    }
+
     def _role(name: str, default_model: str = "gpt-5-mini") -> RoleConfig:
         r = roles.get(name, {})
         timeout = r.get("timeout_sec")
@@ -1336,4 +1454,5 @@ def load_config(path: str | None = None, profile: str | None = None) -> Config:
         http_shape_targets=http_shape_targets,
         write_sink_targets=write_sink_targets,
         overwrite_race_targets=overwrite_race_targets,
+        acceptance_targets=acceptance_targets,
     )
