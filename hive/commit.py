@@ -632,6 +632,23 @@ def _stage_commit_paths(repo_root: str, files: list[str]) -> tuple[bool, str]:
     return True, ""
 
 
+def _index_has_staged_changes(repo_root: str) -> bool:
+    """True if the index holds content to commit (vs HEAD, or the empty tree if unborn).
+
+    This is the AUTHORITATIVE committability test, and it deliberately differs from
+    ``changed_paths`` (``git status``). ``git status`` reports a file as changed on a
+    mere stat/mtime difference, but ``git add`` runs the autocrlf/clean filter: on
+    Windows with ``core.autocrlf=true`` a regenerated/tooling file (status: "modified")
+    can normalize to byte-identical with the HEAD blob, so staging it adds NOTHING.
+    ``git diff --cached --quiet`` exits 0 when the index matches HEAD (nothing staged)
+    and 1 when it differs — reading the index AFTER normalization, which status cannot.
+    Any other (error) exit is treated as "has changes" so a genuine failure still
+    surfaces at ``git commit`` instead of being swallowed as a phantom no-op. (B0001 /
+    NR0003 §A: the contract gap between status-"changed" and add/commit-"committable".)
+    """
+    return _git(repo_root, ["diff", "--cached", "--quiet"]).returncode != 0
+
+
 def execute_commits(plan: dict[str, Any], repo_root: str) -> dict[str, Any]:
     """Run ``git add``/``git commit`` for every commit of a READY plan, scoped.
 
@@ -651,8 +668,9 @@ def execute_commits(plan: dict[str, Any], repo_root: str) -> dict[str, Any]:
     """
     result: dict[str, Any] = {
         "ok": False, "attempted": True, "committed": [],
-        "rolled_back": False, "reason": "",
+        "skipped": [], "rolled_back": False, "reason": "",
     }
+    skipped: list[dict[str, str]] = result["skipped"]
 
     commits = [c for c in (plan.get("commits") or []) if isinstance(c, dict)]
     if not commits:
@@ -715,9 +733,32 @@ def execute_commits(plan: dict[str, Any], repo_root: str) -> dict[str, Any]:
             _rollback()
             return result
 
+        # Phantom no-op guard (B0001 / NR0003 §A+§6.2): the drift re-check above is
+        # status-based, but `git add` may have normalized this commit's files to be
+        # byte-identical with HEAD (autocrlf on a regenerated file), staging nothing.
+        # Committing an empty index fails rc=1 with an EMPTY stderr ("nothing to
+        # commit" lands on stdout), which would blank the failure reason AND roll back
+        # the run's real sibling commits. Instead, surface this commit as a skipped
+        # no-op and carry on — one phantom must never kill the honest siblings.
+        if not _index_has_staged_changes(repo_root):
+            logger.warning(
+                "Skipped %s — staging produced no index change; `git status` reported "
+                "a change that `git add` normalized away (autocrlf/clean-filter "
+                "phantom no-op): %s", cid, message)
+            skipped.append({
+                "id": cid, "message": message,
+                "reason": "no staged changes after normalization "
+                          "(autocrlf phantom no-op) — git status reported a change "
+                          "that `git add` did not stage",
+            })
+            continue
+
         com = _git(repo_root, ["commit", "-m", message])
         if com.returncode != 0:
-            result["reason"] = f"{cid}: git commit failed — {com.stderr.strip()}"
+            result["reason"] = (
+                f"{cid}: git commit failed — "
+                + (com.stderr.strip() or com.stdout.strip()
+                   or "git: nothing to commit (no staged changes)"))
             _rollback()
             return result
 
@@ -738,14 +779,31 @@ def execute_commits(plan: dict[str, Any], repo_root: str) -> dict[str, Any]:
             result["reason"] = f"staged-sweep: {err}"
             _rollback()
             return result
-        com = _git(repo_root, ["commit", "-m", _SWEEP_MESSAGE])
-        if com.returncode != 0:
-            result["reason"] = f"staged-sweep: git commit failed — {com.stderr.strip()}"
-            _rollback()
-            return result
-        sha = _head_commit(repo_root) or "?"
-        committed.append({"id": "staged-sweep", "hash": sha, "message": _SWEEP_MESSAGE})
-        logger.info("Committed staged-sweep %s — %s", sha[:9], _SWEEP_MESSAGE)
+        # Same phantom guard as the per-commit loop: if every swept path normalizes
+        # to a no-op the index is empty — skip the sweep instead of failing the run.
+        if not _index_has_staged_changes(repo_root):
+            logger.warning(
+                "Skipped staged-sweep — staging produced no index change "
+                "(autocrlf/clean-filter phantom no-op) for: %s",
+                ", ".join(orphan_staged))
+            skipped.append({
+                "id": "staged-sweep", "message": _SWEEP_MESSAGE,
+                "reason": "no staged changes after normalization "
+                          "(autocrlf phantom no-op)",
+            })
+        else:
+            com = _git(repo_root, ["commit", "-m", _SWEEP_MESSAGE])
+            if com.returncode != 0:
+                result["reason"] = (
+                    "staged-sweep: git commit failed — "
+                    + (com.stderr.strip() or com.stdout.strip()
+                       or "git: nothing to commit (no staged changes)"))
+                _rollback()
+                return result
+            sha = _head_commit(repo_root) or "?"
+            committed.append({"id": "staged-sweep", "hash": sha,
+                              "message": _SWEEP_MESSAGE})
+            logger.info("Committed staged-sweep %s — %s", sha[:9], _SWEEP_MESSAGE)
 
     result["ok"] = True
     result["committed"] = committed
@@ -981,6 +1039,9 @@ def run_commit(
     w = proposal.get("write")
     if w and w.get("ok"):
         logger.info("Write: COMMITTED %d commit(s)", len(w.get("committed", [])))
+        for s in (w.get("skipped") or []):
+            logger.warning("Write: SKIPPED %s (phantom no-op) — %s",
+                           s.get("id"), s.get("reason"))
     elif w and w.get("attempted"):
         logger.warning("Write: NOT completed — %s", w.get("reason"))
     return proposal

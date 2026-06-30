@@ -346,6 +346,96 @@ def test_write_refused_when_not_ready(tmp_path):
     assert before == after  # not-ready plan never commits
 
 
+# ── autocrlf / normalization phantom no-op (B0001 / NR0003 §A) ────────────────
+
+def _stage_then_restore_phantom(repo, rel, committed_text="gen\n"):
+    """Build the B0001 phantom: a tracked file that `git status` reports as changed
+    but whose worktree content is byte-identical with HEAD, so reset+`git add` at
+    commit time stages NOTHING.
+
+    This reproduces the exact failure signature of the Windows autocrlf case
+    (status: modified → add normalizes to HEAD → empty index → `git commit` rc=1
+    with an EMPTY stderr) deterministically, without depending on autocrlf/mtime
+    racy behaviour: stage a drift, then restore the worktree to the committed bytes.
+    Porcelain then reports ``MM`` (staged-vs-HEAD AND worktree-vs-staged), so it is
+    in ``changed_paths`` and passes the drift gate, yet the per-commit ``reset -q``
+    drops the staged drift and ``git add`` re-stages nothing.
+    """
+    _write(repo, rel, committed_text)
+    _git(repo, "add", rel)
+    _git(repo, "commit", "-q", "-m", f"chore: baseline {rel}")
+    _write(repo, rel, "DRIFT\n")            # dirty the worktree
+    _git(repo, "add", rel)                   # stage the drift (status now sees it)
+    _write(repo, rel, committed_text)        # restore worktree to the committed bytes
+
+
+def test_execute_skips_phantom_noop_and_keeps_real_sibling(tmp_path):
+    """B0001: a file that `git status` calls changed but `git add` normalizes to a
+    no-op must be SKIPPED, not hard-fail the run — the real sibling commit survives
+    and HEAD is not rolled back."""
+    repo = _repo(tmp_path)
+    _write(repo, "real.py", "x = 1\n")            # c1: a genuine change
+    _stage_then_restore_phantom(repo, "gen.txt")  # c2: the phantom no-op
+    assert "gen.txt" in changed_paths(repo)       # status DOES report it changed
+
+    plan = _plan([
+        {"id": "c1", "message": "feat(core): real change", "files": ["real.py"]},
+        {"id": "c2", "message": "chore(gen): regenerate", "files": ["gen.txt"]},
+    ])
+    result = execute_commits(plan, repo)
+
+    assert result["ok"] is True                   # phantom did NOT hard-fail the run
+    assert result["rolled_back"] is False         # the sibling was NOT rolled back
+    assert [c["id"] for c in result["committed"]] == ["c1"]
+    assert [s["id"] for s in result["skipped"]] == ["c2"]
+
+    log = _git(repo, "log", "--oneline").stdout
+    assert "feat(core): real change" in log
+    assert "chore(gen): regenerate" not in log    # the phantom was never committed
+
+
+def test_execute_all_phantom_is_clean_noop_not_failure(tmp_path):
+    """If the only planned commit is a phantom no-op, the run succeeds with zero
+    commits (a clean no-op) rather than failing with a blank reason (→ exit 3)."""
+    repo = _repo(tmp_path)
+    _stage_then_restore_phantom(repo, "gen.txt")
+    plan = _plan([{"id": "c1", "message": "chore(gen): regenerate",
+                   "files": ["gen.txt"]}])
+
+    result = execute_commits(plan, repo)
+    assert result["ok"] is True                   # not a hard failure → no exit 3
+    assert result["committed"] == []
+    assert [s["id"] for s in result["skipped"]] == ["c1"]
+    assert result["reason"] == ""                 # no blank "git commit failed —"
+
+
+def test_commit_failure_reason_falls_back_to_stdout(tmp_path, monkeypatch):
+    """Defect B: a real `git commit` failure with an EMPTY stderr ('nothing to
+    commit' goes to stdout) must surface a NON-blank reason, not the original
+    ``git commit failed —`` with a trailing void."""
+    repo = _repo(tmp_path)
+    _write(repo, "a.py", "x = 1\n")
+    plan = _plan([{"id": "c1", "message": "feat(core): add a", "files": ["a.py"]}])
+
+    real_git = C._git
+
+    def fake_git(repo_root, args, check=False):
+        # Force ONLY the actual commit to fail like git's nothing-to-commit case:
+        # rc=1, stderr empty, the human-readable text on stdout.
+        if args[:1] == ["commit"]:
+            return subprocess.CompletedProcess(
+                args, 1, stdout="nothing to commit, working tree clean\n", stderr="")
+        return real_git(repo_root, args, check=check)
+
+    monkeypatch.setattr(C, "_git", fake_git)
+    result = execute_commits(plan, repo)
+
+    assert result["ok"] is False
+    assert result["reason"]                        # not blank
+    assert result["reason"].strip().endswith("nothing to commit, working tree clean")
+    assert result["rolled_back"] is True
+
+
 # ── prune_phantom_files (NR0003 §8-A: author-fabricated paths) ─────────────────
 
 def test_prune_drops_phantom_from_mixed_commit(tmp_path):
