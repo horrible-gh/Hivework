@@ -6,3 +6,7 @@ pytest>=8.0
 pytest-asyncio>=0.23
 fastapi>=0.110
 httpx>=0.27
+# box-0/box-1 acceptance synthesis parses ``## 수용기준`` YAML. Runtime treats PyYAML as
+# OPTIONAL (acceptance_synth guards the import and fail-opens), but the acceptance tests
+# require it — so it is a dev/test dependency.
+PyYAML>=6.0
