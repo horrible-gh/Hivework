@@ -87,10 +87,22 @@ def test_derive_prose_http_read_non_empty(tmp_path):
     assert s.json_path == "projects[].modules" and s.must == "non_empty"
 
 
-def test_derive_prose_declines_on_ambiguous_field(tmp_path):
+def test_derive_prose_two_fields_resolve_multifield(tmp_path):
+    # box-2 (group 0067, level-3, GAP-2): two backticked fields with a UNIFORM, literal-free
+    # must is field cross-validation, no longer ambiguous — one gate asserts both fields.
     root = _make_codebase(tmp_path)
-    # two backticked field candidates → ambiguous → decline (never guesses)
-    prose = "GET /api/v1/projects must include `modules` and `tags`"
+    prose = "GET /api/v1/projects must return non-empty `modules` and `tags`"
+    s = acc.derive_contract_from_prose(prose, root, "AC1")
+    assert s is not None and s.kind == "http_read"
+    assert [a["json_path"] for a in s.asserts] == ["projects[].modules", "projects[].tags"]
+    assert all(a["must"] == "non_empty" for a in s.asserts)
+
+
+def test_derive_prose_multifield_with_literal_declines(tmp_path):
+    # A literal + ≥2 fields can't attribute "which field == the value" → still declines
+    # (box-0's never-guess trust basis, NR0003 §3).
+    root = _make_codebase(tmp_path)
+    prose = "GET /api/v1/projects `total` and `count` must be 정확히 3"
     assert acc.derive_contract_from_prose(prose, root, "AC1") is None
 
 

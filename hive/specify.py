@@ -45,6 +45,7 @@ from hive import schema_ground
 from hive.http_shape_synth import synthesize_http_shape_red_test
 from hive.acceptance_synth import (
     KILL_SWITCH_ENV as _ACCEPTANCE_ENV_OFF,
+    TEST_ID as _ACCEPTANCE_TEST_ID,
     detect_acceptance,
     read_acceptance_criteria,
     synthesize_acceptance_red_test,
@@ -3272,33 +3273,71 @@ def _synthesize_acceptance_red_test(spec: dict[str, Any],
             return spec  # no marker / no well-formed criterion → fail-open
         existing_ids = {str(e.get("id")) for e in edits}
         existing_files = {e.get("file") for e in edits}
-        for ac in criteria:
+        nodes: list[str] = []
+        test_ids: list[str] = []
+        # box-1 (group 0066, level-2): certify EVERY resolving criterion, not just the
+        # first. A design that lists N acceptance criteria yields N independent gates —
+        # each a distinct RED test file wired into ``verify`` — so ``apply --verify``
+        # observes red→green for all of them (verify runs the whole node list). Level-1
+        # (a single resolving criterion) reduces to exactly one gate = the old behaviour.
+        for idx, ac in enumerate(criteria):
             symptom = detect_acceptance(ac, codebase_root)
+            if symptom is None:
+                continue  # this criterion declined (ambiguous / no harness) → next AC
+            # The FIRST synthesised gate keeps the canonical ACCEPTANCE_RED id (so a
+            # single-gate spec is byte-identical to level-1); later gates get a unique
+            # per-criterion suffix so multiple gates never collide on the fixed id.
+            if not nodes:
+                base_tid = _ACCEPTANCE_TEST_ID
+            else:
+                raw_id = re.sub(r"[^A-Za-z0-9_]+", "_", str(ac.get("id") or "")).strip("_")
+                base_tid = (f"{_ACCEPTANCE_TEST_ID}_{raw_id}" if raw_id
+                            else f"{_ACCEPTANCE_TEST_ID}_{idx}")
+            tid, bump = base_tid, 1
+            while tid in existing_ids:
+                bump += 1
+                tid = f"{base_tid}_{bump}"
             result = synthesize_acceptance_red_test(
                 symptom, codebase_root, setup_block=setup_block,
-                app_fixture=app_fixture, test_dir=test_dir or "tests")
+                app_fixture=app_fixture, test_dir=test_dir or "tests", test_id=tid)
             if not result:
-                continue  # this criterion declined (ambiguous / no harness) → next AC
-            # Avoid an id/path collision with an existing edit (rare; be safe).
+                continue  # no runnable harness for this criterion → next AC
             edit = result["edit"]
+            # Avoid an id/path collision with an existing OR already-synthesised edit.
             if edit["id"] in existing_ids or edit["file"] in existing_files:
                 continue
             spec.setdefault("edits", []).append(edit)
+            existing_ids.add(edit["id"])
+            existing_files.add(edit["file"])
             vblock = spec.setdefault("verify", {})
             if not isinstance(vblock, dict):
                 vblock = {}
                 spec["verify"] = vblock
-            vblock["red_test_node"] = result["node"]
-            ids = list(vblock.get("test_edit_ids") or [])
-            if edit["id"] not in ids:
-                ids.append(edit["id"])
-            vblock["test_edit_ids"] = ids
+            # Primary node = first synthesised (single-gate consumers keep reading it).
+            if not vblock.get("red_test_node"):
+                vblock["red_test_node"] = result["node"]
+            if result["node"] not in nodes:
+                nodes.append(result["node"])
+            if edit["id"] not in test_ids:
+                test_ids.append(edit["id"])
             sym = result["symptom"]
             _append_note(spec, f"acceptance red test synthesised (box-0, AC "
                          f"{sym.source_ac_id}) → node {result['node']}.")
             logger.info("specify: synthesised box-0 acceptance red test for AC %s "
                         "(kind=%s) → node %s", sym.source_ac_id, sym.kind, result["node"])
-            return spec  # one node — first resolving criterion wins
+        if nodes:
+            vblock = spec["verify"]
+            ids = list(vblock.get("test_edit_ids") or [])
+            for tid in test_ids:
+                if tid not in ids:
+                    ids.append(tid)
+            vblock["test_edit_ids"] = ids
+            # Expose the plural gate list only when there is more than one, so a
+            # single-gate spec stays byte-identical to the level-1 shape.
+            if len(nodes) > 1:
+                vblock["red_test_nodes"] = nodes
+                _append_note(spec, f"box-1 level-2: {len(nodes)} acceptance gates "
+                             "synthesised — all must go red→green to certify.")
     except Exception as e:  # observation must never break authoring
         logger.warning("specify: acceptance red-test synthesis skipped (%s)", e)
     return spec

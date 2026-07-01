@@ -256,7 +256,19 @@ def verify_red_green(
     ``verified`` (bool), the ``node``, and the captured ``red`` / ``green`` runs.
     """
     verify_block = spec.get("verify") if isinstance(spec.get("verify"), dict) else {}
+    # A spec may carry ONE red_test_node (the historical single-gate contract shared by
+    # lever ⑦ / L2 / L3) or, since box-1 (group 0066 level-2), several distinct acceptance
+    # gates in ``red_test_nodes`` — a feature whose design lists N acceptance criteria is
+    # certified only when EVERY one goes red→green. ``red_test_node`` stays the primary for
+    # backward compatibility (verdict["node"], legacy consumers); ``red_test_nodes`` extends
+    # it. Deduped, primary first. A single node reduces to the exact pre-box-1 sequence.
     node = verify_block.get("red_test_node") or ""
+    nodes: list[str] = []
+    for n in [node] + [str(x) for x in (verify_block.get("red_test_nodes") or []) if x]:
+        if n and n not in nodes:
+            nodes.append(n)
+    if not node and nodes:
+        node = nodes[0]
     test_edits, source_edits = _partition_edits(spec)
 
     verdict: dict[str, Any] = {
@@ -267,7 +279,7 @@ def verify_red_green(
     if runner is None:
         verdict["reason"] = "no test runner configured for this codebase"
         return verdict
-    if not node:
+    if not nodes:
         verdict["reason"] = "spec has no verify.red_test_node to run"
         return verdict
     if not test_edits:
@@ -285,49 +297,60 @@ def verify_red_green(
         rel_paths, ttl_hours, created_paths=created)
     verdict["bundle"] = bundle["dir"]
 
-    def _run() -> dict[str, Any]:
+    def _run(n: str) -> dict[str, Any]:
         # Rebase here (not once up front): the test file only exists on disk after the
         # red-baseline write, and the rebase confirms the path against the live tree.
-        node_id = _rebase_node_to_cwd(node, codebase_root, cwd)
+        node_id = _rebase_node_to_cwd(n, codebase_root, cwd)
         return run_node(runner.command, cwd, node_id, runner.timeout_sec,
                         getattr(runner, "env", None) or None)
 
     try:
-        # 1+2: red baseline — test edit only, no fix yet.
+        # 1+2: red baseline — test edit(s) only, no fix yet. Run EVERY gate; each must
+        # bite. verdict["red"] stays the primary node's run (single-gate compatibility);
+        # the per-gate runs are exposed as ``red_runs`` only when there is more than one.
         ok, why = _write_subset(test_edits, codebase_root)
         if not ok:
             verdict["transition"] = T_TEST_UNAPPLICABLE
             verdict["reason"] = why
             return verdict
-        red = _run()
-        verdict["red"] = red
-        if red["status"] == RUN_PASS:
+        red_runs = [_run(n) for n in nodes]
+        verdict["red"] = red_runs[0]
+        if len(red_runs) > 1:
+            verdict["red_runs"] = red_runs
+        # A gate that passes WITHOUT the fix does not reproduce its criterion → the whole
+        # feature is not certifiable (one non-biting gate poisons the run).
+        if any(r["status"] == RUN_PASS for r in red_runs):
             verdict["transition"] = T_NO_BITE
             verdict["reason"] = ("red test passed WITHOUT the fix — it does not "
                                  "reproduce the symptom and cannot certify a fix")
             return verdict
-        if red["status"] != RUN_FAIL:
+        bad = next((r for r in red_runs if r["status"] != RUN_FAIL), None)
+        if bad is not None:
             verdict["transition"] = T_RED_INDETERMINATE
             verdict["reason"] = (f"red baseline did not run cleanly "
-                                 f"(status={red['status']}) — cannot certify")
+                                 f"(status={bad['status']}) — cannot certify")
             return verdict
 
-        # 3+4: apply the fix, expect green.
+        # 3+4: apply the fix, expect EVERY gate green. A single gate left red means the
+        # feature does not yet satisfy all its acceptance criteria → still_red.
         ok, why = _write_subset(source_edits, codebase_root)
         if not ok:
             verdict["transition"] = T_SOURCE_UNAPPLICABLE
             verdict["reason"] = why
             return verdict
-        green = _run()
-        verdict["green"] = green
-        if green["status"] == RUN_PASS:
+        green_runs = [_run(n) for n in nodes]
+        verdict["green"] = green_runs[0]
+        if len(green_runs) > 1:
+            verdict["green_runs"] = green_runs
+        stuck = next((g for g in green_runs if g["status"] != RUN_PASS), None)
+        if stuck is None:
             verdict["transition"] = T_RED_TO_GREEN
             verdict["verified"] = True
             verdict["reason"] = "red test failed without the fix and passes with it"
         else:
             verdict["transition"] = T_STILL_RED
             verdict["reason"] = (f"fix applied but the red test still does not pass "
-                                 f"(status={green['status']}) — the edit is inert")
+                                 f"(status={stuck['status']}) — the edit is inert")
         return verdict
     finally:
         # The dry run never persists: put every touched file back exactly.
