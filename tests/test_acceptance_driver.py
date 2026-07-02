@@ -102,9 +102,21 @@ def test_specify_pass_noop_without_source_edit(tmp_path):
     assert not out.get("verify", {}).get("red_test_node")
 
 
-def test_specify_pass_does_not_clobber_existing_node(tmp_path):
+def test_specify_pass_merges_design_gate_with_existing_node(tmp_path):
+    """0076 box-0 MERGE: a pre-existing (author/⑦) red_test_node no longer makes box-0 a
+    no-op. The author node stays PRIMARY and the design-derived ACCEPTANCE_RED gate is
+    ADDED to red_test_nodes so ``apply --verify`` runs BOTH red→green — closing the
+    TSR0003 self-driving bypass where the copilot author's node silently skipped box-0."""
     root = _codebase(tmp_path)
-    spec = {"edits": [{"id": "FIX", "kind": "edit", "file": "app/routes.py"}],
+    spec = {"edits": [{"id": "FIX", "kind": "edit", "file": "app/routes.py",
+                       "anchor_old": "x", "replacement_new": "y"}],
             "verify": {"red_test_node": "tests/existing.py::test_keep"}}
     out = specify._synthesize_acceptance_red_test(spec, _CRITERIA, root)
+    # author node preserved as PRIMARY (backward-compat single-node consumers keep reading it)
     assert out["verify"]["red_test_node"] == "tests/existing.py::test_keep"
+    # design gate synthesised and ADDED alongside — not skipped
+    assert any(e["id"] == "ACCEPTANCE_RED" for e in out["edits"])
+    nodes = out["verify"]["red_test_nodes"]
+    assert nodes[0] == "tests/existing.py::test_keep"  # primary first
+    assert any(n.startswith("tests/test_acceptance_modules.py::") for n in nodes)
+    assert len(nodes) == 2  # author primary + design gate, both certified by verify
