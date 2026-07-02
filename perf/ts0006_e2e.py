@@ -618,6 +618,130 @@ def main() -> int:
         "green_status": (verdict9.get("green") or {}).get("status"),
     }
 
+    # ── Scenario 10: 0076 box-0 MERGE — an author pre-fills verify.red_test_node; box-0 no
+    # longer no-ops. The author's (GOOD) gate stays PRIMARY and the DESIGN-derived
+    # ACCEPTANCE_RED gate is ADDED to red_test_nodes, so verify runs BOTH red→green through
+    # the real pytest subprocess. This is the fix for the TSR0003 self-driving bypass:
+    # pre-fix, box-0 returned early on the author node → design gate silently dropped.
+    root10 = tempfile.mkdtemp(prefix="ts0006_sut_merge_")
+    os.makedirs(os.path.join(root10, "app"), exist_ok=True)
+    os.makedirs(os.path.join(root10, "tests"), exist_ok=True)
+    with open(os.path.join(root10, "app", "routes.py"), "w", encoding="utf-8") as fh:
+        fh.write('from fastapi import APIRouter\n'
+                 'router = APIRouter(prefix="/api/v1")\n'
+                 'def _rows():\n    return [{"id": 1}]\n\n'  # RED: items carry no `modules`
+                 '@router.get("/projects")\n'
+                 'def list_projects():\n'
+                 '    return {"projects": _rows()}\n')
+    with open(os.path.join(root10, "tests", "conftest.py"), "w", encoding="utf-8") as fh:
+        fh.write('import pytest\n'
+                 'from fastapi.testclient import TestClient\n\n'
+                 '@pytest.fixture\n'
+                 'def client():\n'
+                 '    from app.routes import router\n'
+                 '    from fastapi import FastAPI\n'
+                 '    app = FastAPI(); app.include_router(router)\n'
+                 '    return TestClient(app)\n')
+    criteria10 = ("# Feature design\n\n## 수용기준\n"
+                  "- id: AC1\n"
+                  "  prose: GET /api/v1/projects must return a non-empty `modules` field\n")
+    cfg10 = load_config(path=_write_config(root10, with_binding=True, criteria_text=criteria10))
+    kw10 = cli.acceptance_specify_kwargs(cfg10, root10)
+    _author_gate = ('def test_author_modules(client):\n'
+                    '    resp = client.get("/api/v1/projects")\n'
+                    '    assert resp.json()["projects"][0].get("modules")  # RED until fix\n')
+    # The author fills its OWN red_test_node (E3-analog) BEFORE box-0 runs — the exact shape
+    # the real copilot author produces on the self-driving path.
+    spec10 = {"edits": [
+        {"id": "FIX_MODULES", "file": "app/routes.py",
+         "anchor_old": 'return [{"id": 1}]',
+         "replacement_new": 'return [{"id": 1, "modules": [1, 2, 3]}]',
+         "rationale": "build the feature: expose modules on each project", "confidence": "high"},
+        {"id": "AUTHOR_TEST", "kind": "create_file",
+         "file": "tests/test_author_gate.py", "content": _author_gate}],
+        "termination": "ready_to_apply",
+        "verify": {"red_test_node": "tests/test_author_gate.py::test_author_modules",
+                   "test_edit_ids": ["AUTHOR_TEST"]}}
+    spec10 = specify._synthesize_acceptance_red_test(
+        spec10, kw10.get("acceptance_criteria_text"), root10,
+        setup_block=kw10.get("acceptance_setup_block"),
+        app_fixture=kw10.get("acceptance_app_fixture"),
+        test_dir=kw10.get("acceptance_test_dir", "tests"))
+    vblock10 = spec10.get("verify") or {}
+    nodes10 = vblock10.get("red_test_nodes") or []
+    runner10 = cfg10.test_runner_for_codebase(root10)
+    verdict10 = verifymod.verify_red_green(
+        spec10, root10, runner10, os.path.join(root10, ".apply_backups"), ttl_hours=1)
+    results["scenario_10"] = {
+        "transition": verdict10.get("transition"),
+        "verified": verdict10.get("verified"),
+        "primary_is_author": vblock10.get("red_test_node")
+        == "tests/test_author_gate.py::test_author_modules",
+        "gate_count": len(nodes10),                       # 2 = author primary + design gate
+        "primary_first": bool(nodes10) and nodes10[0]
+        == "tests/test_author_gate.py::test_author_modules",
+        "design_gate_added": any(n.startswith("tests/test_acceptance_modules.py::")
+                                 for n in nodes10),
+        "red_all_fail": all(r.get("status") == "fail" for r in (verdict10.get("red_runs") or [])),
+        "green_all_pass": all(g.get("passed") for g in (verdict10.get("green_runs") or [])),
+    }
+
+    # ── Scenario 11: 0076 MERGE safety — an INVERTED author gate (passes WITHOUT the fix)
+    # must still poison the merged run. The design gate is added just the same, but the
+    # author node passing at the red baseline yields T_NO_BITE (NOT READY). Proves the merge
+    # does not weaken the test_does_not_bite safeguard (TSR0003 §3 scenario A, reproduced).
+    root11 = tempfile.mkdtemp(prefix="ts0006_sut_merge_bad_")
+    os.makedirs(os.path.join(root11, "app"), exist_ok=True)
+    os.makedirs(os.path.join(root11, "tests"), exist_ok=True)
+    with open(os.path.join(root11, "app", "routes.py"), "w", encoding="utf-8") as fh:
+        fh.write('from fastapi import APIRouter\n'
+                 'router = APIRouter(prefix="/api/v1")\n'
+                 'def _rows():\n    return [{"id": 1}]\n\n'  # RED: items carry no `modules`
+                 '@router.get("/projects")\n'
+                 'def list_projects():\n'
+                 '    return {"projects": _rows()}\n')
+    with open(os.path.join(root11, "tests", "conftest.py"), "w", encoding="utf-8") as fh:
+        fh.write('import pytest\n'
+                 'from fastapi.testclient import TestClient\n\n'
+                 '@pytest.fixture\n'
+                 'def client():\n'
+                 '    from app.routes import router\n'
+                 '    from fastapi import FastAPI\n'
+                 '    app = FastAPI(); app.include_router(router)\n'
+                 '    return TestClient(app)\n')
+    cfg11 = load_config(path=_write_config(root11, with_binding=True, criteria_text=criteria10))
+    kw11 = cli.acceptance_specify_kwargs(cfg11, root11)
+    _author_inverted = ('def test_author_inverted(client):\n'
+                        '    resp = client.get("/api/v1/projects")\n'
+                        '    assert "modules" not in resp.json()["projects"][0]  # PASSES pre-fix\n')
+    spec11 = {"edits": [
+        {"id": "FIX_MODULES", "file": "app/routes.py",
+         "anchor_old": 'return [{"id": 1}]',
+         "replacement_new": 'return [{"id": 1, "modules": [1, 2, 3]}]',
+         "rationale": "build the feature: expose modules on each project", "confidence": "high"},
+        {"id": "AUTHOR_TEST", "kind": "create_file",
+         "file": "tests/test_author_gate.py", "content": _author_inverted}],
+        "termination": "ready_to_apply",
+        "verify": {"red_test_node": "tests/test_author_gate.py::test_author_inverted",
+                   "test_edit_ids": ["AUTHOR_TEST"]}}
+    spec11 = specify._synthesize_acceptance_red_test(
+        spec11, kw11.get("acceptance_criteria_text"), root11,
+        setup_block=kw11.get("acceptance_setup_block"),
+        app_fixture=kw11.get("acceptance_app_fixture"),
+        test_dir=kw11.get("acceptance_test_dir", "tests"))
+    vblock11 = spec11.get("verify") or {}
+    nodes11 = vblock11.get("red_test_nodes") or []
+    runner11 = cfg11.test_runner_for_codebase(root11)
+    verdict11 = verifymod.verify_red_green(
+        spec11, root11, runner11, os.path.join(root11, ".apply_backups"), ttl_hours=1)
+    results["scenario_11"] = {
+        "transition": verdict11.get("transition"),
+        "verified": verdict11.get("verified"),
+        "gate_count": len(nodes11),                       # 2 = merge still happened
+        "design_gate_added": any(n.startswith("tests/test_acceptance_modules.py::")
+                                 for n in nodes11),
+    }
+
     print(json.dumps(results, indent=2, ensure_ascii=False))
 
     ok = (results["scenario_1"]["transition"] == "red_to_green"
@@ -673,7 +797,19 @@ def main() -> int:
           and results["scenario_9"]["post_call"] == 0
           and results["scenario_9"]["payload_count"] == 2
           and results["scenario_9"]["cross_relation"] is True
-          and results["scenario_9"]["relation_fn"] == 1)
+          and results["scenario_9"]["relation_fn"] == 1
+          and results["scenario_10"]["transition"] == "red_to_green"
+          and results["scenario_10"]["verified"] is True
+          and results["scenario_10"]["primary_is_author"] is True
+          and results["scenario_10"]["gate_count"] == 2
+          and results["scenario_10"]["primary_first"] is True
+          and results["scenario_10"]["design_gate_added"] is True
+          and results["scenario_10"]["red_all_fail"] is True
+          and results["scenario_10"]["green_all_pass"] is True
+          and results["scenario_11"]["transition"] == "test_does_not_bite"
+          and results["scenario_11"]["verified"] is not True
+          and results["scenario_11"]["gate_count"] == 2
+          and results["scenario_11"]["design_gate_added"] is True)
     print("\nTS0006 e2e:", "PASS (go)" if ok else "FAIL")
     return 0 if ok else 1
 
