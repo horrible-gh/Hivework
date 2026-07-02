@@ -3248,11 +3248,17 @@ def _synthesize_acceptance_red_test(spec: dict[str, Any],
 
     Fully fail-open, mirroring ⑦: a no-op unless the kill-switch is off, criteria text is
     supplied (the design+criteria handoff is provided from OUTSIDE the chain — NR0003
-    conclusion, L DEFERRED — so ``None`` means "nothing to extract"), the spec carries no
-    red-test node yet (never clobber an author's or ⑦'s), there is a SOURCE edit to
-    certify, and a criterion + (for http_read) a runnable harness both resolve. Runs
+    conclusion, L DEFERRED — so ``None`` means "nothing to extract"), there is a SOURCE edit
+    to certify, and a criterion + (for http_read) a runnable harness both resolve. Runs
     BEFORE ⑦ so an explicit acceptance criterion wins; ⑦ fills in when none resolves.
-    Never raises.
+
+    box-0 MERGE (0076 NR0006): unlike ⑦/L2/L3, this pass does NOT yield to a pre-existing
+    ``verify.red_test_node``. The box-0 gate is DESIGN-derived, so it must be enforced no
+    matter what test the author wrote. Any pre-existing node stays PRIMARY and the
+    synthesised design gate(s) are ADDED to ``red_test_nodes`` (verify runs the whole list
+    red→green). In the real self-driving path the copilot author fills its own
+    ``red_test_node`` (E3); the old early-return let that silently skip box-0 (TSR0003
+    bypass). Never raises.
     """
     if os.environ.get(_ACCEPTANCE_ENV_OFF):
         return spec
@@ -3260,8 +3266,10 @@ def _synthesize_acceptance_red_test(spec: dict[str, Any],
         return spec  # design+criteria provided from outside the chain; none here → no-op
     try:
         verify = spec.get("verify") if isinstance(spec.get("verify"), dict) else {}
-        if verify.get("red_test_node"):
-            return spec  # an author/⑦ red test already drives the loop — don't clobber
+        # box-0 MERGE: remember any author/⑦ primary but do NOT return — the design gate is
+        # synthesised alongside it (see the plural exposure below). Closes the 0076 bypass
+        # where a copilot-authored red_test_node made this design gate a silent no-op.
+        preexisting_node = verify.get("red_test_node") or ""
         edits = [e for e in (spec.get("edits") or []) if isinstance(e, dict)]
         source_edits = [e for e in edits
                         if e.get("kind", "edit") != "create_file"
@@ -3332,11 +3340,20 @@ def _synthesize_acceptance_red_test(spec: dict[str, Any],
                 if tid not in ids:
                     ids.append(tid)
             vblock["test_edit_ids"] = ids
-            # Expose the plural gate list only when there is more than one, so a
-            # single-gate spec stays byte-identical to the level-1 shape.
-            if len(nodes) > 1:
-                vblock["red_test_nodes"] = nodes
-                _append_note(spec, f"box-1 level-2: {len(nodes)} acceptance gates "
+            # The full gate list = any pre-existing author/⑦ primary + every synthesised
+            # design gate (primary first, deduped). When an author node pre-existed, even a
+            # SINGLE synthesised gate makes the total ≥2, so box-0 MUST be exposed in
+            # red_test_nodes — otherwise verify would run only the author primary and the
+            # design gate would be silently dropped (the 0076 bypass). Byte-identical to the
+            # level-1 shape only when there is no author node AND exactly one synthesised
+            # gate (preexisting_node == "" and len(nodes) == 1).
+            all_nodes: list[str] = []
+            for n in ([preexisting_node] if preexisting_node else []) + nodes:
+                if n and n not in all_nodes:
+                    all_nodes.append(n)
+            if len(all_nodes) > 1:
+                vblock["red_test_nodes"] = all_nodes
+                _append_note(spec, f"box-1 level-2: {len(all_nodes)} acceptance gates "
                              "synthesised — all must go red→green to certify.")
     except Exception as e:  # observation must never break authoring
         logger.warning("specify: acceptance red-test synthesis skipped (%s)", e)
