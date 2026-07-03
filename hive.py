@@ -1023,6 +1023,65 @@ def run_investigate_command(args: argparse.Namespace) -> None:
             f.write(render_local_honey(result, seed_text, args.codebase, args.docs))
         logger.info("Local honey rendered (no assemble call): %s", honey_path)
 
+        # ── Designer stage (group 0079): author the ## 수용기준 acceptance design from
+        #    the grounded verdicts and arm the keymaster BEFORE specify. Priority (L §2.4):
+        #    an operator --acceptance-design wins; the HIVE_NO_DESIGNER kill switch (or a
+        #    seed with no grounded verdict, where the designer abstains) falls back to the
+        #    legacy unarmed/fail-open path; a fully-declined grounded design HALTS here
+        #    (strict, design_no_go) rather than proceeding without acceptance criteria.
+        designer_design_path = getattr(args, "acceptance_design", None)
+        if designer_design_path:
+            logger.info("Designer: skipped (operator --acceptance-design supplied)")
+        elif os.environ.get("HIVE_NO_DESIGNER"):
+            logger.info("Designer: bypassed (HIVE_NO_DESIGNER set) — legacy unarmed path")
+        else:
+            from hive.designer import run_designer
+            designer_role = cfg.role("designer")
+            try:
+                with open(honey_path, encoding="utf-8") as fh:
+                    honey_text = fh.read()
+            except OSError:
+                honey_text = ""
+            ldg_d = open_ledger(cfg.ledger.enabled, cfg.ledger.db_path)
+            ldg_d.start_run(seed=args.seed, codebase=args.codebase,
+                            model_queen=designer_role.model,
+                            model_fanout=designer_role.model)
+            try:
+                dres = run_designer(
+                    seed_text=seed_text, verdicts=result.get("verdicts", []),
+                    honey_text=honey_text, codebase_root=args.codebase,
+                    role=designer_role, provider_kwargs=provider_kwargs, ledger=ldg_d)
+            finally:
+                ldg_d.finish_run(status="done")
+                ldg_d.close()
+            decision = dres.get("decision")
+            logger.info("─" * 60)
+            logger.info("Designer decision: %s (attempts=%s, recipe=%s)",
+                        decision, dres.get("attempts"), dres.get("recipe"))
+            if decision == "proceed":
+                designer_design_path = os.path.splitext(args.out)[0] + ".design.md"
+                with open(designer_design_path, "w", encoding="utf-8") as fh:
+                    fh.write(dres["design_text"])
+                logger.info("Designer: keymaster armed with %d criterion(s) [%s] → %s",
+                            len(dres.get("valid_ids") or []),
+                            ", ".join(dres.get("valid_ids") or []), designer_design_path)
+                if dres.get("declined"):
+                    logger.warning("Designer: %d criterion(s) demoted (partial decline)",
+                                   len(dres["declined"]))
+            elif decision == "no_go":
+                # L §4 invariant — the designer path NEVER proceeds unarmed: halt before
+                # specify with an honest design_no_go instead of a silent unverified apply.
+                logger.error("Designer NO-GO (%s, attempts=%s): halting before specify. "
+                             "The keymaster cannot be armed and the designer path forbids "
+                             "arming-less progress (design_no_go). Set HIVE_NO_DESIGNER to "
+                             "fall back to the legacy unarmed path.",
+                             dres.get("reason"), dres.get("attempts"))
+                return
+            else:  # needs_reinvestigation — no grounded verdict to author criteria from
+                logger.warning("Designer abstained (%s): no grounded verdict to author "
+                               "acceptance criteria — proceeding on the legacy (unarmed) "
+                               "path.", dres.get("reason"))
+
         specify_role = cfg.role("specify")
         spec_out = args.spec_out or (os.path.splitext(args.out)[0] + ".edit_spec.json")
         logger.info("─" * 60)
@@ -1043,8 +1102,10 @@ def run_investigate_command(args: argparse.Namespace) -> None:
             specify_kwargs.update(http_shape_specify_kwargs(cfg, args.codebase))
             specify_kwargs.update(write_sink_specify_kwargs(cfg, args.codebase))
             specify_kwargs.update(overwrite_race_specify_kwargs(cfg, args.codebase))
+            # Arm the keymaster with the designer's design (group 0079) when it proceeded;
+            # otherwise designer_design_path is the operator override or None (legacy).
             specify_kwargs.update(acceptance_specify_kwargs(
-                cfg, args.codebase, getattr(args, "acceptance_design", None)))
+                cfg, args.codebase, designer_design_path))
 
             def _respecify():
                 spec = run_specify(

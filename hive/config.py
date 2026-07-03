@@ -698,6 +698,11 @@ class Config:
     # tuning knob. Falls back to `swarm` when unset, so existing configs are unchanged.
     scout: RoleConfig = field(default_factory=RoleConfig)
     assemble_role: RoleConfig = field(default_factory=RoleConfig)
+    # The DESIGNER (group 0079): authors the ## 수용기준 acceptance design from grounded
+    # investigate verdicts, then arms the keymaster. Sonnet-tier by policy (D-03 §1) — it
+    # must write executable oracles without guessing; a low tier is forbidden.
+    designer: RoleConfig = field(
+        default_factory=lambda: RoleConfig(model="claude-sonnet-4.5"))
     specify: RoleConfig = field(default_factory=RoleConfig)
     review: RoleConfig = field(default_factory=RoleConfig)
     commit: RoleConfig = field(
@@ -895,8 +900,8 @@ class Config:
         if model is None:
             return
         for role in (self.queen, self.fanout_role, self.scout, self.assemble_role,
-                     self.specify, self.review, self.commit, self.judge_role,
-                     self.converge_role):
+                     self.designer, self.specify, self.review, self.commit,
+                     self.judge_role, self.converge_role):
             role.model = model
 
 
@@ -934,7 +939,7 @@ def _profile_path(profile: str | None) -> str:
 # source of truth for which pipeline stage backs which internal role.
 _PIPELINE_ROLE_STAGES = (
     "decompose", "fanout", "judge", "reinforce", "converge",
-    "assemble", "specify", "review", "commit",
+    "assemble", "designer", "specify", "review", "commit",
 )
 
 
@@ -1053,7 +1058,7 @@ def _expand_schema_v2(raw: dict) -> dict:
             ristage["max_rounds"] = ri["rounds"]
         stages["reinvestigation"] = {**(stages.get("reinvestigation") or {}), **ristage}
 
-    for st in ("assemble", "specify", "review"):
+    for st in ("assemble", "designer", "specify", "review"):
         if isinstance(pipeline.get(st), dict):
             roles[st] = _role_pm(pipeline[st])
 
@@ -1401,6 +1406,7 @@ def load_config(path: str | None = None, profile: str | None = None) -> Config:
         fanout_role=fanout_role,
         scout=scout_role,
         assemble_role=_role("assemble"),
+        designer=_role("designer", default_model="claude-sonnet-4.5"),
         specify=_role("specify"),
         review=_role("review"),
         commit=_role("commit", default_model="claude-haiku-4.5"),
