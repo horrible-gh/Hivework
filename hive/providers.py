@@ -203,6 +203,7 @@ def _call_openai_compatible(model, prompt, cwd=None, timeout=120, *, system=None
                             api_key_env="DEEPINFRA_TOKEN",
                             base_url="https://api.deepinfra.com/v1/openai",
                             available_tools=None, on_start=None,
+                            max_iterations=None, prune_keep_rounds=None,
                             **_ignored) -> WorkerResult:
     """Call any OpenAI-compatible chat endpoint (DeepInfra, OpenAI, vLLM, …).
 
@@ -269,9 +270,20 @@ def _call_openai_compatible(model, prompt, cwd=None, timeout=120, *, system=None
     t0 = time.monotonic()
     try:
         if tool_names:
+            # ``max_iterations`` caps the agent loop's rounds; ``prune_keep_rounds``
+            # turns on old-tool-output pruning (config-wired: the openai block's
+            # global knobs, or stage knobs such as fanout.* laid over
+            # provider_kwargs). None/0 keeps the loop's own defaults — existing
+            # configs run unchanged.
+            loop_kwargs = {}
+            if max_iterations:
+                loop_kwargs["max_iterations"] = int(max_iterations)
+            if prune_keep_rounds:
+                loop_kwargs["prune_keep_rounds"] = int(prune_keep_rounds)
             content, real_tokens = http_tools.run_agent_loop(
                 client, model, messages, root=cwd, tool_names=tool_names,
-                temperature=temperature, max_tokens=max_tokens, extra=extra)
+                temperature=temperature, max_tokens=max_tokens, extra=extra,
+                **loop_kwargs)
         else:
             resp = client.chat.completions.create(
                 model=model, messages=messages, temperature=temperature,

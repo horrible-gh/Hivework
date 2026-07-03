@@ -110,7 +110,36 @@ def build_provider_kwargs(cfg) -> dict:
         kwargs["base_url"] = cfg.openai.base_url
     if cfg.openai.api_key_env:
         kwargs["api_key_env"] = cfg.openai.api_key_env
+    # Global agent-loop knobs for the HTTP provider (every tool-ON stage): the
+    # round ceiling and the old-tool-output pruning window. Unset → the loop's
+    # own defaults apply (no cap change, no pruning), so existing configs are
+    # unchanged. Per-stage knobs (fanout_provider_kwargs) override.
+    if cfg.openai.max_agent_iterations:
+        kwargs["max_iterations"] = cfg.openai.max_agent_iterations
+    if cfg.openai.prune_keep_rounds:
+        kwargs["prune_keep_rounds"] = cfg.openai.prune_keep_rounds
     return kwargs
+
+
+def fanout_provider_kwargs(cfg, base_kwargs: dict) -> dict:
+    """The fanout stage's provider_kwargs: the shared dict + the stage's own
+    agent-loop knobs (``pipeline.fanout.max_iterations`` round ceiling and
+    ``prune_keep_rounds`` history-pruning window) laid on top.
+
+    The stage knobs exist because the runaway-history cost is a FANOUT pathology
+    (R0001 0077: 2 of 7 drones spun to the 25-round bound and carried 82% of the
+    run's HTTP tokens) — tuning drones must not tighten other tool-ON stages.
+    Unset → the shared dict passes through unchanged (global knob or code default).
+    CLI providers ignore the keys via ``**_ignored``.
+    """
+    overrides = {}
+    if cfg.fanout.max_iterations:
+        overrides["max_iterations"] = cfg.fanout.max_iterations
+    if cfg.fanout.prune_keep_rounds:
+        overrides["prune_keep_rounds"] = cfg.fanout.prune_keep_rounds
+    if not overrides:
+        return base_kwargs
+    return {**base_kwargs, **overrides}
 
 
 def http_shape_specify_kwargs(cfg, codebase_root: str | None) -> dict:
@@ -496,7 +525,7 @@ def run_pipeline(args: argparse.Namespace) -> None:
             model=fanout_role.model,
             provider=fanout_role.provider,
             ledger=ldg,
-            provider_kwargs=provider_kwargs,
+            provider_kwargs=fanout_provider_kwargs(cfg, provider_kwargs),
             max_workers=cfg.fanout.parallel,
             respecify_retries=cfg.fanout.retries,
             max_calls=cfg.fanout.max_calls,
