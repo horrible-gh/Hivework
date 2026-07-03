@@ -595,20 +595,22 @@ class TestShippedDefaultProfile(unittest.TestCase):
         # floor. Premise updated from the old votes=5 default.
         self.assertEqual(self.cfg.judge.votes_per_axis, 3)
 
-    def test_swarm_run_default_off(self):
-        # The SHIPPED default keeps the source-mining swarm OFF (pipeline.fanout.enabled
-        # = false), so safety.allow_swarm (derived from fanout.enabled, config.py:798) is
-        # False. Swarm is turned on per-run by an explicit profile (e.g. --profile small2,
-        # group 0056 / NR0006 #2): the shipped default stays a lean, swarm-off baseline
-        # rather than the 24/true this test originally anticipated at R0001 start.
-        self.assertFalse(self.cfg.safety.allow_swarm)
+    def test_swarm_run_default_on(self):
+        # Premise updated (group 0076): the shipped default now ships the CERTIFIED
+        # swarm-ON preset (pipeline.fanout.enabled = true, Qwen HTTP drones) — the
+        # measured cost/quality baseline — so safety.allow_swarm (derived from
+        # fanout.enabled) is True. The old lean swarm-off baseline is history.
+        self.assertTrue(self.cfg.safety.allow_swarm)
 
     def test_fanout_tuning_knobs_surfaced(self):
-        # The previously-hidden fan-out spend knobs are now read from config. The shipped
-        # default carries the lean 8-call ceiling; profiles like small2 raise/enable it.
-        self.assertEqual(self.cfg.fanout.parallel, 4)
+        # The previously-hidden fan-out spend knobs are read from config. Premise
+        # updated to the certified 0076 preset (parallel 8 / max_calls 16); 0077
+        # adds the per-drone agent-loop round ceiling (25 → 12: the tail-drone
+        # runaway carried 82% of run 681's HTTP tokens; healthy drones end ≤ 11).
+        self.assertEqual(self.cfg.fanout.parallel, 8)
         self.assertEqual(self.cfg.fanout.retries, 1)
-        self.assertEqual(self.cfg.fanout.max_calls, 8)
+        self.assertEqual(self.cfg.fanout.max_calls, 16)
+        self.assertEqual(self.cfg.fanout.max_iterations, 12)
 
     def test_converge_split_enabled_without_placeholder_model(self):
         self.assertTrue(self.cfg.converge_split.enabled)

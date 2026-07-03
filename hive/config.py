@@ -176,6 +176,15 @@ class OpenAiConfig:
     """
     base_url: str = "https://api.deepinfra.com/v1/openai"
     api_key_env: str = "DEEPINFRA_TOKEN"
+    # Ceiling on the client-side agent-loop rounds (hive/http_tools.py) for EVERY
+    # HTTP tool-ON stage. None = keep the code default (DEFAULT_MAX_ITERATIONS),
+    # so existing configs run exactly as before. A per-stage knob (e.g.
+    # FanoutConfig.max_iterations) overrides this global one where both are set.
+    max_agent_iterations: int | None = None
+    # Agent-loop history pruning for every HTTP tool-ON stage: keep the last N
+    # tool-call rounds' outputs verbatim, stub older ones (R0001 0077 req 2).
+    # None = pruning off (existing behaviour). Stage knob overrides, as above.
+    prune_keep_rounds: int | None = None
 
 
 @dataclass
@@ -657,10 +666,22 @@ class FanoutConfig:
       (was the single, unconditional respecify pass). 1 preserves today's behaviour.
     - ``max_calls``: a hard ceiling on TOTAL drone calls per run (0 = unlimited). When set,
       the axis list is trimmed pre-launch so worst-case ``axes x (1 + retries) <= max_calls``.
+    - ``max_iterations``: ceiling on the HTTP agent loop's tool-call rounds PER DRONE
+      (hive/http_tools.py run_agent_loop). The loop resends the whole transcript every
+      round with no cache discount on DeepInfra, so cost grows ~quadratically with rounds;
+      runaway drones spin to the ceiling while healthy ones finish in a handful (R0001
+      0077: 2 of 7 drones hit the 25-round bound and carried 82% of the run's tokens).
+      None = keep the code default (25) — the safe fallback for existing configs; the
+      default profile lowers it. Ignored by CLI providers (copilot/codex).
     """
     parallel: int = 4
     retries: int = 1
     max_calls: int = 0
+    max_iterations: int | None = None
+    # Drone-loop history pruning (R0001 0077 req 2): keep the last N tool-call
+    # rounds' outputs verbatim, stub older ones so the per-round resend stops
+    # growing quadratically. None = off (existing behaviour byte-for-byte).
+    prune_keep_rounds: int | None = None
 
 
 @dataclass
@@ -977,6 +998,10 @@ def _expand_schema_v2(raw: dict) -> dict:
             "retries": int(fo.get("retries", 1)),
             "max_calls": int(fo.get("max_calls", 0)),
         }
+        if fo.get("max_iterations") is not None:
+            out["fanout"]["max_iterations"] = int(fo["max_iterations"])
+        if fo.get("prune_keep_rounds") is not None:
+            out["fanout"]["prune_keep_rounds"] = int(fo["prune_keep_rounds"])
 
     ju = pipeline.get("judge")
     if isinstance(ju, dict):
@@ -1398,6 +1423,12 @@ def load_config(path: str | None = None, profile: str | None = None) -> Config:
             base_url=str(openai_raw.get("base_url",
                                         "https://api.deepinfra.com/v1/openai")),
             api_key_env=str(openai_raw.get("api_key_env", "DEEPINFRA_TOKEN")),
+            max_agent_iterations=(int(openai_raw["max_agent_iterations"])
+                                  if openai_raw.get("max_agent_iterations")
+                                  is not None else None),
+            prune_keep_rounds=(int(openai_raw["prune_keep_rounds"])
+                               if openai_raw.get("prune_keep_rounds")
+                               is not None else None),
         ),
         ledger=LedgerConfig(
             enabled=bool(ledger_raw.get("enabled", True)),
@@ -1418,6 +1449,12 @@ def load_config(path: str | None = None, profile: str | None = None) -> Config:
             parallel=int(fanout_raw.get("parallel", 4)),
             retries=int(fanout_raw.get("retries", 1)),
             max_calls=int(fanout_raw.get("max_calls", 0)),
+            max_iterations=(int(fanout_raw["max_iterations"])
+                            if fanout_raw.get("max_iterations") is not None
+                            else None),
+            prune_keep_rounds=(int(fanout_raw["prune_keep_rounds"])
+                               if fanout_raw.get("prune_keep_rounds") is not None
+                               else None),
         ),
         safety=SafetyConfig(
             allow_swarm=bool(safety_raw.get("allow_swarm", True)),
