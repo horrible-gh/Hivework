@@ -46,6 +46,62 @@ _GREP_SKIP_DIRS = {".git", "node_modules", "__pycache__", ".apply_backups",
 # spending unbounded tokens; the common path terminates in a handful of rounds.
 DEFAULT_MAX_ITERATIONS = 25
 
+# ── History pruning (R0001 0077 requirement 2) ────────────────────────────────
+# The loop resends the WHOLE transcript every round and DeepInfra has no cached-
+# input discount, so a long drone's bill grows ~quadratically with rounds — old
+# tool outputs (read/grep dumps it already mined) are re-billed verbatim on every
+# later round. Pruning replaces tool outputs older than the last
+# ``prune_keep_rounds`` tool-call rounds with a short head + a stub note, keeping
+# growth near-linear. The model keeps its OWN turns (its reasoning and citations
+# survive) and can always re-run a tool if it truly needs pruned content back —
+# that costs one cheap call, only when needed, instead of billing every round.
+
+# Lines of a pruned tool result kept verbatim (enough to recognise WHAT the call
+# returned — the file path / first matches — without carrying the full dump).
+_PRUNE_HEAD_LINES = 5
+
+
+def _prune_stub(text: str) -> str:
+    """Shrink one old tool result to a head + stub note. Idempotent by caller
+    bookkeeping (the loop prunes each message object at most once)."""
+    lines = text.splitlines()
+    if len(lines) <= _PRUNE_HEAD_LINES + 2:  # already tiny — not worth a stub
+        return text
+    head = "\n".join(lines[:_PRUNE_HEAD_LINES])
+    return (f"{head}\n[... pruned {len(lines) - _PRUNE_HEAD_LINES} older lines to "
+            f"save context — call the tool again if you need this content]")
+
+
+def _prune_old_tool_results(messages: list, keep_rounds: int,
+                            pruned_ids: set) -> None:
+    """Stub tool outputs older than the last ``keep_rounds`` tool-call rounds.
+
+    A "round" is an assistant turn carrying ``tool_calls``; everything before the
+    keep-window's first such turn is old. Only RESULT payloads are shrunk — the
+    ``role=='tool'`` messages and the RC-C bridge's user-turn results (identified
+    by their fixed prefix). The message SKELETON is untouched (roles, tool_call_id
+    pairing, the assistant's own turns, the system/seed prompt), so the OpenAI
+    protocol stays valid and the model keeps its reasoning trail. ``pruned_ids``
+    (object ids, loop-local) makes repeated passes no-ops.
+    """
+    round_starts = [idx for idx, m in enumerate(messages)
+                    if m.get("role") == "assistant" and m.get("tool_calls")]
+    if len(round_starts) <= keep_rounds:
+        return
+    cutoff = round_starts[-keep_rounds]
+    for m in messages[:cutoff]:
+        if id(m) in pruned_ids:
+            continue
+        content = m.get("content")
+        if not isinstance(content, str):
+            continue
+        is_tool_result = m.get("role") == "tool"
+        is_bridge_result = (m.get("role") == "user"
+                            and content.startswith("[You printed a search"))
+        if is_tool_result or is_bridge_result:
+            m["content"] = _prune_stub(content)
+            pruned_ids.add(id(m))
+
 
 def _resolve(root: str, path: str) -> str:
     """Resolve ``path`` against ``root`` and refuse anything that escapes it.
@@ -476,7 +532,8 @@ def _looks_like_tool_call_text(content: str, tool_param_names: set[str]) -> bool
 
 
 def run_agent_loop(client, model, messages, *, root, tool_names,
-                   temperature, max_tokens, extra, max_iterations=DEFAULT_MAX_ITERATIONS):
+                   temperature, max_tokens, extra, max_iterations=DEFAULT_MAX_ITERATIONS,
+                   prune_keep_rounds=None):
     """Drive the tool-calling loop against an OpenAI-compatible ``client``.
 
     Repeatedly calls ``client.chat.completions.create`` with the tool schemas;
@@ -489,6 +546,12 @@ def run_agent_loop(client, model, messages, *, root, tool_names,
     ``messages`` is mutated in place (the running transcript). On the final
     iteration tools are withheld (``tool_choice='none'``) so the model is forced
     to answer instead of requesting yet another call it has no budget to run.
+
+    ``prune_keep_rounds`` (R0001 0077 req 2): when a positive int, tool outputs
+    older than the last N tool-call rounds are shrunk to a head + stub before
+    every round-trip (see :func:`_prune_old_tool_results`), so the re-billed
+    transcript stops growing quadratically. None/0 = no pruning — existing
+    behaviour byte-for-byte.
     """
     tools = schemas_for(tool_names)
     tool_param_names = _tool_arg_param_names(tool_names)
@@ -496,8 +559,11 @@ def run_agent_loop(client, model, messages, *, root, tool_names,
     saw_usage = False
     content = ""
     bridges = 0
+    pruned_ids: set = set()
     for i in range(max_iterations):
         last = i == max_iterations - 1
+        if prune_keep_rounds:
+            _prune_old_tool_results(messages, prune_keep_rounds, pruned_ids)
         kwargs = dict(model=model, messages=messages, temperature=temperature,
                       max_tokens=max_tokens, **extra)
         if tools and not last:
@@ -509,6 +575,11 @@ def run_agent_loop(client, model, messages, *, root, tool_names,
         if tot is not None:
             total_tokens += tot
             saw_usage = True
+            # Per-round spend trace: the loop resends the whole transcript every
+            # round, so per-round usage is the ground truth for measuring history
+            # growth (R0001 0077). Debug-level — visible under -v only.
+            logger.debug("agent loop round %d: usage %d tokens (cumulative %d)",
+                         i + 1, tot, total_tokens)
         msg = resp.choices[0].message
         tool_calls = getattr(msg, "tool_calls", None)
         content = message_text(msg)
@@ -592,6 +663,8 @@ def run_agent_loop(client, model, messages, *, root, tool_names,
                        "Conclude from the evidence you have already gathered. Do "
                        "not return an empty message.",
         })
+        if prune_keep_rounds:
+            _prune_old_tool_results(messages, prune_keep_rounds, pruned_ids)
         kwargs = dict(model=model, messages=messages, temperature=temperature,
                       max_tokens=max_tokens, **extra)
         try:

@@ -469,3 +469,116 @@ def test_provider_no_cwd_forces_single_shot(tree, monkeypatch):
     # available_tools=None but no cwd → nothing to read → single-shot.
     providers._call_openai_compatible("m", "p", cwd=None, available_tools=None)
     assert "tools" not in client.calls[0]
+
+
+# ── history pruning (R0001 0077 req 2) ────────────────────────────────────────
+
+def _many_line_result_call(call_id):
+    # grep over conftest-made tree isn't long enough; read a real multi-line file.
+    return _tool_call(call_id, "read_file", {"path": "a.py"})
+
+
+def _long_tool_round(call_id):
+    return _resp(tool_calls=[_tool_call(call_id, "list_dir", {"path": "."})])
+
+
+def _pruning_tree_file(tree, name="big.txt", lines=30):
+    path = os.path.join(tree, name)
+    with open(path, "w", encoding="utf-8") as f:
+        for i in range(lines):
+            f.write(f"line-{i}\n")
+    return name
+
+
+def test_prune_off_keeps_old_tool_results_verbatim(tree):
+    # Default (no prune_keep_rounds) is byte-for-byte today's behaviour.
+    name = _pruning_tree_file(tree)
+    scripted = [
+        _resp(tool_calls=[_tool_call("c1", "read_file", {"path": name})]),
+        _resp(tool_calls=[_tool_call("c2", "list_dir", {"path": "."})]),
+        _resp(tool_calls=[_tool_call("c3", "list_dir", {"path": "."})]),
+        _resp(content="done"),
+    ]
+    messages = [{"role": "user", "content": "go"}]
+    run_agent_loop(_FakeClient(scripted), "m", messages, root=tree,
+                   tool_names=list(ALL_TOOL_NAMES), temperature=0.2,
+                   max_tokens=64, extra={})
+    first_tool = next(m for m in messages if m["role"] == "tool")
+    assert "line-29" in first_tool["content"]
+    assert "pruned" not in first_tool["content"]
+
+
+def test_prune_stubs_old_rounds_keeps_recent_full(tree):
+    name = _pruning_tree_file(tree)
+    scripted = [
+        _resp(tool_calls=[_tool_call("c1", "read_file", {"path": name})]),
+        _resp(tool_calls=[_tool_call("c2", "read_file", {"path": name})]),
+        _resp(tool_calls=[_tool_call("c3", "read_file", {"path": name})]),
+        _resp(content="done"),
+    ]
+    messages = [{"role": "user", "content": "go"}]
+    content, _ = run_agent_loop(
+        _FakeClient(scripted), "m", messages, root=tree,
+        tool_names=list(ALL_TOOL_NAMES), temperature=0.2, max_tokens=64,
+        extra={}, prune_keep_rounds=1)
+    assert content == "done"
+    tool_msgs = [m for m in messages if m["role"] == "tool"]
+    assert len(tool_msgs) == 3
+    # Rounds 1–2 (older than the keep window when later rounds fired) are stubbed…
+    assert "pruned" in tool_msgs[0]["content"]
+    assert "call the tool again" in tool_msgs[0]["content"]
+    # …with the head kept so the drone can still recognise what it was.
+    assert tool_msgs[0]["content"].startswith("1\tline-0")
+    assert "pruned" in tool_msgs[1]["content"]
+    # The keep-window round stays verbatim.
+    assert "line-29" in tool_msgs[2]["content"]
+    assert "pruned" not in tool_msgs[2]["content"]
+    # Skeleton intact: ids/roles survive so the OpenAI protocol stays valid.
+    assert all(m.get("tool_call_id") for m in tool_msgs)
+    assert [m["role"] for m in messages[:2]] == ["user", "assistant"]
+
+
+def test_prune_leaves_tiny_results_alone(tree):
+    # A result at/under the head+2 threshold isn't worth a stub — left as is.
+    scripted = [
+        _resp(tool_calls=[_tool_call("c1", "list_dir", {"path": "."})]),
+        _resp(tool_calls=[_tool_call("c2", "list_dir", {"path": "."})]),
+        _resp(tool_calls=[_tool_call("c3", "list_dir", {"path": "."})]),
+        _resp(content="done"),
+    ]
+    messages = [{"role": "user", "content": "go"}]
+    run_agent_loop(_FakeClient(scripted), "m", messages, root=tree,
+                   tool_names=list(ALL_TOOL_NAMES), temperature=0.2,
+                   max_tokens=64, extra={}, prune_keep_rounds=1)
+    tool_msgs = [m for m in messages if m["role"] == "tool"]
+    assert all("pruned" not in m["content"] for m in tool_msgs)
+
+
+def test_prune_helper_is_idempotent_and_protocol_safe(tree):
+    from hive.http_tools import _prune_old_tool_results
+    long = "\n".join(f"l{i}" for i in range(40))
+    messages = [
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "seed " + long},   # seed prompt NEVER pruned
+        {"role": "assistant", "content": None,
+         "tool_calls": [{"id": "c1"}]},
+        {"role": "tool", "tool_call_id": "c1", "content": long},
+        {"role": "assistant", "content": "memo"},
+        {"role": "user",
+         "content": "[You printed a search instead of calling a tool…]\n" + long},
+        {"role": "assistant", "content": None,
+         "tool_calls": [{"id": "c2"}]},
+        {"role": "tool", "tool_call_id": "c2", "content": long},
+    ]
+    pruned_ids: set = set()
+    _prune_old_tool_results(messages, 1, pruned_ids)
+    snapshot = [dict(m) for m in messages]
+    _prune_old_tool_results(messages, 1, pruned_ids)   # second pass: no-op
+    assert [dict(m) for m in messages] == snapshot
+    assert "pruned" in messages[3]["content"]          # old tool result stubbed
+    assert "pruned" in messages[5]["content"]          # bridge result stubbed
+    assert messages[5]["content"].startswith("[You printed a search")
+    assert "pruned" not in messages[7]["content"]      # keep-window round full
+    assert messages[1]["content"].startswith("seed ")  # seed untouched
+    assert "pruned" not in messages[1]["content"]
+    assert messages[4]["content"] == "memo"            # assistant turns untouched
