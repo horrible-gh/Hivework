@@ -11,13 +11,13 @@
     "decompose":  { "provider": "copilot", "model": "gpt-5-mini", "retries": 2,
                     "_comment": "Splits the seed into leaf axes. Was roles.queen. Single call; retries covers the occasional rc=0 blank reply (T905)." },
 
-    "fanout":     { "provider": "copilot", "model": "gpt-5-mini",
+    "fanout":     { "provider": "openai", "model": "Qwen/Qwen3-235B-A22B-Instruct-2507",
                     "enabled": true, "parallel": 4, "retries": 1, "max_calls": 24, "max_iterations": 12, "prune_keep_rounds": 2,
                     "_comment": "Source-mining swarm (was roles.swarm). enabled = old ops.swarm_run.allow; parallel = the previously-hidden max_workers; retries = the previously-hidden respecify retry; max_calls = new total ceiling. Actual calls = axes x (1 + retries). max_iterations / prune_keep_rounds (R0001 0077, HTTP provider only): per-drone agent-loop round ceiling and history-pruning window — the loop resends the whole transcript every round, so runaway drones grow quadratically; cap the rounds and keep only the last N rounds' tool outputs verbatim (older ones become head+stub). Omit both keys for the old behaviour (25 rounds, no pruning)." },
 
-    "judge":      { "provider": "copilot", "model": "gpt-5-mini",
-                    "enabled": true, "jury_size": 5, "retries": 1, "parallel": 5, "max_axes": 10, "max_calls": 40,
-                    "_comment": "Post-decompose judgement (best-of-N). jury_size = old votes_per_axis; retries = old max_calls_per_axis - 1; max_calls = old max_total_calls; parallel = old max_parallel. (enabled is documentation only — judge has no off-switch in code.)" },
+    "judge":      { "provider": "openai", "model": "openai/gpt-oss-120b",
+                    "enabled": true, "jury_size": 3, "retries": 1, "parallel": 5, "max_axes": 10, "max_calls": 40,
+                    "_comment": "Post-decompose judgement (best-of-N). jury_size = old votes_per_axis; retries = old max_calls_per_axis - 1; max_calls = old max_total_calls; parallel = old max_parallel. (enabled is documentation only — judge has no off-switch in code.) Routing/caps follow config/hive.routing.certified.json (0076 preset + 0062 jury floor) — a template that shipped copilot here once resurrected the 0081 misrouting on fresh setups." },
 
     "reinforce":  { "provider": "copilot", "model": "gpt-5-mini",
                     "enabled": true, "parallel": 4, "retries": 0, "max_calls": 8,

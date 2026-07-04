@@ -50,6 +50,12 @@ _MIGRATIONS = (
     # on a fresh DB created with the new DDL the column is already `model_fanout`
     # so this RENAME raises "no such column: model_swarm" and is swallowed below.
     "ALTER TABLE runs RENAME COLUMN model_swarm TO model_fanout",
+    # Routing provenance (group 0081): the resolved per-stage provider/model plus the
+    # config file path+sha256 the run loaded, as JSON. The 07-04 copilot misrouting
+    # could only be reconstructed from a leftover log banner — model_queen/model_fanout
+    # alone cannot answer "which provider did judge use, from which config state"
+    # (the cheap path even stores the JUDGE model in model_fanout).
+    "ALTER TABLE runs ADD COLUMN routing_json TEXT",
 )
 
 
@@ -116,17 +122,23 @@ class Ledger:
         return self._run_id
 
     def start_run(self, seed: str, codebase: str, model_queen: str, model_fanout: str,
-                  ts: str | None = None) -> None:
-        """Insert a runs row with status='running'."""
+                  ts: str | None = None, routing_json: str | None = None) -> None:
+        """Insert a runs row with status='running'.
+
+        ``routing_json``: Config.routing_snapshot() as JSON — the resolved per-stage
+        provider/model + config path/sha256 (0081 provenance). Optional so existing
+        callers and perf scripts keep working.
+        """
         if self._conn is None:
             return
         ts = ts or datetime.now(timezone.utc).isoformat()
         try:
             with self._lock:
                 cur = self._conn.execute(
-                    "INSERT INTO runs (ts, seed, work_type, codebase, model_queen, model_fanout, status)"
-                    " VALUES (?,?,?,?,?,?,?)",
-                    (ts, seed, "investigate", codebase, model_queen, model_fanout, "running"))
+                    "INSERT INTO runs (ts, seed, work_type, codebase, model_queen, model_fanout,"
+                    " status, routing_json) VALUES (?,?,?,?,?,?,?,?)",
+                    (ts, seed, "investigate", codebase, model_queen, model_fanout,
+                     "running", routing_json))
                 self._conn.commit()
                 self._run_id = cur.lastrowid
         except Exception as e:
@@ -329,6 +341,30 @@ class Ledger:
         except Exception as e:
             logger.warning("Ledger: finish_run failed: %s", e)
 
+    def cost_summary(self) -> list[dict[str, Any]]:
+        """Per provider/model call+token aggregate for the CURRENT run (0080 TS-01 gap).
+
+        Read from the ledger so the numbers are the billed record, not a re-estimate.
+        copilot reports no real tokens (real_tokens stays None) — its spend is call
+        counts; deepinfra's is real_tokens. Returns [] when disabled/failed (NullLedger
+        contract), so callers can embed the result unconditionally.
+        """
+        if self._conn is None or self._run_id is None:
+            return []
+        try:
+            with self._lock:
+                rows = self._conn.execute(
+                    "SELECT provider, model, COUNT(*), SUM(est_tokens), SUM(real_tokens)"
+                    " FROM worker_calls WHERE run_id=? GROUP BY provider, model"
+                    " ORDER BY COUNT(*) DESC",
+                    (self._run_id,)).fetchall()
+            return [{"provider": p, "model": m, "calls": c,
+                     "est_tokens": est or 0, "real_tokens": real}
+                    for p, m, c, est, real in rows]
+        except Exception as e:
+            logger.warning("Ledger: cost_summary failed: %s", e)
+            return []
+
     def close(self) -> None:
         if self._conn:
             try:
@@ -350,6 +386,7 @@ class NullLedger:
     def timed_local(self, *a, **kw):
         yield
     def finish_run(self, *a, **kw): pass
+    def cost_summary(self, *a, **kw): return []
     def close(self): pass
 
 

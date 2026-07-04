@@ -1,0 +1,11 @@
+{
+  "_comment": "CERTIFIED per-stage routing manifest (group 0081). This is the version-controlled pin of the tuned routing: the 0076-certified swarm preset (judge/fanout on deepinfra) plus the 0062 L3 jury floor (3 jurors, 10 axes). The live profile files under config/ are gitignored LOCAL state and proved silently mutable between sessions — on 07-04 a drifted pipeline.judge block (openai→copilot) burned a day of copilot credits and derailed the post-hoc audit (TSR 0080.0007). check_routing_drift (hive/config.py) compares every loaded config against this manifest and hive.py warns loudly at run start on any mismatch. Only keys listed here are compared; drift is a WARNING, not a hard stop (deliberate experiments stay possible). Update this file ONLY alongside a new certified preset decision.",
+  "_comment_queen": "queen is deliberately NOT pinned: the operator alternates it between copilot/gpt-5-mini and codex/gpt-5.4-mini (see test_queen_alternates_copilot_or_codex_with_retries) and both are certified.",
+  "roles": {
+    "fanout": {"provider": "openai", "model": "Qwen/Qwen3-235B-A22B-Instruct-2507"},
+    "judge": {"provider": "openai", "model": "openai/gpt-oss-120b"},
+    "converge": {"provider": "copilot", "model": "gpt-5-mini"},
+    "designer": {"provider": "copilot", "model": "claude-sonnet-4.5"}
+  },
+  "judge_caps": {"votes_per_axis": 3, "max_axes": 10}
+}

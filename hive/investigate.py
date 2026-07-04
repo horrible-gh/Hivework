@@ -1389,6 +1389,11 @@ def run_investigate(
         "seed_kind": seed_kind,
         "converge": converge_dict,
         "verdicts": verdicts,
+        # Per provider/model billed-call aggregate straight from the ledger (0080
+        # TS-01 gap: the spend had to be dug out of hive_ledger.db after the fact).
+        # Covers every call recorded so far; only the final free report_write local
+        # entry lands after this line.
+        "cost_summary": ledger.cost_summary() if ledger is not None else [],
     }
     with _local_timer(ledger, stage="report_write", mechanism="verdict_json_md",
                       detail=f"verdicts={len(verdicts)}"):

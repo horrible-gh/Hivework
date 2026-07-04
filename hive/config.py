@@ -6,6 +6,7 @@ reproduce today's behavior exactly: all roles use provider=copilot, model=gpt-5-
 
 Precedence: explicit CLI --model overrides all role models.
 """
+import hashlib
 import json, logging, os
 from dataclasses import dataclass, field
 from typing import Any
@@ -754,6 +755,35 @@ class Config:
     # three above. Empty by default — acceptance synthesis stays a no-op when a run's codebase
     # has no entry AND no --acceptance-design is supplied (no criteria text → nothing to ground).
     acceptance_targets: dict[str, AcceptanceConfig] = field(default_factory=dict)
+    # Provenance of the loaded config file (group 0081): the 07-04 misrouting could
+    # only be reconstructed from a leftover startup banner because nothing recorded
+    # WHICH file (and which content) a run resolved its routing from. load_config
+    # stamps these; routing_snapshot() carries them into the ledger per run.
+    source_path: str = ""
+    source_sha256: str = ""
+
+    def routing_snapshot(self) -> dict[str, Any]:
+        """Resolved per-stage routing + config provenance, for the ledger runs row.
+
+        This is the startup banner made durable: after a run, the ledger alone must
+        answer "which provider/model did each stage resolve to, from which config
+        file state" — without trusting the file on disk, which can drift (0081: the
+        judge block was edited between the runs and the post-hoc audit, sending the
+        audit to the wrong culprit).
+        """
+        snap: dict[str, Any] = {
+            "config_path": self.source_path,
+            "config_sha256": self.source_sha256,
+            "roles": {
+                name: {"provider": self.role(name).provider,
+                       "model": self.role(name).model}
+                for name in ("queen", "fanout", "judge", "converge",
+                             "scout", "designer", "specify")
+            },
+            "judge_caps": {"votes_per_axis": self.judge.votes_per_axis,
+                           "max_axes": self.judge.max_axes},
+        }
+        return snap
 
     def db_for_codebase(self, codebase_root: str | None) -> DbConnection | None:
         """Resolve the DB connection for a run's ``--codebase`` path, or None.
@@ -1257,10 +1287,13 @@ def load_config(path: str | None = None, profile: str | None = None) -> Config:
                                resolved_path, e)
 
     raw: dict[str, Any] = {}
+    source_sha256 = ""
     if os.path.exists(resolved_path):
         try:
-            with open(resolved_path, "r", encoding="utf-8") as f:
-                raw = json.load(f)
+            with open(resolved_path, "rb") as f:
+                raw_bytes = f.read()
+            source_sha256 = hashlib.sha256(raw_bytes).hexdigest()
+            raw = json.loads(raw_bytes.decode("utf-8"))
             logger.debug("Loaded config from %s", resolved_path)
         except (OSError, json.JSONDecodeError) as e:
             logger.warning("Failed to load config from %s: %s — using defaults", resolved_path, e)
@@ -1401,7 +1434,7 @@ def load_config(path: str | None = None, profile: str | None = None) -> Config:
     # aliased in _normalize) carries over unchanged.
     fanout_role = _role("fanout")
     scout_role = _role("scout") if "scout" in roles else fanout_role
-    return Config(
+    cfg = Config(
         queen=_role("queen"),
         fanout_role=fanout_role,
         scout=scout_role,
@@ -1499,3 +1532,46 @@ def load_config(path: str | None = None, profile: str | None = None) -> Config:
         overwrite_race_targets=overwrite_race_targets,
         acceptance_targets=acceptance_targets,
     )
+    cfg.source_path = resolved_path
+    cfg.source_sha256 = source_sha256
+    return cfg
+
+
+# The CERTIFIED routing manifest — the committed, version-controlled copy of the
+# tuned per-stage routing (0076 preset + 0062 jury floor). The live profile files
+# under config/ are gitignored LOCAL state and proved mutable between sessions
+# (0081: pipeline.judge silently flipped openai→copilot, burning copilot credits
+# for a day and misleading the post-hoc audit). check_routing_drift compares a
+# loaded config against this manifest so a drifted profile is loud at run start.
+_CERTIFIED_ROUTING_PATH = os.path.join(_CONFIG_DIR, "hive.routing.certified.json")
+
+
+def check_routing_drift(cfg: Config,
+                        manifest_path: str | None = None) -> list[str]:
+    """Compare cfg's resolved routing against the certified manifest.
+
+    Returns human-readable mismatch lines (empty = no drift or no manifest).
+    Only the keys present in the manifest are compared, so the manifest pins
+    exactly what was certified and nothing else. Never raises.
+    """
+    path = manifest_path or _CERTIFIED_ROUTING_PATH
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            manifest = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return []
+    drifts: list[str] = []
+    for name, want in (manifest.get("roles") or {}).items():
+        if not isinstance(want, dict):
+            continue
+        role = cfg.role(name)
+        for key in ("provider", "model"):
+            if key in want and getattr(role, key) != want[key]:
+                drifts.append(f"{name}.{key}: certified={want[key]!r} "
+                              f"resolved={getattr(role, key)!r}")
+    caps = manifest.get("judge_caps") or {}
+    for key in ("votes_per_axis", "max_axes"):
+        if key in caps and getattr(cfg.judge, key) != caps[key]:
+            drifts.append(f"judge_caps.{key}: certified={caps[key]!r} "
+                          f"resolved={getattr(cfg.judge, key)!r}")
+    return drifts

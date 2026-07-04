@@ -17,7 +17,7 @@ import sys
 import time
 from datetime import datetime
 
-from hive.config import load_config
+from hive.config import check_routing_drift, load_config
 from hive.ledger import open_ledger
 from hive.commit import run_propose, run_commit, render_commit_summary_lines
 from hive import backup as backup_store
@@ -119,6 +119,36 @@ def build_provider_kwargs(cfg) -> dict:
     if cfg.openai.prune_keep_rounds:
         kwargs["prune_keep_rounds"] = cfg.openai.prune_keep_rounds
     return kwargs
+
+
+def routing_guard(cfg, logger, cli_model: str | None = None) -> str:
+    """Surface routing drift + blanket-override risk at run start; return the
+    routing provenance JSON for the ledger runs row (group 0081).
+
+    The 07-04 misrouting burned a day of copilot credits invisibly: the local
+    (gitignored) profile's judge block had drifted off the certified preset, and
+    nothing but a leftover log banner recorded what the run actually resolved.
+    This makes the drift LOUD (log + stdout, for unmanned chains) and the resolved
+    routing durable. Warn-only by design: an operator may drift deliberately for
+    an experiment, so the run proceeds.
+    """
+    snapshot = cfg.routing_snapshot()
+    if cli_model:
+        logger.warning("--model %s overrides EVERY role's model (judge/fanout "
+                       "included) but never their provider — with a paid-provider "
+                       "role this calls that provider with a model it may not "
+                       "serve. Prefer per-role config for anything but one-offs.",
+                       cli_model)
+    drifts = check_routing_drift(cfg)
+    if drifts:
+        lines = ["ROUTING DRIFT — resolved config differs from the certified "
+                 "manifest (config/hive.routing.certified.json):"]
+        lines += [f"  {d}" for d in drifts]
+        lines.append(f"  config: {cfg.source_path} sha256={cfg.source_sha256[:12]}")
+        for ln in lines:
+            logger.warning("%s", ln)
+        print("\n".join(lines), file=sys.stderr)
+    return json.dumps(snapshot, ensure_ascii=False)
 
 
 def fanout_provider_kwargs(cfg, base_kwargs: dict) -> dict:
@@ -352,9 +382,11 @@ def run_pipeline(args: argparse.Namespace) -> None:
         logger.info("  specify:  %s/%s (chained)", specify_role.provider, specify_role.model)
     logger.info("=" * 60)
 
+    routing_json = routing_guard(cfg, logger, cli_model=args.model)
     ldg = open_ledger(cfg.ledger.enabled, cfg.ledger.db_path)
     ldg.start_run(seed=args.seed, codebase=args.codebase,
-                  model_queen=queen_role.model, model_fanout=fanout_role.model)
+                  model_queen=queen_role.model, model_fanout=fanout_role.model,
+                  routing_json=routing_json)
 
     honey_path = ""
     final_combs: list[dict] = []
@@ -962,9 +994,11 @@ def run_investigate_command(args: argparse.Namespace) -> None:
         logger.info("Caller-supplied context: %d comment(s) folded into seed",
                     len(args.comment))
 
+    routing_json = routing_guard(cfg, logger, cli_model=args.model)
     ldg = open_ledger(cfg.ledger.enabled, cfg.ledger.db_path)
     ldg.start_run(seed=args.seed, codebase=args.codebase,
-                  model_queen=queen.model, model_fanout=judge_role.model)
+                  model_queen=queen.model, model_fanout=judge_role.model,
+                  routing_json=routing_json)
     run_id = ldg.run_id
     result: dict = {}
     investigate_ok = False
@@ -1045,7 +1079,8 @@ def run_investigate_command(args: argparse.Namespace) -> None:
             ldg_d = open_ledger(cfg.ledger.enabled, cfg.ledger.db_path)
             ldg_d.start_run(seed=args.seed, codebase=args.codebase,
                             model_queen=designer_role.model,
-                            model_fanout=designer_role.model)
+                            model_fanout=designer_role.model,
+                            routing_json=routing_json)
             try:
                 dres = run_designer(
                     seed_text=seed_text, verdicts=result.get("verdicts", []),
@@ -1093,7 +1128,8 @@ def run_investigate_command(args: argparse.Namespace) -> None:
         # and the chained specify worker calls leave NO rows. Start a run here so
         # the post-converge worker shows up in the configured ledger DB.
         ldg2.start_run(seed=args.seed, codebase=args.codebase,
-                       model_queen=specify_role.model, model_fanout=specify_role.model)
+                       model_queen=specify_role.model, model_fanout=specify_role.model,
+                       routing_json=routing_json)
         try:
             review_role = cfg.role("review")
             specify_kwargs = dict(author_retries=specify_role.retries)
