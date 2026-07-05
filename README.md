@@ -31,7 +31,7 @@ apply (render the proposal)**.
 
 ## Prerequisites
 
-- Python 3.11+ (Linux: `python3` + `python3-venv`, e.g. `sudo apt install python3 python3-venv`)
+- Python 3.11+ — on Linux you need `python3` plus the venv module (Debian/Ubuntu: `sudo apt install python3 python3-venv`); on Windows/git-bash the `python` command
 - Worker provider: the `copilot` CLI (per-role models live in `hive.config.json`)
 - stdout/stderr are forced to UTF-8 so Korean logs don't crash the Windows console
 

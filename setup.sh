@@ -9,10 +9,13 @@
 set -eu
 cd "$(dirname "$0")"
 
-# Pick the host interpreter: 'python3' on *nix, 'python' on Windows git-bash.
-# Each candidate must actually RUN, not just resolve — 'command -v' alone would
-# accept the fake Windows-Store 'python3' alias stub, which only opens the
-# Store and exits nonzero.
+# ---------------------------------------------------------------------------
+# Locate a usable Python 3 interpreter.
+# Linux ships `python3` (Debian/Ubuntu has no bare `python`); Windows/git-bash
+# uses `python`. Try python3 first, then python, and *execute* each candidate so
+# a non-runnable stub (e.g. the Windows Store `python3` alias that only opens the
+# Store) is rejected rather than picked.
+# ---------------------------------------------------------------------------
 PY=""
 for cand in python3 python; do
   if command -v "$cand" >/dev/null 2>&1 && "$cand" -c "import sys" >/dev/null 2>&1; then
@@ -20,35 +23,54 @@ for cand in python3 python; do
     break
   fi
 done
+
 if [ -z "$PY" ]; then
   echo "Python 3 not found on PATH (tried: python3, python)." >&2
-  echo "  Debian/Ubuntu:      sudo apt install python3 python3-venv" >&2
-  echo "  Windows (git-bash): install Python from https://www.python.org/downloads/" >&2
+  echo "  Debian/Ubuntu:       sudo apt install python3 python3-venv" >&2
+  echo "  Windows (git-bash):  install Python 3 from https://python.org and reopen the shell" >&2
   exit 1
 fi
 
-# On Debian/Ubuntu without python3-venv, 'python -m venv' fails AFTER creating a
-# pip-less half-venv; drop the debris so a re-run retries cleanly instead of
-# skipping creation and dying later at 'pip install' with "No module named pip".
+# venv layout differs by platform: Scripts/ on Windows (git-bash), bin/ elsewhere.
+venv_python() {
+  if [ -x ".venv/Scripts/python.exe" ]; then
+    printf '%s\n' ".venv/Scripts/python.exe"
+  else
+    printf '%s\n' ".venv/bin/python"
+  fi
+}
+
 create_venv() {
   echo "Creating virtual environment .venv ..."
   if ! "$PY" -m venv .venv; then
+    # A failed `venv` often leaves a half-built .venv behind; clear it so the
+    # next run starts clean instead of tripping over the debris.
     rm -rf .venv
-    echo "" >&2
-    echo "venv creation failed. On Debian/Ubuntu install the venv module first:" >&2
-    echo "  sudo apt install python3-venv" >&2
+    echo "Failed to create the virtual environment." >&2
+    echo "  The 'venv' module may be missing. Debian/Ubuntu:  sudo apt install python3-venv" >&2
     exit 1
   fi
 }
 
-# venv layout differs by platform: Scripts/ on Windows (git-bash), bin/ elsewhere.
 if [ ! -x ".venv/Scripts/python.exe" ] && [ ! -x ".venv/bin/python" ]; then
   create_venv
 fi
-if [ -x ".venv/Scripts/python.exe" ]; then
-  VPY=".venv/Scripts/python.exe"
-else
-  VPY=".venv/bin/python"
+
+VPY="$(venv_python)"
+
+# A previous failed run (typically missing python3-venv) can leave a .venv whose
+# interpreter exists but has no pip ("No module named pip"). Detect that and
+# rebuild the environment automatically instead of failing downstream.
+if ! "$VPY" -m pip --version >/dev/null 2>&1; then
+  echo "Existing .venv has no working pip - recreating it ..."
+  rm -rf .venv
+  create_venv
+  VPY="$(venv_python)"
+  if ! "$VPY" -m pip --version >/dev/null 2>&1; then
+    echo "The recreated .venv still has no working pip." >&2
+    echo "  Install the venv module and retry. Debian/Ubuntu:  sudo apt install python3-venv" >&2
+    exit 1
+  fi
 fi
 
 # A .venv left by an earlier failed create can have a python but no pip.
